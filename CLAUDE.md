@@ -107,11 +107,13 @@ Runtime artifacts (all under `~/.claude/`, hardcoded — see Gotchas):
 
 ## Documentation
 
-The project currently has no supplementary docs beyond this file. A
-user-facing `README.md` is planned (install, usage, env vars, the `--all`
-data-exposure warning) but not yet written. Design rationale for the extraction
-lives in `tmp/plans/2026-07-17-extract-retry-proxy-design.md` (gitignored —
-planning artifact, not published).
+- [README.md](README.md) — user-facing: install, usage, configuration, trace
+  log, the `--all` data-exposure warning, testing notes.
+- Design rationale for the extraction lives in
+  `tmp/plans/2026-07-17-extract-retry-proxy-design.md` (gitignored — planning
+  artifact, not published).
+
+No other supplementary docs.
 
 ## Future Work — TODO
 
