@@ -58,10 +58,12 @@ When you run `claude-retry-proxy start`:
 
 1. It reads the current `ANTHROPIC_BASE_URL` from `~/.claude/settings.json` and
    validates it (rejects localhost — the proxy cannot proxy to itself).
-2. It saves the original URL to a lock file (`~/.claude/proxy/base-url.lock`).
-3. It rewrites `ANTHROPIC_BASE_URL` in `settings.json` to
+2. It checks the trace log and prunes entries older than 5 days, printing a
+   one-line summary (best-effort; a failure does not block startup).
+3. It saves the original URL to a lock file (`~/.claude/proxy/base-url.lock`).
+4. It rewrites `ANTHROPIC_BASE_URL` in `settings.json` to
    `http://localhost:<port>`.
-4. It launches the proxy server, which forwards requests to the original URL
+5. It launches the proxy server, which forwards requests to the original URL
    with retry handling.
 
 `claude-retry-proxy stop` reverses this: graceful HTTP shutdown of the server,
@@ -126,7 +128,7 @@ are safe; override only if you need to.
 | `PROXY_MAX_RETRIES` | `10` | 1–100 | Max retry attempts per request (shared by 429 and 503) |
 | `PROXY_INITIAL_DELAY` | `1` | 1–60 | First backoff delay, seconds |
 | `PROXY_MAX_DELAY` | `30` | 1–300 | Backoff cap, seconds. Applied before jitter; 429 retries use this directly. |
-| `PROXY_MAX_BODY_SIZE` | `10485760` | 1024–100 MiB | Request body size cap (bytes); larger → 413 |
+| `PROXY_MAX_BODY_SIZE` | `10485760` | 1024–100 MiB | Request body size cap (bytes); larger → 413. Also caps the upstream error body drain on retry exhaustion. |
 | `PROXY_LOG_ALL` | unset | `1` to enable | Log full request **and** response bodies |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | path | Trace log location |
 
@@ -155,6 +157,16 @@ Default location: `~/.claude/logs/proxy-trace.jsonl` (one JSON object per line).
 Each request logs: timestamp, method, path, model, status, http_status, retry
 count, total latency, first-byte latency, and a sanitized error. Lifecycle
 markers (`proxy_start`, `proxy_stop`) and per-retry events are also logged.
+When a client disconnects mid-response (e.g. timed out during a long retry
+storm), a `client_disconnect` event is logged (with `request_id`,
+`http_status`, `retries`) instead of printing a traceback.
+
+Entries older than 5 days are pruned on each `claude-retry-proxy start`.
+
+When retries are exhausted on a `429`/`503`, the upstream's error body is
+preserved and returned to the client (capped at `PROXY_MAX_BODY_SIZE`).
+On connection-error exhaustion, a synthesized `upstream_unreachable` body is
+logged to the trace.
 
 Use `--all` (or `PROXY_LOG_ALL=1`) to include full request and response bodies.
 
@@ -178,6 +190,13 @@ of platform if you enable `--all`.
 - **Automatic retries** — `429`, `503`, and connection errors retried with
   jittered exponential backoff (default 10 attempts). `429`s back off at the
   maximal delay; jitter de-synchronizes concurrent sessions.
+- **Error body preservation** — exhausted retries on `429`/`503` return the
+  upstream error body to the client; connection-error exhaustion returns a
+  synthesized `upstream_unreachable` body (visible in the trace log).
+- **Graceful disconnect handling** — client disconnects mid-response are
+  logged as `client_disconnect` trace events; no tracebacks.
+- **Trace pruning** — `start` removes entries older than 5 days from the
+  trace log and prints a one-line summary.
 - **URL swapping** — original `ANTHROPIC_BASE_URL` saved and restored
   automatically; no manual config editing.
 - **Crash recovery** — if the proxy is killed without `stop`, a stale lock is
@@ -200,7 +219,7 @@ While the proxy runs, it creates (all under `~/.claude/`):
 | `proxy/url-swap.lock` | Cross-process lock serializing `start`/`stop` |
 | `proxy/proxy-state.json` | Runtime state (PID, port, heartbeat); removed on clean shutdown |
 | `proxy/proxy-stderr.log` | Server stderr (startup messages, retry notices) |
-| `logs/proxy-trace.jsonl` | The JSONL request trace |
+| `logs/proxy-trace.jsonl` | The JSONL request trace (pruned of entries >5 days on each `start`) |
 
 ## Testing
 
@@ -209,12 +228,12 @@ pip install -e .
 python tests/test_claude_proxy.py
 ```
 
-The suite has 27 tests. **12 of them exercise the CLI's URL swap and require
+The suite has 32 tests. **12 of them exercise the CLI's URL swap and require
 `ANTHROPIC_BASE_URL` in `~/.claude/settings.json` to be a non-localhost URL**
 (the proxy correctly rejects localhost to avoid proxying to itself). Set it to a
-real upstream or a mock before running the full suite. The other 15 tests start
+real upstream or a mock before running the full suite. The other 20 tests start
 the server directly with mock upstreams and pass regardless (these include the
-jitter/429 retry tests).
+jitter/429 retry, body preservation, disconnect catch, and trace prune tests).
 
 > The tests back up and restore `~/.claude/settings.json`, but during a run your
 > live config is temporarily altered. Don't run the suite while a Claude Code

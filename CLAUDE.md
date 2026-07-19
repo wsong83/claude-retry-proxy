@@ -22,7 +22,7 @@ src/claude_retry_proxy/
   server.py       the HTTP retry proxy server (ThreadingHTTPServer, retry/backoff, trace logging)
   cli.py          the claude-retry-proxy CLI: start / stop / status (URL swap, lock files, crash recovery)
 tests/
-  test_claude_proxy.py   27 behavioral tests (ported + cleaned from claude-config; +3 for jitter/429)
+  test_claude_proxy.py   32 behavioral tests (ported + cleaned from claude-config; +3 for jitter/429; +5 for body preservation, disconnect catch, trace prune)
 pyproject.toml   setuptools src-layout, console scripts, zero deps
 LICENSE          MIT
 ```
@@ -50,7 +50,8 @@ paths resolve against cwd), `--all` (log full request/response bodies).
 
 - **CLI `start`**: read+validate `ANTHROPIC_BASE_URL` from `~/.claude/settings.json`
   (reject localhost — proxy-to-self), acquire a swap lock (`O_EXCL`), swap the
-  URL to `http://localhost:<port>`, spawn the server via
+  URL to `http://localhost:<port>`, **check and prune the trace log** (entries
+  older than 5 days are removed; a one-line summary is printed), spawn the server via
   `python -m claude_retry_proxy.server --upstream-url <original>`, write a lock
   with the server PID, TCP-probe the port for readiness (2s), rollback on
   failure. Cross-platform PID liveness/kill via `ctypes` on Windows (`OpenProcess`
@@ -66,6 +67,18 @@ paths resolve against cwd), `--all` (log full request/response bodies).
   log a JSONL trace entry.
   `/admin/shutdown` (localhost-only) triggers graceful shutdown → `finally`
   block writes a `proxy_stop` marker and removes `proxy-state.json`.
+  **Client disconnect catch:** `_send_response` is wrapped in
+  `try/except _DISCONNECT_ERRORS` (`ConnectionResetError`,
+  `BrokenPipeError`, `ConnectionAbortedError`); on disconnect, a
+  `client_disconnect` trace event is logged instead of printing a
+  traceback per occurrence. The `_log_client_disconnect` method wraps
+  its own `log_trace` call in try/except to prevent re-raise.
+  **Give-up body preservation:** when retries are exhausted on 429/503,
+  `forward_request` drains the upstream error body (capped at
+  `PROXY_MAX_BODY_SIZE` via `_read_capped`) and returns it to the client
+  instead of `b''`. On connection-error exhaustion, a synthesized
+  `upstream_unreachable` JSON body is returned (includes the sanitized
+  last error string).
 - **Upstream URL resolution** happens in `server.py main()` at runtime (not
   import time): `--upstream-url` if given, else `read_upstream_url()` from
   settings.json. Direct invocation emits a clean, source-attributed error if the
@@ -79,13 +92,15 @@ paths resolve against cwd), `--all` (log full request/response bodies).
 | `PROXY_MAX_RETRIES` | 10 | Max retry attempts (1-100). Shared by 429 and 503. |
 | `PROXY_INITIAL_DELAY` | 1 | First backoff delay, seconds (1-60) |
 | `PROXY_MAX_DELAY` | 30 | Backoff cap, seconds (1-300). Applied *before* jitter, so actual sleeps can exceed it by up to 25%. 429 retries use this value directly (jittered). |
-| `PROXY_MAX_BODY_SIZE` | 10485760 | Request body size cap, bytes (1024-100MiB) → 413 |
+| `PROXY_MAX_BODY_SIZE` | 10485760 | Request body size cap, bytes (1024-100MiB) → 413. Also caps the upstream error body drain on retry exhaustion (give-up path) via `_read_capped`. |
 | `PROXY_LOG_ALL` | "" | Set to `1` to log full request/response bodies |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | Trace log path |
 
 Runtime artifacts (all under `~/.claude/`, hardcoded — see Gotchas):
 `proxy/base-url.lock`, `proxy/url-swap.lock`, `proxy/proxy-state.json`,
-`proxy/proxy-stderr.log`, `logs/proxy-trace.jsonl`.
+`proxy/proxy-stderr.log`, `logs/proxy-trace.jsonl`. The trace log is pruned of
+entries older than 5 days on each `claude-retry-proxy start` (best-effort;
+does not block startup on failure).
 
 ## Gotchas
 
@@ -117,7 +132,16 @@ Runtime artifacts (all under `~/.claude/`, hardcoded — see Gotchas):
   On the 503 path that means the 3rd retry onward; the 429 path uses
   `PROXY_MAX_DELAY` (default 30), so it de-syncs from the first 429.
   Sub-second jitter was considered and rejected (integer rounding requested).
-- **`_shutting_down` is not checked during retry `time.sleep`** (pre-existing,
+- **Give-up error body preservation:** when retries are exhausted on 429/503,
+  the upstream error body is drained (capped at `PROXY_MAX_BODY_SIZE` via
+  `_read_capped`) and returned to the client instead of `b''`. On
+  connection-error exhaustion, a synthesized `upstream_unreachable` JSON body
+  is returned. Preserved bodies flow into the `--all` trace log — on Windows
+  the trace file is world-readable (see `--all` gotcha above).
+- **`response-streaming-no-size-cap` is partially addressed.** The give-up
+  drain is capped, but the **streaming success path** (the normal response
+  read loop in `forward_request`) is still uncapped. The Open issue tracked
+  in `## Future Work` remains open for the streaming path.
   out of scope of the jitter/429 plan) — a mid-retry request blocks
   `/admin/shutdown` for up to `MAX_RETRIES * jittered_max_delay`. Tracked as
   Open issue `shutdown-during-retry-sleep` in the jitter plan's Issue Log for
@@ -157,13 +181,15 @@ to a future hardening plan.
   - **Tracking:** issue `start-early-exit-rollback-port-bind-race`
     ([report](tmp/reports/2026-07-17-extract-retry-proxy-start-early-exit-rollback-port-bind-race.json)).
 
-- [ ] **Response body has no size cap** — `forward_request` streams the entire
-  upstream response into memory (8 KB chunk loop, appended to a list) with no
-  size limit. Only the *request* body is capped (`PROXY_MAX_BODY_SIZE`,
-  default 10 MB → 413). An abnormally large response (huge `max_tokens`,
-  misconfigured/untrusted upstream) can grow the proxy's memory until the OS
-  kills it (OOM), taking down all concurrent sessions. `ThreadingHTTPServer`
-  has no thread-pool cap, so concurrent large responses compound the pressure.
+- [ ] **Response body has no size cap (streaming path)** — `forward_request`
+  streams the entire upstream success response into memory (8 KB chunk loop,
+  appended to a list) with no size limit. Only the *request* body is capped
+  (`PROXY_MAX_BODY_SIZE`, default 10 MB → 413), and the retry-exhaustion
+  give-up drain is now also capped (via `_read_capped`). But the streaming
+  success path remains uncapped. An abnormally large response (huge
+  `max_tokens`, misconfigured/untrusted upstream) can grow the proxy's
+  memory until the OS kills it (OOM). `ThreadingHTTPServer` has no
+  thread-pool cap, so concurrent large responses compound the pressure.
   - **Location:** `src/claude_retry_proxy/server.py` `forward_request`
     (response read loop). Upstream, ported near-verbatim.
   - **Fix sketch:** cap streamed response bytes (a `PROXY_MAX_RESPONSE_SIZE`

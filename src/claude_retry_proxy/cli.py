@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 
 
 HOME = os.path.expanduser("~")
@@ -19,6 +20,11 @@ PROXY_STATE_FILE = os.path.join(PROXY_DIR, "proxy-state.json")
 URL_LOCK_FILE = os.path.join(PROXY_DIR, "base-url.lock")
 URL_SWAP_LOCK_FILE = os.path.join(PROXY_DIR, "url-swap.lock")
 SETTINGS_FILE = os.path.join(HOME, ".claude", "settings.json")
+
+# Trace file defaults — MUST mirror server.py main()'s resolution so the CLI
+# prunes the same file the server writes to.
+TRACE_FILE_DEFAULT = os.path.join(HOME, ".claude", "logs", "proxy-trace.jsonl")
+PRUNE_RETENTION_DAYS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +312,148 @@ def validate_url(url):
 
 
 # ---------------------------------------------------------------------------
+# Trace log pruning (best-effort maintenance)
+# ---------------------------------------------------------------------------
+
+def resolve_trace_path(log_arg):
+    """Resolve the trace file path the same way server.py main() does.
+
+    MUST mirror server.py main()'s resolution so the CLI prunes the same file
+    the server writes to. Order: --log (relative to cwd) > $PROXY_TRACE_FILE
+    > default. If you change this, change server.py main() too.
+    """
+    if log_arg:
+        return log_arg if os.path.isabs(log_arg) else os.path.join(os.getcwd(), log_arg)
+    env = os.environ.get("PROXY_TRACE_FILE", "")
+    return env if env else TRACE_FILE_DEFAULT
+
+
+_TS_FORMATS = ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _parse_trace_entry(line):
+    """Parse one JSONL trace line into {ts, event, status} (subset).
+
+    Returns None if the line is not valid JSON. `ts` may be None within a
+    valid entry if the timestamp field is missing or unparseable (the entry
+    is kept but not age-checked). Callers MUST use `is not None` checks on
+    the returned `ts` field.
+    """
+    try:
+        obj = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    ts_str = obj.get("timestamp")
+    ts = None
+    if isinstance(ts_str, str):
+        for fmt in _TS_FORMATS:
+            try:
+                ts = datetime.strptime(ts_str, fmt).replace(
+                    tzinfo=timezone.utc).timestamp()
+                break
+            except ValueError:
+                continue
+    return {"ts": ts, "event": obj.get("event"), "status": obj.get("status")}
+
+
+def _fmt_ts(epoch):
+    return time.strftime("%Y-%m-%d", time.gmtime(epoch))
+
+
+def prune_trace_file(path):
+    """Print a summary of the trace log and prune entries older than 5 days.
+
+    Returns (kept_count, removed_count). Streams the file line-by-line to a
+    temp file (no full read into memory), then atomically replaces. Malformed
+    lines (partial crash writes, unparseable JSON) are preserved as-is — we
+    can't date them, and dropping history silently is worse than keeping it;
+    they count toward kept_count. If the file doesn't exist or can't be
+    opened, prints a message and returns (0, 0) without error.
+    """
+    cutoff = time.time() - PRUNE_RETENTION_DAYS * 86400
+    kept = 0
+    removed = 0
+    oldest_ts = None
+    newest_ts = None
+    failure_count = 0
+    total_bytes = 0
+    tmp = path + ".tmp"
+
+    try:
+        total_bytes = os.path.getsize(path)
+    except OSError:
+        total_bytes = 0
+
+    try:
+        f_in = open(path, "r", encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        print("Trace: no trace file yet ({})".format(path))
+        return 0, 0
+    except OSError as e:
+        print("Trace: cannot read {} ({})".format(path, e), file=sys.stderr)
+        return 0, 0
+
+    try:
+        f_out = open(tmp, "w", encoding="utf-8", errors="replace")
+    except OSError as e:
+        f_in.close()
+        print("Trace: cannot write temp file {} ({})".format(tmp, e),
+              file=sys.stderr)
+        return 0, 0
+
+    try:
+        with f_in, f_out:
+            for line in f_in:
+                if not line.strip():
+                    # Preserve blank lines (don't silently drop them).
+                    f_out.write(line)
+                    kept += 1
+                    continue
+                entry = _parse_trace_entry(line)
+                if entry is None:
+                    # Malformed JSON — keep as-is, can't age-check.
+                    f_out.write(line)
+                    kept += 1
+                    continue
+                ts = entry.get("ts")
+                if ts is not None:
+                    if oldest_ts is None or ts < oldest_ts:
+                        oldest_ts = ts
+                    if newest_ts is None or ts > newest_ts:
+                        newest_ts = ts
+                if (entry.get("event") == "request"
+                        and entry.get("status") == "failure"):
+                    failure_count += 1
+                if ts is not None and ts < cutoff:
+                    removed += 1
+                else:
+                    f_out.write(line)
+                    kept += 1
+        # Atomic replace (same directory → same volume → atomic on Windows too).
+        os.replace(tmp, path)
+    except OSError as e:
+        # Best-effort temp cleanup on any failure; the original file is intact.
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        print("Trace: prune failed for {} ({})".format(path, e),
+              file=sys.stderr)
+        return 0, 0
+
+    print("Trace: {} entries ({} kept, {} pruned >{}d); {}B; range {}..{}; {} failures".format(
+        kept + removed, kept, removed, PRUNE_RETENTION_DAYS,
+        total_bytes,
+        _fmt_ts(oldest_ts) if oldest_ts is not None else "n/a",
+        _fmt_ts(newest_ts) if newest_ts is not None else "n/a",
+        failure_count,
+    ))
+    return kept, removed
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -361,6 +509,14 @@ def cmd_start(args):
             _trace("cmd_start: invalid URL: {}".format(err))
             print("ERROR: Invalid ANTHROPIC_BASE_URL: {}".format(err))
             return 1
+
+        # Check + prune the trace log (best-effort; hardcoded 5-day retention).
+        # A failure here must not block proxy start.
+        try:
+            prune_trace_file(resolve_trace_path(parsed.log))
+        except Exception as e:
+            print("WARNING: trace log check failed ({}); continuing".format(e),
+                  file=sys.stderr)
 
         # Swap URL in settings BEFORE spawning proxy
         write_settings_url("http://localhost:{}".format(port))

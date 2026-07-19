@@ -169,6 +169,14 @@ _requests_retried = 0
 # graceful shutdown. Set True by the /admin/shutdown handler.
 _shutting_down = False
 
+# Client-disconnect errors: raised when the client closed the connection
+# before we finished writing the response (e.g. it timed out during a long
+# retry storm). These are expected under load; we log a single line and a
+# trace event instead of letting socketserver print a traceback per request.
+# ConnectionAbortedError covers Windows WinError 10053; ConnectionResetError
+# covers WinError 10054 and POSIX ECONNRESET; BrokenPipeError covers POSIX EPIPE.
+_DISCONNECT_ERRORS = (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)
+
 
 def increment_total():
     global _requests_total
@@ -236,6 +244,44 @@ def compute_jittered_delay(base):
         return 0
     jitter = _rng().uniform(-0.25, 0.25) * base
     return max(0, math.floor(base + jitter + 0.5))
+
+
+def _read_capped(resp, max_bytes):
+    """Read up to max_bytes from resp. Truncate past the cap with a marker.
+
+    Drains the response body so the connection can be closed cleanly, but
+    bounds memory: if the body exceeds max_bytes, stop reading and return a
+    standalone truncation marker. Returns the full body unchanged if it fits
+    within max_bytes.
+    """
+    if max_bytes <= 0:
+        return b''
+    chunks = []
+    total = 0
+    try:
+        while total < max_bytes:
+            chunk = resp.read(min(8192, max_bytes - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    except OSError:
+        pass
+    # Drain-and-discard the rest so the connection can be closed without a
+    # pending RST. Track whether we actually read tail data to distinguish
+    # "exactly at cap" from "truncated".
+    truncated = False
+    try:
+        while True:
+            tail = resp.read(8192)
+            if not tail:
+                break
+            truncated = True
+    except OSError:
+        pass
+    if truncated:
+        return b'{"error":"[proxy: response body truncated]"}'
+    return b"".join(chunks)
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +373,12 @@ def forward_request(method, path, headers, body):
                     conn.close()
                     continue
                 else:
-                    return resp.status, {}, b'', None, time.time() - total_start, retries
+                    err_body = _read_capped(resp, PROXY_MAX_BODY_SIZE)
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    return resp.status, {}, err_body, None, time.time() - total_start, retries
 
             # Non-retryable response — stream it back
             first_byte_start = time.time()
@@ -373,7 +424,14 @@ def forward_request(method, path, headers, body):
                 continue
             else:
                 total_elapsed = time.time() - total_start
-                return 0, {}, b'', None, total_elapsed, retries
+                err_body = json.dumps({
+                    "error": {
+                        "type": "upstream_unreachable",
+                        "message": "upstream: {} after {} retries".format(
+                            sanitize_error(str(e)) or "connection failed", retries),
+                    }
+                }).encode("utf-8")
+                return 0, {}, err_body, None, total_elapsed, retries
 
     total_elapsed = time.time() - total_start
     return last_status or 0, {}, b'', None, total_elapsed, retries
@@ -426,6 +484,30 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body_bytes)
 
+    def _log_client_disconnect(self, request_id, status, retries):
+        """Record a client_disconnect event; suppress the traceback.
+
+        Must never raise: it runs from an except handler, so a secondary
+        failure here would re-raise and defeat the fix. stderr print is
+        primary; trace event is best-effort.
+        """
+        try:
+            print("[proxy] client disconnected mid-response "
+                  "(request_id={}, status={}, retries={})".format(
+                      request_id, status, retries), file=sys.stderr)
+        except Exception:
+            pass
+        try:
+            log_trace({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "event": "client_disconnect",
+                "request_id": request_id,
+                "http_status": status,
+                "retries": retries,
+            })
+        except Exception:
+            pass
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Allow", "POST, OPTIONS")
@@ -464,8 +546,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # Read request body
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length > PROXY_MAX_BODY_SIZE:
-            self._send_response(413,
-                b'{"error":"Payload too large"}')
+            try:
+                self._send_response(413,
+                    b'{"error":"Payload too large"}')
+            except _DISCONNECT_ERRORS:
+                self._log_client_disconnect(request_id, 413, 0)
             log_trace({
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "event": "request",
@@ -525,7 +610,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         log_trace(trace_entry)
 
-        self._send_response(status, resp_body, resp_headers)
+        try:
+            self._send_response(status, resp_body, resp_headers)
+        except _DISCONNECT_ERRORS:
+            # Client disconnected mid-response (timed out, cancelled, etc.).
+            # The request already completed upstream and is traced above;
+            # record a delivery-failure event and avoid a traceback.
+            self._log_client_disconnect(request_id, status, retries)
 
     def log_message(self, format, *args):
         # Suppress default http.server logging (we use our own trace log)

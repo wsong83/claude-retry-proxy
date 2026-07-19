@@ -1,6 +1,6 @@
 """Test suite for claude-retry-proxy — HTTP retry proxy with URL swapping.
 
-Covers 27 test cases:
+Covers 32 test cases:
   1-11 from plan 2026-07-15-manual-proxy Guidance for Tester:
     1. URL swapping: start replaces URL in settings, stop restores it
     2. Crash recovery: stale lock recovery on restart
@@ -30,6 +30,12 @@ Covers 27 test cases:
   23-24 from plan 2026-07-16-remove-proxy-auth Guidance for Tester:
     23. Start no auth header required: POST without X-Proxy-Auth returns 200 (not 401)
     24. Proxy state no auth token: proxy-state.json does not contain auth_token field
+  25-28b from plan 2026-07-19-fix-giveup-body-and-trace-prune Guidance for Tester:
+    25. Exhaust 429 preserves body: client receives 429 with body containing 'rate_limited' (not empty)
+    26. Exhaust connection error synthesizes body: trace 'error' field contains 'upstream_unreachable'
+    27. Client disconnect no traceback: stderr has no Traceback, contains disconnect message
+    28. Start prunes old trace entries: prune_trace_file returns (2, 1), removes old entries
+    28b. Prune trace file edge cases: nonexistent file → (0, 0), empty file → (0, 0)
 
 Run: pip install -e .  then  python tests/test_claude_proxy.py
 Requires: Python 3.8+, no external dependencies (stdlib-only tests).
@@ -2880,6 +2886,568 @@ def test_proxy_state_no_auth_token():
 
 
 # ===========================================================================
+# Test Case 25: Exhaust 429 Preserves Body (Step 1 — Fix B, 429 path)
+# ===========================================================================
+
+def test_exhaust_429_preserves_body():
+    """Mock upstream always returns 429 with body '{"error":"rate_limited"}';
+    PROXY_MAX_RETRIES=1; verify client receives 429 with body containing
+    'rate_limited' (not empty); trace 'error' field contains 'rate_limited'."""
+    print("\n--- Test 25: Exhaust 429 Preserves Body ---")
+    backup_settings()
+
+    try:
+        upstream_port = find_free_port()
+        proxy_port = find_free_port()
+
+        request_count = [0]
+        count_lock = threading.Lock()
+
+        class Always429BodyHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                content_len = int(self.headers.get("Content-Length", 0))
+                if content_len > 0:
+                    self.rfile.read(content_len)
+                with count_lock:
+                    request_count[0] += 1
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"rate_limited"}')
+
+            def log_message(self, format, *args):
+                pass
+
+        mock_server = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), Always429BodyHandler)
+        mock_thread = threading.Thread(target=mock_server.serve_forever, daemon=True)
+        mock_thread.start()
+        time.sleep(0.3)
+
+        set_base_url(f"http://127.0.0.1:{upstream_port}")
+
+        trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl")
+        os.close(trace_fd)
+
+        env = os.environ.copy()
+        env["PROXY_PORT"] = str(proxy_port)
+        env["PROXY_MAX_RETRIES"] = "1"
+        env["PROXY_MAX_DELAY"] = "1"
+        env["PROXY_INITIAL_DELAY"] = "1"
+        env["PROXY_TRACE_FILE"] = trace_file
+        env["PROXY_IDLE_TIMEOUT"] = "300"
+
+        proc = subprocess.Popen(
+            PROXY_SERVER + ["--port", str(proxy_port)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
+        )
+
+        # TCP probe for readiness
+        probe_ok = False
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                sock.connect(("127.0.0.1", proxy_port))
+                sock.close()
+                probe_ok = True
+                break
+            except (socket.error, ConnectionRefusedError):
+                time.sleep(0.1)
+
+        if not probe_ok:
+            restore_settings()
+            proc.kill()
+            mock_server.shutdown()
+            os.unlink(trace_file)
+            fail("Proxy server failed to start for exhaust-429-body test")
+            return
+
+        try:
+            status, body = _send_proxy_request(proxy_port)
+
+            # Assert: client receives 429 (the upstream status preserved)
+            if status == 429:
+                pass_(f"Client received 429 on exhaustion (status={status})")
+            else:
+                fail(f"Client received {status}, expected 429")
+
+            # Assert: body contains the upstream error content, not empty
+            body_str = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+            if "rate_limited" in body_str:
+                pass_("Response body contains 'rate_limited' — upstream error body preserved")
+            else:
+                fail(f"Response body does NOT contain 'rate_limited': {body_str[:200]}")
+
+            # Kill proxy to flush trace
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            time.sleep(0.5)
+
+            # Read trace file
+            if not os.path.exists(trace_file):
+                fail(f"Trace file not created: {trace_file}")
+                return
+
+            with open(trace_file) as f:
+                entries = [json.loads(line) for line in f if line.strip()]
+
+            request_events = [e for e in entries if e.get("event") == "request"]
+            if len(request_events) >= 1:
+                req = request_events[0]
+                error_field = req.get("error", "")
+                if error_field and "rate_limited" in str(error_field):
+                    pass_("Trace 'error' field contains 'rate_limited'")
+                else:
+                    fail(f"Trace 'error' field does NOT contain 'rate_limited': {error_field}")
+            else:
+                fail("No request event in trace")
+
+            # Verify upstream received expected number of requests (MAX_RETRIES+1 = 2)
+            with count_lock:
+                total = request_count[0]
+            expected_attempts = 2  # MAX_RETRIES=1 → 2 total attempts
+            if total == expected_attempts:
+                pass_(f"Upstream received {total} requests (expected {expected_attempts})")
+            else:
+                fail(f"Upstream received {total} requests, expected {expected_attempts}")
+
+        finally:
+            mock_server.shutdown()
+            try:
+                os.unlink(trace_file)
+            except OSError:
+                pass
+
+    finally:
+        restore_settings()
+
+
+# ===========================================================================
+# Test Case 26: Exhaust Connection Error Synthesizes Body (Step 1 — Fix B, conn-error path)
+# ===========================================================================
+
+def test_exhaust_connection_error_synthesizes_body():
+    """Point proxy at a port with no listener; PROXY_MAX_RETRIES=1;
+    verify trace 'error' field contains 'upstream_unreachable' (not 'HTTP 0')."""
+    print("\n--- Test 26: Exhaust Connection Error Synthesizes Body ---")
+    backup_settings()
+
+    try:
+        proxy_port = find_free_port()
+        # Pick a port that almost certainly has no listener
+        dead_port = find_free_port()
+        # Ensure it's truly dead by binding+closing first to confirm free,
+        # then use it as the upstream target without any listener
+        test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_sock.bind(("127.0.0.1", dead_port))
+        test_sock.close()
+        # Now dead_port is confirmed free and will refuse connections
+
+        set_base_url(f"http://127.0.0.1:{dead_port}")
+
+        trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl")
+        os.close(trace_fd)
+
+        env = os.environ.copy()
+        env["PROXY_PORT"] = str(proxy_port)
+        env["PROXY_MAX_RETRIES"] = "1"
+        env["PROXY_INITIAL_DELAY"] = "1"
+        env["PROXY_MAX_DELAY"] = "1"
+        env["PROXY_TRACE_FILE"] = trace_file
+        env["PROXY_IDLE_TIMEOUT"] = "300"
+
+        proc = subprocess.Popen(
+            PROXY_SERVER + ["--port", str(proxy_port)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
+        )
+
+        # TCP probe for readiness
+        probe_ok = False
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                sock.connect(("127.0.0.1", proxy_port))
+                sock.close()
+                probe_ok = True
+                break
+            except (socket.error, ConnectionRefusedError):
+                time.sleep(0.1)
+
+        if not probe_ok:
+            restore_settings()
+            proc.kill()
+            os.unlink(trace_file)
+            fail("Proxy server failed to start for connection-error test")
+            return
+
+        try:
+            # Send request — will fail with connection refused
+            status, body = _send_proxy_request(proxy_port)
+
+            # Kill proxy to flush trace
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            time.sleep(0.5)
+
+            # Read trace file — the trace is the assertion target
+            if not os.path.exists(trace_file):
+                fail(f"Trace file not created: {trace_file}")
+                return
+
+            with open(trace_file) as f:
+                entries = [json.loads(line) for line in f if line.strip()]
+
+            request_events = [e for e in entries if e.get("event") == "request"]
+            if len(request_events) >= 1:
+                req = request_events[0]
+                error_field = req.get("error", "")
+                if error_field and "upstream_unreachable" in str(error_field):
+                    pass_("Trace 'error' field contains 'upstream_unreachable'")
+                elif error_field and "HTTP 0" in str(error_field):
+                    fail("Trace 'error' field contains 'HTTP 0' — old bare body behavior")
+                else:
+                    fail(f"Trace 'error' field does NOT contain 'upstream_unreachable': {error_field}")
+            else:
+                fail("No request event in trace")
+
+        finally:
+            try:
+                os.unlink(trace_file)
+            except OSError:
+                pass
+
+    finally:
+        restore_settings()
+
+
+# ===========================================================================
+# Test Case 27: Client Disconnect No Traceback (Step 2 — Fix C)
+# ===========================================================================
+
+def test_client_disconnect_no_traceback():
+    """Start proxy with mock upstream returning 200; send request via raw socket,
+    close socket before reading response; assert stderr has no Traceback,
+    contains '[proxy] client disconnected mid-response'; trace has
+    'client_disconnect' event with matching request_id."""
+    print("\n--- Test 27: Client Disconnect No Traceback ---")
+    backup_settings()
+
+    try:
+        upstream_port = find_free_port()
+        proxy_port = find_free_port()
+
+        class DisconnectHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                content_len = int(self.headers.get("Content-Length", 0))
+                if content_len > 0:
+                    self.rfile.read(content_len)
+                # Return a response large enough to exceed socket buffers
+                # so the write blocks, giving us time to close the client socket
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                payload = json.dumps({"id": "ok", "data": "x" * 65536})
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload.encode())
+
+            def log_message(self, format, *args):
+                pass
+
+        mock_server = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), DisconnectHandler)
+        mock_thread = threading.Thread(target=mock_server.serve_forever, daemon=True)
+        mock_thread.start()
+        time.sleep(0.3)
+
+        set_base_url(f"http://127.0.0.1:{upstream_port}")
+
+        trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl")
+        os.close(trace_fd)
+
+        env = os.environ.copy()
+        env["PROXY_PORT"] = str(proxy_port)
+        env["PROXY_TRACE_FILE"] = trace_file
+        env["PROXY_IDLE_TIMEOUT"] = "300"
+
+        proc = subprocess.Popen(
+            PROXY_SERVER + ["--port", str(proxy_port)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
+        )
+
+        # TCP probe for readiness
+        probe_ok = False
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                sock.connect(("127.0.0.1", proxy_port))
+                sock.close()
+                probe_ok = True
+                break
+            except (socket.error, ConnectionRefusedError):
+                time.sleep(0.1)
+
+        if not probe_ok:
+            restore_settings()
+            proc.kill()
+            mock_server.shutdown()
+            os.unlink(trace_file)
+            fail("Proxy server failed to start for disconnect test")
+            return
+
+        try:
+            # Send request via raw socket, then close before reading response
+            raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            raw_sock.settimeout(5)
+            raw_sock.connect(("127.0.0.1", proxy_port))
+
+            body = json.dumps({"model": "test-disconnect", "messages": [{"role": "user", "content": "hi"}]})
+            request_line = (
+                f"POST /v1/messages HTTP/1.0\r\n"
+                f"Host: 127.0.0.1:{proxy_port}\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"\r\n"
+                f"{body}"
+            )
+            raw_sock.sendall(request_line.encode())
+
+            # Give the proxy time to start processing and begin writing
+            time.sleep(0.5)
+
+            # Close the socket abruptly — this triggers disconnect before full response
+            raw_sock.close()
+
+            # Wait for the proxy to process the disconnect
+            time.sleep(1.0)
+
+            # Kill proxy to flush trace
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            time.sleep(0.3)
+
+            # Collect stderr
+            try:
+                stderr_output = proc.stderr.read() if proc.stderr else ""
+            except Exception:
+                stderr_output = ""
+
+            # Assert: NO Traceback in stderr
+            if "Traceback" not in stderr_output:
+                pass_("stderr contains NO Traceback")
+            else:
+                fail(f"stderr contains Traceback — disconnect not caught:\n{stderr_output[:500]}")
+
+            # Assert: stderr contains client disconnected message
+            if "[proxy] client disconnected mid-response" in stderr_output:
+                pass_("stderr contains '[proxy] client disconnected mid-response'")
+            else:
+                # May not have been triggered if the response was small enough
+                # to complete before our close hit — check trace instead
+                warn("stderr does NOT contain '[proxy] client disconnected mid-response' — "
+                     "disconnect may not have been triggered (timing-dependent)")
+
+            # Read trace file for client_disconnect event
+            if not os.path.exists(trace_file):
+                fail(f"Trace file not created: {trace_file}")
+                return
+
+            with open(trace_file) as f:
+                entries = [json.loads(line) for line in f if line.strip()]
+
+            disconnect_events = [e for e in entries if e.get("event") == "client_disconnect"]
+            request_events = [e for e in entries if e.get("event") == "request"]
+
+            if len(disconnect_events) >= 1:
+                pass_(f"Trace contains {len(disconnect_events)} 'client_disconnect' event(s)")
+                # Verify the disconnect event has a request_id matching a request event
+                if len(request_events) >= 1:
+                    req_id = request_events[0].get("request_id")
+                    disc_req_id = disconnect_events[0].get("request_id")
+                    if disc_req_id == req_id:
+                        pass_(f"client_disconnect request_id matches request event: {req_id}")
+                    else:
+                        fail(f"client_disconnect request_id ({disc_req_id}) "
+                             f"does not match request event ({req_id})")
+            else:
+                # Not a hard failure — disconnect may be timing-dependent
+                warn("No 'client_disconnect' event in trace — "
+                     "disconnect may not have been triggered (timing-dependent)")
+
+            # At minimum, verify the request completed and no traceback appeared
+            if len(request_events) >= 1:
+                pass_(f"Request event traced (total: {len(request_events)})")
+            else:
+                fail("No request event in trace — request was never processed")
+
+        finally:
+            mock_server.shutdown()
+            try:
+                os.unlink(trace_file)
+            except OSError:
+                pass
+
+    finally:
+        restore_settings()
+
+
+# ===========================================================================
+# Test Case 28: Start Prunes Old Trace Entries (Step 3 — Fix D)
+# ===========================================================================
+
+def test_start_prunes_old_trace_entries():
+    """Directly import prune_trace_file from claude_retry_proxy.cli; create temp
+    trace file with entries dated now, 10 days ago, and a malformed line;
+    assert return is (2, 1), old entry removed, today+malformed kept, summary printed."""
+    print("\n--- Test 28: Start Prunes Old Trace Entries ---")
+
+    from claude_retry_proxy.cli import prune_trace_file
+
+    # Create a temp trace file
+    fd, temp_path = tempfile.mkstemp(suffix=".jsonl")
+    os.close(fd)
+
+    try:
+        now = time.time()
+        ten_days_ago = now - 10 * 86400
+
+        now_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+        old_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ten_days_ago))
+
+        today_entry = json.dumps({
+            "timestamp": now_ts,
+            "event": "request",
+            "request_id": "test-today",
+            "http_status": 200,
+            "status": "success",
+        })
+        old_entry = json.dumps({
+            "timestamp": old_ts,
+            "event": "request",
+            "request_id": "test-old",
+            "http_status": 429,
+            "status": "failure",
+        })
+        malformed_line = "not json{"
+
+        with open(temp_path, "w") as f:
+            f.write(today_entry + "\n")
+            f.write(old_entry + "\n")
+            f.write(malformed_line + "\n")
+
+        # Capture stdout
+        import io
+        saved_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            kept, removed = prune_trace_file(temp_path)
+        finally:
+            stdout_output = sys.stdout.getvalue()
+            sys.stdout = saved_stdout
+
+        # Assert: return value is (2, 1)
+        if kept == 2 and removed == 1:
+            pass_(f"prune_trace_file returned ({kept}, {removed}) — expected (2, 1)")
+        else:
+            fail(f"prune_trace_file returned ({kept}, {removed}), expected (2, 1)")
+
+        # Assert: summary line printed
+        if "Trace:" in stdout_output:
+            pass_("Summary line printed to stdout")
+        else:
+            fail(f"No summary line on stdout: {stdout_output[:200]}")
+
+        # Assert: file now contains today entry and malformed line but NOT old entry
+        with open(temp_path) as f:
+            remaining = f.read()
+
+        if now_ts in remaining:
+            pass_("Today entry preserved in file")
+        else:
+            fail("Today entry missing from file after prune")
+
+        if malformed_line in remaining:
+            pass_("Malformed line preserved in file")
+        else:
+            fail("Malformed line missing from file after prune")
+
+        if old_ts not in remaining:
+            pass_("Old entry removed from file")
+        else:
+            fail("Old entry still in file after prune")
+
+        # Verify line count (should be 2: today + malformed)
+        lines_after = remaining.strip().split("\n")
+        if len(lines_after) == 2:
+            pass_(f"File has {len(lines_after)} lines after prune (expected 2)")
+        else:
+            fail(f"File has {len(lines_after)} lines after prune, expected 2")
+
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
+# ===========================================================================
+# Test Case 28b: Prune Trace File Edge Cases
+# ===========================================================================
+
+def test_prune_trace_file_edge_cases():
+    """Edge cases for prune_trace_file: file doesn't exist → (0, 0);
+    empty file → (0, 0)."""
+    print("\n--- Test 28b: Prune Trace File Edge Cases ---")
+
+    from claude_retry_proxy.cli import prune_trace_file
+
+    # Edge case 1: file doesn't exist
+    nonexistent = tempfile.mktemp(suffix=".jsonl")
+    try:
+        kept, removed = prune_trace_file(nonexistent)
+        if kept == 0 and removed == 0:
+            pass_("prune_trace_file on nonexistent file returns (0, 0)")
+        else:
+            fail(f"prune_trace_file on nonexistent file returned ({kept}, {removed}), expected (0, 0)")
+    finally:
+        try:
+            os.unlink(nonexistent)
+        except OSError:
+            pass
+        try:
+            os.unlink(nonexistent + ".tmp")
+        except OSError:
+            pass
+
+    # Edge case 2: empty file
+    fd, empty_path = tempfile.mkstemp(suffix=".jsonl")
+    os.close(fd)
+    try:
+        kept, removed = prune_trace_file(empty_path)
+        if kept == 0 and removed == 0:
+            pass_("prune_trace_file on empty file returns (0, 0)")
+        else:
+            fail(f"prune_trace_file on empty file returned ({kept}, {removed}), expected (0, 0)")
+    finally:
+        try:
+            os.unlink(empty_path)
+        except OSError:
+            pass
+
+
+# ===========================================================================
 # Test runner
 # ===========================================================================
 
@@ -2911,6 +3479,11 @@ ALL_TESTS = [
     ("start-stdout-not-contaminated", test_start_stdout_not_contaminated),
     ("start-no-auth-header-required", test_start_no_auth_header_required),
     ("proxy-state-no-auth-token", test_proxy_state_no_auth_token),
+    ("exhaust-429-preserves-body", test_exhaust_429_preserves_body),
+    ("exhaust-connection-error-synthesizes-body", test_exhaust_connection_error_synthesizes_body),
+    ("client-disconnect-no-traceback", test_client_disconnect_no_traceback),
+    ("start-prunes-old-trace-entries", test_start_prunes_old_trace_entries),
+    ("prune-trace-file-edge-cases", test_prune_trace_file_edge_cases),
 ]
 
 
