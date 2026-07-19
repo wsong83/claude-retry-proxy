@@ -1,12 +1,12 @@
 """Test suite for claude-retry-proxy — HTTP retry proxy with URL swapping.
 
-Covers 24 test cases:
+Covers 27 test cases:
   1-11 from plan 2026-07-15-manual-proxy Guidance for Tester:
     1. URL swapping: start replaces URL in settings, stop restores it
     2. Crash recovery: stale lock recovery on restart
     3. Race conditions: concurrent start calls rejected while proxy runs
     4. Concurrent requests: 10+ parallel requests complete
-    5. Retry logic: 503 retries with exponential backoff
+    5. Retry logic: 429 and 503 retried with jittered exponential backoff
     6. Trace markers: start/end events logged with counters
     7. URL validation: rejects localhost URLs at startup
     8. Manual edit detection: stop after manual edit warns
@@ -726,6 +726,364 @@ def test_retry_logic():
                     pass_(f"Retry logic active ({actual_retries} retries) — may be less than mock 503s due to timing")
             else:
                 fail(f"Request failed with status {status} after {actual_retries} retries — expected 200")
+
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            mock_server.shutdown()
+
+    finally:
+        restore_settings()
+
+
+# ===========================================================================
+# Test Case 5b: Jittered Delay Bounds (unit test of compute_jittered_delay)
+# ===========================================================================
+
+def test_compute_jittered_delay_bounds():
+    """Unit-test compute_jittered_delay: bounds, rounding, de-sync pattern, guards, thread-local RNG."""
+    print("\n--- Test 5b: Jittered Delay Bounds ---")
+
+    import math
+    from claude_retry_proxy.server import compute_jittered_delay, compute_delay, _rng, \
+        PROXY_INITIAL_DELAY, PROXY_MAX_DELAY
+
+    bases = [1, 2, 3, 4, 8, 16, 30, 300]
+    draws_per_base = 2000
+
+    for base in bases:
+        results = [compute_jittered_delay(base) for _ in range(draws_per_base)]
+
+        # Every result must be an int >= 0
+        for r in results:
+            if not isinstance(r, int):
+                fail(f"base={base}: non-int result: {r} (type={type(r).__name__})")
+                break
+            if r < 0:
+                fail(f"base={base}: negative result: {r}")
+                break
+        else:
+            # Upper bound: floor(base * 1.25 + 0.5)
+            hi = math.floor(base * 1.25 + 0.5)
+            for r in results:
+                if r > hi:
+                    fail(f"base={base}: result {r} exceeds upper bound {hi}")
+                    break
+            else:
+                pass_(f"base={base}: all {draws_per_base} draws within [0, {hi}]")
+
+            # Lower bound (allow one integer step below floor for edge effects)
+            lo = math.floor(base * 0.75 + 0.5) - 1
+            for r in results:
+                if r < lo:
+                    fail(f"base={base}: result {r} below lower bound {lo}")
+                    break
+            else:
+                pass_(f"base={base}: all draws >= lower bound {lo}")
+
+            # Empirical mean check (±15% of base — unbiased jitter)
+            mean = sum(results) / len(results)
+            if abs(mean - base) < 0.15 * base:
+                pass_(f"base={base}: mean={mean:.2f} ≈ {base} (within ±15%)")
+            else:
+                fail(f"base={base}: mean={mean:.2f} deviates >15% from {base}")
+
+    # De-sync regression guard: base=3 and base=4 produce ≥2 distinct values
+    for base in [3, 4]:
+        results = [compute_jittered_delay(base) for _ in range(draws_per_base)]
+        distinct = len(set(results))
+        if distinct >= 2:
+            pass_(f"base={base}: {distinct} distinct values (de-sync active)")
+        else:
+            fail(f"base={base}: only 1 distinct value — de-sync dead (rounding bug)")
+
+    # De-sync regression guard: base=1 and base=2 are degenerate (documented)
+    for base in [1, 2]:
+        results = [compute_jittered_delay(base) for _ in range(500)]
+        distinct = len(set(results))
+        if distinct == 1:
+            pass_(f"base={base}: exactly 1 distinct value ({results[0]}) — degenerate, documented")
+        else:
+            fail(f"base={base}: {distinct} distinct values — expected exactly 1 (degenerate case)")
+
+    # Guard clause: compute_jittered_delay(0) == 0 and compute_jittered_delay(-5) == 0
+    if compute_jittered_delay(0) == 0:
+        pass_("compute_jittered_delay(0) == 0")
+    else:
+        fail(f"compute_jittered_delay(0) = {compute_jittered_delay(0)}, expected 0")
+
+    if compute_jittered_delay(-5) == 0:
+        pass_("compute_jittered_delay(-5) == 0")
+    else:
+        fail(f"compute_jittered_delay(-5) = {compute_jittered_delay(-5)}, expected 0")
+
+    # Regression guard on unchanged compute_delay
+    if compute_delay(0) == PROXY_INITIAL_DELAY:
+        pass_(f"compute_delay(0) == PROXY_INITIAL_DELAY ({PROXY_INITIAL_DELAY})")
+    else:
+        fail(f"compute_delay(0) = {compute_delay(0)}, expected {PROXY_INITIAL_DELAY}")
+
+    if compute_delay(100) == PROXY_MAX_DELAY:
+        pass_(f"compute_delay(100) == PROXY_MAX_DELAY ({PROXY_MAX_DELAY})")
+    else:
+        fail(f"compute_delay(100) = {compute_delay(100)}, expected {PROXY_MAX_DELAY}")
+
+    # Thread-local RNG correctness: same object within one thread
+    r1 = _rng()
+    r2 = _rng()
+    if r1 is r2:
+        pass_("_rng() returns same object within one thread")
+    else:
+        fail("_rng() returned different objects within the same thread")
+
+    # Thread-local RNG correctness: distinct objects across threads
+    cross_thread_results = []
+    def get_rng():
+        cross_thread_results.append(_rng())
+
+    t = threading.Thread(target=get_rng)
+    t.start()
+    t.join()
+    if len(cross_thread_results) == 1 and cross_thread_results[0] is not r1:
+        pass_("_rng() returns distinct objects across threads")
+    elif len(cross_thread_results) == 1 and cross_thread_results[0] is r1:
+        fail("_rng() returned the SAME object across threads — not thread-local")
+    else:
+        fail(f"Unexpected cross-thread _rng() result: {cross_thread_results}")
+
+
+# ===========================================================================
+# Test Case 5c: 429 Retry (3x 429 then 200)
+# ===========================================================================
+
+def test_retry_429():
+    """Mock upstream returns 429 3x then 200; assert success, trace reason:'429'."""
+    print("\n--- Test 5c: 429 Retry ---")
+    backup_settings()
+
+    try:
+        upstream_port = find_free_port()
+        proxy_port = find_free_port()
+
+        retry_count = [0]
+        count_lock = threading.Lock()
+
+        class Retry429Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                content_len = int(self.headers.get("Content-Length", 0))
+                if content_len > 0:
+                    self.rfile.read(content_len)
+                with count_lock:
+                    retry_count[0] += 1
+                    current = retry_count[0]
+                if current <= 3:
+                    self.send_response(429)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"Too Many Requests"}')
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"id":"ok","type":"message","content":[{"text":"response"}]}')
+
+            def log_message(self, format, *args):
+                pass
+
+        mock_server = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), Retry429Handler)
+        mock_thread = threading.Thread(target=mock_server.serve_forever, daemon=True)
+        mock_thread.start()
+        time.sleep(0.3)
+
+        set_base_url(f"http://127.0.0.1:{upstream_port}")
+
+        trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl")
+        os.close(trace_fd)
+
+        env = os.environ.copy()
+        env["PROXY_PORT"] = str(proxy_port)
+        env["PROXY_MAX_RETRIES"] = "5"
+        env["PROXY_INITIAL_DELAY"] = "1"
+        env["PROXY_MAX_DELAY"] = "2"
+        env["PROXY_TRACE_FILE"] = trace_file
+        env["PROXY_IDLE_TIMEOUT"] = "300"
+
+        proc = subprocess.Popen(
+            PROXY_SERVER + ["--port", str(proxy_port)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
+        )
+
+        # TCP probe for readiness
+        probe_ok = False
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                sock.connect(("127.0.0.1", proxy_port))
+                sock.close()
+                probe_ok = True
+                break
+            except (socket.error, ConnectionRefusedError):
+                time.sleep(0.1)
+
+        if not probe_ok:
+            restore_settings()
+            proc.kill()
+            mock_server.shutdown()
+            os.unlink(trace_file)
+            fail("Proxy server failed to start for 429 retry test")
+            return
+
+        try:
+            status, body = _send_proxy_request(proxy_port)
+
+            with count_lock:
+                total_attempts = retry_count[0]
+                actual_retries = max(0, total_attempts - 1)
+
+            info(f"Total upstream requests made: {total_attempts} (first 3 = 429, 4th = 200)")
+
+            if status == 200:
+                pass_(f"Request succeeded after {actual_retries} retries (expected 3)")
+                if total_attempts >= 4:
+                    pass_(f"Upstream received {total_attempts} calls (expected 4: 3×429 + 1×200)")
+                else:
+                    fail(f"Upstream received only {total_attempts} calls, expected at least 4")
+            else:
+                fail(f"Request failed with status {status} after {actual_retries} retries — expected 200")
+
+            # Kill proxy to flush trace
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            time.sleep(0.5)
+
+            # Verify trace file has a retry line with reason "429"
+            if not os.path.exists(trace_file):
+                fail(f"Trace file not created: {trace_file}")
+                return
+
+            with open(trace_file) as f:
+                entries = [json.loads(line) for line in f if line.strip()]
+
+            retry_429_events = [e for e in entries
+                                if e.get("event") == "retry" and e.get("reason") == "429"]
+            if len(retry_429_events) >= 1:
+                pass_(f"Trace has {len(retry_429_events)} retry event(s) with reason '429'")
+            else:
+                fail("No retry event with reason '429' in trace")
+
+        finally:
+            mock_server.shutdown()
+            try:
+                os.unlink(trace_file)
+            except OSError:
+                pass
+
+    finally:
+        restore_settings()
+
+
+# ===========================================================================
+# Test Case 5d: 429 Exhaustion Returns 429
+# ===========================================================================
+
+def test_retry_429_exhaust_returns_429():
+    """Mock upstream always returns 429; verify client gets 429 on exhaustion."""
+    print("\n--- Test 5d: 429 Exhaustion Returns 429 ---")
+    backup_settings()
+
+    try:
+        upstream_port = find_free_port()
+        proxy_port = find_free_port()
+
+        request_count = [0]
+        count_lock = threading.Lock()
+
+        class Always429Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                content_len = int(self.headers.get("Content-Length", 0))
+                if content_len > 0:
+                    self.rfile.read(content_len)
+                with count_lock:
+                    request_count[0] += 1
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"Too Many Requests"}')
+
+            def log_message(self, format, *args):
+                pass
+
+        mock_server = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), Always429Handler)
+        mock_thread = threading.Thread(target=mock_server.serve_forever, daemon=True)
+        mock_thread.start()
+        time.sleep(0.3)
+
+        set_base_url(f"http://127.0.0.1:{upstream_port}")
+
+        env = os.environ.copy()
+        env["PROXY_PORT"] = str(proxy_port)
+        env["PROXY_MAX_RETRIES"] = "2"
+        env["PROXY_MAX_DELAY"] = "1"
+        env["PROXY_INITIAL_DELAY"] = "1"
+        env["PROXY_IDLE_TIMEOUT"] = "300"
+
+        proc = subprocess.Popen(
+            PROXY_SERVER + ["--port", str(proxy_port)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
+        )
+
+        # TCP probe for readiness
+        probe_ok = False
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                sock.connect(("127.0.0.1", proxy_port))
+                sock.close()
+                probe_ok = True
+                break
+            except (socket.error, ConnectionRefusedError):
+                time.sleep(0.1)
+
+        if not probe_ok:
+            restore_settings()
+            proc.kill()
+            mock_server.shutdown()
+            fail("Proxy server failed to start for 429 exhaustion test")
+            return
+
+        try:
+            status, body = _send_proxy_request(proxy_port)
+
+            with count_lock:
+                total = request_count[0]
+
+            if status == 429:
+                pass_(f"Client received 429 on exhaustion (status={status})")
+            elif status == 503:
+                fail(f"Client received 503 — should be 429 (the actual upstream status)")
+            elif status == 0:
+                fail(f"Client received 0 — connection error, expected 429")
+            else:
+                fail(f"Client received {status}, expected 429 on exhaustion")
+
+            expected_attempts = 3  # MAX_RETRIES=2 → 3 total attempts (attempts 0,1,2)
+            if total == expected_attempts:
+                pass_(f"Upstream received {total} requests (expected {expected_attempts} = MAX_RETRIES+1)")
+            elif total < expected_attempts:
+                fail(f"Upstream received only {total} requests, expected {expected_attempts}")
+            else:
+                # More than expected may be OK if timing caused extra attempts
+                warn(f"Upstream received {total} requests, expected {expected_attempts}")
 
         finally:
             proc.terminate()
@@ -2531,6 +2889,9 @@ ALL_TESTS = [
     ("race-conditions", test_race_conditions),
     ("concurrent-requests", test_concurrent_requests),
     ("retry-logic", test_retry_logic),
+    ("compute-jittered-delay-bounds", test_compute_jittered_delay_bounds),
+    ("retry-429", test_retry_429),
+    ("retry-429-exhaust-returns-429", test_retry_429_exhaust_returns_429),
     ("trace-markers", test_trace_markers),
     ("url-validation", test_url_validation),
     ("manual-edit-detection", test_manual_edit_detection),

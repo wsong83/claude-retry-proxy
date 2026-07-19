@@ -1,9 +1,9 @@
 # claude-retry-proxy
 
 A local HTTP retry proxy for the Claude API. It listens on `localhost`, forwards
-requests to your upstream `ANTHROPIC_BASE_URL`, retries `503` (Service
-Unavailable) responses with exponential backoff, and logs every request to a
-JSONL trace file.
+requests to your upstream `ANTHROPIC_BASE_URL`, retries `429` (Too Many
+Requests) and `503` (Service Unavailable) responses with jittered exponential
+backoff, and logs every request to a JSONL trace file.
 
 It works with **any** `ANTHROPIC_BASE_URL` — official Anthropic, a third-party
 provider, or a self-hosted gateway. The proxy is provider-agnostic.
@@ -12,11 +12,13 @@ Stdlib-only. Zero runtime dependencies. Python 3.8+. MIT licensed.
 
 ## Why
 
-Some upstream endpoints return `503` under load. Claude Code treats a `503` as a
-hard failure, so a transiently-busy provider interrupts your session. This proxy
-sits between Claude Code and the upstream, transparently retrying `503`s (and
-connection errors) with exponential backoff so a busy provider doesn't abort
-your work.
+Some upstream endpoints return `503` under load or `429` when rate-limiting.
+Claude Code treats a `503` as a hard failure, so a transiently-busy provider
+interrupts your session. This proxy sits between Claude Code and the upstream,
+transparently retrying `429`s, `503`s, and connection errors with jittered
+exponential backoff so a busy provider doesn't abort your work. Jitter
+(±25% per delay, de-synchronized per thread) prevents concurrent sessions
+from re-stampeding the upstream in lockstep.
 
 ## Install
 
@@ -121,19 +123,30 @@ are safe; override only if you need to.
 | Variable | Default | Range | Description |
 |----------|---------|-------|-------------|
 | `PROXY_PORT` | `8080` | 1024–65535 | Port to listen on |
-| `PROXY_MAX_RETRIES` | `10` | 1–100 | Max retry attempts per request |
+| `PROXY_MAX_RETRIES` | `10` | 1–100 | Max retry attempts per request (shared by 429 and 503) |
 | `PROXY_INITIAL_DELAY` | `1` | 1–60 | First backoff delay, seconds |
-| `PROXY_MAX_DELAY` | `30` | 1–300 | Backoff cap, seconds |
+| `PROXY_MAX_DELAY` | `30` | 1–300 | Backoff cap, seconds. Applied before jitter; 429 retries use this directly. |
 | `PROXY_MAX_BODY_SIZE` | `10485760` | 1024–100 MiB | Request body size cap (bytes); larger → 413 |
 | `PROXY_LOG_ALL` | unset | `1` to enable | Log full request **and** response bodies |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | path | Trace log location |
 
 Backoff is `PROXY_INITIAL_DELAY * 2**attempt`, capped at `PROXY_MAX_DELAY`.
+**429** responses retry using `PROXY_MAX_DELAY` directly (maximal latency);
+**503** and connection errors use the exponential. Every retry delay then gets
+**±25% uniform jitter** (integer seconds), drawn from a per-thread RNG, so
+concurrent sessions de-synchronize instead of retrying in lockstep.
 
-> **Worst case:** with the max bounds (`PROXY_MAX_RETRIES=100`,
-> `PROXY_MAX_DELAY=300`), a single request that keeps getting `503` can block a
-> worker thread for up to ~8.3 hours. With the defaults (10 retries, 30 s cap)
-> the worst case is about 5 minutes per request.
+> **Worst case:** jitter raises the per-retry upper bound to `1.25 *
+> PROXY_MAX_DELAY` (the cap is applied before the ±25%). With the max bounds
+> (`PROXY_MAX_RETRIES=100`, `PROXY_MAX_DELAY=300`), a single request that keeps
+> getting `429`/`503` can block a worker thread for up to ~10.4 hours. With the
+> defaults (10 retries, 30 s cap) the worst case is about 3.8 minutes per
+> request.
+>
+> Note: with integer-second rounding, ±25% jitter is ineffective for delays of
+> 1–2 s (the range lands in one integer bucket); de-sync becomes effective from
+> ~3 s onward. The 429 path uses `PROXY_MAX_DELAY` (default 30 s), so it
+> de-syncs from the first retry.
 
 ## Trace log
 
@@ -162,8 +175,9 @@ of platform if you enable `--all`.
 
 ## Features
 
-- **Automatic retries** — `503` and connection errors retried with exponential
-  backoff (default 10 attempts).
+- **Automatic retries** — `429`, `503`, and connection errors retried with
+  jittered exponential backoff (default 10 attempts). `429`s back off at the
+  maximal delay; jitter de-synchronizes concurrent sessions.
 - **URL swapping** — original `ANTHROPIC_BASE_URL` saved and restored
   automatically; no manual config editing.
 - **Crash recovery** — if the proxy is killed without `stop`, a stale lock is
@@ -195,11 +209,12 @@ pip install -e .
 python tests/test_claude_proxy.py
 ```
 
-The suite has 24 tests. **12 of them exercise the CLI's URL swap and require
+The suite has 27 tests. **12 of them exercise the CLI's URL swap and require
 `ANTHROPIC_BASE_URL` in `~/.claude/settings.json` to be a non-localhost URL**
 (the proxy correctly rejects localhost to avoid proxying to itself). Set it to a
-real upstream or a mock before running the full suite. The other 12 tests start
-the server directly with mock upstreams and pass regardless.
+real upstream or a mock before running the full suite. The other 15 tests start
+the server directly with mock upstreams and pass regardless (these include the
+jitter/429 retry tests).
 
 > The tests back up and restore `~/.claude/settings.json`, but during a run your
 > live config is temporarily altered. Don't run the suite while a Claude Code

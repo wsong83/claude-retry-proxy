@@ -6,10 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `claude-retry-proxy` is a stdlib-only HTTP retry proxy for the Claude API. It
 listens on localhost, forwards requests to the upstream `ANTHROPIC_BASE_URL`
-(read from `~/.claude/settings.json`), retries `503` responses with exponential
-backoff, and logs every request to a JSONL trace file. A CLI manager swaps the
-`ANTHROPIC_BASE_URL` in `~/.claude/settings.json` to `http://localhost:<port>`
-while the proxy runs and restores it on stop.
+(read from `~/.claude/settings.json`), retries `429` and `503` responses with
+jittered exponential backoff, and logs every request to a JSONL trace file.
+A CLI manager swaps the `ANTHROPIC_BASE_URL` in `~/.claude/settings.json` to
+`http://localhost:<port>` while the proxy runs and restores it on stop.
 
 Extracted from the personal `claude-config` repo into a standalone, public,
 pip-installable package. Zero runtime dependencies; Python 3.8+.
@@ -22,7 +22,7 @@ src/claude_retry_proxy/
   server.py       the HTTP retry proxy server (ThreadingHTTPServer, retry/backoff, trace logging)
   cli.py          the claude-retry-proxy CLI: start / stop / status (URL swap, lock files, crash recovery)
 tests/
-  test_claude_proxy.py   24 behavioral tests (ported + cleaned from claude-config)
+  test_claude_proxy.py   27 behavioral tests (ported + cleaned from claude-config; +3 for jitter/429)
 pyproject.toml   setuptools src-layout, console scripts, zero deps
 LICENSE          MIT
 ```
@@ -56,9 +56,14 @@ paths resolve against cwd), `--all` (log full request/response bodies).
   failure. Cross-platform PID liveness/kill via `ctypes` on Windows (`OpenProcess`
   + `WaitForSingleObject` / `TerminateProcess`), `os.kill` on POSIX.
 - **Server**: `ThreadingHTTPServer` on 127.0.0.1. Per request: filter
-  whitelisted headers, forward to upstream, retry on 503 / connection error with
-  exponential backoff (`PROXY_INITIAL_DELAY * 2**attempt`, capped at
-  `PROXY_MAX_DELAY`), stream the response back, log a JSONL trace entry.
+  whitelisted headers, forward to upstream, retry on **429** and **503** /
+  connection error with jittered exponential backoff
+  (`PROXY_INITIAL_DELAY * 2**attempt`, capped at `PROXY_MAX_DELAY`, then ±25%
+  uniform jitter, integer seconds). **429 retries use `PROXY_MAX_DELAY`**
+  directly (maximal latency); 503 and connection errors use the exponential.
+  Jitter draws from a **thread-local `random.Random()`** (the module-global
+  `random` is not thread-safe under worker threads). Stream the response back,
+  log a JSONL trace entry.
   `/admin/shutdown` (localhost-only) triggers graceful shutdown → `finally`
   block writes a `proxy_stop` marker and removes `proxy-state.json`.
 - **Upstream URL resolution** happens in `server.py main()` at runtime (not
@@ -71,9 +76,9 @@ paths resolve against cwd), `--all` (log full request/response bodies).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PROXY_PORT` | 8080 | Listen port (1024-65535) |
-| `PROXY_MAX_RETRIES` | 10 | Max retry attempts (1-100) |
+| `PROXY_MAX_RETRIES` | 10 | Max retry attempts (1-100). Shared by 429 and 503. |
 | `PROXY_INITIAL_DELAY` | 1 | First backoff delay, seconds (1-60) |
-| `PROXY_MAX_DELAY` | 30 | Backoff cap, seconds (1-300) |
+| `PROXY_MAX_DELAY` | 30 | Backoff cap, seconds (1-300). Applied *before* jitter, so actual sleeps can exceed it by up to 25%. 429 retries use this value directly (jittered). |
 | `PROXY_MAX_BODY_SIZE` | 10485760 | Request body size cap, bytes (1024-100MiB) → 413 |
 | `PROXY_LOG_ALL` | "" | Set to `1` to log full request/response bodies |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | Trace log path |
@@ -101,9 +106,22 @@ Runtime artifacts (all under `~/.claude/`, hardcoded — see Gotchas):
   before running the full suite; the 12 direct-server tests pass regardless.
 - **`PROXY_IDLE_TIMEOUT` is a dead env var** some tests still set — the server
   defines no idle-timeout feature. Harmlessly ignored.
-- **Worst-case retry hold**: with env maxes (`PROXY_MAX_RETRIES=100`,
-  `PROXY_MAX_DELAY=300`), a single 503-ing request can block a worker thread
-  for ~8.3h. Defaults (10 retries, 30s cap) give ~5min worst case.
+- **Worst-case retry hold**: with jitter the *expected* sleep is unchanged but
+  the upper bound per retry is `1.25 * PROXY_MAX_DELAY` (cap applied before
+  the ±25% jitter). With env maxes (`PROXY_MAX_RETRIES=100`,
+  `PROXY_MAX_DELAY=300`), a single 429/503-ing request can block a worker
+  thread for ~10.4h. Defaults (10 retries, 30s cap) give ~3.8 min worst case.
+- **Integer-second jitter is degenerate for small delays.** With ±25% rounded
+  to an integer second, `base ∈ {1, 2}` get **zero** de-sync (the ±0.5s range
+  lands in one integer bucket); de-sync is effective from `base ≥ 3` onward.
+  On the 503 path that means the 3rd retry onward; the 429 path uses
+  `PROXY_MAX_DELAY` (default 30), so it de-syncs from the first 429.
+  Sub-second jitter was considered and rejected (integer rounding requested).
+- **`_shutting_down` is not checked during retry `time.sleep`** (pre-existing,
+  out of scope of the jitter/429 plan) — a mid-retry request blocks
+  `/admin/shutdown` for up to `MAX_RETRIES * jittered_max_delay`. Tracked as
+  Open issue `shutdown-during-retry-sleep` in the jitter plan's Issue Log for
+  a future hardening pass.
 
 ## Documentation
 

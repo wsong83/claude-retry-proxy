@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """HTTP retry proxy for Claude API. Listens on localhost and forwards requests
-to the upstream endpoint, retrying on 503 (Service Unavailable) with exponential
-backoff. Logs all requests to a JSONL trace file.
+to the upstream endpoint, retrying on 429 (Too Many Requests) and 503 (Service
+Unavailable) with jittered exponential backoff. Logs all requests to a JSONL
+trace file.
 
 Provider-agnostic — reads upstream URL from settings.json at startup. Supports
 concurrent requests via ThreadingHTTPServer.
@@ -14,7 +15,9 @@ import argparse
 import http.client
 import http.server
 import json
+import math
 import os
+import random
 import re
 import signal
 import socket
@@ -59,6 +62,18 @@ PROXY_LOG_ALL = _env_str("PROXY_LOG_ALL", "") == "1"
 
 _default_trace = os.path.join(os.path.expanduser("~"), ".claude", "logs", "proxy-trace.jsonl")
 PROXY_TRACE_FILE = _env_str("PROXY_TRACE_FILE", _default_trace)
+
+# Thread-local RNG — the module-global random is not thread-safe under
+# ThreadingHTTPServer worker threads (Mersenne Twister state is shared).
+_rng_local = threading.local()
+
+def _rng():
+    """Per-thread random.Random instance, lazily created."""
+    r = getattr(_rng_local, "rng", None)
+    if r is None:
+        r = random.Random()
+        _rng_local.rng = r
+    return r
 
 # Whitelisted paths and methods
 ALLOWED_PATH_RE = re.compile(r"^/v1/")
@@ -211,6 +226,18 @@ def compute_delay(attempt):
     return min(delay, PROXY_MAX_DELAY)
 
 
+def compute_jittered_delay(base):
+    """±25% uniform jitter on base, unbiased half-up rounded to an integer second, floored at 0.
+
+    Uses floor(x + 0.5), NOT round(): Python 3 round() is banker's rounding,
+    which collapses small even base values to a constant.
+    """
+    if base <= 0:
+        return 0
+    jitter = _rng().uniform(-0.25, 0.25) * base
+    return max(0, math.floor(base + jitter + 0.5))
+
+
 # ---------------------------------------------------------------------------
 # Heartbeat thread
 # ---------------------------------------------------------------------------
@@ -234,7 +261,8 @@ def forward_request(method, path, headers, body):
     """Forward a request to the upstream API.
     Returns (status, response_headers, body_bytes, first_byte_ms, total_sec, retries).
     total_sec covers the entire request including all retry waits.
-    On 503, retries with exponential backoff.
+    On 429 and 503, retries with jittered exponential backoff. 429 uses the
+    maximal delay (PROXY_MAX_DELAY); 503 uses the exponential.
     """
     if method not in ALLOWED_METHODS:
         return 400, {}, b'{"error":"Method not allowed"}', 0, 0, 0
@@ -267,29 +295,41 @@ def forward_request(method, path, headers, body):
             conn.request(method, upstream_path, body=body, headers=fwd_headers)
             resp = conn.getresponse()
 
-            if resp.status == 503:
-                last_status = 503
+            if resp.status in (429, 503):
+                last_status = resp.status
                 if attempt < PROXY_MAX_RETRIES:
-                    delay = compute_delay(attempt)
+                    if resp.status == 429:
+                        delay = compute_jittered_delay(PROXY_MAX_DELAY)
+                        reason = "429"
+                    elif resp.status == 503:
+                        delay = compute_jittered_delay(compute_delay(attempt))
+                        reason = "503"
+                    else:  # defensive — future expansion must add a branch here
+                        delay = compute_jittered_delay(compute_delay(attempt))
+                        reason = str(resp.status)
+                    try:
+                        resp.read()  # drain response body before close
+                    except (socket.error, OSError):
+                        pass
                     retries += 1
                     increment_retried()
-                    print("[proxy] 503 on attempt {}/{}, retrying in {}s".format(
-                        attempt + 1, PROXY_MAX_RETRIES + 1, delay), file=sys.stderr)
+                    print("[proxy] {} on attempt {}/{}, retrying in {}s".format(
+                        reason, attempt + 1, PROXY_MAX_RETRIES + 1, delay), file=sys.stderr)
                     log_trace({
                         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "event": "retry",
                         "attempt": attempt + 1,
                         "delay_s": delay,
-                        "reason": "503",
+                        "reason": reason,
                         "path": path,
                     })
                     time.sleep(delay)
                     conn.close()
                     continue
                 else:
-                    return 503, {}, b'', None, time.time() - total_start, retries
+                    return resp.status, {}, b'', None, time.time() - total_start, retries
 
-            # Non-503 response — stream it back
+            # Non-retryable response — stream it back
             first_byte_start = time.time()
             chunks = []
             first_byte = True
