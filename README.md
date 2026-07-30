@@ -170,6 +170,25 @@ logged to the trace.
 
 Use `--all` (or `PROXY_LOG_ALL=1`) to include full request and response bodies.
 
+### Analyzing the trace log
+
+A utility script is provided for analyzing proxy trace data:
+
+```bash
+python scripts/analyze_proxy_trace.py --days 3
+```
+
+This prints per-model statistics including request count, average retries,
+query success rate, attempt success rate, and geomean TTFT/latency. Models are
+auto-detected from the trace (no hardcoded names). Outliers (latency >30 min,
+max retries + failure) are filtered automatically.
+
+Run with `--help` for all options:
+
+```bash
+python scripts/analyze_proxy_trace.py --help
+```
+
 ### ⚠️ Data exposure with `--all` / `PROXY_LOG_ALL`
 
 With `--all`, the trace file contains **raw prompts and completions** in

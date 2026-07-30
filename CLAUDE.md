@@ -23,6 +23,8 @@ src/claude_retry_proxy/
   cli.py          the claude-retry-proxy CLI: start / stop / status (URL swap, lock files, crash recovery)
 tests/
   test_claude_proxy.py   32 behavioral tests (ported + cleaned from claude-config; +3 for jitter/429; +5 for body preservation, disconnect catch, trace prune)
+scripts/
+  analyze_proxy_trace.py  trace log analysis tool (model stats, latency, success rates)
 pyproject.toml   setuptools src-layout, console scripts, zero deps
 LICENSE          MIT
 ```
@@ -151,6 +153,9 @@ does not block startup on failure).
 
 - [README.md](README.md) — user-facing: install, usage, configuration, trace
   log, the `--all` data-exposure warning, testing notes.
+- [scripts/analyze_proxy_trace.py](scripts/analyze_proxy_trace.py) — trace log
+  analysis tool: calculates per-model stats (request count, retries, success
+  rates, TTFT, latency) for a configurable time window, with outlier filtering.
 - Design rationale for the extraction lives in
   `tmp/plans/2026-07-17-extract-retry-proxy-design.md` (gitignored — planning
   artifact, not published).
