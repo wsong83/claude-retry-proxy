@@ -99,7 +99,7 @@ Examples:
 ```bash
 claude-retry-proxy start --port 9090
 claude-retry-proxy start --log /tmp/trace.jsonl
-claude-retry-proxy start --all            # log full request + response bodies
+claude-retry-proxy start --all            # log full request bodies (+ error response bodies)
 ```
 
 ### Direct server invocation
@@ -129,7 +129,7 @@ are safe; override only if you need to.
 | `PROXY_INITIAL_DELAY` | `1` | 1–60 | First backoff delay, seconds |
 | `PROXY_MAX_DELAY` | `30` | 1–300 | Backoff cap, seconds. Applied before jitter; 429 retries use this directly. |
 | `PROXY_MAX_BODY_SIZE` | `10485760` | 1024–100 MiB | Request body size cap (bytes); larger → 413. Also caps the upstream error body drain on retry exhaustion. |
-| `PROXY_LOG_ALL` | unset | `1` to enable | Log full request **and** response bodies |
+| `PROXY_LOG_ALL` | unset | `1` to enable | Log full request bodies; response bodies on error paths only (streamed 2xx bodies are not captured) |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | path | Trace log location |
 
 Backoff is `PROXY_INITIAL_DELAY * 2**attempt`, capped at `PROXY_MAX_DELAY`.
@@ -168,7 +168,9 @@ preserved and returned to the client (capped at `PROXY_MAX_BODY_SIZE`).
 On connection-error exhaustion, a synthesized `upstream_unreachable` body is
 logged to the trace.
 
-Use `--all` (or `PROXY_LOG_ALL=1`) to include full request and response bodies.
+Use `--all` (or `PROXY_LOG_ALL=1`) to include full request bodies; response
+bodies are captured on the buffered (error) path only — streamed 2xx success
+bodies are not stored.
 
 ### Analyzing the trace log
 
@@ -191,8 +193,9 @@ python scripts/analyze_proxy_trace.py --help
 
 ### ⚠️ Data exposure with `--all` / `PROXY_LOG_ALL`
 
-With `--all`, the trace file contains **raw prompts and completions** in
-plaintext. The proxy applies `0600` permissions to the trace and state files on
+With `--all`, the trace file contains **raw prompts** (plus error-path
+response bodies) in plaintext; streamed 2xx success bodies are not captured.
+The proxy applies `0600` permissions to the trace and state files on
 **POSIX** systems. On **Windows**, `chmod` is effectively a no-op (it only
 toggles the read-only attribute; there is no Unix group/other model), so you
 must restrict the trace directory's ACL yourself, e.g.:
@@ -247,12 +250,13 @@ pip install -e .
 python tests/test_claude_proxy.py
 ```
 
-The suite has 32 tests. **12 of them exercise the CLI's URL swap and require
+The suite has 36 tests. **12 of them exercise the CLI's URL swap and require
 `ANTHROPIC_BASE_URL` in `~/.claude/settings.json` to be a non-localhost URL**
 (the proxy correctly rejects localhost to avoid proxying to itself). Set it to a
-real upstream or a mock before running the full suite. The other 20 tests start
+real upstream or a mock before running the full suite. The other 24 tests start
 the server directly with mock upstreams and pass regardless (these include the
-jitter/429 retry, body preservation, disconnect catch, and trace prune tests).
+streaming delivery, mid-stream failure, CRLF header filter, jitter/429 retry,
+body preservation, disconnect catch, and trace prune tests).
 
 > The tests back up and restore `~/.claude/settings.json`, but during a run your
 > live config is temporarily altered. Don't run the suite while a Claude Code

@@ -303,12 +303,15 @@ def heartbeat_loop():
 # HTTP request forwarding
 # ---------------------------------------------------------------------------
 
-def forward_request(method, path, headers, body):
+def forward_request(method, path, headers, body, handler=None, request_id=None):
     """Forward a request to the upstream API.
     Returns (status, response_headers, body_bytes, first_byte_ms, total_sec, retries).
     total_sec covers the entire request including all retry waits.
     On 429 and 503, retries with jittered exponential backoff. 429 uses the
     maximal delay (PROXY_MAX_DELAY); 503 uses the exponential.
+    When handler is provided and the upstream responds 2xx, the body is
+    streamed to the client in real time via the handler (body_bytes is then
+    b""); otherwise the body is buffered and returned.
     """
     if method not in ALLOWED_METHODS:
         return 400, {}, b'{"error":"Method not allowed"}', 0, 0, 0
@@ -380,7 +383,21 @@ def forward_request(method, path, headers, body):
                         pass
                     return resp.status, {}, err_body, None, time.time() - total_start, retries
 
-            # Non-retryable response — stream it back
+            # Non-retryable response
+            if handler is not None and 200 <= resp.status < 300:
+                # Stream the 2xx body to the client in real time. The stream
+                # method absorbs its own failures (client disconnect, upstream
+                # truncation), so nothing propagates into the retry loop below:
+                # once the first byte is delivered, the response is never retried.
+                resp_headers = dict(resp.getheaders())
+                first_byte_ms = handler._stream_upstream_response(
+                    resp, resp.status, resp_headers, request_id, retries)
+                conn.close()
+                return (resp.status, resp_headers, b"",
+                        first_byte_ms, time.time() - total_start, retries)
+
+            # Non-2xx — buffer the body so upstream error content stays in the
+            # trace log.
             first_byte_start = time.time()
             chunks = []
             first_byte = True
@@ -470,19 +487,89 @@ def sanitize_error(msg):
 # HTTP request handler
 # ---------------------------------------------------------------------------
 
+def _crlf_safe(headers):
+    """Drop headers whose name or value contains CR/LF (response-splitting guard).
+
+    A header name or value carrying a raw newline would let an upstream-injected
+    value reach the client's parser as a different header set than the proxy
+    parsed (parser-differential attack; cf. CVE-2019-9740/CVE-2019-9947). Omit
+    such entries rather than forwarding them.
+    """
+    if not headers:
+        return {}
+    return {k: v for k, v in headers.items()
+            if "\r" not in k and "\n" not in k
+            and "\r" not in str(v) and "\n" not in str(v)}
+
+
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _send_response(self, status, body_bytes, headers=None):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         if headers:
-            for k, v in headers.items():
+            for k, v in _crlf_safe(headers).items():
                 if k.lower() not in {"content-type", "transfer-encoding",
                                      "content-length", "connection"}:
                     self.send_header(k, v)
         self.send_header("Content-Length", str(len(body_bytes)))
         self.end_headers()
         self.wfile.write(body_bytes)
+
+    def _stream_upstream_response(self, resp, status, resp_headers, request_id, retries):
+        """Stream an upstream 2xx response body to the client as it arrives.
+
+        Sends the status line and headers immediately, then copies body chunks
+        through as they arrive (read1 returns data as soon as it is available,
+        at most one underlying socket read per call), flushing after each
+        write. Returns the first-byte latency in ms (measured on the first
+        chunk write+flush — headers ride that flush and are what the client
+        actually sees), or None if the stream was aborted before any chunk was
+        delivered.
+
+        The method absorbs its own failures so it never raises into
+        forward_request: client-side write errors are logged as a
+        client_disconnect event (outer handler) and never re-raised; upstream
+        read errors break the loop (inner handler) — the close-delimited EOF
+        signals truncation to the client. Retries never happen after the first
+        byte reaches the client.
+        """
+        first_byte_start = time.time()
+        first_byte_ms = None
+        first_chunk = True
+        try:
+            self.send_response(status)
+            # Forward all other headers verbatim, including content-type
+            # (required for text/event-stream SSE responses). Drop hop-by-hop
+            # headers — http.client already de-chunked the upstream body, and
+            # the response is close-delimited via HTTP/1.0.
+            for k, v in _crlf_safe(resp_headers).items():
+                if k.lower() not in {"transfer-encoding", "content-length",
+                                     "connection"}:
+                    self.send_header(k, v)
+            self.end_headers()
+            while True:
+                try:
+                    # read1 returns data as soon as it arrives (at most one
+                    # underlying socket read); read(amt) would buffer to EOF and
+                    # deliver the body all at once — the original defect.
+                    chunk = resp.read1(8192)
+                except (http.client.IncompleteRead, http.client.RemoteDisconnected,
+                        socket.error, OSError):
+                    # Upstream truncated mid-stream — stop forwarding; the
+                    # close-delimited EOF tells the client the stream ended.
+                    break
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                if first_chunk:
+                    first_byte_ms = (time.time() - first_byte_start) * 1000
+                    first_chunk = False
+        except _DISCONNECT_ERRORS:
+            self._log_client_disconnect(request_id, status, retries)
+            return None
+        return first_byte_ms
 
     def _log_client_disconnect(self, request_id, status, retries):
         """Record a client_disconnect event; suppress the traceback.
@@ -576,7 +663,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         status, resp_headers, resp_body, first_byte_ms, total_sec, retries = \
             forward_request(self.command, self.path,
                             {k: v for k, v in self.headers.items()},
-                            body)
+                            body, handler=self, request_id=request_id)
+
+        # Mirrors forward_request's streaming branch (handler is self there, so
+        # every 2xx is streamed): headers and body were already delivered by
+        # _stream_upstream_response, so _send_response must be skipped.
+        streamed = 200 <= status < 300
 
         # Build trace entry
         success = 200 <= status < 300
@@ -603,20 +695,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 trace_entry["request_body"] = json.loads(body.decode("utf-8"))
             except Exception:
                 trace_entry["request_body"] = body.decode("utf-8", errors="replace") if body else None
-            try:
-                trace_entry["response_body"] = json.loads(resp_body.decode("utf-8"))
-            except Exception:
-                trace_entry["response_body"] = resp_body.decode("utf-8", errors="replace") if resp_body else None
+            if not streamed:
+                # Streamed 2xx bodies were consumed by the client in real time
+                # and are not captured — a deliberate reduction in data-at-rest
+                # exposure under --all.
+                try:
+                    trace_entry["response_body"] = json.loads(resp_body.decode("utf-8"))
+                except Exception:
+                    trace_entry["response_body"] = resp_body.decode("utf-8", errors="replace") if resp_body else None
 
         log_trace(trace_entry)
 
-        try:
-            self._send_response(status, resp_body, resp_headers)
-        except _DISCONNECT_ERRORS:
-            # Client disconnected mid-response (timed out, cancelled, etc.).
-            # The request already completed upstream and is traced above;
-            # record a delivery-failure event and avoid a traceback.
-            self._log_client_disconnect(request_id, status, retries)
+        if not streamed:
+            try:
+                self._send_response(status, resp_body, resp_headers)
+            except _DISCONNECT_ERRORS:
+                # Client disconnected mid-response (timed out, cancelled, etc.).
+                # The request already completed upstream and is traced above;
+                # record a delivery-failure event and avoid a traceback.
+                self._log_client_disconnect(request_id, status, retries)
 
     def log_message(self, format, *args):
         # Suppress default http.server logging (we use our own trace log)

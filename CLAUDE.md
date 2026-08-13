@@ -22,7 +22,7 @@ src/claude_retry_proxy/
   server.py       the HTTP retry proxy server (ThreadingHTTPServer, retry/backoff, trace logging)
   cli.py          the claude-retry-proxy CLI: start / stop / status (URL swap, lock files, crash recovery)
 tests/
-  test_claude_proxy.py   32 behavioral tests (ported + cleaned from claude-config; +3 for jitter/429; +5 for body preservation, disconnect catch, trace prune)
+  test_claude_proxy.py   36 behavioral tests (ported + cleaned from claude-config; +3 for jitter/429; +5 for body preservation, disconnect catch, trace prune; +4 for streaming delivery + CRLF hardening)
 scripts/
   analyze_proxy_trace.py  trace log analysis tool (model stats, latency, success rates)
 pyproject.toml   setuptools src-layout, console scripts, zero deps
@@ -65,15 +65,24 @@ paths resolve against cwd), `--all` (log full request/response bodies).
   uniform jitter, integer seconds). **429 retries use `PROXY_MAX_DELAY`**
   directly (maximal latency); 503 and connection errors use the exponential.
   Jitter draws from a **thread-local `random.Random()`** (the module-global
-  `random` is not thread-safe under worker threads). Stream the response back,
-  log a JSONL trace entry.
+  `random` is not thread-safe under worker threads). On a non-retryable **2xx**,
+  the response body is **streamed to the client in real time**
+  (`_stream_upstream_response`: status + headers sent immediately, `read1(8192)`
+  chunks written and flushed as they arrive — SSE events reach the client as
+  generated; `read(amt)` must NOT be used, it fills amt-or-EOF and buffers).
+  Non-2xx responses stay buffered so upstream error bodies remain available
+  for the trace. Log a JSONL trace entry.
   `/admin/shutdown` (localhost-only) triggers graceful shutdown → `finally`
   block writes a `proxy_stop` marker and removes `proxy-state.json`.
   **Client disconnect catch:** `_send_response` is wrapped in
   `try/except _DISCONNECT_ERRORS` (`ConnectionResetError`,
   `BrokenPipeError`, `ConnectionAbortedError`); on disconnect, a
   `client_disconnect` trace event is logged instead of printing a
-  traceback per occurrence. The `_log_client_disconnect` method wraps
+  traceback per occurrence. `_stream_upstream_response` has the same outer
+  `_DISCONNECT_ERRORS` handler plus an inner try/except for upstream read
+  errors (`IncompleteRead`, `RemoteDisconnected`, `socket.error`, `OSError`) —
+  mid-stream upstream truncation aborts the stream (never retried: the first
+  byte already reached the client). The `_log_client_disconnect` method wraps
   its own `log_trace` call in try/except to prevent re-raise.
   **Give-up body preservation:** when retries are exhausted on 429/503,
   `forward_request` drains the upstream error body (capped at
@@ -110,17 +119,20 @@ does not block startup on failure).
   `ANTHROPIC_BASE_URL` in `~/.claude/settings.json`. There is no env-var
   fallback and no `--settings-path` flag (deliberate design decision).
 - **`--all` / `PROXY_LOG_ALL` writes raw prompts and completions** to the
-  plaintext trace file. `log_trace` and `write_state` apply `os.chmod(0o600)`
-  on **POSIX only** (guarded by `os.name == 'posix'`) — on Windows `chmod` is a
-  near-no-op (read-only bit only; no group/other model). Windows users must
-  restrict the trace/state directory ACL manually (`icacls`).
-- **Tests mutate the live `~/.claude/settings.json`.** 12 of the 24 tests
+  plaintext trace file. Note: **streamed 2xx success response bodies are NOT
+  captured** even with `--all` (deliberate reduction in data-at-rest exposure;
+  error-path bodies still are). `log_trace` and `write_state` apply
+  `os.chmod(0o600)` on **POSIX only** (guarded by `os.name == 'posix'`) — on
+  Windows `chmod` is a near-no-op (read-only bit only; no group/other model).
+  Windows users must restrict the trace/state directory ACL manually
+  (`icacls`).
+- **Tests mutate the live `~/.claude/settings.json`.** 12 of the 36 tests
   exercise the CLI's URL swap; backup/restore protects the file, but a crash
   mid-test can leave settings pointing at localhost. Don't run the suite while a
   Claude Code session is active against the same settings.
 - **12 CLI tests require a non-localhost `ANTHROPIC_BASE_URL`** in settings.json
   (the CLI correctly rejects localhost). Set it to a real upstream or mock
-  before running the full suite; the 12 direct-server tests pass regardless.
+  before running the full suite; the 24 direct-server/unit tests pass regardless.
 - **`PROXY_IDLE_TIMEOUT` is a dead env var** some tests still set — the server
   defines no idle-timeout feature. Harmlessly ignored.
 - **Worst-case retry hold**: with jitter the *expected* sleep is unchanged but
@@ -141,13 +153,20 @@ does not block startup on failure).
   is returned. Preserved bodies flow into the `--all` trace log — on Windows
   the trace file is world-readable (see `--all` gotcha above).
 - **`response-streaming-no-size-cap` is partially addressed.** The give-up
-  drain is capped, but the **streaming success path** (the normal response
-  read loop in `forward_request`) is still uncapped. The Open issue tracked
+  drain is capped, but the **streaming success path** (the `read1` loop in
+  `_stream_upstream_response`) is still uncapped. The Open issue tracked
   in `## Future Work` remains open for the streaming path.
-  out of scope of the jitter/429 plan) — a mid-retry request blocks
-  `/admin/shutdown` for up to `MAX_RETRIES * jittered_max_delay`. Tracked as
-  Open issue `shutdown-during-retry-sleep` in the jitter plan's Issue Log for
-  a future hardening pass.
+- **Streaming disconnect catch is scoped to `_DISCONNECT_ERRORS`.** A
+  non-standard client-write `OSError` outside that tuple (e.g.
+  WSAENOBUFS/WSAENOTSOCK/ENOTCONN) can propagate into `forward_request`'s
+  retry `except` after headers were sent, re-issuing the upstream POST. All
+  realistic disconnect classes are caught; accepted residual (reviewer
+  Warning, non-blocking).
+- **`/admin/shutdown` can block during retry sleep.** Graceful shutdown waits
+  for in-flight requests to finish, and a request mid-retry-backoff holds its
+  worker thread for up to `PROXY_MAX_RETRIES * jittered_max_delay`, so shutdown
+  can take that long to drain. Tracked as Open issue `shutdown-during-retry-sleep`
+  in the jitter plan's Issue Log for a future hardening pass.
 
 ## Documentation
 
@@ -186,17 +205,19 @@ to a future hardening plan.
   - **Tracking:** issue `start-early-exit-rollback-port-bind-race`
     ([report](tmp/reports/2026-07-17-extract-retry-proxy-start-early-exit-rollback-port-bind-race.json)).
 
-- [ ] **Response body has no size cap (streaming path)** — `forward_request`
-  streams the entire upstream success response into memory (8 KB chunk loop,
-  appended to a list) with no size limit. Only the *request* body is capped
+- [ ] **Response body has no size cap (streaming path)** — the 2xx success
+  path (`_stream_upstream_response`) streams upstream bytes to the client
+  chunk-by-chunk (`read1(8192)` loop, O(1) memory per request — the old
+  buffer-into-a-list OOM risk is gone). What remains uncapped is the
+  *size/duration* of a streamed response: only the *request* body is capped
   (`PROXY_MAX_BODY_SIZE`, default 10 MB → 413), and the retry-exhaustion
-  give-up drain is now also capped (via `_read_capped`). But the streaming
-  success path remains uncapped. An abnormally large response (huge
-  `max_tokens`, misconfigured/untrusted upstream) can grow the proxy's
-  memory until the OS kills it (OOM). `ThreadingHTTPServer` has no
-  thread-pool cap, so concurrent large responses compound the pressure.
-  - **Location:** `src/claude_retry_proxy/server.py` `forward_request`
-    (response read loop). Upstream, ported near-verbatim.
+  give-up drain is capped (via `_read_capped`), but no knob limits streamed
+  response bytes or stream duration. A misconfigured/untrusted upstream can
+  pin a worker thread for an arbitrarily long stream, and
+  `ThreadingHTTPServer` has no thread-pool cap, so concurrent long streams
+  compound the pressure.
+  - **Location:** `src/claude_retry_proxy/server.py`
+    `_stream_upstream_response` (read1 loop).
   - **Fix sketch:** cap streamed response bytes (a `PROXY_MAX_RESPONSE_SIZE`
     knob mirroring `PROXY_MAX_BODY_SIZE`); past the cap, abort the upstream
     read and return an error to the client. Optionally bound

@@ -1,6 +1,6 @@
 """Test suite for claude-retry-proxy — HTTP retry proxy with URL swapping.
 
-Covers 32 test cases:
+Covers 36 test cases:
   1-11 from plan 2026-07-15-manual-proxy Guidance for Tester:
     1. URL swapping: start replaces URL in settings, stop restores it
     2. Crash recovery: stale lock recovery on restart
@@ -36,6 +36,11 @@ Covers 32 test cases:
     27. Client disconnect no traceback: stderr has no Traceback, contains disconnect message
     28. Start prunes old trace entries: prune_trace_file returns (2, 1), removes old entries
     28b. Prune trace file edge cases: nonexistent file → (0, 0), empty file → (0, 0)
+  29-32 from plan 2026-08-12-streaming-proxy Guidance for Tester:
+    29. Streaming response body: 5 chunks streamed with delays reach client in order, first byte fast
+    30. Streaming mid-stream upstream failure: truncated upstream → partial body, no traceback, no client_disconnect event
+    31. Empty body 429 exhaust: client receives proper 429 status line (streamed-flag regression guard)
+    32. CRLF header filter: _crlf_safe drops CR/LF headers, keeps clean ones
 
 Run: pip install -e .  then  python tests/test_claude_proxy.py
 Requires: Python 3.8+, no external dependencies (stdlib-only tests).
@@ -3154,10 +3159,17 @@ def test_client_disconnect_no_traceback():
                 # so the write blocks, giving us time to close the client socket
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
-                payload = json.dumps({"id": "ok", "data": "x" * 65536})
+                # ~2MB payload — large enough to overflow the socket buffers so
+                # the proxy blocks mid-write and reliably detects the client
+                # disconnect (the original 64KB could complete into the OS
+                # buffer, making the disconnect timing-dependent).
+                payload = json.dumps({"id": "ok", "data": "x" * (2 * 1024 * 1024)})
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload.encode())
+                try:
+                    self.wfile.write(payload.encode())
+                except (socket.error, OSError):
+                    pass
 
             def log_message(self, format, *args):
                 pass
@@ -3230,6 +3242,38 @@ def test_client_disconnect_no_traceback():
             # Wait for the proxy to process the disconnect
             time.sleep(1.0)
 
+            # Phase 2: streaming-path disconnect — the client reads the status
+            # line and headers, then closes mid-stream while the proxy is still
+            # delivering the (large) body. Exercises _stream_upstream_response's
+            # outer _DISCONNECT_ERRORS handler on the streaming path.
+            raw_sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            raw_sock2.settimeout(5)
+            raw_sock2.connect(("127.0.0.1", proxy_port))
+            raw_sock2.sendall(request_line.encode())
+
+            header_buf = b""
+            read_deadline = time.time() + 5
+            while time.time() < read_deadline and b"\r\n\r\n" not in header_buf:
+                try:
+                    part = raw_sock2.recv(4096)
+                except socket.timeout:
+                    break
+                if not part:
+                    break
+                header_buf += part
+
+            first_line = header_buf.split(b"\r\n", 1)[0] if header_buf else b""
+            if b"200 OK" in first_line:
+                pass_("Phase 2: received HTTP 200 status line + headers before closing")
+            else:
+                fail(f"Phase 2: did not receive 200 status line before close (got {header_buf[:80]!r})")
+
+            # Close mid-stream while the proxy is still delivering body chunks.
+            raw_sock2.close()
+
+            # Wait for the proxy to detect the disconnect and log the event.
+            time.sleep(1.0)
+
             # Kill proxy to flush trace
             proc.terminate()
             try:
@@ -3250,14 +3294,14 @@ def test_client_disconnect_no_traceback():
             else:
                 fail(f"stderr contains Traceback — disconnect not caught:\n{stderr_output[:500]}")
 
-            # Assert: stderr contains client disconnected message
+            # Assert: stderr contains client disconnected message. With the 2MB
+            # payload and the phase-2 mid-stream close, the disconnect is now
+            # reliably detected (no longer timing-dependent), so this is a hard
+            # assertion rather than the old warn-with-fallback.
             if "[proxy] client disconnected mid-response" in stderr_output:
                 pass_("stderr contains '[proxy] client disconnected mid-response'")
             else:
-                # May not have been triggered if the response was small enough
-                # to complete before our close hit — check trace instead
-                warn("stderr does NOT contain '[proxy] client disconnected mid-response' — "
-                     "disconnect may not have been triggered (timing-dependent)")
+                fail("stderr does NOT contain '[proxy] client disconnected mid-response'")
 
             # Read trace file for client_disconnect event
             if not os.path.exists(trace_file):
@@ -3272,19 +3316,19 @@ def test_client_disconnect_no_traceback():
 
             if len(disconnect_events) >= 1:
                 pass_(f"Trace contains {len(disconnect_events)} 'client_disconnect' event(s)")
-                # Verify the disconnect event has a request_id matching a request event
-                if len(request_events) >= 1:
-                    req_id = request_events[0].get("request_id")
-                    disc_req_id = disconnect_events[0].get("request_id")
-                    if disc_req_id == req_id:
-                        pass_(f"client_disconnect request_id matches request event: {req_id}")
-                    else:
-                        fail(f"client_disconnect request_id ({disc_req_id}) "
-                             f"does not match request event ({req_id})")
+                # Verify EVERY disconnect event's request_id matches some request
+                # event (phases 1 and 2 may each log a disconnect; each must
+                # correlate to the request that produced it).
+                req_ids = {e.get("request_id") for e in request_events}
+                mismatched = [e.get("request_id") for e in disconnect_events
+                              if e.get("request_id") not in req_ids]
+                if not mismatched:
+                    pass_("All client_disconnect request_ids match a request event")
+                else:
+                    fail(f"client_disconnect request_ids {mismatched} do not match "
+                         f"request events {req_ids}")
             else:
-                # Not a hard failure — disconnect may be timing-dependent
-                warn("No 'client_disconnect' event in trace — "
-                     "disconnect may not have been triggered (timing-dependent)")
+                fail("No 'client_disconnect' event in trace — disconnect was not detected")
 
             # At minimum, verify the request completed and no traceback appeared
             if len(request_events) >= 1:
@@ -3448,6 +3492,450 @@ def test_prune_trace_file_edge_cases():
 
 
 # ===========================================================================
+# Test Case 29: Streaming Response Body (plan 2026-08-12-streaming-proxy, Step 1)
+# ===========================================================================
+
+def test_streaming_response_body():
+    """Mock upstream streams 5 chunks with 50ms delays between them; proxy
+    forwards to the client in real time; client reads incrementally. Verify:
+    (a) first byte arrives within 1s AND before generation completes,
+    (b) all 5 chunks received in order, (c) concatenated body matches upstream,
+    (d) HTTP status is 200."""
+    print("\n--- Test 29: Streaming Response Body ---")
+    backup_settings()
+
+    try:
+        upstream_port = find_free_port()
+        proxy_port = find_free_port()
+
+        chunk_data = [b"chunk-0-", b"chunk-1-", b"chunk-2-", b"chunk-3-", b"chunk-4-"]
+        expected_body = b"".join(chunk_data)
+        generation_done = [False]
+
+        class StreamHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                content_len = int(self.headers.get("Content-Length", 0))
+                if content_len > 0:
+                    self.rfile.read(content_len)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for chunk in chunk_data:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    time.sleep(0.05)
+                generation_done[0] = True
+
+            def log_message(self, format, *args):
+                pass
+
+        mock_server = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), StreamHandler)
+        mock_thread = threading.Thread(target=mock_server.serve_forever, daemon=True)
+        mock_thread.start()
+        time.sleep(0.3)
+
+        set_base_url(f"http://127.0.0.1:{upstream_port}")
+
+        proc, probe_ok = _start_proxy_server_directly(proxy_port)
+        if proc is None or not probe_ok:
+            restore_settings()
+            mock_server.shutdown()
+            fail("Proxy server failed to start for streaming test")
+            return
+
+        try:
+            import http.client as _hc
+            body_bytes = json.dumps({"model": "test-stream",
+                                     "messages": [{"role": "user", "content": "hi"}]})
+
+            start = time.time()
+            conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+            conn.request("POST", "/v1/messages", body=body_bytes,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            status = resp.status
+            first_byte = resp.read(1)          # incremental read: first byte
+            first_byte_ms = (time.time() - start) * 1000
+            generation_was_running = not generation_done[0]
+            remainder = resp.read()            # read the rest incrementally
+            conn.close()
+
+            if status == 200:
+                pass_(f"HTTP status 200 (status={status})")
+            else:
+                fail(f"HTTP status {status}, expected 200")
+
+            if first_byte_ms < 1000:
+                pass_(f"First byte arrived in {first_byte_ms:.0f}ms (< 1000ms)")
+            else:
+                fail(f"First byte arrived in {first_byte_ms:.0f}ms (>= 1000ms) — "
+                     "response was buffered, not streamed")
+
+            # (a) TTFB << total generation time: the first byte must arrive while
+            # the mock is STILL generating (only the first chunk flushed). A
+            # buffering regression would deliver nothing until generation done.
+            if generation_was_running:
+                pass_("First byte arrived while upstream was still generating "
+                      "(TTFB << total generation time)")
+            else:
+                fail("First byte arrived only AFTER generation completed — "
+                     "response was buffered")
+
+            body = first_byte + remainder
+            if body == expected_body:
+                pass_(f"All 5 chunks received in order; concatenated body matches "
+                      f"upstream ({len(body)} bytes)")
+            else:
+                fail(f"Body mismatch: got {body[:60]!r}... expected {expected_body[:60]!r}...")
+
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            mock_server.shutdown()
+
+    finally:
+        restore_settings()
+
+
+# ===========================================================================
+# Test Case 30: Streaming Mid-Stream Upstream Failure (plan 2026-08-12-streaming-proxy, Step 1)
+# ===========================================================================
+
+def test_streaming_mid_stream_upstream_failure():
+    """Two mock modes validate the proxy's dual-path truncation detection:
+
+    (a) close-delimited — the mock sends 2 chunks with a Content-Length larger
+        than the bytes actually sent, then closes. `read1(amt)` returns b'' on
+        short read (only bare `read()` raises IncompleteRead), so the proxy's
+        `if not chunk: break` branch ends the loop.
+    (b) chunked — the mock sends 2 chunked (Transfer-Encoding) chunks then drops
+        the connection WITHOUT the terminating 0-chunk; `read1` raises
+        http.client.IncompleteRead, exercising the inner except.
+
+    Both: the client receives the 2 chunks then a truncated (close-delimited)
+    response; no traceback in proxy stderr AND no 'client_disconnect' trace
+    event — an upstream failure must not be misattributed as a client
+    disconnect."""
+    print("\n--- Test 30: Streaming Mid-Stream Upstream Failure ---")
+    backup_settings()
+
+    chunk1 = b"chunk-one-"
+    chunk2 = b"chunk-two-"
+    expected = chunk1 + chunk2
+
+    def run_mode(name, handler_cls):
+        upstream_port = find_free_port()
+        proxy_port = find_free_port()
+
+        mock_server = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), handler_cls)
+        mock_thread = threading.Thread(target=mock_server.serve_forever, daemon=True)
+        mock_thread.start()
+        time.sleep(0.3)
+
+        set_base_url(f"http://127.0.0.1:{upstream_port}")
+
+        trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl")
+        os.close(trace_fd)
+
+        env = os.environ.copy()
+        env["PROXY_PORT"] = str(proxy_port)
+        env["PROXY_TRACE_FILE"] = trace_file
+        env["PROXY_IDLE_TIMEOUT"] = "300"
+
+        proc = subprocess.Popen(
+            PROXY_SERVER + ["--port", str(proxy_port)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
+        )
+
+        # TCP probe for readiness
+        probe_ok = False
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                sock.connect(("127.0.0.1", proxy_port))
+                sock.close()
+                probe_ok = True
+                break
+            except (socket.error, ConnectionRefusedError):
+                time.sleep(0.1)
+
+        try:
+            if not probe_ok:
+                fail(f"[{name}] Proxy server failed to start")
+                return
+
+            import http.client as _hc
+            body_bytes = json.dumps({"model": "test-trunc",
+                                     "messages": [{"role": "user", "content": "hi"}]})
+            conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+            conn.request("POST", "/v1/messages", body=body_bytes,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            status = resp.status
+            received = resp.read()   # 2 chunks then close-delimited EOF
+            conn.close()
+
+            if status == 200:
+                pass_(f"[{name}] HTTP status 200 (status={status})")
+            else:
+                fail(f"[{name}] HTTP status {status}, expected 200")
+
+            if received == expected:
+                pass_(f"[{name}] Client received the {len(received)} streamed bytes "
+                      "before truncation")
+            else:
+                fail(f"[{name}] Client received {received!r}, expected {expected!r}")
+
+            # Kill proxy to flush trace, then collect stderr
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            time.sleep(0.3)
+
+            try:
+                stderr_output = proc.stderr.read() if proc.stderr else ""
+            except Exception:
+                stderr_output = ""
+
+            if "Traceback" not in stderr_output:
+                pass_(f"[{name}] stderr contains NO Traceback on upstream truncation")
+            else:
+                fail(f"[{name}] stderr contains Traceback:\n{stderr_output[:500]}")
+
+            # No client_disconnect event — the truncation was an UPSTREAM
+            # failure, not a client disconnect.
+            with open(trace_file) as f:
+                entries = [json.loads(line) for line in f if line.strip()]
+            disconnect_events = [e for e in entries if e.get("event") == "client_disconnect"]
+            if not disconnect_events:
+                pass_(f"[{name}] No 'client_disconnect' trace event — upstream "
+                      "failure correctly distinguished from client disconnect")
+            else:
+                fail(f"[{name}] Found {len(disconnect_events)} 'client_disconnect' "
+                     "event(s) on upstream failure")
+
+        finally:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            mock_server.shutdown()
+            try:
+                os.unlink(trace_file)
+            except OSError:
+                pass
+
+    try:
+        # Mode (a): close-delimited — oversized Content-Length, connection
+        # closes with an unsatisfied length → read1 returns b'' (clean EOF,
+        # `if not chunk: break` branch).
+        class TruncatedHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                content_len = int(self.headers.get("Content-Length", 0))
+                if content_len > 0:
+                    self.rfile.read(content_len)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(chunk1) + len(chunk2) + 1000000))
+                self.end_headers()
+                self.wfile.write(chunk1)
+                self.wfile.flush()
+                time.sleep(0.05)
+                self.wfile.write(chunk2)
+                self.wfile.flush()
+                # return → HTTP/1.0 close with unsatisfied Content-Length
+
+            def log_message(self, format, *args):
+                pass
+
+        run_mode("close-delimited", TruncatedHandler)
+
+        # Mode (b): chunked — Transfer-Encoding: chunked, connection dropped
+        # before the terminating 0-chunk → read1 raises IncompleteRead (inner
+        # except).
+        class ChunkedTruncatedHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                content_len = int(self.headers.get("Content-Length", 0))
+                if content_len > 0:
+                    self.rfile.read(content_len)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                for c in (chunk1, chunk2):
+                    self.wfile.write(("%x\r\n" % len(c)).encode() + c + b"\r\n")
+                    self.wfile.flush()
+                    time.sleep(0.05)
+                # Force the connection closed WITHOUT the terminating
+                # "0\r\n\r\n" chunk → the proxy's next read1 raises IncompleteRead.
+                self.close_connection = True
+
+            def log_message(self, format, *args):
+                pass
+
+        run_mode("chunked", ChunkedTruncatedHandler)
+
+    finally:
+        restore_settings()
+
+
+# ===========================================================================
+# Test Case 31: Empty Body 429 Exhaust (plan 2026-08-12-streaming-proxy, Step 3 regression guard)
+# ===========================================================================
+
+def test_empty_body_429_exhaust():
+    """Mock upstream always returns 429 with Content-Length: 0 (empty body)
+    through all retries; PROXY_MAX_RETRIES=1. The client must receive a proper
+    HTTP 429 status line (not a bare connection close). Regression guard for
+    do_POST's explicit `streamed` flag discrimination (an empty-body error
+    response must still get a status line via _send_response)."""
+    print("\n--- Test 31: Empty Body 429 Exhaust ---")
+    backup_settings()
+
+    try:
+        upstream_port = find_free_port()
+        proxy_port = find_free_port()
+
+        class Empty429Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                content_len = int(self.headers.get("Content-Length", 0))
+                if content_len > 0:
+                    self.rfile.read(content_len)
+                self.send_response(429)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                # no body written — empty 429
+
+            def log_message(self, format, *args):
+                pass
+
+        mock_server = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), Empty429Handler)
+        mock_thread = threading.Thread(target=mock_server.serve_forever, daemon=True)
+        mock_thread.start()
+        time.sleep(0.3)
+
+        set_base_url(f"http://127.0.0.1:{upstream_port}")
+
+        env = os.environ.copy()
+        env["PROXY_PORT"] = str(proxy_port)
+        env["PROXY_MAX_RETRIES"] = "1"
+        env["PROXY_MAX_DELAY"] = "1"
+        env["PROXY_INITIAL_DELAY"] = "1"
+        env["PROXY_IDLE_TIMEOUT"] = "300"
+
+        proc = subprocess.Popen(
+            PROXY_SERVER + ["--port", str(proxy_port)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
+        )
+
+        # TCP probe for readiness
+        probe_ok = False
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                sock.connect(("127.0.0.1", proxy_port))
+                sock.close()
+                probe_ok = True
+                break
+            except (socket.error, ConnectionRefusedError):
+                time.sleep(0.1)
+
+        if not probe_ok:
+            restore_settings()
+            proc.kill()
+            mock_server.shutdown()
+            fail("Proxy server failed to start for empty-body-429 test")
+            return
+
+        try:
+            status, body = _send_proxy_request(proxy_port)
+            if status == 429:
+                pass_(f"Client received proper HTTP 429 status line (status={status})")
+            else:
+                fail(f"Client received status={status}, expected 429 (body={body[:100]!r})")
+
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            mock_server.shutdown()
+
+    finally:
+        restore_settings()
+
+
+# ===========================================================================
+# Test Case 32: CRLF Header Filter (plan 2026-08-12-streaming-proxy, Step 5 unit test)
+# ===========================================================================
+
+def test_crlf_header_filter():
+    """In-process unit test of _crlf_safe: clean headers pass through; a header
+    VALUE containing CR/LF is omitted; a header NAME containing CR/LF is
+    omitted; None → {}; a mixed dict keeps only clean entries. Behavioral
+    testing via a mock upstream is infeasible (modern http.client parses raw
+    CR/LF header lines into separate clean headers before the proxy sees them)
+    — the unit test is authoritative."""
+    print("\n--- Test 32: CRLF Header Filter ---")
+
+    from claude_retry_proxy.server import _crlf_safe
+
+    # Clean headers pass through
+    result = _crlf_safe({"X-Ok": "fine"})
+    if result == {"X-Ok": "fine"}:
+        pass_("Clean header preserved: {\"X-Ok\": \"fine\"}")
+    else:
+        fail(f"_crlf_safe({{'X-Ok': 'fine'}}) returned {result!r}, expected "
+             "{\"X-Ok\": \"fine\"}")
+
+    # Header VALUE containing CR/LF is omitted
+    result = _crlf_safe({"X-Bad": "a\r\nSet-Cookie: injected=1"})
+    if result == {}:
+        pass_("Header value with CRLF omitted")
+    else:
+        fail(f"_crlf_safe returned {result!r}, expected {{}} for CRLF value")
+
+    # Header NAME containing CR/LF is omitted
+    result = _crlf_safe({"X\nBad": "v"})
+    if result == {}:
+        pass_("Header name with newline omitted")
+    else:
+        fail(f"_crlf_safe returned {result!r}, expected {{}} for CRLF name")
+
+    # None input returns {}
+    if _crlf_safe(None) == {}:
+        pass_("_crlf_safe(None) returns {}")
+    else:
+        fail(f"_crlf_safe(None) returned {_crlf_safe(None)!r}, expected {{}}")
+
+    # Empty dict returns {}
+    if _crlf_safe({}) == {}:
+        pass_("_crlf_safe({}) returns {}")
+    else:
+        fail(f"_crlf_safe({{}}) returned {_crlf_safe({})!r}, expected {{}}")
+
+    # Mixed dict keeps only clean entries
+    result = _crlf_safe({"X-Clean": "ok", "X-Dirty": "a\nb", "Y\nZ": "1"})
+    if result == {"X-Clean": "ok"}:
+        pass_("Mixed dict keeps only clean entries")
+    else:
+        fail(f"_crlf_safe mixed returned {result!r}, expected "
+             "{\"X-Clean\": \"ok\"}")
+
+
+# ===========================================================================
 # Test runner
 # ===========================================================================
 
@@ -3484,6 +3972,10 @@ ALL_TESTS = [
     ("client-disconnect-no-traceback", test_client_disconnect_no_traceback),
     ("start-prunes-old-trace-entries", test_start_prunes_old_trace_entries),
     ("prune-trace-file-edge-cases", test_prune_trace_file_edge_cases),
+    ("streaming-response-body", test_streaming_response_body),
+    ("streaming-mid-stream-upstream-failure", test_streaming_mid_stream_upstream_failure),
+    ("empty-body-429-exhaust", test_empty_body_429_exhaust),
+    ("crlf-header-filter", test_crlf_header_filter),
 ]
 
 
