@@ -1,0 +1,21 @@
+{
+  "tiers": {
+    "haiku": {
+      "provider": "",
+      "model": ""
+    },
+    "sonnet": {
+      "provider": "",
+      "model": ""
+    },
+    "opus": {
+      "provider": "",
+      "model": ""
+    }
+  },
+  "models": {
+    "haiku": ["claude-haiku-4-5", "claude-3-5-haiku-latest"],
+    "sonnet": ["claude-sonnet-4-5", "claude-sonnet-4-20250514", "claude-3-5-sonnet-latest"],
+    "opus": ["claude-opus-4-5", "claude-opus-4-20250514", "claude-3-opus-latest"]
+  }
+}

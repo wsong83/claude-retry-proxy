@@ -1,24 +1,31 @@
 # claude-retry-proxy
 
-A local HTTP retry proxy for the Claude API. It listens on `localhost`, forwards
-requests to your upstream `ANTHROPIC_BASE_URL`, retries `429` (Too Many
-Requests) and `503` (Service Unavailable) responses with jittered exponential
-backoff, and logs every request to a JSONL trace file.
+A local HTTP retry gateway for the Claude API. It listens on `localhost`, routes
+requests by model tier (haiku/sonnet/opus) to different upstream providers,
+retries `429` (Too Many Requests) and `503` (Service Unavailable) responses with
+jittered exponential backoff, rewrites model names bidirectionally (tier ↔
+actual), and logs every request to a JSONL trace file.
 
-It works with **any** `ANTHROPIC_BASE_URL` — official Anthropic, a third-party
-provider, or a self-hosted gateway. The proxy is provider-agnostic.
+It works with **any** upstream provider — official Anthropic, third-party
+gateways, or self-hosted endpoints. Different tiers can route to different
+providers simultaneously.
 
-Stdlib-only. Zero runtime dependencies. Python 3.8+. MIT licensed.
+Python 3.8+. `cryptography` package required (for encrypted key storage). MIT licensed.
 
 ## Why
 
 Some upstream endpoints return `503` under load or `429` when rate-limiting.
 Claude Code treats a `503` as a hard failure, so a transiently-busy provider
-interrupts your session. This proxy sits between Claude Code and the upstream,
-transparently retrying `429`s, `503`s, and connection errors with jittered
-exponential backoff so a busy provider doesn't abort your work. Jitter
+interrupts your session. This proxy sits between Claude Code and your upstream
+providers, transparently retrying `429`s, `503`s, and connection errors with
+jittered exponential backoff so a busy provider doesn't abort your work. Jitter
 (±25% per delay, de-synchronized per thread) prevents concurrent sessions
 from re-stampeding the upstream in lockstep.
+
+Additionally, the proxy enables **multi-provider routing**: send lightweight
+tasks (haiku) to a cheaper provider, standard tasks (sonnet) to your primary
+provider, and complex tasks (opus) to a premium provider — all from a single
+proxy with hot-switchable tier mappings via an admin page.
 
 ## Install
 
@@ -34,44 +41,58 @@ Requires `setuptools >= 64` (for PEP 660 src-layout editable installs). Python
 ## Quick start
 
 ```bash
-# 1. Make sure ANTHROPIC_BASE_URL in ~/.claude/settings.json points at a real
-#    (non-localhost) upstream, e.g. https://api.anthropic.com
+# 1. Configure ~/.claude/settings.json (once, manually):
+#    ANTHROPIC_BASE_URL = http://localhost:8080
+#    ANTHROPIC_DEFAULT_SONNET_MODEL = sonnet
+#    ANTHROPIC_DEFAULT_OPUS_MODEL = opus
+#    ANTHROPIC_DEFAULT_HAIKU_MODEL = haiku
+#    ANTHROPIC_API_KEY = <any value — the proxy injects the real key>
 
-# 2. Start the proxy (swaps settings.json to http://localhost:8080 while running)
+# 2. Prepare ~/.claude/keys-index.json (encrypted, vim blowfish2 format)
+#    with your provider URLs and API keys
+
+# 3. Start the proxy (prompts for passphrase to decrypt keys)
 claude-retry-proxy start
 
-# 3. Use Claude Code as usual — its traffic now flows through the proxy
+# 4. Use Claude Code as usual — its traffic now flows through the proxy
 
-# 4. Stop the proxy (restores the original URL)
+# 5. Hot-switch tier mappings via the admin page
+#    Open http://localhost:8080/admin/ in your browser
+
+# 6. Stop the proxy
 claude-retry-proxy stop
 ```
 
 Check state at any time:
 
 ```bash
-claude-retry-proxy status
+claude-retry-proxy status     # running/stopped + tier mapping
+claude-retry-proxy reload     # reload config.json from disk
 ```
 
 ## How it works
 
 When you run `claude-retry-proxy start`:
 
-1. It reads the current `ANTHROPIC_BASE_URL` from `~/.claude/settings.json` and
-   validates it (rejects localhost — the proxy cannot proxy to itself).
-2. It checks the trace log and prunes entries older than 5 days, printing a
-   one-line summary (best-effort; a failure does not block startup).
-3. It saves the original URL to a lock file (`~/.claude/proxy/base-url.lock`).
-4. It rewrites `ANTHROPIC_BASE_URL` in `settings.json` to
-   `http://localhost:<port>`.
-5. It launches the proxy server, which forwards requests to the original URL
-   with retry handling.
+1. It checks that `~/.claude/proxy/config.json` exists. On first run, it copies
+   a template and tells you to populate it with your tier→provider mappings.
+2. It prompts for your passphrase and decrypts `~/.claude/keys-index.json`
+   (provider URLs and API keys, vim blowfish2 encrypted).
+3. It validates the config: all 3 tiers present with valid provider references,
+   no reverse map collisions.
+4. It checks the trace log and prunes entries older than 5 days.
+5. It launches the proxy server, piping the passphrase via stdin.
 
-`claude-retry-proxy stop` reverses this: graceful HTTP shutdown of the server,
-then the original URL is restored to `settings.json` and the lock is removed.
+For each request from Claude Code:
 
-Because the URL lives in `settings.json`, **the proxy is coupled to Claude
-Code's config** — it reads and writes `ANTHROPIC_BASE_URL` there. This is
-deliberate; there is no env-var fallback or `--settings-path` flag.
+1. The model name is resolved to a tier (haiku/sonnet/opus)
+2. The config maps the tier to a specific provider and model name
+3. The request body's `model` field is rewritten to the actual model name
+4. The provider's API key is injected (replacing the client's dummy key)
+5. The request is forwarded to the provider's URL with retry handling
+6. The response model name is rewritten back to the tier name
+
+`settings.json` is never touched — it points at `localhost:8080` permanently.
 
 ## Usage
 
@@ -79,27 +100,23 @@ deliberate; there is no env-var fallback or `--settings-path` flag.
 Usage: claude-retry-proxy <command> [options]
 
 Commands:
-  start   Start the proxy (URL swap + launch proxy server)
-  stop    Stop the proxy and restore original URL
-  status  Show proxy status
+  start   Start the proxy (passphrase prompt + config validation + launch server)
+  stop    Stop the proxy
+  status  Show proxy status + current tier mapping
+  reload  Reload config.json from disk into running proxy
 ```
 
 ### `start` options
 
 ```
 claude-retry-proxy start [-h] [--port PORT] [--log LOG] [--all]
+                         [--config-path PATH] [--keys-path PATH]
 
-  --port, -p PORT  Port to listen on (default: 8080)
-  --log, -l LOG    Trace log file path
-  --all, -a        Log full request/response bodies
-```
-
-Examples:
-
-```bash
-claude-retry-proxy start --port 9090
-claude-retry-proxy start --log /tmp/trace.jsonl
-claude-retry-proxy start --all            # log full request bodies (+ error response bodies)
+  --port, -p PORT         Port to listen on (default: 8080)
+  --log, -l LOG           Trace log file path
+  --all, -a               Log full request/response bodies
+  --config-path PATH      Config file path (default: ~/.claude/proxy/config.json)
+  --keys-path PATH        Keys file path (default: ~/.claude/keys-index.json)
 ```
 
 ### Direct server invocation
@@ -108,19 +125,53 @@ The server can also be run directly (the `start` subcommand normally does this
 for you):
 
 ```bash
-claude-retry-proxy-server --port 8080 --upstream-url https://api.anthropic.com
+claude-retry-proxy-server --port 8080 --config-path ~/.claude/proxy/config.json --keys-path ~/.claude/keys-index.json
 # or
-python -m claude_retry_proxy.server --port 8080 --upstream-url https://api.anthropic.com
+python -m claude_retry_proxy.server --port 8080 --config-path ... --keys-path ...
 ```
 
-`--upstream-url` overrides what the server would otherwise read from
-`settings.json`. Without it, the server reads `ANTHROPIC_BASE_URL` from
-`~/.claude/settings.json`.
+The server prompts for the passphrase on stdin. Use `--passphrase-file <path>`
+for non-interactive use.
 
 ## Configuration
 
-All knobs are environment variables (read by the server at startup). Defaults
-are safe; override only if you need to.
+### Config file (`~/.claude/proxy/config.json`)
+
+Maps each tier to a provider and model name. Editable via the admin page or
+directly on disk (use `claude-retry-proxy reload` after manual edits).
+
+```json
+{
+  "tiers": {
+    "haiku":  { "provider": "provider-a", "model": "claude-haiku-4-5-20251001" },
+    "sonnet": { "provider": "provider-b", "model": "claude-sonnet-5" },
+    "opus":   { "provider": "provider-c", "model": "claude-opus-5" }
+  },
+  "models": {
+    "haiku": ["claude-haiku-4-5-20251001", "model-x"],
+    "sonnet": ["claude-sonnet-5", "model-y"],
+    "opus": ["claude-opus-5", "model-z"]
+  }
+}
+```
+
+The `models` section populates the admin page dropdowns. Each key is a tier
+name (`haiku`, `sonnet`, `opus`); the value is a list of model names shown in
+the admin page dropdown for that tier.
+
+### Keys file (`~/.claude/keys-index.json`)
+
+Encrypted with vim blowfish2 (same format as `claude-config`). Contains
+provider URLs and API keys. Decrypted at startup; immutable during runtime
+(restart required to change).
+
+### Admin page (`http://localhost:8080/admin/`)
+
+A browser-based admin panel for hot-switching tier mappings. Changes are
+written to `config.json` and take effect immediately. The admin page is
+localhost-only with CSRF protection (Origin header validation).
+
+### Server environment variables
 
 | Variable | Default | Range | Description |
 |----------|---------|-------|-------------|
@@ -129,8 +180,10 @@ are safe; override only if you need to.
 | `PROXY_INITIAL_DELAY` | `1` | 1–60 | First backoff delay, seconds |
 | `PROXY_MAX_DELAY` | `30` | 1–300 | Backoff cap, seconds. Applied before jitter; 429 retries use this directly. |
 | `PROXY_MAX_BODY_SIZE` | `10485760` | 1024–100 MiB | Request body size cap (bytes); larger → 413. Also caps the upstream error body drain on retry exhaustion. |
+| `PROXY_MAX_RESPONSE_SIZE` | `104857600` | 1024–1 GiB | Streaming response size cap (bytes); larger → truncated with a warning trace event. |
 | `PROXY_LOG_ALL` | unset | `1` to enable | Log full request bodies; response bodies on error paths only (streamed 2xx bodies are not captured) |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | path | Trace log location |
+| `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | path | Encrypted keys file location |
 
 Backoff is `PROXY_INITIAL_DELAY * 2**attempt`, capped at `PROXY_MAX_DELAY`.
 **429** responses retry using `PROXY_MAX_DELAY` directly (maximal latency);
@@ -144,37 +197,20 @@ concurrent sessions de-synchronize instead of retrying in lockstep.
 > getting `429`/`503` can block a worker thread for up to ~10.4 hours. With the
 > defaults (10 retries, 30 s cap) the worst case is about 3.8 minutes per
 > request.
->
-> Note: with integer-second rounding, ±25% jitter is ineffective for delays of
-> 1–2 s (the range lands in one integer bucket); de-sync becomes effective from
-> ~3 s onward. The 429 path uses `PROXY_MAX_DELAY` (default 30 s), so it
-> de-syncs from the first retry.
 
 ## Trace log
 
 Default location: `~/.claude/logs/proxy-trace.jsonl` (one JSON object per line).
 
-Each request logs: timestamp, method, path, model, status, http_status, retry
-count, total latency, first-byte latency, and a sanitized error. Lifecycle
-markers (`proxy_start`, `proxy_stop`) and per-retry events are also logged.
-When a client disconnects mid-response (e.g. timed out during a long retry
-storm), a `client_disconnect` event is logged (with `request_id`,
-`http_status`, `retries`) instead of printing a traceback.
+Each request logs: timestamp, method, path, model, tier, provider, status,
+http_status, retry count, total latency, first-byte latency, and a sanitized
+error. Lifecycle markers (`proxy_start`, `proxy_stop`) and per-retry events
+are also logged. When a client disconnects mid-response, a `client_disconnect`
+event is logged instead of printing a traceback.
 
 Entries older than 5 days are pruned on each `claude-retry-proxy start`.
 
-When retries are exhausted on a `429`/`503`, the upstream's error body is
-preserved and returned to the client (capped at `PROXY_MAX_BODY_SIZE`).
-On connection-error exhaustion, a synthesized `upstream_unreachable` body is
-logged to the trace.
-
-Use `--all` (or `PROXY_LOG_ALL=1`) to include full request bodies; response
-bodies are captured on the buffered (error) path only — streamed 2xx success
-bodies are not stored.
-
 ### Analyzing the trace log
-
-A utility script is provided for analyzing proxy trace data:
 
 ```bash
 python scripts/analyze_proxy_trace.py --days 3
@@ -184,12 +220,6 @@ This prints per-model statistics including request count, average retries,
 query success rate, attempt success rate, and geomean TTFT/latency. Models are
 auto-detected from the trace (no hardcoded names). Outliers (latency >30 min,
 max retries + failure) are filtered automatically.
-
-Run with `--help` for all options:
-
-```bash
-python scripts/analyze_proxy_trace.py --help
-```
 
 ### ⚠️ Data exposure with `--all` / `PROXY_LOG_ALL`
 
@@ -204,11 +234,12 @@ must restrict the trace directory's ACL yourself, e.g.:
 icacls "$env:USERPROFILE\.claude\logs" /inheritance:r /grant:r "$env:USERNAME:(OI)(CI)F"
 ```
 
-Point `PROXY_TRACE_FILE` at a directory with restrictive permissions regardless
-of platform if you enable `--all`.
-
 ## Features
 
+- **Multi-provider tier routing** — route haiku/sonnet/opus to different
+  upstream providers. Hot-switchable via admin page.
+- **Model name rewriting** — request: tier → actual model. Response: actual
+  model → tier. Claude Code only sees tier names.
 - **Automatic retries** — `429`, `503`, and connection errors retried with
   jittered exponential backoff (default 10 attempts). `429`s back off at the
   maximal delay; jitter de-synchronizes concurrent sessions.
@@ -219,16 +250,14 @@ of platform if you enable `--all`.
   logged as `client_disconnect` trace events; no tracebacks.
 - **Trace pruning** — `start` removes entries older than 5 days from the
   trace log and prints a one-line summary.
-- **URL swapping** — original `ANTHROPIC_BASE_URL` saved and restored
-  automatically; no manual config editing.
-- **Crash recovery** — if the proxy is killed without `stop`, a stale lock is
-  detected on the next `start` and the original URL is restored.
+- **Admin page** — browser-based tier switching at `http://localhost:8080/admin/`.
+  CSRF-protected, localhost-only.
+- **Encrypted key storage** — provider credentials stored in vim blowfish2
+  encrypted `keys-index.json`, decrypted at startup via passphrase.
 - **Concurrent sessions** — `ThreadingHTTPServer` handles multiple in-flight
   requests.
 - **Localhost-only** — the proxy binds `127.0.0.1`; it is not reachable from
   the network.
-- **Provider-agnostic** — works with any `ANTHROPIC_BASE_URL`.
-- **Zero dependencies** — Python standard library only.
 
 ## Files written at runtime
 
@@ -236,9 +265,7 @@ While the proxy runs, it creates (all under `~/.claude/`):
 
 | Path | Purpose |
 |------|---------|
-| `settings.json` (`env.ANTHROPIC_BASE_URL`) | Swapped to `http://localhost:<port>` while running, restored on `stop` |
-| `proxy/base-url.lock` | The URL-swap lock (original URL, port, server PID) |
-| `proxy/url-swap.lock` | Cross-process lock serializing `start`/`stop` |
+| `proxy/config.json` | Tier→provider mapping (editable via admin page or manually) |
 | `proxy/proxy-state.json` | Runtime state (PID, port, heartbeat); removed on clean shutdown |
 | `proxy/proxy-stderr.log` | Server stderr (startup messages, retry notices) |
 | `logs/proxy-trace.jsonl` | The JSONL request trace (pruned of entries >5 days on each `start`) |
@@ -250,19 +277,16 @@ pip install -e .
 python tests/test_claude_proxy.py
 ```
 
-The suite has 36 tests. **12 of them exercise the CLI's URL swap and require
-`ANTHROPIC_BASE_URL` in `~/.claude/settings.json` to be a non-localhost URL**
-(the proxy correctly rejects localhost to avoid proxying to itself). Set it to a
-real upstream or a mock before running the full suite. The other 24 tests start
-the server directly with mock upstreams and pass regardless (these include the
-streaming delivery, mid-stream failure, CRLF header filter, jitter/429 retry,
-body preservation, disconnect catch, and trace prune tests).
+The suite covers tier routing, model rewriting, admin API, config validation,
+key decryption, retry logic, streaming delivery, disconnect handling, and trace
+logging. Tests use mock upstream servers and temporary config/keys files — no
+live `~/.claude/settings.json` mutation required.
 
-> The tests back up and restore `~/.claude/settings.json`, but during a run your
-> live config is temporarily altered. Don't run the suite while a Claude Code
-> session is active against the same settings file, and avoid interrupting it
-> mid-test (a crash can leave `settings.json` pointing at localhost — run
-> `claude-retry-proxy stop` to recover).
+## Dependencies
+
+- `cryptography` (>= 38.0) — Blowfish ECB for vim blowfish2 decryption of
+  `keys-index.json`
+- Python standard library — all other functionality
 
 ## License
 

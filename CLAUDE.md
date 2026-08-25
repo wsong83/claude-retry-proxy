@@ -4,28 +4,34 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Purpose
 
-`claude-retry-proxy` is a stdlib-only HTTP retry proxy for the Claude API. It
-listens on localhost, forwards requests to the upstream `ANTHROPIC_BASE_URL`
-(read from `~/.claude/settings.json`), retries `429` and `503` responses with
-jittered exponential backoff, and logs every request to a JSONL trace file.
-A CLI manager swaps the `ANTHROPIC_BASE_URL` in `~/.claude/settings.json` to
-`http://localhost:<port>` while the proxy runs and restores it on stop.
+`claude-retry-proxy` is a multi-provider HTTP retry gateway for the Claude API.
+It listens on localhost, routes requests by model tier (haiku/sonnet/opus) to
+different upstream providers, retries `429` and `503` responses with jittered
+exponential backoff, and logs every request to a JSONL trace file. Tier routing
+is configured via `~/.claude/proxy/config.json`; provider credentials are stored
+encrypted in `~/.claude/keys-index.json` (vim blowfish2) and decrypted at
+startup via a passphrase prompt. An admin HTML page at `/admin/` allows
+hot-switching tier mappings at runtime.
 
 Extracted from the personal `claude-config` repo into a standalone, public,
-pip-installable package. Zero runtime dependencies; Python 3.8+.
+pip-installable package. Runtime dependency: `cryptography` (for vim blowfish2
+decryption). Python 3.8+.
 
 ## Structure
 
 ```
 src/claude_retry_proxy/
-  __init__.py     __version__
-  server.py       the HTTP retry proxy server (ThreadingHTTPServer, retry/backoff, trace logging)
-  cli.py          the claude-retry-proxy CLI: start / stop / status (URL swap, lock files, crash recovery)
+  __init__.py           __version__
+  server.py             the HTTP retry gateway server (ThreadingHTTPServer, tier routing, model rewriting, admin API, retry/backoff, trace logging)
+  cli.py                the claude-retry-proxy CLI: start / stop / status / reload (passphrase prompt, config validation, no URL swap)
+  vimcrypt.py           vim blowfish2 (VimCrypt~03!) decryption (derived from claude-config bin/vimcrypt.py)
+  admin.html            admin page for hot-switching tier mappings (served at /admin/)
+  config-template.json  template for ~/.claude/proxy/config.json (copied on first start)
 tests/
-  test_claude_proxy.py   36 behavioral tests (ported + cleaned from claude-config; +3 for jitter/429; +5 for body preservation, disconnect catch, trace prune; +4 for streaming delivery + CRLF hardening)
+  test_claude_proxy.py  behavioral tests (tier routing, model rewriting, admin API, config validation, key decryption, retry, streaming, disconnect, trace)
 scripts/
   analyze_proxy_trace.py  trace log analysis tool (model stats, latency, success rates)
-pyproject.toml   setuptools src-layout, console scripts, zero deps
+pyproject.toml   setuptools src-layout, console scripts, cryptography dependency
 LICENSE          MIT
 ```
 
@@ -37,63 +43,94 @@ Two console scripts (defined in `pyproject.toml` `[project.scripts]`):
 
 ```bash
 pip install -e .                              # editable install (needs setuptools>=64)
-claude-retry-proxy start                      # start the proxy (URL swap + launch server)
-claude-retry-proxy status                     # show running/stopped/stale
-claude-retry-proxy stop                       # stop + restore original URL
+claude-retry-proxy start                      # start the proxy (passphrase prompt + config validation + launch server)
+claude-retry-proxy status                     # show running/stopped/stale + tier mapping
+claude-retry-proxy stop                       # stop the proxy
+claude-retry-proxy reload                     # reload config.json from disk into running proxy
 python tests/test_claude_proxy.py             # run the test suite
 python -m claude_retry_proxy.cli --help       # PATH-independent invocation
 python -m claude_retry_proxy.server --help
 ```
 
 Start options: `--port` (default 8080), `--log <path>` (trace file; relative
-paths resolve against cwd), `--all` (log full request/response bodies).
+paths resolve against cwd), `--all` (log full request/response bodies),
+`--config-path <path>` (config.json location), `--keys-path <path>`
+(keys-index.json location).
 
 ## Architecture
 
-- **CLI `start`**: read+validate `ANTHROPIC_BASE_URL` from `~/.claude/settings.json`
-  (reject localhost — proxy-to-self), acquire a swap lock (`O_EXCL`), swap the
-  URL to `http://localhost:<port>`, **check and prune the trace log** (entries
-  older than 5 days are removed; a one-line summary is printed), spawn the server via
-  `python -m claude_retry_proxy.server --upstream-url <original>`, write a lock
-  with the server PID, TCP-probe the port for readiness (2s), rollback on
-  failure. Cross-platform PID liveness/kill via `ctypes` on Windows (`OpenProcess`
-  + `WaitForSingleObject` / `TerminateProcess`), `os.kill` on POSIX.
-- **Server**: `ThreadingHTTPServer` on 127.0.0.1. Per request: filter
-  whitelisted headers, forward to upstream, retry on **429** and **503** /
-  connection error with jittered exponential backoff
-  (`PROXY_INITIAL_DELAY * 2**attempt`, capped at `PROXY_MAX_DELAY`, then ±25%
-  uniform jitter, integer seconds). **429 retries use `PROXY_MAX_DELAY`**
-  directly (maximal latency); 503 and connection errors use the exponential.
-  Jitter draws from a **thread-local `random.Random()`** (the module-global
-  `random` is not thread-safe under worker threads). On a non-retryable **2xx**,
-  the response body is **streamed to the client in real time**
-  (`_stream_upstream_response`: status + headers sent immediately, `read1(8192)`
-  chunks written and flushed as they arrive — SSE events reach the client as
-  generated; `read(amt)` must NOT be used, it fills amt-or-EOF and buffers).
-  Non-2xx responses stay buffered so upstream error bodies remain available
-  for the trace. Log a JSONL trace entry.
-  `/admin/shutdown` (localhost-only) triggers graceful shutdown → `finally`
-  block writes a `proxy_stop` marker and removes `proxy-state.json`.
-  **Client disconnect catch:** `_send_response` is wrapped in
-  `try/except _DISCONNECT_ERRORS` (`ConnectionResetError`,
-  `BrokenPipeError`, `ConnectionAbortedError`); on disconnect, a
-  `client_disconnect` trace event is logged instead of printing a
-  traceback per occurrence. `_stream_upstream_response` has the same outer
-  `_DISCONNECT_ERRORS` handler plus an inner try/except for upstream read
-  errors (`IncompleteRead`, `RemoteDisconnected`, `socket.error`, `OSError`) —
-  mid-stream upstream truncation aborts the stream (never retried: the first
-  byte already reached the client). The `_log_client_disconnect` method wraps
-  its own `log_trace` call in try/except to prevent re-raise.
-  **Give-up body preservation:** when retries are exhausted on 429/503,
-  `forward_request` drains the upstream error body (capped at
-  `PROXY_MAX_BODY_SIZE` via `_read_capped`) and returns it to the client
-  instead of `b''`. On connection-error exhaustion, a synthesized
-  `upstream_unreachable` JSON body is returned (includes the sanitized
-  last error string).
-- **Upstream URL resolution** happens in `server.py main()` at runtime (not
-  import time): `--upstream-url` if given, else `read_upstream_url()` from
-  settings.json. Direct invocation emits a clean, source-attributed error if the
-  URL can't be parsed.
+- **`settings.json` is static.** The user configures `ANTHROPIC_BASE_URL=http://localhost:8080`,
+  standard tier model names (`ANTHROPIC_DEFAULT_SONNET_MODEL=sonnet`, etc.),
+  and a dummy API key. The proxy NEVER reads or writes `settings.json`.
+- **CLI `start`**: check `~/.claude/proxy/config.json` exists (if not, copy
+  template and exit 1 with instructions), prompt passphrase via
+  `vimcrypt.prompt_hidden`, decrypt `~/.claude/keys-index.json`, validate
+  config against decrypted vendors, **prune the trace log** (entries older
+  than 5 days), spawn the server via `python -m claude_retry_proxy.server
+  --port <port> --config-path <path> --keys-path <path>`, pipe passphrase
+  via stdin, write `proxy-state.json` (PID, port, start_time), TCP-probe
+  the port for readiness (2s), rollback on failure. Cross-platform PID
+  liveness/kill via `ctypes` on Windows (`OpenProcess` +
+  `WaitForSingleObject` / `TerminateProcess`), `os.kill` on POSIX.
+- **Server**: `ThreadingHTTPServer` on 127.0.0.1. Per request:
+  1. Extract model name from request body → `resolve_tier` (direct name,
+     reverse lookup, pattern match, or 400 error for unknown)
+  2. Config lookup: tier → (provider, model name)
+  3. Keys lookup: provider → (url, api_key) from decrypted vendors table
+  4. Rewrite request: replace `"model"` field with actual model name,
+     inject provider's `x-api-key`, drop `authorization` header
+  5. Forward to resolved upstream, retry on **429** and **503** /
+     connection error with jittered exponential backoff (same logic as
+     before: `PROXY_INITIAL_DELAY * 2**attempt`, capped at `PROXY_MAX_DELAY`,
+     ±25% jitter, thread-local RNG). **429 retries use `PROXY_MAX_DELAY`**
+     directly; 503 and connection errors use the exponential.
+  6. **Response model rewriting**: build reverse map `{actual_model: tier}`
+     at config load. For SSE (`text/event-stream`): buffer first event
+     (64 KB cap), rewrite `model` in `message_start` event, forward
+     remainder + subsequent events unchanged. For JSON
+     (`application/json`): parse body, replace `model` with tier name,
+     re-serialize. Other Content-Types pass through unchanged.
+     Content-Type checked FIRST before any buffering/parsing.
+     Unmapped model names pass through with a warning trace event.
+  7. **`do_POST` streamed flag**: `streamed = (200 <= status < 300) and
+     (resp_body == b"")` — streaming paths return `b""`, buffering paths
+     return actual body. Only buffered responses call `_send_response`.
+  8. Log a JSONL trace entry with `tier` and `provider` fields.
+  - `/admin/shutdown` (localhost-only) triggers graceful shutdown.
+  - **Admin page** (`GET /admin/`): serves `admin.html` from package data.
+  - **Admin API** (localhost-only, CSRF-protected via Origin validation):
+    - `GET /admin/api/config` — return current tiers + models
+    - `GET /admin/api/providers` — return list of available provider names
+    - `POST /admin/api/switch` — update tier mappings (preserves models
+      catalog), validate all 3 tiers present, validate provider names,
+      drain-and-swap pattern (block new queries, drain in-flight, swap,
+      unblock)
+    - `POST /admin/api/reload` — re-read config.json from disk, validate,
+      drain-and-swap pattern
+  - **Drain-and-swap pattern:** config changes use `_config_swapping` flag
+    + `_inflight_count` counter + `_swap_done` Event. New requests wait if
+    swap in progress. Admin waits for in-flight to drain (30s timeout,
+    100ms poll), swaps under lock, signals completion. `forward_request`
+    snapshots config + reverse_map at entry under lock, uses snapshots
+    throughout (immune to mid-request config changes).
+  - CSRF: reject missing Origin, reject `null`, accept only
+    `http://localhost:<port>`, `http://127.0.0.1:<port>`, `http://[::1]:<port>`.
+  - Admin POST bodies capped at 64 KB.
+  - **Client disconnect catch:** `_send_response` wrapped in
+    `try/except _DISCONNECT_ERRORS`; on disconnect, a `client_disconnect`
+    trace event is logged. `_stream_upstream_response` has the same outer
+    handler plus inner try/except for upstream read errors.
+  - **Give-up body preservation:** when retries are exhausted on 429/503,
+    `forward_request` drains the upstream error body (capped at
+    `PROXY_MAX_BODY_SIZE` via `_read_capped`) and returns it to the client.
+    On connection-error exhaustion, a synthesized `upstream_unreachable`
+    JSON body is returned.
+- **Passphrase pipe protocol**: CLI writes passphrase + `\n` to `proc.stdin`,
+  closes stdin. Server reads one line from stdin in `main()` before
+  `serve_forever()`. On decryption failure, server prints error to stderr
+  and exits non-zero. CLI detects `proc.poll() != 0` as startup failure.
+  Direct invocation: prompts interactively when `sys.stdin.isatty()`,
+  supports `--passphrase-file` for non-interactive use.
 
 ## Environment Variables (server)
 
@@ -104,20 +141,22 @@ paths resolve against cwd), `--all` (log full request/response bodies).
 | `PROXY_INITIAL_DELAY` | 1 | First backoff delay, seconds (1-60) |
 | `PROXY_MAX_DELAY` | 30 | Backoff cap, seconds (1-300). Applied *before* jitter, so actual sleeps can exceed it by up to 25%. 429 retries use this value directly (jittered). |
 | `PROXY_MAX_BODY_SIZE` | 10485760 | Request body size cap, bytes (1024-100MiB) → 413. Also caps the upstream error body drain on retry exhaustion (give-up path) via `_read_capped`. |
+| `PROXY_MAX_RESPONSE_SIZE` | 104857600 | Streaming response size cap, bytes (1024-1GiB). Responses exceeding this are truncated with a `response_size_cap_exceeded` warning trace event. |
 | `PROXY_LOG_ALL` | "" | Set to `1` to log full request/response bodies |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | Trace log path |
+| `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | Encrypted keys file path |
 
 Runtime artifacts (all under `~/.claude/`, hardcoded — see Gotchas):
-`proxy/base-url.lock`, `proxy/url-swap.lock`, `proxy/proxy-state.json`,
+`proxy/config.json`, `proxy/proxy-state.json`,
 `proxy/proxy-stderr.log`, `logs/proxy-trace.jsonl`. The trace log is pruned of
 entries older than 5 days on each `claude-retry-proxy start` (best-effort;
 does not block startup on failure).
 
 ## Gotchas
 
-- **Settings coupling is hardcoded.** The proxy reads and swaps
-  `ANTHROPIC_BASE_URL` in `~/.claude/settings.json`. There is no env-var
-  fallback and no `--settings-path` flag (deliberate design decision).
+- **`~/.claude/settings.json` is static.** The user configures it once with
+  `ANTHROPIC_BASE_URL=http://localhost:8080` and standard tier model names.
+  The proxy never reads or writes it.
 - **`--all` / `PROXY_LOG_ALL` writes raw prompts and completions** to the
   plaintext trace file. Note: **streamed 2xx success response bodies are NOT
   captured** even with `--all` (deliberate reduction in data-at-rest exposure;
@@ -126,13 +165,14 @@ does not block startup on failure).
   Windows `chmod` is a near-no-op (read-only bit only; no group/other model).
   Windows users must restrict the trace/state directory ACL manually
   (`icacls`).
-- **Tests mutate the live `~/.claude/settings.json`.** 12 of the 36 tests
-  exercise the CLI's URL swap; backup/restore protects the file, but a crash
-  mid-test can leave settings pointing at localhost. Don't run the suite while a
-  Claude Code session is active against the same settings.
-- **12 CLI tests require a non-localhost `ANTHROPIC_BASE_URL`** in settings.json
-  (the CLI correctly rejects localhost). Set it to a real upstream or mock
-  before running the full suite; the 24 direct-server/unit tests pass regardless.
+- **Config validation is strict.** The proxy refuses to start if config.json
+  is missing (copies template and tells user to populate it), has empty
+  provider/model fields, or references unknown providers. Reverse map
+  collisions (two tiers mapping to the same model name) are also rejected.
+- **Admin API CSRF protection.** Admin POST endpoints validate the Origin
+  header. Non-browser clients (curl, CLI `reload`) must include an Origin
+  header matching `http://localhost:<port>` or `http://127.0.0.1:<port>` or
+  `http://[::1]:<port>`. Origin: null and missing Origin are rejected.
 - **`PROXY_IDLE_TIMEOUT` is a dead env var** some tests still set — the server
   defines no idle-timeout feature. Harmlessly ignored.
 - **Worst-case retry hold**: with jitter the *expected* sleep is unchanged but
@@ -153,9 +193,11 @@ does not block startup on failure).
   is returned. Preserved bodies flow into the `--all` trace log — on Windows
   the trace file is world-readable (see `--all` gotcha above).
 - **`response-streaming-no-size-cap` is partially addressed.** The give-up
-  drain is capped, but the **streaming success path** (the `read1` loop in
-  `_stream_upstream_response`) is still uncapped. The Open issue tracked
-  in `## Future Work` remains open for the streaming path.
+  drain is capped, and the SSE first-event buffer is capped at 64 KB, but
+  the **streaming success path** (the `read1` loop in
+  `_stream_upstream_response` for events after the first) is still uncapped.
+  The Open issue tracked in `## Future Work` remains open for the streaming
+  path.
 - **Streaming disconnect catch is scoped to `_DISCONNECT_ERRORS`.** A
   non-standard client-write `OSError` outside that tuple (e.g.
   WSAENOBUFS/WSAENOTSOCK/ENOTCONN) can propagate into `forward_request`'s
@@ -167,6 +209,13 @@ does not block startup on failure).
   worker thread for up to `PROXY_MAX_RETRIES * jittered_max_delay`, so shutdown
   can take that long to drain. Tracked as Open issue `shutdown-during-retry-sleep`
   in the jitter plan's Issue Log for a future hardening pass.
+- **Drain-and-swap timeout during retry sleep.** Admin switch/reload drain
+  waits up to 30s for in-flight requests to complete. A request stuck in
+  retry backoff (worst case ~3.8 min with defaults) exceeds this timeout —
+  the swap is **aborted** (returns 503 to admin client) rather than waiting
+  indefinitely. The in-flight request continues with its original config
+  snapshot and completes normally. Same root cause as
+  `shutdown-during-retry-sleep`.
 
 ## Documentation
 
@@ -178,50 +227,12 @@ does not block startup on failure).
 - Design rationale for the extraction lives in
   `tmp/plans/2026-07-17-extract-retry-proxy-design.md` (gitignored — planning
   artifact, not published).
+- Multi-provider gateway design lives in
+  `tmp/plans/2026-08-23-cc-switch-mode.md` (gitignored — planning artifact).
 
 No other supplementary docs.
 
 ## Future Work — TODO
 
-Pre-existing upstream behaviors carried over from the `claude-config` extraction
-(`src/claude_retry_proxy/server.py`, `src/claude_retry_proxy/cli.py`, ported
-near-verbatim). Each is documented in
-`tmp/plans/2026-07-17-extract-retry-proxy-design.md` (Risks) and tracked as an
-Open issue in the plan's `## Issue Log`. Not blocking normal operation; deferred
-to a future hardening plan.
-
-- [ ] **Port-bind readiness race (Windows)** — `claude-retry-proxy start`'s TCP
-  readiness probe can report success (exit 0) when the target port is already
-  occupied, because the server's asynchronous bind failure races past the CLI's
-  2s TCP probe (Windows `SO_REUSEADDR` semantics differ from POSIX). Result: a
-  false "Proxy started" with `settings.json` pointing at `localhost:<port>`
-  served by whatever was already there, not the retry proxy.
-  - **Location:** `src/claude_retry_proxy/cli.py` `cmd_start` (spawn + TCP probe
-    + `proc.poll()`). Upstream `bin/claude-proxy`, ported near-verbatim.
-  - **Fix sketch:** make the CLI wait for the server subprocess to either bind
-    successfully or exit with an error before reporting success — e.g. a
-    readiness handshake on a stdout line the server prints once bound, or a
-    health-check loop that distinguishes "bound" from "not yet failed".
-  - **Tracking:** issue `start-early-exit-rollback-port-bind-race`
-    ([report](tmp/reports/2026-07-17-extract-retry-proxy-start-early-exit-rollback-port-bind-race.json)).
-
-- [ ] **Response body has no size cap (streaming path)** — the 2xx success
-  path (`_stream_upstream_response`) streams upstream bytes to the client
-  chunk-by-chunk (`read1(8192)` loop, O(1) memory per request — the old
-  buffer-into-a-list OOM risk is gone). What remains uncapped is the
-  *size/duration* of a streamed response: only the *request* body is capped
-  (`PROXY_MAX_BODY_SIZE`, default 10 MB → 413), and the retry-exhaustion
-  give-up drain is capped (via `_read_capped`), but no knob limits streamed
-  response bytes or stream duration. A misconfigured/untrusted upstream can
-  pin a worker thread for an arbitrarily long stream, and
-  `ThreadingHTTPServer` has no thread-pool cap, so concurrent long streams
-  compound the pressure.
-  - **Location:** `src/claude_retry_proxy/server.py`
-    `_stream_upstream_response` (read1 loop).
-  - **Fix sketch:** cap streamed response bytes (a `PROXY_MAX_RESPONSE_SIZE`
-    knob mirroring `PROXY_MAX_BODY_SIZE`); past the cap, abort the upstream
-    read and return an error to the client. Optionally bound
-    `ThreadingHTTPServer`'s thread pool.
-  - **Tracking:** issue `response-streaming-no-size-cap` (Open in the plan's
-    `## Issue Log`; no separate report file — identified during mega-audit
-    iteration 1, audit ref M32).
+All deferred issues from the original `claude-config` extraction have been resolved.
+Future hardening work can focus on additional features or performance optimizations.

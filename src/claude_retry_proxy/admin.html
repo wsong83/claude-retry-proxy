@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude Retry Proxy - Admin</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #eee; min-height: 100vh; padding: 2rem; }
+        .container { max-width: 800px; margin: 0 auto; }
+        h1 { color: #4fc3f7; margin-bottom: 1rem; }
+        h2 { color: #81c784; margin: 1.5rem 0 0.5rem; }
+        .card { background: #16213e; border-radius: 8px; padding: 1.5rem; margin-bottom: 1rem; }
+        .tier-row { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.75rem; }
+        .tier-label { width: 80px; font-weight: bold; text-transform: uppercase; }
+        .tier-label.haiku { color: #4fc3f7; }
+        .tier-label.sonnet { color: #81c784; }
+        .tier-label.opus { color: #ffb74d; }
+        select, input { background: #0f3460; border: 1px solid #4fc3f7; color: #eee; padding: 0.5rem; border-radius: 4px; flex: 1; }
+        button { background: #4fc3f7; color: #1a1a2e; border: none; padding: 0.75rem 1.5rem; border-radius: 4px; cursor: pointer; font-weight: bold; margin-right: 0.5rem; }
+        button:hover { background: #81d4fa; }
+        button.secondary { background: #455a64; color: #eee; }
+        button.secondary:hover { background: #607d8b; }
+        .status { padding: 1rem; border-radius: 4px; margin-top: 1rem; display: none; }
+        .status.success { background: #1b5e20; display: block; }
+        .status.error { background: #b71c1c; display: block; }
+        .model-custom { margin-top: 0.5rem; display: none; }
+        .model-custom.visible { display: block; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Claude Retry Proxy</h1>
+        <div class="card">
+            <h2>Tier Configuration</h2>
+            <div id="tiers-container"></div>
+            <div style="margin-top: 1.5rem;">
+                <button onclick="saveConfig()">Save Configuration</button>
+                <button class="secondary" onclick="reloadConfig()">Reload from Disk</button>
+            </div>
+            <div id="status" class="status"></div>
+        </div>
+    </div>
+
+    <script>
+        const TIERS = ['haiku', 'sonnet', 'opus'];
+        let config = null;
+        let providers = [];
+
+        async function loadConfig() {
+            try {
+                const [configResp, providersResp] = await Promise.all([
+                    fetch('/admin/api/config'),
+                    fetch('/admin/api/providers')
+                ]);
+                config = await configResp.json();
+                const providersData = await providersResp.json();
+                providers = providersData.providers || [];
+                renderTiers();
+            } catch (e) {
+                showStatus('error', 'Failed to load config: ' + e.message);
+            }
+        }
+
+        function renderTiers() {
+            const container = document.getElementById('tiers-container');
+            container.innerHTML = '';
+            TIERS.forEach(tier => {
+                const tierConfig = config.tiers[tier] || { provider: '', model: '' };
+                const models = config.models?.[tier] || [];
+                const div = document.createElement('div');
+                div.className = 'tier-row';
+                div.innerHTML = `
+                    <span class="tier-label ${tier}">${tier}</span>
+                    <select id="${tier}-provider" onchange="onProviderChange('${tier}')">
+                        <option value="">Select provider...</option>
+                    </select>
+                    <select id="${tier}-model" onchange="onModelSelect('${tier}')">
+                        <option value="">Select model...</option>
+                        <option value="__custom__">Custom...</option>
+                    </select>
+                    <input type="text" id="${tier}-custom-model" class="model-custom" placeholder="Enter model name">
+                `;
+                container.appendChild(div);
+
+                // Populate providers dropdown
+                const providerSelect = document.getElementById(`${tier}-provider`);
+                providers.forEach(p => {
+                    const opt = document.createElement('option');
+                    opt.value = p;
+                    opt.textContent = p;
+                    providerSelect.appendChild(opt);
+                });
+                providerSelect.value = tierConfig.provider || '';
+
+                // Populate models
+                const modelSelect = document.getElementById(`${tier}-model`);
+                models.forEach(m => {
+                    const opt = document.createElement('option');
+                    opt.value = m;
+                    opt.textContent = m;
+                    modelSelect.appendChild(opt);
+                });
+                modelSelect.value = tierConfig.model || '';
+            });
+        }
+
+        function onModelSelect(tier) {
+            const select = document.getElementById(`${tier}-model`);
+            const custom = document.getElementById(`${tier}-custom-model`);
+            if (select.value === '__custom__') {
+                custom.classList.add('visible');
+                custom.focus();
+            } else {
+                custom.classList.remove('visible');
+            }
+        }
+
+        function onProviderChange(tier) {
+            // Could refresh model list based on provider
+        }
+
+        function getModelValue(tier) {
+            const select = document.getElementById(`${tier}-model`);
+            if (select.value === '__custom__') {
+                return document.getElementById(`${tier}-custom-model`).value;
+            }
+            return select.value;
+        }
+
+        async function saveConfig() {
+            const newConfig = {
+                tiers: {}
+            };
+            TIERS.forEach(tier => {
+                newConfig.tiers[tier] = {
+                    provider: document.getElementById(`${tier}-provider`).value,
+                    model: getModelValue(tier)
+                };
+            });
+
+            // Validate
+            for (const tier of TIERS) {
+                if (!newConfig.tiers[tier].provider) {
+                    showStatus('error', `Provider required for ${tier}`);
+                    return;
+                }
+                if (!newConfig.tiers[tier].model) {
+                    showStatus('error', `Model required for ${tier}`);
+                    return;
+                }
+            }
+
+            try {
+                const resp = await fetch('/admin/api/switch', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Origin': window.location.origin
+                    },
+                    body: JSON.stringify(newConfig)
+                });
+                const result = await resp.json();
+                if (resp.ok) {
+                    showStatus('success', 'Configuration saved successfully');
+                    config.tiers = newConfig.tiers;
+                } else {
+                    showStatus('error', 'Error: ' + (result.error || 'Unknown error'));
+                }
+            } catch (e) {
+                showStatus('error', 'Failed to save: ' + e.message);
+            }
+        }
+
+        async function reloadConfig() {
+            try {
+                const resp = await fetch('/admin/api/reload', {
+                    method: 'POST',
+                    headers: { 'Origin': window.location.origin }
+                });
+                const result = await resp.json();
+                if (resp.ok) {
+                    config = result.config;
+                    renderTiers();
+                    showStatus('success', 'Configuration reloaded from disk');
+                } else {
+                    showStatus('error', 'Error: ' + (result.error || 'Unknown error'));
+                }
+            } catch (e) {
+                showStatus('error', 'Failed to reload: ' + e.message);
+            }
+        }
+
+        function showStatus(type, message) {
+            const el = document.getElementById('status');
+            el.className = 'status ' + type;
+            el.textContent = message;
+            setTimeout(() => { el.className = 'status'; }, 5000);
+        }
+
+        // Load config on page load
+        loadConfig();
+    </script>
+</body>
+</html>

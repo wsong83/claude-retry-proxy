@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""HTTP retry proxy for Claude API. Listens on localhost and forwards requests
-to the upstream endpoint, retrying on 429 (Too Many Requests) and 503 (Service
-Unavailable) with jittered exponential backoff. Logs all requests to a JSONL
-trace file.
+"""Multi-provider HTTP retry gateway for Claude API. Listens on localhost, routes
+requests by model tier (haiku/sonnet/opus) to different upstream providers, retries
+429/503/connection errors with jittered exponential backoff, and logs every request
+to a JSONL trace file. Tier routing configured via ~/.claude/proxy/config.json;
+provider credentials stored encrypted in ~/.claude/keys-index.json (vim blowfish2)
+and decrypted at startup via passphrase prompt. Supports concurrent requests via
+ThreadingHTTPServer.
 
-Provider-agnostic — reads upstream URL from settings.json at startup. Supports
-concurrent requests via ThreadingHTTPServer.
-
-Dependencies: Python stdlib only (http.server, http.client, json, threading,
-uuid, signal, socket, os, sys, time, re, urllib.parse, argparse).
+Dependencies: cryptography (for vim blowfish2 decryption), plus Python stdlib
+(http.server, http.client, json, threading, uuid, signal, socket, os, sys, time,
+re, urllib.parse, argparse).
 """
 
 import argparse
@@ -26,6 +27,8 @@ import threading
 import time
 import uuid
 from urllib.parse import urlparse
+
+from . import vimcrypt
 
 
 # ---------------------------------------------------------------------------
@@ -57,11 +60,33 @@ PROXY_MAX_RETRIES = _env_int("PROXY_MAX_RETRIES", 10, 1, 100)
 PROXY_INITIAL_DELAY = _env_int("PROXY_INITIAL_DELAY", 1, 1, 60)
 PROXY_MAX_DELAY = _env_int("PROXY_MAX_DELAY", 30, 1, 300)
 PROXY_MAX_BODY_SIZE = _env_int("PROXY_MAX_BODY_SIZE", 10 * 1024 * 1024, 1024, 100 * 1024 * 1024)
+PROXY_MAX_RESPONSE_SIZE = _env_int("PROXY_MAX_RESPONSE_SIZE", 100 * 1024 * 1024, 1024, 1024 * 1024 * 1024)
 
 PROXY_LOG_ALL = _env_str("PROXY_LOG_ALL", "") == "1"
 
 _default_trace = os.path.join(os.path.expanduser("~"), ".claude", "logs", "proxy-trace.jsonl")
 PROXY_TRACE_FILE = _env_str("PROXY_TRACE_FILE", _default_trace)
+
+# Config paths
+DEFAULT_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".claude", "proxy", "config.json")
+CONFIG_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "config-template.json")
+_default_keys = os.path.join(os.path.expanduser("~"), ".claude", "keys-index.json")
+PROXY_KEYS_PATH = _env_str("PROXY_KEYS_PATH", _default_keys)
+
+# Thread-safe config access (read by worker threads, written by admin API)
+_config_lock = threading.RLock()
+_current_config = None  # Set at startup after validation
+_reverse_model_map = None  # {actual_model: tier_name}, rebuilt on config change
+_config_path = None  # Path to config.json, set at startup
+
+# Drain-and-swap state for config changes (prevents race with in-flight requests)
+_inflight_count = 0  # Number of requests currently in-flight
+_config_swapping = False  # True when config swap is in progress
+_swap_done = threading.Event()  # Signaled when swap completes
+
+# Decrypted vendors table (read-only after init)
+# {provider_name: {"url": ..., "key": ...}}
+_vendors = None
 
 # Thread-local RNG — the module-global random is not thread-safe under
 # ThreadingHTTPServer worker threads (Mersenne Twister state is shared).
@@ -75,6 +100,47 @@ def _rng():
         _rng_local.rng = r
     return r
 
+# Admin page and validation
+_admin_html_cache = None
+ADMIN_BODY_LIMIT = 64 * 1024  # 64 KB cap for admin POST bodies
+_ADMIN_NAME_RE = re.compile(r"^[a-zA-Z0-9_./-]+$")
+
+
+def _load_admin_html():
+    """Load admin.html from package data, cached."""
+    global _admin_html_cache
+    if _admin_html_cache is None:
+        admin_path = os.path.join(os.path.dirname(__file__), "admin.html")
+        with open(admin_path, "r", encoding="utf-8") as f:
+            _admin_html_cache = f.read()
+    return _admin_html_cache
+
+
+def _validate_admin_name(name):
+    """Validate provider/model name contains only safe characters."""
+    return bool(_ADMIN_NAME_RE.match(name))
+
+
+def _validate_csrf_origin(handler, port):
+    """Validate Origin header for CSRF protection.
+
+    Returns True if valid, False if invalid.
+    Rejects: missing Origin, null Origin, non-localhost origins.
+    Accepts: http://localhost:<port>, http://127.0.0.1:<port>, http://[::1]:<port>
+    """
+    origin = handler.headers.get("Origin")
+    if not origin:
+        return False
+    if origin == "null":
+        return False
+    valid_origins = [
+        "http://localhost:{}".format(port),
+        "http://127.0.0.1:{}".format(port),
+        "http://[::1]:{}".format(port),
+    ]
+    return origin in valid_origins
+
+
 # Whitelisted paths and methods
 ALLOWED_PATH_RE = re.compile(r"^/v1/")
 ALLOWED_METHODS = {"POST", "OPTIONS"}
@@ -85,20 +151,8 @@ FORWARD_HEADERS = {"authorization", "x-api-key", "content-type",
 
 
 # ---------------------------------------------------------------------------
-# Upstream URL — read from settings.json at startup (provider-agnostic)
+# Upstream URL parsing
 # ---------------------------------------------------------------------------
-
-def read_upstream_url():
-    """Read ANTHROPIC_BASE_URL from settings.json."""
-    settings_path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
-    try:
-        with open(settings_path) as f:
-            data = json.load(f)
-        url = data.get("env", {}).get("ANTHROPIC_BASE_URL", "")
-        return url
-    except (FileNotFoundError, json.JSONDecodeError):
-        return ""
-
 
 def parse_upstream(url):
     """Parse upstream URL into (host, port, use_ssl, path_prefix). Returns None on failure."""
@@ -120,11 +174,189 @@ def parse_upstream(url):
     return (host, port, use_ssl, path_prefix)
 
 
-# Module-level globals — assigned at runtime in main() (not at import time).
-# This avoids sys.exit(1) on import when settings.json is absent, so tests
-# and --help work without a valid upstream URL configured.
-UPSTREAM_URL = ""
-UPSTREAM_HOST = UPSTREAM_PORT = UPSTREAM_USE_SSL = UPSTREAM_PATH_PREFIX = None
+# ---------------------------------------------------------------------------
+# Config loading and validation
+# ---------------------------------------------------------------------------
+
+def load_config(path):
+    """Load config.json from path. Returns dict with 'tiers' and 'models' keys.
+
+    Raises ValueError on invalid JSON or missing required structure.
+    Raises FileNotFoundError if path doesn't exist.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("config must be a JSON object")
+    if "tiers" not in data:
+        raise ValueError("config missing 'tiers' key")
+    if "models" not in data:
+        raise ValueError("config missing 'models' key")
+    if not isinstance(data["tiers"], dict):
+        raise ValueError("'tiers' must be an object")
+    if not isinstance(data["models"], dict):
+        raise ValueError("'models' must be an object")
+    return data
+
+
+def validate_config(config, providers):
+    """Validate config against available providers.
+
+    Args:
+        config: dict with 'tiers' and 'models' keys
+        providers: set of available provider names (from keys-index.json)
+
+    Returns:
+        list of error strings. Empty list means valid.
+    """
+    errors = []
+    tiers = config.get("tiers", {})
+
+    # Check all 3 required tiers present
+    required_tiers = {"haiku", "sonnet", "opus"}
+    missing = required_tiers - set(tiers.keys())
+    if missing:
+        errors.append("missing required tiers: {}".format(", ".join(sorted(missing))))
+
+    # Check each tier has non-empty provider and model
+    for tier_name in required_tiers:
+        if tier_name not in tiers:
+            continue
+        tier = tiers[tier_name]
+        if not isinstance(tier, dict):
+            errors.append("tier '{}' must be an object".format(tier_name))
+            continue
+        provider = tier.get("provider", "")
+        model = tier.get("model", "")
+        if not provider:
+            errors.append("tier '{}' has empty provider".format(tier_name))
+        elif provider not in providers:
+            errors.append("tier '{}' references unknown provider '{}'".format(tier_name, provider))
+        if not model:
+            errors.append("tier '{}' has empty model".format(tier_name))
+
+    return errors
+
+
+def build_reverse_map(config):
+    """Build reverse map from actual model names to tier names.
+
+    Returns:
+        dict mapping actual_model -> tier_name
+
+    Raises:
+        ValueError if two tiers map to the same model (collision)
+    """
+    reverse_map = {}
+    tiers = config.get("tiers", {})
+    for tier_name, tier_config in tiers.items():
+        if not isinstance(tier_config, dict):
+            continue
+        model = tier_config.get("model")
+        if model:
+            if model in reverse_map:
+                raise ValueError(
+                    "model '{}' is mapped by multiple tiers: '{}' and '{}'".format(
+                        model, reverse_map[model], tier_name))
+            reverse_map[model] = tier_name
+    return reverse_map
+
+
+def write_config(path, config):
+    """Atomically write config to path (write to .tmp, os.replace)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        # Clean up temp file on failure
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def install_template(dest_path):
+    """Copy config-template.json from package data to dest_path."""
+    import shutil
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    shutil.copy2(CONFIG_TEMPLATE_PATH, dest_path)
+
+
+def decrypt_keys(path, passphrase):
+    """Decrypt keys-index.json and return vendors table.
+
+    Args:
+        path: path to encrypted keys-index.json
+        passphrase: decryption passphrase
+
+    Returns:
+        dict: {provider_name: {"url": ..., "key": ...}}
+
+    Raises:
+        FileNotFoundError: if keys file doesn't exist
+        ValueError: if decryption fails or JSON is invalid
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+    plaintext = vimcrypt.decrypt(data, passphrase)
+    try:
+        text = plaintext.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError("decrypted keys file is not valid UTF-8: {}".format(e))
+    try:
+        keys_data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError("decrypted keys file is not valid JSON: {}".format(e))
+    if not isinstance(keys_data, dict):
+        raise ValueError("keys file must be a JSON object")
+    if "vendors" not in keys_data:
+        raise ValueError("keys file missing 'vendors' key")
+    vendors = keys_data["vendors"]
+    if not isinstance(vendors, dict):
+        raise ValueError("'vendors' must be an object")
+    # Validate each vendor has url and key
+    for name, vendor in vendors.items():
+        if not isinstance(vendor, dict):
+            raise ValueError("vendor '{}' must be an object".format(name))
+        if "url" not in vendor:
+            raise ValueError("vendor '{}' missing 'url'".format(name))
+        if "key" not in vendor:
+            raise ValueError("vendor '{}' missing 'key'".format(name))
+    return vendors
+
+
+def read_passphrase_from_stdin():
+    """Read passphrase from stdin (pipe protocol or interactive).
+
+    For direct server invocation:
+    - If stdin is a tty: prompt interactively
+    - If stdin is a pipe/file: read one line
+
+    Returns:
+        str: the passphrase
+
+    Raises:
+        ValueError: on EOF or empty passphrase
+        SystemExit: on error
+    """
+    if sys.stdin.isatty():
+        # Interactive prompt
+        return vimcrypt.prompt_hidden("Passphrase: ")
+    else:
+        # Pipe protocol: read one line
+        line = sys.stdin.readline()
+        if not line:
+            print("[proxy] ERROR: EOF on stdin before passphrase", file=sys.stderr)
+            sys.exit(1)
+        passphrase = line.rstrip("\r\n")
+        if not passphrase:
+            print("[proxy] ERROR: empty passphrase on stdin", file=sys.stderr)
+            sys.exit(1)
+        return passphrase
 
 
 STATE_FILE = os.path.join(os.path.expanduser("~"), ".claude", "proxy",
@@ -210,7 +442,6 @@ def write_start_marker():
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
         "event": "proxy_start",
         "port": PROXY_PORT,
-        "original_url": UPSTREAM_URL,
         "pid": os.getpid()
     })
 
@@ -304,8 +535,14 @@ def heartbeat_loop():
 # ---------------------------------------------------------------------------
 
 def forward_request(method, path, headers, body, handler=None, request_id=None):
-    """Forward a request to the upstream API.
-    Returns (status, response_headers, body_bytes, first_byte_ms, total_sec, retries).
+    """Forward a request to the upstream API with tier-based routing.
+
+    Args:
+        method, path, headers, body: request components
+        handler: ProxyHandler instance for streaming responses
+        request_id: unique request identifier for tracing
+
+    Returns (status, response_headers, body_bytes, first_byte_ms, total_sec, retries, tier, provider).
     total_sec covers the entire request including all retry waits.
     On 429 and 503, retries with jittered exponential backoff. 429 uses the
     maximal delay (PROXY_MAX_DELAY); 503 uses the exponential.
@@ -313,20 +550,104 @@ def forward_request(method, path, headers, body, handler=None, request_id=None):
     streamed to the client in real time via the handler (body_bytes is then
     b""); otherwise the body is buffered and returned.
     """
+    global _inflight_count
+
+    # Drain-and-swap: snapshot config state at request start
+    # If a config swap is in progress, wait for it to complete before proceeding
+    # Snapshot config, vendors, AND reverse_map together under the same lock
+    # to prevent race where config is read before lock but reverse_map is
+    # snapshotted inside lock (reviewer-drain-swap-race fix).
+    while True:
+        with _config_lock:
+            if not _config_swapping:
+                # No swap in progress - increment counter and snapshot all state together
+                _inflight_count += 1
+                config_snapshot = _current_config
+                vendors_snapshot = _vendors
+                reverse_map_snapshot = _reverse_model_map
+                break
+        # Swap in progress - wait for it to complete
+        _swap_done.wait()
+
+    try:
+        return _forward_request_impl(method, path, headers, body, handler, request_id,
+                                     config_snapshot, vendors_snapshot, reverse_map_snapshot)
+    finally:
+        # Decrement counter when request completes (success or failure)
+        with _config_lock:
+            _inflight_count -= 1
+
+
+def _forward_request_impl(method, path, headers, body, handler, request_id,
+                          config, vendors, reverse_map):
+    """Internal implementation of forward_request with snapshot reverse_map."""
     if method not in ALLOWED_METHODS:
-        return 400, {}, b'{"error":"Method not allowed"}', 0, 0, 0
+        return 400, {}, b'{"error":"Method not allowed"}', 0, 0, 0, "unknown", None
 
     if not ALLOWED_PATH_RE.match(path):
-        return 400, {}, b'{"error":"Path not allowed"}', 0, 0, 0
+        return 400, {}, b'{"error":"Path not allowed"}', 0, 0, 0, "unknown", None
 
     if body and len(body) > PROXY_MAX_BODY_SIZE:
-        return 413, {}, b'{"error":"Payload too large"}', 0, 0, 0
+        return 413, {}, b'{"error":"Payload too large"}', 0, 0, 0, "unknown", None
 
-    # Filter headers for forwarding
+    # Resolve tier from model name
+    model_name = extract_model(body)
+    tier = resolve_tier(model_name, config)
+
+    if tier == "unknown":
+        # Unknown model - reject with 400 listing valid tiers
+        # List in plan-specified order: haiku, sonnet, opus
+        valid_tiers = [t for t in ("haiku", "sonnet", "opus") if t in config.get("tiers", {})]
+        err_msg = json.dumps({
+            "error": "Unrecognized model: {}. Valid tiers: {}".format(
+                model_name, ", ".join(valid_tiers))
+        })
+        return 400, {}, err_msg.encode("utf-8"), 0, 0, 0, "unknown", None
+
+    # Look up provider and upstream info
+    tier_config = config["tiers"][tier]
+    provider_name = tier_config["provider"]
+    actual_model = tier_config["model"]
+    vendor = vendors[provider_name]
+    upstream_url = vendor["url"]
+    api_key = vendor["key"]
+
+    # Parse upstream URL
+    parsed = parse_upstream(upstream_url)
+    if parsed is None:
+        err_msg = json.dumps({
+            "error": {
+                "type": "invalid_provider_url",
+                "message": "Provider '{}' has invalid URL: {}".format(provider_name, upstream_url)
+            }
+        })
+        return 500, {}, err_msg.encode("utf-8"), 0, 0, 0, tier, provider_name
+
+    host, port, use_ssl, path_prefix = parsed
+
+    # Rewrite request body with actual model name
+    rewritten_body = body
+    if body:
+        try:
+            body_json = json.loads(body)
+            body_json["model"] = actual_model
+            rewritten_body = json.dumps(body_json).encode("utf-8")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass  # Keep original body if parsing fails
+
+    # Build headers for forwarding
     fwd_headers = {}
     for k, v in headers.items():
         if k.lower() in FORWARD_HEADERS:
+            # Skip authorization (we inject provider's key)
+            if k.lower() == "authorization":
+                continue
+            # Skip x-api-key (we inject provider's key)
+            if k.lower() == "x-api-key":
+                continue
             fwd_headers[k] = v
+    # Inject provider's API key
+    fwd_headers["x-api-key"] = api_key
 
     total_start = time.time()
     last_status = None
@@ -334,14 +655,12 @@ def forward_request(method, path, headers, body, handler=None, request_id=None):
 
     for attempt in range(PROXY_MAX_RETRIES + 1):
         try:
-            if UPSTREAM_USE_SSL:
-                conn = http.client.HTTPSConnection(UPSTREAM_HOST, UPSTREAM_PORT,
-                                                   timeout=300)
+            if use_ssl:
+                conn = http.client.HTTPSConnection(host, port, timeout=300)
             else:
-                conn = http.client.HTTPConnection(UPSTREAM_HOST, UPSTREAM_PORT,
-                                                  timeout=300)
-            upstream_path = UPSTREAM_PATH_PREFIX + path if UPSTREAM_PATH_PREFIX else path
-            conn.request(method, upstream_path, body=body, headers=fwd_headers)
+                conn = http.client.HTTPConnection(host, port, timeout=300)
+            upstream_path = path_prefix + path if path_prefix else path
+            conn.request(method, upstream_path, body=rewritten_body, headers=fwd_headers)
             resp = conn.getresponse()
 
             if resp.status in (429, 503):
@@ -381,23 +700,61 @@ def forward_request(method, path, headers, body, handler=None, request_id=None):
                         conn.close()
                     except OSError:
                         pass
-                    return resp.status, {}, err_body, None, time.time() - total_start, retries
+                    return resp.status, {}, err_body, None, time.time() - total_start, retries, tier, provider_name
 
             # Non-retryable response
-            if handler is not None and 200 <= resp.status < 300:
-                # Stream the 2xx body to the client in real time. The stream
-                # method absorbs its own failures (client disconnect, upstream
-                # truncation), so nothing propagates into the retry loop below:
-                # once the first byte is delivered, the response is never retried.
-                resp_headers = dict(resp.getheaders())
-                first_byte_ms = handler._stream_upstream_response(
-                    resp, resp.status, resp_headers, request_id, retries)
-                conn.close()
-                return (resp.status, resp_headers, b"",
-                        first_byte_ms, time.time() - total_start, retries)
+            resp_headers = dict(resp.getheaders())
+            content_type = resp_headers.get("Content-Type", "").lower()
 
-            # Non-2xx — buffer the body so upstream error content stays in the
-            # trace log.
+            # Determine response handling strategy based on status and Content-Type
+            if handler is not None and 200 <= resp.status < 300:
+                # 2xx response - check Content-Type to decide streaming vs buffering
+                if "text/event-stream" in content_type:
+                    # SSE: stream with first-event rewriting
+                    first_byte_ms = handler._stream_upstream_response(
+                        resp, resp.status, resp_headers, request_id, retries,
+                        tier=tier, reverse_map=reverse_map)
+                    conn.close()
+                    return (resp.status, resp_headers, b"",
+                            first_byte_ms, time.time() - total_start, retries, tier, provider_name)
+                elif "application/json" in content_type and reverse_map:
+                    # JSON: buffer, parse, rewrite model, return (don't stream)
+                    first_byte_start = time.time()
+                    chunks = []
+                    first_byte = True
+                    first_byte_elapsed = None
+
+                    while True:
+                        chunk = resp.read(8192)
+                        if not chunk:
+                            break
+                        if first_byte:
+                            first_byte_elapsed = (time.time() - first_byte_start) * 1000
+                            first_byte = False
+                        chunks.append(chunk)
+
+                    total_elapsed = time.time() - total_start
+                    resp_body = b"".join(chunks)
+                    conn.close()
+
+                    # Rewrite model in JSON response
+                    resp_body = _rewrite_json_response(
+                        resp_body, tier, reverse_map, request_id)
+                    resp_headers["Content-Length"] = str(len(resp_body))
+
+                    return (resp.status, resp_headers, resp_body,
+                            first_byte_elapsed, total_elapsed, retries, tier, provider_name)
+                else:
+                    # Other content types: stream unchanged
+                    first_byte_ms = handler._stream_upstream_response(
+                        resp, resp.status, resp_headers, request_id, retries,
+                        tier=tier, reverse_map=reverse_map)
+                    conn.close()
+                    return (resp.status, resp_headers, b"",
+                            first_byte_ms, time.time() - total_start, retries, tier, provider_name)
+
+            # Non-2xx or no handler — buffer the body so upstream error content
+            # stays in the trace log.
             first_byte_start = time.time()
             chunks = []
             first_byte = True
@@ -414,16 +771,22 @@ def forward_request(method, path, headers, body, handler=None, request_id=None):
 
             total_elapsed = time.time() - total_start
 
-            resp_headers = dict(resp.getheaders())
+            resp_body = b"".join(chunks)
             conn.close()
 
-            return (resp.status, resp_headers, b"".join(chunks),
-                    first_byte_elapsed, total_elapsed, retries)
+            # Rewrite model in JSON responses (non-2xx error path)
+            if "application/json" in content_type and reverse_map:
+                resp_body = _rewrite_json_response(
+                    resp_body, tier, reverse_map, request_id)
+                resp_headers["Content-Length"] = str(len(resp_body))
+
+            return (resp.status, resp_headers, resp_body,
+                    first_byte_elapsed, total_elapsed, retries, tier, provider_name)
 
         except (socket.error, ConnectionError, OSError) as e:
             last_status = 0
             if attempt < PROXY_MAX_RETRIES:
-                delay = compute_delay(attempt)
+                delay = compute_jittered_delay(compute_delay(attempt))
                 retries += 1
                 increment_retried()
                 print("[proxy] Connection error on attempt {}: {}, retrying in {}s".format(
@@ -448,24 +811,69 @@ def forward_request(method, path, headers, body, handler=None, request_id=None):
                             sanitize_error(str(e)) or "connection failed", retries),
                     }
                 }).encode("utf-8")
-                return 0, {}, err_body, None, total_elapsed, retries
+                return 0, {}, err_body, None, total_elapsed, retries, tier, provider_name
 
     total_elapsed = time.time() - total_start
-    return last_status or 0, {}, b'', None, total_elapsed, retries
+    return last_status or 0, {}, b'', None, total_elapsed, retries, tier, provider_name
 
 
 # ---------------------------------------------------------------------------
-# Model extraction
+# Model extraction and tier resolution
 # ---------------------------------------------------------------------------
 
 def extract_model(body_bytes):
+    """Extract model name from request body.
+
+    Returns "unknown" if body is empty, not valid JSON, or model is missing/None/non-string.
+    """
     if not body_bytes:
         return "unknown"
     try:
         data = json.loads(body_bytes)
-        return data.get("model", "unknown")
+        model = data.get("model")
+        # Guard against None or non-string model values
+        if model is None or not isinstance(model, str):
+            return "unknown"
+        return model
     except (json.JSONDecodeError, UnicodeDecodeError):
         return "unknown"
+
+
+def resolve_tier(model_name, config):
+    """Resolve a model name to a tier name.
+
+    Resolution order:
+    1. None guard: if model_name is None or not a string, return "unknown"
+    2. Direct match: if model_name is "haiku"/"sonnet"/"opus"
+    3. Reverse lookup: scan config tiers for matching model
+    4. Pattern match: check if tier keyword is in model_name (opus, sonnet, haiku order)
+
+    Returns:
+        str: tier name ("haiku", "sonnet", "opus") or "unknown" if unresolvable
+    """
+    # 1. None guard
+    if model_name is None or not isinstance(model_name, str):
+        return "unknown"
+
+    # 2. Direct match
+    if model_name in ("haiku", "sonnet", "opus"):
+        return model_name
+
+    # 3. Reverse lookup: find tier whose configured model matches
+    tiers = config.get("tiers", {})
+    for tier_name, tier_config in tiers.items():
+        if isinstance(tier_config, dict):
+            configured_model = tier_config.get("model")
+            if configured_model and configured_model == model_name:
+                return tier_name
+
+    # 4. Pattern match: check in order opus, sonnet, haiku (most-specific first)
+    model_lower = model_name.lower()
+    for tier in ("opus", "sonnet", "haiku"):
+        if tier in model_lower:
+            return tier
+
+    return "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +889,135 @@ def sanitize_error(msg):
     msg = re.sub(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b',
                  '[redacted-ip]', msg)
     return msg[:200]
+
+
+# ---------------------------------------------------------------------------
+# Response model rewriting helpers
+# ---------------------------------------------------------------------------
+
+SSE_EVENT_DELIMITER = b"\n\n"
+
+
+def _rewrite_sse_first_event(event_bytes, tier, reverse_map, request_id):
+    """Rewrite model in first SSE event if it's a message_start event.
+
+    Args:
+        event_bytes: raw bytes of first SSE event
+        tier: tier name to rewrite model to
+        reverse_map: {actual_model: tier_name} for lookup
+        request_id: for logging
+
+    Returns:
+        bytes: possibly rewritten event
+    """
+    # Parse SSE event - look for event: and data: lines
+    event_text = event_bytes.decode("utf-8", errors="replace")
+    lines = event_text.split("\n")
+    event_type = None
+    data_lines = []
+
+    for line in lines:
+        if line.startswith("event:"):
+            event_type = line[6:].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].strip())
+
+    # Parse JSON from data lines
+    if not data_lines:
+        return event_bytes
+
+    json_text = "\n".join(data_lines)
+    try:
+        data = json.loads(json_text)
+    except json.JSONDecodeError:
+        # Malformed JSON - forward unchanged with warning
+        log_trace({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "sse_rewrite_malformed_json",
+            "request_id": request_id,
+        })
+        return event_bytes
+
+    # Check if this is a message_start event
+    # Check both SSE event type and JSON type field (SSE events can omit event: line)
+    json_type = data.get("type") if isinstance(data, dict) else None
+    is_message_start = (event_type == "message_start") or (json_type == "message_start")
+
+    if not is_message_start:
+        # Not a message_start event - forward unchanged
+        return event_bytes
+
+    # Check for model field and rewrite
+    message = data.get("message", {})
+    if not isinstance(message, dict):
+        return event_bytes
+
+    upstream_model = message.get("model")
+    if not upstream_model:
+        return event_bytes
+
+    # Look up tier from reverse map
+    if upstream_model in reverse_map:
+        # Rewrite model to tier name
+        message["model"] = reverse_map[upstream_model]
+        data["message"] = message
+
+        # Rebuild SSE event - preserve original format
+        new_json = json.dumps(data)
+        if event_type:
+            # Had explicit event: line
+            new_event = "event: {}\ndata: {}\n\n".format(event_type, new_json)
+        else:
+            # Data-only format
+            new_event = "data: {}\n\n".format(new_json)
+        return new_event.encode("utf-8")
+    else:
+        # Model not in reverse map - log warning and forward unchanged
+        log_trace({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "sse_unmapped_model",
+            "request_id": request_id,
+            "upstream_model": upstream_model,
+        })
+        return event_bytes
+
+
+def _rewrite_json_response(body_bytes, tier, reverse_map, request_id):
+    """Rewrite model field in JSON response body.
+
+    Args:
+        body_bytes: raw response body
+        tier: tier name (unused, we use reverse_map)
+        reverse_map: {actual_model: tier_name}
+        request_id: for logging
+
+    Returns:
+        bytes: possibly rewritten body
+    """
+    try:
+        data = json.loads(body_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body_bytes
+
+    if not isinstance(data, dict):
+        return body_bytes
+
+    upstream_model = data.get("model")
+    if not upstream_model or not isinstance(upstream_model, str):
+        return body_bytes
+
+    if upstream_model in reverse_map:
+        data["model"] = reverse_map[upstream_model]
+        return json.dumps(data).encode("utf-8")
+    else:
+        # Unmapped model - log warning
+        log_trace({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "json_unmapped_model",
+            "request_id": request_id,
+            "upstream_model": upstream_model,
+        })
+        return body_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -516,27 +1053,27 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body_bytes)
 
-    def _stream_upstream_response(self, resp, status, resp_headers, request_id, retries):
+    def _stream_upstream_response(self, resp, status, resp_headers, request_id, retries,
+                                   tier=None, reverse_map=None):
         """Stream an upstream 2xx response body to the client as it arrives.
 
-        Sends the status line and headers immediately, then copies body chunks
-        through as they arrive (read1 returns data as soon as it is available,
-        at most one underlying socket read per call), flushing after each
-        write. Returns the first-byte latency in ms (measured on the first
-        chunk write+flush — headers ride that flush and are what the client
-        actually sees), or None if the stream was aborted before any chunk was
-        delivered.
+        For SSE (text/event-stream): buffers first event (64KB cap), rewrites
+        model in message_start event to tier name. Subsequent events forwarded
+        unchanged.
 
-        The method absorbs its own failures so it never raises into
-        forward_request: client-side write errors are logged as a
-        client_disconnect event (outer handler) and never re-raised; upstream
-        read errors break the loop (inner handler) — the close-delimited EOF
-        signals truncation to the client. Retries never happen after the first
-        byte reaches the client.
+        For other content types: streams unchanged.
+
+        Returns the first-byte latency in ms, or None if aborted.
         """
         first_byte_start = time.time()
         first_byte_ms = None
         first_chunk = True
+        bytes_streamed = 0
+
+        # Check Content-Type to determine rewriting strategy
+        content_type = resp_headers.get("Content-Type", "").lower()
+        is_sse = "text/event-stream" in content_type
+
         try:
             self.send_response(status)
             # Forward all other headers verbatim, including content-type
@@ -548,24 +1085,119 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                                      "connection"}:
                     self.send_header(k, v)
             self.end_headers()
-            while True:
-                try:
-                    # read1 returns data as soon as it arrives (at most one
-                    # underlying socket read); read(amt) would buffer to EOF and
-                    # deliver the body all at once — the original defect.
-                    chunk = resp.read1(8192)
-                except (http.client.IncompleteRead, http.client.RemoteDisconnected,
-                        socket.error, OSError):
-                    # Upstream truncated mid-stream — stop forwarding; the
-                    # close-delimited EOF tells the client the stream ended.
-                    break
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-                if first_chunk:
+
+            if is_sse and tier and reverse_map:
+                # SSE path: buffer first event for model rewriting
+                # Buffer chunks until \n\n delimiter is found or 64KB cap is exceeded
+                first_event_buffer = bytearray()
+                MAX_FIRST_EVENT_BUFFER = 64 * 1024  # 64 KB cap
+                first_event_found = False
+                rewrite_skipped = False
+
+                while not first_event_found:
+                    try:
+                        chunk = resp.read1(8192)
+                    except (http.client.IncompleteRead, http.client.RemoteDisconnected,
+                            socket.error, OSError):
+                        break
+                    if not chunk:
+                        break
+                    first_event_buffer.extend(chunk)
+
+                    # Check for event delimiter
+                    if b"\n\n" in first_event_buffer:
+                        first_event_found = True
+                    elif len(first_event_buffer) > MAX_FIRST_EVENT_BUFFER:
+                        # Buffer exceeded cap - forward as-is without rewriting
+                        rewrite_skipped = True
+                        first_event_found = True
+                        log_trace({
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "event": "sse_buffer_cap_exceeded",
+                            "request_id": request_id,
+                        })
+
+                if first_event_buffer:
+                    # Split buffer at first \n\n to isolate first event
+                    delimiter_idx = first_event_buffer.find(b"\n\n")
+                    if delimiter_idx >= 0:
+                        # Extract first event (including \n\n)
+                        first_event_bytes = bytes(first_event_buffer[:delimiter_idx + 2])
+                        # Remainder is everything after the first \n\n
+                        remainder = bytes(first_event_buffer[delimiter_idx + 2:])
+                    else:
+                        # No delimiter found (buffer exceeded cap)
+                        first_event_bytes = bytes(first_event_buffer)
+                        remainder = b""
+
+                    if not rewrite_skipped:
+                        # Try to rewrite model in first event only
+                        first_event_bytes = _rewrite_sse_first_event(
+                            first_event_bytes, tier, reverse_map, request_id)
+
+                    # Write rewritten first event
+                    self.wfile.write(first_event_bytes)
+                    self.wfile.flush()
+                    bytes_streamed += len(first_event_bytes)
+                    # Write remainder (may contain additional events from the same chunk)
+                    if remainder:
+                        self.wfile.write(remainder)
+                        self.wfile.flush()
+                        bytes_streamed += len(remainder)
                     first_byte_ms = (time.time() - first_byte_start) * 1000
                     first_chunk = False
+
+                # Stream remaining events unchanged
+                while True:
+                    try:
+                        chunk = resp.read1(8192)
+                    except (http.client.IncompleteRead, http.client.RemoteDisconnected,
+                            socket.error, OSError):
+                        break
+                    if not chunk:
+                        break
+                    bytes_streamed += len(chunk)
+                    if bytes_streamed > PROXY_MAX_RESPONSE_SIZE:
+                        log_trace({
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "event": "response_size_cap_exceeded",
+                            "request_id": request_id,
+                            "bytes_streamed": bytes_streamed,
+                            "limit": PROXY_MAX_RESPONSE_SIZE,
+                        })
+                        print("[proxy] Response size limit exceeded ({} bytes)".format(
+                            bytes_streamed), file=sys.stderr)
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            else:
+                # Non-SSE path: stream unchanged
+                while True:
+                    try:
+                        chunk = resp.read1(8192)
+                    except (http.client.IncompleteRead, http.client.RemoteDisconnected,
+                            socket.error, OSError):
+                        break
+                    if not chunk:
+                        break
+                    bytes_streamed += len(chunk)
+                    if bytes_streamed > PROXY_MAX_RESPONSE_SIZE:
+                        log_trace({
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "event": "response_size_cap_exceeded",
+                            "request_id": request_id,
+                            "bytes_streamed": bytes_streamed,
+                            "limit": PROXY_MAX_RESPONSE_SIZE,
+                        })
+                        print("[proxy] Response size limit exceeded ({} bytes)".format(
+                            bytes_streamed), file=sys.stderr)
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    if first_chunk:
+                        first_byte_ms = (time.time() - first_byte_start) * 1000
+                        first_chunk = False
+
         except _DISCONNECT_ERRORS:
             self._log_client_disconnect(request_id, status, retries)
             return None
@@ -600,14 +1232,76 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Allow", "POST, OPTIONS")
         self.end_headers()
 
-    def do_POST(self):
-        # Admin shutdown — localhost-only, graceful shutdown via server.shutdown()
-        if self.path == "/admin/shutdown":
+    def do_GET(self):
+        # Admin page
+        if self.path == "/admin/" or self.path == "/admin":
+            # localhost-only check
             if self.client_address[0] not in ("127.0.0.1", "::1"):
                 self.send_response(403)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(b'{"error":"forbidden"}')
+                return
+
+            try:
+                html = _load_admin_html()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html.encode("utf-8"))))
+                self.end_headers()
+                self.wfile.write(html.encode("utf-8"))
+            except Exception as e:
+                self._send_response(500, json.dumps({"error": str(e)}).encode("utf-8"))
+            return
+
+        # Admin API: get config
+        if self.path == "/admin/api/config":
+            # localhost-only check
+            if self.client_address[0] not in ("127.0.0.1", "::1"):
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"forbidden"}')
+                return
+
+            with _config_lock:
+                config_copy = json.loads(json.dumps(_current_config))
+            self._send_response(200, json.dumps(config_copy).encode("utf-8"))
+            return
+
+        # Admin API: get providers list
+        if self.path == "/admin/api/providers":
+            # localhost-only check
+            if self.client_address[0] not in ("127.0.0.1", "::1"):
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"forbidden"}')
+                return
+
+            providers = list(_vendors.keys()) if _vendors else []
+            self._send_response(200, json.dumps({"providers": providers}).encode("utf-8"))
+            return
+
+        # Default: 404
+        self._send_response(404, b'{"error":"not found"}')
+
+    def do_POST(self):
+        global _current_config, _reverse_model_map
+
+        # Admin shutdown — localhost-only, graceful shutdown via server.shutdown()
+        if self.path == "/admin/shutdown":
+            # localhost-only check
+            if self.client_address[0] not in ("127.0.0.1", "::1"):
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"forbidden"}')
+                return
+
+            # CSRF check
+            if not _validate_csrf_origin(self, PROXY_PORT):
+                self._send_response(403, b'{"error":"forbidden: invalid Origin"}')
                 return
 
             global _shutting_down
@@ -628,10 +1322,228 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             threading.Thread(target=_delayed_shutdown, daemon=True).start()
             return
 
+        # Admin API: switch tiers
+        if self.path == "/admin/api/switch":
+            # localhost-only check
+            if self.client_address[0] not in ("127.0.0.1", "::1"):
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"forbidden"}')
+                return
+
+            # CSRF check
+            if not _validate_csrf_origin(self, PROXY_PORT):
+                self._send_response(403, b'{"error":"forbidden: invalid Origin"}')
+                return
+
+            # Read and validate body size
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+            except (ValueError, TypeError):
+                self._send_response(400, b'{"error":"invalid Content-Length"}')
+                return
+            if content_length > ADMIN_BODY_LIMIT:
+                self._send_response(413, b'{"error":"request body too large"}')
+                return
+
+            body = self.rfile.read(content_length) if content_length > 0 else b""
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                self._send_response(400, b'{"error":"invalid JSON"}')
+                return
+
+            # Validate all 3 tiers present
+            new_tiers = data.get("tiers", {})
+            required_tiers = {"haiku", "sonnet", "opus"}
+            missing = required_tiers - set(new_tiers.keys())
+            if missing:
+                self._send_response(400, json.dumps({
+                    "error": "missing tiers: {}".format(", ".join(sorted(missing)))
+                }).encode("utf-8"))
+                return
+
+            # Validate provider names and model names
+            for tier_name, tier_config in new_tiers.items():
+                if not isinstance(tier_config, dict):
+                    self._send_response(400, json.dumps({
+                        "error": "tier '{}' must be an object".format(tier_name)
+                    }).encode("utf-8"))
+                    return
+                provider = tier_config.get("provider", "")
+                model = tier_config.get("model", "")
+                if not _validate_admin_name(provider):
+                    self._send_response(400, json.dumps({
+                        "error": "invalid provider name: {}".format(provider)
+                    }).encode("utf-8"))
+                    return
+                if not _validate_admin_name(model):
+                    self._send_response(400, json.dumps({
+                        "error": "invalid model name: {}".format(model)
+                    }).encode("utf-8"))
+                    return
+
+            # Validate providers exist
+            provider_names = set(_vendors.keys())
+            for tier_name, tier_config in new_tiers.items():
+                provider = tier_config.get("provider", "")
+                if provider not in provider_names:
+                    self._send_response(400, json.dumps({
+                        "error": "unknown provider: {}".format(provider)
+                    }).encode("utf-8"))
+                    return
+
+            # Drain-and-swap: wait for in-flight requests to complete before swapping
+            response_status = None
+            response_body = None
+
+            # Phase 1: Set swap flag and wait for drain
+            with _config_lock:
+                _config_swapping = True
+                _swap_done.clear()
+
+            # Phase 2: Wait for in-flight requests to drain (with timeout)
+            drain_timeout = 30.0  # seconds
+            drain_start = time.time()
+            while True:
+                with _config_lock:
+                    if _inflight_count == 0:
+                        break
+                if time.time() - drain_start > drain_timeout:
+                    # Timeout - abort swap
+                    with _config_lock:
+                        _config_swapping = False
+                        _swap_done.set()
+                    self._send_response(503, b'{"error":"config swap timeout: requests still in-flight"}')
+                    return
+                time.sleep(0.1)
+
+            # Phase 3: Perform the swap
+            try:
+                with _config_lock:
+                    # Preserve models section, replace tiers
+                    new_config = {
+                        "tiers": new_tiers,
+                        "models": _current_config.get("models", {})
+                    }
+                    try:
+                        new_reverse_map = build_reverse_map(new_config)
+                    except ValueError as e:
+                        response_status = 400
+                        response_body = json.dumps({"error": str(e)}).encode("utf-8")
+
+                    if response_status is None:
+                        # Write to disk FIRST, then update in-memory
+                        try:
+                            write_config(_config_path, new_config)
+                            # Only update in-memory after successful disk write
+                            _current_config = new_config
+                            _reverse_model_map = new_reverse_map
+                            response_status = 200
+                            response_body = json.dumps({"status": "ok"}).encode("utf-8")
+                        except OSError as e:
+                            response_status = 500
+                            response_body = json.dumps({
+                                "error": "failed to write config: {}".format(e)
+                            }).encode("utf-8")
+            finally:
+                # Phase 4: Clear swap flag and signal completion
+                with _config_lock:
+                    _config_swapping = False
+                    _swap_done.set()
+
+            # Send response after releasing lock
+            self._send_response(response_status, response_body)
+            return
+
+        # Admin API: reload config from disk
+        if self.path == "/admin/api/reload":
+            # localhost-only check
+            if self.client_address[0] not in ("127.0.0.1", "::1"):
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"forbidden"}')
+                return
+
+            # CSRF check
+            if not _validate_csrf_origin(self, PROXY_PORT):
+                self._send_response(403, b'{"error":"forbidden: invalid Origin"}')
+                return
+
+            # Reload config from disk
+            try:
+                new_config = load_config(_config_path)
+            except (FileNotFoundError, json.JSONDecodeError, ValueError) as e:
+                self._send_response(400, json.dumps({
+                    "error": "failed to load config: {}".format(e)
+                }).encode("utf-8"))
+                return
+
+            # Validate against providers
+            provider_names = set(_vendors.keys())
+            errors = validate_config(new_config, provider_names)
+            if errors:
+                self._send_response(400, json.dumps({
+                    "error": "config validation failed: {}".format("; ".join(errors))
+                }).encode("utf-8"))
+                return
+
+            # Build reverse map
+            try:
+                new_reverse_map = build_reverse_map(new_config)
+            except ValueError as e:
+                self._send_response(400, json.dumps({"error": str(e)}).encode("utf-8"))
+                return
+
+            # Drain-and-swap: wait for in-flight requests to complete before swapping
+            # Phase 1: Set swap flag and wait for drain
+            with _config_lock:
+                _config_swapping = True
+                _swap_done.clear()
+
+            # Phase 2: Wait for in-flight requests to drain (with timeout)
+            drain_timeout = 30.0  # seconds
+            drain_start = time.time()
+            while True:
+                with _config_lock:
+                    if _inflight_count == 0:
+                        break
+                if time.time() - drain_start > drain_timeout:
+                    # Timeout - abort swap
+                    with _config_lock:
+                        _config_swapping = False
+                        _swap_done.set()
+                    self._send_response(503, b'{"error":"config swap timeout: requests still in-flight"}')
+                    return
+                time.sleep(0.1)
+
+            # Phase 3: Perform the swap
+            try:
+                with _config_lock:
+                    _current_config = new_config
+                    _reverse_model_map = new_reverse_map
+            finally:
+                # Phase 4: Clear swap flag and signal completion
+                with _config_lock:
+                    _config_swapping = False
+                    _swap_done.set()
+
+            self._send_response(200, json.dumps({
+                "status": "ok",
+                "config": new_config
+            }).encode("utf-8"))
+            return
+
         request_id = str(uuid.uuid4())
 
         # Read request body
-        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except (ValueError, TypeError):
+            self._send_response(400, b'{"error":"invalid Content-Length"}')
+            return
         if content_length > PROXY_MAX_BODY_SIZE:
             try:
                 self._send_response(413,
@@ -660,15 +1572,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         increment_total()
 
-        status, resp_headers, resp_body, first_byte_ms, total_sec, retries = \
+        status, resp_headers, resp_body, first_byte_ms, total_sec, retries, tier, provider = \
             forward_request(self.command, self.path,
                             {k: v for k, v in self.headers.items()},
                             body, handler=self, request_id=request_id)
 
-        # Mirrors forward_request's streaming branch (handler is self there, so
-        # every 2xx is streamed): headers and body were already delivered by
-        # _stream_upstream_response, so _send_response must be skipped.
-        streamed = 200 <= status < 300
+        # Mirrors forward_request's streaming branch: streaming paths return
+        # resp_body=b"" (already sent to client), buffering paths return the
+        # actual body (needs _send_response). Check both status and body.
+        streamed = (200 <= status < 300) and (resp_body == b"")
 
         # Build trace entry
         success = 200 <= status < 300
@@ -679,6 +1591,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "method": self.command,
             "path": self.path,
             "model": model,
+            "tier": tier,
+            "provider": provider,
             "status": "success" if success else "failure",
             "http_status": status,
             "retries": retries,
@@ -734,12 +1648,16 @@ def main():
                         help="Trace log file path")
     parser.add_argument("--all", "-a", action="store_true",
                         help="Log full request/response bodies")
-    parser.add_argument("--upstream-url", type=str, default=None,
-                        help="Upstream API base URL (passed by CLI; overrides settings.json)")
+    parser.add_argument("--config-path", type=str, default=None,
+                        help="Path to config.json (default: ~/.claude/proxy/config.json)")
+    parser.add_argument("--keys-path", type=str, default=None,
+                        help="Path to encrypted keys-index.json (default: ~/.claude/keys-index.json)")
+    parser.add_argument("--passphrase-file", type=str, default=None,
+                        help="Read passphrase from file instead of stdin")
     args = parser.parse_args()
 
     global PROXY_PORT, PROXY_TRACE_FILE, PROXY_LOG_ALL
-    global UPSTREAM_URL, UPSTREAM_HOST, UPSTREAM_PORT, UPSTREAM_USE_SSL, UPSTREAM_PATH_PREFIX
+    global _current_config, _reverse_model_map, _vendors
 
     if args.port is not None:
         PROXY_PORT = args.port
@@ -750,22 +1668,60 @@ def main():
     if getattr(args, "all"):
         PROXY_LOG_ALL = True
 
-    # Resolve upstream URL at runtime (not import time).
-    # CLI always passes --upstream-url; direct invocation reads settings.json.
-    if args.upstream_url is not None:
-        UPSTREAM_URL = args.upstream_url
+    # Resolve paths
+    config_path = args.config_path or DEFAULT_CONFIG_PATH
+    keys_path = args.keys_path or PROXY_KEYS_PATH
+
+    # Read passphrase
+    if args.passphrase_file:
+        try:
+            with open(args.passphrase_file, "r", encoding="utf-8") as f:
+                passphrase = f.read().rstrip("\r\n")
+        except OSError as e:
+            print("[proxy] ERROR: Cannot read passphrase file: {}".format(e), file=sys.stderr)
+            sys.exit(1)
+        if not passphrase:
+            print("[proxy] ERROR: Empty passphrase in file", file=sys.stderr)
+            sys.exit(1)
     else:
-        UPSTREAM_URL = read_upstream_url()
-    parsed = parse_upstream(UPSTREAM_URL)
-    if parsed is None:
-        if args.upstream_url is not None:
-            print("[proxy] ERROR: Invalid --upstream-url: {}".format(UPSTREAM_URL),
-                  file=sys.stderr)
-        else:
-            print("[proxy] ERROR: Could not parse ANTHROPIC_BASE_URL from settings.json: {!r}".format(UPSTREAM_URL),
-                  file=sys.stderr)
+        passphrase = read_passphrase_from_stdin()
+
+    # Decrypt keys
+    try:
+        _vendors = decrypt_keys(keys_path, passphrase)
+    except FileNotFoundError:
+        print("[proxy] ERROR: Keys file not found: {}".format(keys_path), file=sys.stderr)
         sys.exit(1)
-    UPSTREAM_HOST, UPSTREAM_PORT, UPSTREAM_USE_SSL, UPSTREAM_PATH_PREFIX = parsed
+    except ValueError as e:
+        print("[proxy] ERROR: Key decryption failed: {}".format(e), file=sys.stderr)
+        sys.exit(1)
+
+    # Load and validate config
+    try:
+        _current_config = load_config(config_path)
+        _config_path = config_path
+    except FileNotFoundError:
+        print("[proxy] ERROR: Config file not found: {}".format(config_path), file=sys.stderr)
+        print("[proxy] Run 'claude-retry-proxy start' to create from template", file=sys.stderr)
+        sys.exit(1)
+    except (json.JSONDecodeError, ValueError) as e:
+        print("[proxy] ERROR: Invalid config: {}".format(e), file=sys.stderr)
+        sys.exit(1)
+
+    provider_names = set(_vendors.keys())
+    errors = validate_config(_current_config, provider_names)
+    if errors:
+        print("[proxy] ERROR: Config validation failed:", file=sys.stderr)
+        for err in errors:
+            print("[proxy]   - {}".format(err), file=sys.stderr)
+        sys.exit(1)
+
+    # Build reverse model map
+    try:
+        _reverse_model_map = build_reverse_map(_current_config)
+    except ValueError as e:
+        print("[proxy] ERROR: {}".format(e), file=sys.stderr)
+        sys.exit(1)
 
     # Check if another proxy is already running on this port
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -784,7 +1740,6 @@ def main():
         "port": PROXY_PORT,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "owner_pid": os.getppid(),
-        "original_url": UPSTREAM_URL,
         "last_heartbeat": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "last_request_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -799,7 +1754,9 @@ def main():
     # Start server with ThreadingHTTPServer for concurrent requests
     server = http.server.ThreadingHTTPServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
     print("[proxy] Listening on 127.0.0.1:{}".format(PROXY_PORT), file=sys.stderr)
-    print("[proxy] Upstream: {}:{}".format(UPSTREAM_HOST, UPSTREAM_PORT), file=sys.stderr)
+    print("[proxy] Providers: {}".format(", ".join(_vendors.keys())), file=sys.stderr)
+    # Print readiness marker to stdout for CLI to detect (separate from stderr logs)
+    print("READY", flush=True)
     # Register graceful shutdown signal handlers so write_stop_marker()
     # runs on normal shutdown (claude-retry-proxy stop sends SIGTERM/taskkill).
     # server.shutdown() causes serve_forever() to return normally into

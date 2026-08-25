@@ -2,9 +2,10 @@
 """CLI for managing the Claude API retry proxy.
 
 Commands:
-    start    Start the proxy (URL swap, then launch proxy server)
-    stop     Stop the proxy (kill process, restore original URL)
+    start    Start the proxy (load config, decrypt keys, launch proxy server)
+    stop     Stop the proxy (kill process)
     status   Show proxy status (running/stopped/stale)
+    reload   Reload config from disk
 """
 
 import json
@@ -17,9 +18,9 @@ from datetime import datetime, timezone
 HOME = os.path.expanduser("~")
 PROXY_DIR = os.path.join(HOME, ".claude", "proxy")
 PROXY_STATE_FILE = os.path.join(PROXY_DIR, "proxy-state.json")
-URL_LOCK_FILE = os.path.join(PROXY_DIR, "base-url.lock")
-URL_SWAP_LOCK_FILE = os.path.join(PROXY_DIR, "url-swap.lock")
-SETTINGS_FILE = os.path.join(HOME, ".claude", "settings.json")
+CONFIG_FILE = os.path.join(PROXY_DIR, "config.json")
+KEYS_FILE = os.path.join(HOME, ".claude", "keys-index.json")
+CONFIG_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "config-template.json")
 
 # Trace file defaults — MUST mirror server.py main()'s resolution so the CLI
 # prunes the same file the server writes to.
@@ -37,74 +38,6 @@ def _trace(msg):
         print("[claude-retry-proxy] {}".format(msg), file=sys.stderr)
     except Exception:
         pass
-
-
-# ---------------------------------------------------------------------------
-# URL swap locking (cross-platform O_EXCL)
-# ---------------------------------------------------------------------------
-
-def acquire_swap_lock(timeout=10):
-    """Acquire URL swap lock with timeout using O_EXCL."""
-    _trace("acquire_swap_lock: entering (timeout={})".format(timeout))
-    os.makedirs(PROXY_DIR, exist_ok=True)
-    deadline = time.time() + timeout
-    attempt = 0
-    while time.time() < deadline:
-        try:
-            fd = os.open(URL_SWAP_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
-            _trace("acquire_swap_lock: success on attempt {}".format(attempt + 1))
-            return True
-        except OSError:
-            # Stale lock detection: if the lock file is older than 30s,
-            # the previous holder crashed. Remove it and retry.
-            try:
-                mtime = os.path.getmtime(URL_SWAP_LOCK_FILE)
-                if time.time() - mtime > 30:
-                    _trace("acquire_swap_lock: stale lock detected, removing")
-                    try:
-                        os.remove(URL_SWAP_LOCK_FILE)
-                    except OSError:
-                        pass
-                    continue
-            except OSError:
-                pass
-            attempt += 1
-            _trace("acquire_swap_lock: attempt {} failed (OSError), retrying".format(attempt))
-            time.sleep(0.1)
-    _trace("acquire_swap_lock: timeout after {} attempts".format(attempt))
-    return False
-
-
-def release_swap_lock():
-    """Release URL swap lock with retry on transient failures.
-
-    On Windows, os.remove can fail transiently (indexer, virus scanner).
-    Retries up to 5 times with exponential backoff. Silently returns if the
-    lock file is already gone (ENOENT). On final failure after all retries,
-    prints a warning to stderr.
-    """
-    import errno
-    try:
-        _trace("release_swap_lock: entering")
-    except Exception:
-        pass
-    for attempt in range(5):
-        try:
-            os.remove(URL_SWAP_LOCK_FILE)
-            _trace("release_swap_lock: removed on attempt {}".format(attempt + 1))
-            return
-        except OSError as e:
-            if getattr(e, 'errno', None) == errno.ENOENT:
-                _trace("release_swap_lock: already removed")
-                return
-            if attempt < 4:
-                _trace("release_swap_lock: attempt {} failed, retrying".format(attempt + 1))
-                time.sleep(0.1 * (2 ** attempt))
-    # Final failure after all retries exhausted
-    _trace("release_swap_lock: FAILED after 5 attempts")
-    print("WARNING: Failed to remove URL swap lock after 5 attempts: {}".format(
-        URL_SWAP_LOCK_FILE), file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -197,118 +130,6 @@ def kill_process_windows(pid):
     except Exception as e:
         _trace("kill_process_windows: exception: {}".format(e))
     return False
-
-
-# ---------------------------------------------------------------------------
-# URL lock file I/O
-# ---------------------------------------------------------------------------
-
-def read_url_lock():
-    """Read base-url.lock. Returns dict or None."""
-    _trace("read_url_lock: entering")
-    try:
-        with open(URL_LOCK_FILE) as f:
-            data = json.load(f)
-            _trace("read_url_lock: found, pid={}".format(data.get("pid")))
-            return data
-    except (FileNotFoundError, json.JSONDecodeError):
-        _trace("read_url_lock: not found")
-        return None
-
-
-def write_url_lock(original_url, port, pid):
-    """Write base-url.lock atomically."""
-    _trace("write_url_lock: entering (url={!r}, port={}, pid={})".format(
-        original_url, port, pid))
-    import tempfile
-    data = {
-        "original_url": original_url,
-        "proxy_port": port,
-        "locked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "locked_at_epoch": time.time(),
-        "pid": pid
-    }
-    os.makedirs(PROXY_DIR, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=PROXY_DIR, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, URL_LOCK_FILE)
-        _trace("write_url_lock: success")
-    except Exception:
-        _trace("write_url_lock: FAILED, cleaning up temp file")
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
-
-
-# ---------------------------------------------------------------------------
-# Settings file I/O
-# ---------------------------------------------------------------------------
-
-def read_settings_url():
-    """Read ANTHROPIC_BASE_URL from settings.json."""
-    _trace("read_settings_url: entering")
-    try:
-        with open(SETTINGS_FILE) as f:
-            data = json.load(f)
-        url = data.get("env", {}).get("ANTHROPIC_BASE_URL", "")
-        _trace("read_settings_url: url={!r}".format(url))
-        return url
-    except (FileNotFoundError, json.JSONDecodeError):
-        _trace("read_settings_url: file not found or invalid JSON -> ''")
-        return ""
-
-
-def write_settings_url(url):
-    """Write ANTHROPIC_BASE_URL to settings.json atomically."""
-    _trace("write_settings_url: entering")
-    import tempfile
-    try:
-        with open(SETTINGS_FILE) as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        data = {}
-    if "env" not in data:
-        data["env"] = {}
-    data["env"]["ANTHROPIC_BASE_URL"] = url
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(SETTINGS_FILE), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
-        os.replace(tmp, SETTINGS_FILE)
-        _trace("write_settings_url: success")
-    except Exception:
-        _trace("write_settings_url: FAILED, cleaning up temp file")
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
-
-
-# ---------------------------------------------------------------------------
-# URL validation
-# ---------------------------------------------------------------------------
-
-def validate_url(url):
-    """Validate URL is not localhost and has valid hostname.
-    Returns (is_valid, error_message).
-    """
-    from urllib.parse import urlparse
-    if not url:
-        return False, "URL is empty"
-    parsed = urlparse(url)
-    if not parsed.hostname:
-        return False, "URL has no hostname"
-    if parsed.hostname in ("localhost", "127.0.0.1", "::1"):
-        return False, "URL is localhost - cannot proxy to self"
-    if parsed.scheme not in ("http", "https"):
-        return False, "URL scheme must be http or https"
-    return True, None
 
 
 # ---------------------------------------------------------------------------
@@ -457,11 +278,70 @@ def prune_trace_file(path):
 # Commands
 # ---------------------------------------------------------------------------
 
+def _read_state():
+    """Read proxy-state.json. Returns dict or None."""
+    try:
+        with open(PROXY_STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _write_state(state):
+    """Write proxy-state.json atomically."""
+    import tempfile
+    os.makedirs(PROXY_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=PROXY_DIR, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, PROXY_STATE_FILE)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _load_config_for_validation(path=None):
+    """Load and validate config.json. Returns (config, error_msg)."""
+    if path is None:
+        path = CONFIG_FILE
+    if not os.path.exists(path):
+        return None, "config file not found: {}".format(path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except json.JSONDecodeError as e:
+        return None, "invalid JSON in config: {}".format(e)
+    if not isinstance(config, dict):
+        return None, "config must be a JSON object"
+    if "tiers" not in config:
+        return None, "config missing 'tiers' key"
+    # Validate each tier has non-empty provider and model
+    tiers = config.get("tiers", {})
+    for tier_name in ("haiku", "sonnet", "opus"):
+        if tier_name not in tiers:
+            return None, "missing required tier: {}".format(tier_name)
+        tier = tiers[tier_name]
+        if not isinstance(tier, dict):
+            return None, "tier '{}' must be an object".format(tier_name)
+        if not tier.get("provider"):
+            return None, "tier '{}' has empty provider".format(tier_name)
+        if not tier.get("model"):
+            return None, "tier '{}' has empty model".format(tier_name)
+    return config, None
+
+
 def cmd_start(args):
     """Start the proxy."""
     import argparse
+    import shutil
     import socket
     import subprocess
+
+    from . import vimcrypt
 
     parser = argparse.ArgumentParser(prog="claude-retry-proxy start")
     parser.add_argument("--port", "-p", type=int, default=8080,
@@ -470,320 +350,430 @@ def cmd_start(args):
                         help="Trace log file path")
     parser.add_argument("--all", "-a", action="store_true",
                         help="Log full request/response bodies")
+    parser.add_argument("--config-path", type=str, default=None,
+                        help="Path to config.json")
+    parser.add_argument("--keys-path", type=str, default=None,
+                        help="Path to keys-index.json")
     parsed = parser.parse_args(args)
     port = parsed.port
+    config_path = parsed.config_path or CONFIG_FILE
+    keys_path = parsed.keys_path or KEYS_FILE
 
     _trace("cmd_start: entering (port={})".format(port))
 
-    # Acquire swap lock
-    if not acquire_swap_lock(timeout=10):
-        _trace("cmd_start: acquire_swap_lock -> False, returning 1")
-        print("ERROR: Could not acquire URL swap lock. Another start/stop in progress?")
+    # 1. Check config.json exists
+    if not os.path.exists(config_path):
+        # Copy template
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        if os.path.exists(CONFIG_TEMPLATE_PATH):
+            shutil.copy2(CONFIG_TEMPLATE_PATH, config_path)
+            print("Created config template at: {}".format(config_path))
+            print("Please populate the config and run 'claude-retry-proxy start' again.")
+        else:
+            print("ERROR: Config file not found: {}".format(config_path))
+            print("Template not available at: {}".format(CONFIG_TEMPLATE_PATH))
         return 1
+
+    # 2. Load and validate config
+    config, err = _load_config_for_validation(config_path)
+    if err:
+        print("ERROR: {}".format(err))
+        return 1
+
+    # 3. Prompt passphrase
     try:
-        # Check for existing base-url.lock
-        lock = read_url_lock()
-        if lock:
-            _trace("cmd_start: existing lock found, pid={}".format(lock.get("pid")))
-            pid = lock.get("pid")
-            if pid and is_pid_alive(pid):
-                print("ERROR: Proxy already running (PID {})".format(pid))
-                _trace("cmd_start: proxy already running, returning 1")
-                return 1
-            # Crash recovery — restore original URL from lock first
-            _trace("cmd_start: crash recovery — restoring original URL")
-            print("INFO: Crash recovery — restoring original URL from stale lock")
-            original = lock.get("original_url")
-            if original:
-                write_settings_url(original)
-            # Remove stale lock
-            try:
-                os.remove(URL_LOCK_FILE)
-            except OSError:
-                pass
+        passphrase = vimcrypt.prompt_hidden("Passphrase: ")
+    except (ValueError, KeyboardInterrupt) as e:
+        print("\nERROR: {}".format(e))
+        return 1
 
-        # Read and validate current URL
-        current_url = read_settings_url()
-        valid, err = validate_url(current_url)
-        if not valid:
-            _trace("cmd_start: invalid URL: {}".format(err))
-            print("ERROR: Invalid ANTHROPIC_BASE_URL: {}".format(err))
+    # 4. Decrypt keys-index.json
+    try:
+        with open(keys_path, "rb") as f:
+            keys_data = f.read()
+        plaintext = vimcrypt.decrypt(keys_data, passphrase)
+        keys_json = json.loads(plaintext.decode("utf-8"))
+        if "vendors" not in keys_json:
+            print("ERROR: keys file missing 'vendors' key")
             return 1
+        vendors = keys_json["vendors"]
+        _trace("cmd_start: decrypted {} vendors".format(len(vendors)))
+    except FileNotFoundError:
+        print("ERROR: Keys file not found: {}".format(keys_path))
+        return 1
+    except ValueError as e:
+        print("ERROR: Decryption failed: {}".format(e))
+        return 1
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        print("ERROR: Invalid keys file: {}".format(e))
+        return 1
 
-        # Check + prune the trace log (best-effort; hardcoded 5-day retention).
-        # A failure here must not block proxy start.
+    # 5. Validate config against vendors
+    tiers = config.get("tiers", {})
+    provider_names = set(vendors.keys())
+    errors = []
+    required_tiers = {"haiku", "sonnet", "opus"}
+    missing = required_tiers - set(tiers.keys())
+    if missing:
+        errors.append("missing tiers: {}".format(", ".join(sorted(missing))))
+    for tier_name in required_tiers:
+        if tier_name in tiers:
+            tier = tiers[tier_name]
+            if not isinstance(tier, dict):
+                errors.append("tier '{}' must be an object".format(tier_name))
+                continue
+            provider = tier.get("provider", "")
+            if provider and provider not in provider_names:
+                errors.append("tier '{}' references unknown provider '{}'".format(tier_name, provider))
+    if errors:
+        print("ERROR: Config validation failed:")
+        for e in errors:
+            print("  - {}".format(e))
+        return 1
+
+    # 6. Check if proxy already running
+    state = _read_state()
+    if state:
+        pid = state.get("pid")
+        if pid and is_pid_alive(pid):
+            print("ERROR: Proxy already running (PID {})".format(pid))
+            return 1
+        # Stale state - clean up
+        _trace("cmd_start: cleaning up stale state")
         try:
-            prune_trace_file(resolve_trace_path(parsed.log))
-        except Exception as e:
-            print("WARNING: trace log check failed ({}); continuing".format(e),
-                  file=sys.stderr)
+            os.remove(PROXY_STATE_FILE)
+        except OSError:
+            pass
 
-        # Swap URL in settings BEFORE spawning proxy
-        write_settings_url("http://localhost:{}".format(port))
-        _trace("cmd_start: URL swapped to localhost:{}".format(port))
+    # 7. Prune trace log (best-effort)
+    try:
+        prune_trace_file(resolve_trace_path(parsed.log))
+    except Exception as e:
+        print("WARNING: trace log check failed ({}); continuing".format(e),
+              file=sys.stderr)
 
-        # Build proxy server command — pass original URL so proxy doesn't read
-        # localhost from settings.json (already swapped above)
-        proxy_cmd = [sys.executable, "-m", "claude_retry_proxy.server",
-                     "--port", str(port), "--upstream-url", current_url]
-        if parsed.log:
-            proxy_cmd.extend(["--log", parsed.log])
-        if getattr(parsed, "all"):
-            proxy_cmd.append("--all")
+    # 8. Build server command
+    proxy_cmd = [sys.executable, "-m", "claude_retry_proxy.server",
+                 "--port", str(port),
+                 "--config-path", config_path,
+                 "--keys-path", keys_path]
+    if parsed.log:
+        proxy_cmd.extend(["--log", parsed.log])
+    if getattr(parsed, "all"):
+        proxy_cmd.append("--all")
 
-        # Start proxy in background
-        creationflags = 0
-        if sys.platform == "win32":
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+    # 9. Start proxy with passphrase piped via stdin
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
 
-        stderr_fh = open(os.path.join(PROXY_DIR, "proxy-stderr.log"), "ab")
-        proc = subprocess.Popen(
-            proxy_cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=stderr_fh,
-            creationflags=creationflags
-        )
-        _trace("cmd_start: proxy spawned (pid={})".format(proc.pid))
+    os.makedirs(PROXY_DIR, exist_ok=True)
+    stderr_fh = open(os.path.join(PROXY_DIR, "proxy-stderr.log"), "ab")
+    proc = subprocess.Popen(
+        proxy_cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=stderr_fh,
+        creationflags=creationflags
+    )
+    _trace("cmd_start: proxy spawned (pid={})".format(proc.pid))
 
-        # Write URL lock with PROXY SERVER PID (not CLI PID)
-        # MUST be after Popen so proc.pid is the server PID for liveness checking
-        write_url_lock(current_url, port, proc.pid)
+    # Pipe passphrase to server
+    try:
+        proc.stdin.write((passphrase + "\n").encode("utf-8"))
+        proc.stdin.close()
+    except (BrokenPipeError, OSError) as e:
+        _trace("cmd_start: stdin write failed: {}".format(e))
+        # Read stderr for error message
+        stderr_fh.flush()
+        try:
+            with open(stderr_fh.name, "rb") as f:
+                tail = f.read(2048).decode("utf-8", errors="replace")
+        except OSError:
+            tail = ""
+        print("ERROR: Server failed to start: {}".format(tail))
+        # Cleanup
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            os.remove(PROXY_STATE_FILE)
+        except OSError:
+            pass
+        return 1
 
-        def read_tail(fh, n):
+    def read_tail(fh, n):
+        try:
+            fh.flush()
+            size = os.fstat(fh.fileno()).st_size
+            with open(fh.name, "rb") as f:
+                if size > n:
+                    f.seek(-n, os.SEEK_END)
+                return f.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def cleanup(kill_proc=False):
+        """Clean up after a failed start."""
+        _trace("cmd_start: cleanup (kill_proc={})".format(kill_proc))
+        if kill_proc and proc is not None and proc.poll() is None:
             try:
-                fh.flush()
-                size = os.fstat(fh.fileno()).st_size
-                with open(fh.name, "rb") as f:
-                    if size > n:
-                        f.seek(-n, os.SEEK_END)
-                    return f.read().decode("utf-8", errors="replace")
-            except OSError:
-                return ""
-
-        def rollback(kill_proc=False):
-            """Restore the original URL and remove the lock after a failed start.
-
-            Two independent try/except blocks: a failure restoring settings must
-            not prevent lock removal (and vice versa). If kill_proc, also stop the
-            still-running server so no detached zombie is left listening.
-            """
-            _trace("cmd_start: rollback (kill_proc={})".format(kill_proc))
-            if kill_proc and proc is not None and proc.poll() is None:
+                proc.terminate()
                 try:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                except OSError:
-                    pass
-            try:
-                write_settings_url(current_url)
-            except Exception:
-                pass
-            try:
-                os.remove(URL_LOCK_FILE)
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
             except OSError:
                 pass
+        try:
+            os.remove(PROXY_STATE_FILE)
+        except OSError:
+            pass
 
-        # TCP probe: the server binds the port and is ready when a
-        # TCP connection succeeds. The probe also detects a server that
-        # started then crashed (proc.poll() check on each iteration).
-        deadline = time.time() + 2
-        probe_ok = False
-        attempt = 0
-        while time.time() < deadline:
-            try:
-                s = socket.create_connection(("127.0.0.1", port), 0.5)
-                s.close()
-                probe_ok = True
-                _trace("cmd_start: TCP probe OK on attempt {}".format(attempt + 1))
-                break
-            except OSError:
-                attempt += 1
-                if proc.poll() is not None:
-                    _trace("cmd_start: proxy exited during TCP probe, rolling back")
-                    rollback(kill_proc=False)
-                    tail = read_tail(stderr_fh, 2048)
-                    print("ERROR: Proxy exited during startup")
-                    print(tail)
-                    return 1
-                time.sleep(0.1)
-        if not probe_ok:
-            _trace("cmd_start: TCP probe timeout after {} attempts, rolling back".format(attempt))
-            rollback(kill_proc=True)
+    # 9.5. Wait for readiness marker from server (with timeout)
+    readiness_timeout = 5.0  # seconds
+    readiness_start = time.time()
+    ready_received = False
+    stderr_tail = ""
+
+    while time.time() - readiness_start < readiness_timeout:
+        # Check if process exited
+        if proc.poll() is not None:
+            _trace("cmd_start: proxy exited before READY")
+            cleanup(kill_proc=False)
             tail = read_tail(stderr_fh, 2048)
-            print("ERROR: Proxy did not become ready on port {} "
-                  "within 2s".format(port))
+            print("ERROR: Proxy exited during startup")
             print(tail)
             return 1
 
-        print("Proxy started on port {}".format(port))
-        print("Original URL: {}".format(current_url))
-        _trace("cmd_start: success, returning 0")
-        return 0
-    finally:
-        release_swap_lock()
+        # Try to read from stdout (non-blocking)
+        try:
+            import select
+            if select.select([proc.stdout], [], [], 0.1)[0]:
+                line = proc.stdout.readline()
+                if line:
+                    line_str = line.decode("utf-8", errors="replace").strip()
+                    _trace("cmd_start: stdout: {}".format(line_str))
+                    if line_str == "READY":
+                        ready_received = True
+                        _trace("cmd_start: READY received")
+                        break
+        except (OSError, ValueError):
+            # select or readline failed
+            pass
+
+    if not ready_received:
+        _trace("cmd_start: READY timeout after {:.1f}s".format(time.time() - readiness_start))
+        cleanup(kill_proc=True)
+        tail = read_tail(stderr_fh, 2048)
+        print("ERROR: Proxy did not become ready within {:.0f}s".format(readiness_timeout))
+        print(tail)
+        return 1
+
+    # 10. TCP readiness probe (2s timeout)
+    deadline = time.time() + 2
+    probe_ok = False
+    attempt = 0
+    while time.time() < deadline:
+        try:
+            s = socket.create_connection(("127.0.0.1", port), 0.5)
+            s.close()
+            probe_ok = True
+            _trace("cmd_start: TCP probe OK on attempt {}".format(attempt + 1))
+            break
+        except OSError:
+            attempt += 1
+            if proc.poll() is not None:
+                _trace("cmd_start: proxy exited during TCP probe")
+                cleanup(kill_proc=False)
+                tail = read_tail(stderr_fh, 2048)
+                print("ERROR: Proxy exited during startup")
+                print(tail)
+                return 1
+            time.sleep(0.1)
+
+    if not probe_ok:
+        _trace("cmd_start: TCP probe timeout after {} attempts".format(attempt))
+        cleanup(kill_proc=True)
+        tail = read_tail(stderr_fh, 2048)
+        print("ERROR: Proxy did not become ready on port {} within 2s".format(port))
+        print(tail)
+        return 1
+
+    # 11. Write proxy-state.json (PID, port, start_time, config_path)
+    _write_state({
+        "pid": proc.pid,
+        "port": port,
+        "start_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "config_path": config_path
+    })
+
+    print("Proxy started on port {}".format(port))
+    print("Tiers:")
+    for tier_name in sorted(tiers.keys()):
+        tier = tiers[tier_name]
+        if isinstance(tier, dict):
+            print("  {} -> {} ({})".format(tier_name, tier.get("model"), tier.get("provider")))
+    _trace("cmd_start: success, returning 0")
+    return 0
 
 
 def cmd_stop(args):
-    """Stop the proxy and restore original URL."""
-
+    """Stop the proxy."""
     _trace("cmd_stop: entering")
 
-    ok = acquire_swap_lock(timeout=10)
-    _trace("cmd_stop: acquire_swap_lock -> {}".format(ok))
-    if not ok:
-        print("ERROR: Could not acquire URL swap lock. Another start/stop in progress?")
-        _trace("cmd_stop: returning 1")
-        return 1
-    try:
-        lock = read_url_lock()
-        _trace("cmd_stop: read_url_lock -> {}".format(
-            "found" if lock else "not found"))
-        if not lock:
-            print("Proxy: not running (no lock file)")
-            _trace("cmd_stop: returning 0")
-            release_swap_lock()
-            return 0
-
-        pid = lock.get("pid")
-        current_url = read_settings_url()
-        original = lock.get("original_url")
-
-        # 1. Signal graceful shutdown via HTTP (if port known)
-        port = lock.get("proxy_port")
-        shutdown_ok = False
-        if port and pid and is_pid_alive(pid):
-            _trace("cmd_stop: sending shutdown to pid={} port={}".format(pid, port))
-            try:
-                import urllib.request
-                req = urllib.request.Request(
-                    "http://127.0.0.1:{}/admin/shutdown".format(port),
-                    method="POST")
-                with urllib.request.urlopen(req, timeout=2) as resp:
-                    resp.read()
-                shutdown_ok = True
-                _trace("cmd_stop: shutdown request accepted")
-            except Exception as e:
-                _trace("cmd_stop: shutdown request failed: {}".format(e))
-
-        # 2. Wait for graceful exit (5s timeout) — poll for proxy-state.json
-        #    removal. The server removes this file in its finally block right
-        #    after server_close(). os.path.exists is a pure filesystem check —
-        #    no PID interaction, no antivirus risk.
-        #    Port-polling via socket.create_connection is unreliable on Windows:
-        #    the OS may accept connections briefly after server_close().
-        if shutdown_ok:
-            _trace("cmd_stop: waiting for proxy to exit...")
-            deadline = time.time() + 5
-            try:
-                while time.time() < deadline:
-                    if not os.path.exists(PROXY_STATE_FILE):
-                        _trace("cmd_stop: proxy exited gracefully (state file removed)")
-                        break
-                    time.sleep(0.3)
-                else:
-                    _trace("cmd_stop: timeout waiting for graceful exit")
-            except KeyboardInterrupt:
-                _trace("cmd_stop: interrupted, proceeding to cleanup")
-                # Fall through to cleanup — don't leave locks/URL in bad state
-
-        # 3. Clean up lock files and restore URL BEFORE any force-kill.
-        #    If force-kill triggers the antivirus crash, cleanup is already done
-        #    and the URL is restored. The proxy process may survive (orphaned)
-        #    but the user's settings are correct and locks are cleared.
-        try:
-            os.remove(URL_LOCK_FILE)
-            _trace("cmd_stop: base-url.lock removed")
-        except OSError:
-            _trace("cmd_stop: base-url.lock not found")
-
-        release_swap_lock()
-
-        try:
-            os.remove(PROXY_STATE_FILE)
-            _trace("cmd_stop: proxy-state.json removed")
-        except OSError:
-            _trace("cmd_stop: proxy-state.json not found")
-        try:
-            os.remove(os.path.join(PROXY_DIR, "proxy-state.lock"))
-            _trace("cmd_stop: proxy-state.lock removed")
-        except OSError:
-            _trace("cmd_stop: proxy-state.lock not found")
-
-        # Check if settings already has a non-localhost URL (manual edit).
-        # Warn but still restore — the original URL from the lock is authoritative.
-        current_url = read_settings_url()
-        if current_url and "localhost" not in current_url and "127.0.0.1" not in current_url:
-            if current_url != original:
-                print("WARNING: settings.json has non-localhost URL (manual edit?)")
-                print("  Current: {}".format(current_url))
-                print("  Restoring original: {}".format(original))
-
-        if original:
-            _trace("cmd_stop: restoring original={!r}".format(original))
-            try:
-                write_settings_url(original)
-                print("Restored URL: {}".format(original))
-            except Exception as e:
-                print("ERROR: Failed to restore original URL: {}".format(e))
-                print("  Please restore manually: ANTHROPIC_BASE_URL={}".format(original))
-        else:
-            _trace("cmd_stop: no original_url in lock, skipping URL restore")
-
-        print("Proxy: stopped")
-
-        # 4. Force kill only as last resort — AFTER all cleanup is complete.
-        #    If this crashes the CLI (antivirus), the damage is contained.
-        if pid and is_pid_alive(pid):
-            _trace("cmd_stop: force-killing pid={} (cleanup already done)".format(pid))
-            if sys.platform == "win32":
-                kill_process_windows(pid)
-                # Brief check: did the kill work?
-                time.sleep(0.3)
-                if is_pid_alive(pid):
-                    print("WARNING: Proxy PID {} may still be running".format(pid),
-                          file=sys.stderr)
-            else:
-                import signal
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except OSError:
-                    pass
-
-        _trace("cmd_stop: returning 0")
+    state = _read_state()
+    if not state:
+        print("Proxy: not running (no state file)")
         return 0
-    finally:
-        # Release swap lock as a final safety net (already released above,
-        # but calling again is harmless — release_swap_lock handles ENOENT).
-        release_swap_lock()
+
+    pid = state.get("pid")
+    port = state.get("port")
+
+    # 1. Signal graceful shutdown via HTTP
+    shutdown_ok = False
+    if port and pid and is_pid_alive(pid):
+        _trace("cmd_stop: sending shutdown to pid={} port={}".format(pid, port))
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "http://127.0.0.1:{}/admin/shutdown".format(port),
+                method="POST")
+            # Add Origin header for CSRF validation (reviewer-cmd-stop-csrf fix)
+            req.add_header("Origin", "http://127.0.0.1:{}".format(port))
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                resp.read()
+            shutdown_ok = True
+            _trace("cmd_stop: shutdown request accepted")
+        except Exception as e:
+            _trace("cmd_stop: shutdown request failed: {}".format(e))
+
+    # 2. Wait for graceful exit (5s timeout)
+    if shutdown_ok:
+        _trace("cmd_stop: waiting for proxy to exit...")
+        deadline = time.time() + 5
+        try:
+            while time.time() < deadline:
+                if not os.path.exists(PROXY_STATE_FILE):
+                    _trace("cmd_stop: proxy exited gracefully")
+                    break
+                time.sleep(0.3)
+            else:
+                _trace("cmd_stop: timeout waiting for graceful exit")
+        except KeyboardInterrupt:
+            _trace("cmd_stop: interrupted, proceeding to cleanup")
+
+    # 3. Clean up state file
+    try:
+        os.remove(PROXY_STATE_FILE)
+        _trace("cmd_stop: proxy-state.json removed")
+    except OSError:
+        _trace("cmd_stop: proxy-state.json not found")
+
+    print("Proxy: stopped")
+
+    # 4. Force kill if still running
+    if pid and is_pid_alive(pid):
+        _trace("cmd_stop: force-killing pid={}".format(pid))
+        if sys.platform == "win32":
+            kill_process_windows(pid)
+            time.sleep(0.3)
+            if is_pid_alive(pid):
+                print("WARNING: Proxy PID {} may still be running".format(pid),
+                      file=sys.stderr)
+        else:
+            import signal
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+    _trace("cmd_stop: returning 0")
+    return 0
 
 
 def cmd_status(args):
     """Show proxy status."""
     _trace("cmd_status: entering")
-    lock = read_url_lock()
-    if not lock:
-        _trace("cmd_status: no lock file -> returning 1")
-        print("Proxy: not running (no lock file)")
+
+    state = _read_state()
+    if not state:
+        _trace("cmd_status: no state file -> returning 1")
+        print("Proxy: not running (no state file)")
         return 1
 
-    pid = lock.get("pid")
-    port = lock.get("proxy_port", 8080)
-    original = lock.get("original_url", "unknown")
+    pid = state.get("pid")
+    port = state.get("port", 8080)
+    start_time = state.get("start_time", "unknown")
+    config_path = state.get("config_path")
 
     if pid and is_pid_alive(pid):
         _trace("cmd_status: pid={} alive -> returning 0".format(pid))
         print("Proxy: running")
         print("  PID: {}".format(pid))
         print("  Port: {}".format(port))
-        print("  Original URL: {}".format(original))
+        print("  Started: {}".format(start_time))
+
+        # Show tier mapping from config
+        config, err = _load_config_for_validation(config_path)
+        if not err and config:
+            tiers = config.get("tiers", {})
+            if tiers:
+                print("  Tiers:")
+                for tier_name in sorted(tiers.keys()):
+                    tier = tiers[tier_name]
+                    if isinstance(tier, dict):
+                        print("    {} -> {} ({})".format(
+                            tier_name, tier.get("model"), tier.get("provider")))
         return 0
     else:
-        _trace("cmd_status: pid={} dead (stale lock) -> returning 1".format(pid))
-        print("Proxy: not running (stale lock, PID {} dead)".format(pid))
+        _trace("cmd_status: pid={} dead (stale state) -> returning 1".format(pid))
+        print("Proxy: not running (stale state, PID {} dead)".format(pid))
         print("  Run 'claude-retry-proxy stop' to clean up")
+        return 1
+
+
+def cmd_reload(args):
+    """Reload config from disk."""
+    _trace("cmd_reload: entering")
+
+    state = _read_state()
+    if not state:
+        print("ERROR: Proxy not running")
+        return 1
+
+    port = state.get("port")
+    pid = state.get("pid")
+
+    if not port or not pid or not is_pid_alive(pid):
+        print("ERROR: Proxy not running (stale state)")
+        return 1
+
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "http://127.0.0.1:{}/admin/api/reload".format(port),
+            method="POST",
+            headers={"Origin": "http://127.0.0.1:{}".format(port)})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read().decode("utf-8")
+            data = json.loads(body)
+            if data.get("status") == "ok":
+                print("Config reloaded successfully")
+                config = data.get("config", {})
+                tiers = config.get("tiers", {})
+                if tiers:
+                    print("Tiers:")
+                    for tier_name in sorted(tiers.keys()):
+                        tier = tiers[tier_name]
+                        if isinstance(tier, dict):
+                            print("  {} -> {} ({})".format(
+                                tier_name, tier.get("model"), tier.get("provider")))
+                return 0
+            else:
+                print("ERROR: {}".format(data.get("error", "unknown error")))
+                return 1
+    except Exception as e:
+        print("ERROR: Reload failed: {}".format(e))
         return 1
 
 
@@ -795,9 +785,10 @@ def print_usage():
     print("Usage: claude-retry-proxy <command> [options]")
     print()
     print("Commands:")
-    print("  start   Start the proxy (URL swap + launch proxy server)")
-    print("  stop    Stop the proxy and restore original URL")
+    print("  start   Start the proxy (load config, decrypt keys, launch server)")
+    print("  stop    Stop the proxy")
     print("  status  Show proxy status")
+    print("  reload  Reload config from disk")
 
 
 def main():
@@ -818,6 +809,8 @@ def main():
         exit_code = cmd_stop(args)
     elif cmd == "status":
         exit_code = cmd_status(args)
+    elif cmd == "reload":
+        exit_code = cmd_reload(args)
     else:
         print("Unknown command: {}".format(cmd))
         print("Usage: claude-retry-proxy <command> [options]")
