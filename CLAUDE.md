@@ -170,12 +170,19 @@ does not block startup on failure).
   (`icacls`).
 - **Config validation is strict.** The proxy refuses to start if config.json
   is missing (copies template and tells user to populate it), has empty
-  provider/model fields, or references unknown providers. Every provider in
-  keys-index.json must have at least one model name in config.models (the
-  proxy refuses to start otherwise). The check validates the shape of each
-  entry — it must be a non-empty list of non-empty strings; a bare string
-  value or a list containing empty/whitespace-only entries is rejected. Two tiers may map to the same model
+  provider/model fields, or references unknown providers. Validation flows
+  config→keys, not keys→config: every provider in `config.models` must have a
+  corresponding entry in `keys-index.json`; every provider in `config.models`
+  must have at least one valid model name (non-empty list of non-empty strings);
+  every provider referenced by a tier must have an entry in `config.models`.
+  Providers in `keys-index.json` that aren't in `config.models` and aren't
+  referenced by any tier are silently ignored. Two tiers may map to the same model
   name; response rewriting uses the per-request tier, not a reverse map.
+- **Heartbeat state is in-memory.** The server keeps its startup state
+  (pid, port, etc.) in a module-level `_startup_state` variable. The heartbeat
+  thread updates `last_heartbeat` on this in-memory copy and writes it to disk
+  — it never reads from disk. If `proxy-state.json` is deleted externally, the
+  next heartbeat recreates it with all fields intact within 30s.
 - **Admin API CSRF protection.** Admin POST endpoints validate the Origin
   header. Non-browser clients (curl, CLI `reload`) must include an Origin
   header matching `http://localhost:<port>` or `http://127.0.0.1:<port>` or

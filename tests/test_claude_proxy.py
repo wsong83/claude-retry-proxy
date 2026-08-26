@@ -4230,20 +4230,251 @@ def test_config_validation_unknown_provider():
 
 
 # ===========================================================================
+# Test: Config Validation Models To Keys
+# ===========================================================================
+
+def test_config_validation_models_to_keys():
+    """Config validation direction is config→keys, not keys→config.
+
+    A provider present in config.models but missing from keys-index.json →
+    server refuses to start with "has no entry in keys-index.json". A provider
+    present in keys-index.json but absent from config.models and not referenced
+    by any tier → server starts successfully (config is authoritative; inactive
+    keys providers are silently ignored).
+    """
+    print("\n--- Test: Config Validation Models To Keys ---")
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_cfg_models_keys_")
+    try:
+        # Config models references "orphan" which has no entry in keys-index.json
+        invalid_config = {
+            "tiers": {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            },
+            "models": {"p": ["claude-sonnet-5", "claude-opus-5"], "orphan": ["some-model"]}
+        }
+        config_path = os.path.join(temp_dir, "config.json")
+        with open(config_path, "w") as f:
+            json.dump(invalid_config, f)
+
+        keys_path = os.path.join(temp_dir, "keys-index.json")
+        with open(keys_path, "w") as f:
+            json.dump({"vendors": {"p": {"url": "http://127.0.0.1:9999", "key": "k"}}}, f)
+
+        proc, probe_ok = _start_proxy_server_directly(
+            find_free_port(), config_path=config_path, keys_path=keys_path
+        )
+
+        if not probe_ok:
+            try:
+                _, err = proc.communicate(timeout=5)
+            except Exception:
+                err = ""
+            if "has no entry in keys-index.json" in err:
+                pass_("Server refused to start when config.models references a provider missing from keys-index.json")
+            else:
+                fail(f"Server refused but without 'has no entry in keys-index.json' error: {err[:300]!r}")
+        else:
+            fail("Server started although config.models references a provider missing from keys-index.json")
+            proc.kill()
+
+        # Now: provider in keys-index.json but not in config.models and not tier-referenced → starts
+        valid_config = {
+            "tiers": {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            },
+            "models": {"p": ["claude-sonnet-5", "claude-opus-5"]}
+        }
+        config_path2 = os.path.join(temp_dir, "config2.json")
+        with open(config_path2, "w") as f:
+            json.dump(valid_config, f)
+
+        # keys-index.json contains an extra "legacy" provider not in config.models
+        keys_path2 = os.path.join(temp_dir, "keys2-index.json")
+        with open(keys_path2, "w") as f:
+            json.dump({"vendors": {
+                "p": {"url": "http://127.0.0.1:9999", "key": "k"},
+                "legacy": {"url": "http://127.0.0.1:9998", "key": "k2"},
+            }}, f)
+
+        proc2, probe_ok2 = _start_proxy_server_directly(
+            find_free_port(), config_path=config_path2, keys_path=keys_path2
+        )
+        if probe_ok2:
+            pass_("Server started with a keys-only provider absent from config.models (not tier-referenced)")
+            proc2.terminate()
+            try:
+                proc2.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc2.kill()
+        else:
+            try:
+                _, err2 = proc2.communicate(timeout=5)
+            except Exception:
+                err2 = ""
+            fail(f"Server refused to start with tier-unreferenced keys-only provider: {err2[:300]!r}")
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ===========================================================================
+# Test: Config Validation Tier Provider Needs Models
+# ===========================================================================
+
+def test_config_validation_tier_provider_needs_models():
+    """A tier-referenced provider must have an entry in config.models.
+
+    Server refuses to start when a tier's provider has no models entry, with a
+    clear error mentioning the tier name.
+    """
+    print("\n--- Test: Config Validation Tier Provider Needs Models ---")
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_cfg_tier_models_")
+    try:
+        # "q" is referenced by the opus tier but has no entry in config.models
+        invalid_config = {
+            "tiers": {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "q", "model": "claude-opus-5"},
+            },
+            "models": {"p": ["claude-sonnet-5", "claude-opus-5"]}
+        }
+        config_path = os.path.join(temp_dir, "config.json")
+        with open(config_path, "w") as f:
+            json.dump(invalid_config, f)
+
+        keys_path = os.path.join(temp_dir, "keys-index.json")
+        with open(keys_path, "w") as f:
+            json.dump({"vendors": {
+                "p": {"url": "http://127.0.0.1:9999", "key": "k"},
+                "q": {"url": "http://127.0.0.1:9998", "key": "k2"},
+            }}, f)
+
+        proc, probe_ok = _start_proxy_server_directly(
+            find_free_port(), config_path=config_path, keys_path=keys_path
+        )
+
+        if not probe_ok:
+            try:
+                _, err = proc.communicate(timeout=5)
+            except Exception:
+                err = ""
+            if "used by tier" in err and "opus" in err:
+                pass_("Server refused to start when tier-referenced provider has no models entry, mentioning the tier")
+            else:
+                fail(f"Server refused but without 'used by tier'/'opus' error: {err[:300]!r}")
+        else:
+            fail("Server started although a tier-referenced provider had no models entry")
+            proc.kill()
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ===========================================================================
+# Test: Heartbeat Preserves State
+# ===========================================================================
+
+def test_heartbeat_preserves_state():
+    """Heartbeat writes the in-memory startup state, never a disk-read {}.
+
+    The heartbeat must write from _startup_state (full pid/port fields), not
+    from read_state() which returns {} when proxy-state.json is deleted
+    externally. This test exercises the server module in-process: it sets
+    _startup_state to a full state dict (as main() does at startup), runs the
+    same write the heartbeat performs, and asserts pid/port are preserved when
+    the file was deleted first (simulating external deletion).
+    """
+    print("\n--- Test: Heartbeat Preserves State ---")
+
+    import claude_retry_proxy.server as srv
+
+    state_path = srv.STATE_FILE
+    state_backup = None
+    if os.path.exists(state_path):
+        with open(state_path) as f:
+            state_backup = f.read()
+    try:
+        # Simulate external deletion of the state file (file gone on disk)
+        try:
+            os.remove(state_path)
+        except OSError:
+            pass
+
+        # Simulate main() startup: _startup_state holds the full state dict
+        full_state = {
+            "pid": 12345,
+            "port": 8080,
+            "started_at": "2026-08-26T00:00:00Z",
+            "owner_pid": 54321,
+            "last_heartbeat": "2026-08-26T00:00:00Z",
+            "last_request_at": "2026-08-26T00:00:00Z",
+        }
+        srv._startup_state = full_state
+
+        # Heartbeat write: update last_heartbeat on the in-memory copy and write it
+        srv._startup_state["last_heartbeat"] = "2026-08-26T01:00:00Z"
+        srv.write_state(srv._startup_state)
+
+        with open(state_path) as f:
+            recreated = json.load(f)
+
+        pid_ok = recreated.get("pid") == 12345
+        port_ok = recreated.get("port") == 8080
+        started_ok = recreated.get("started_at") == "2026-08-26T00:00:00Z"
+        hb_ok = recreated.get("last_heartbeat") == "2026-08-26T01:00:00Z"
+
+        if pid_ok and port_ok and started_ok:
+            pass_("Heartbeat write preserves pid, port, started_at from in-memory state")
+        else:
+            fail(f"Heartbeat write lost fields: {recreated!r}")
+        if hb_ok:
+            pass_("Heartbeat write updates last_heartbeat")
+        else:
+            fail(f"Heartbeat write did not update last_heartbeat: {recreated!r}")
+
+        # Clean up the file we wrote
+        try:
+            os.remove(state_path)
+        except OSError:
+            pass
+    finally:
+        # Restore the previous state file (if any)
+        if state_backup is not None:
+            os.makedirs(os.path.dirname(state_path), exist_ok=True)
+            with open(state_path, "w") as f:
+                f.write(state_backup)
+        else:
+            try:
+                os.remove(state_path)
+            except OSError:
+                pass
+
+
+# ===========================================================================
 # Test: Models Per Provider Validation
 # ===========================================================================
 
 def test_models_per_provider_validation():
-    """Every provider in keys-index.json must have a non-empty models catalog.
+    """Config.models entries must have valid shape; tier-referenced providers must have a models entry.
 
-    Server refuses to start when a provider has no models entry, an empty
-    list, a string instead of a list, or a list whose entries are empty or
-    whitespace-only — with a clear "has no models" error — and starts when all
-    providers have at least one non-empty model name.
+    Server refuses to start when a provider's models entry is malformed (missing,
+    empty list, a string instead of a list, or a list whose entries are empty or
+    whitespace-only) — with a clear "has no models" error — and when a provider
+    referenced by a tier has no models entry ("used by tier" error). Starts when
+    all tier-referenced providers have at least one non-empty model name.
+    Providers in keys-index.json that are neither referenced by a tier nor
+    present in config.models are silently ignored.
     """
     print("\n--- Test: Models Per Provider Validation ---")
 
-    def try_start(models):
+    def try_start(models, keys_vendors=None):
         temp_dir = tempfile.mkdtemp(prefix="proxy_models_val_")
         try:
             config = {
@@ -4257,9 +4488,9 @@ def test_models_per_provider_validation():
             config_path = os.path.join(temp_dir, "config.json")
             with open(config_path, "w") as f:
                 json.dump(config, f)
-            keys_path = _create_test_keys(temp_dir, {
-                "p": {"url": "http://127.0.0.1:1", "key": "k"}
-            })
+            if keys_vendors is None:
+                keys_vendors = {"p": {"url": "http://127.0.0.1:1", "key": "k"}}
+            keys_path = _create_test_keys(temp_dir, keys_vendors)
             proc, probe_ok = _start_proxy_server_directly(
                 find_free_port(), config_path=config_path, keys_path=keys_path
             )
@@ -4283,14 +4514,14 @@ def test_models_per_provider_validation():
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    # (a) provider "p" missing from models -> refuse with clear message
+    # (a) provider "p" missing from models but referenced by tiers -> refuse with "used by tier"
     started, err = try_start({})
-    if not started and "has no models" in err:
-        pass_("Server refused to start with 'has no models' for missing providers entry")
+    if not started and "used by tier" in err:
+        pass_("Server refused to start with 'used by tier' when tier provider has no models entry")
     else:
-        fail(f"Expected refusal with 'has no models', got started={started}, stderr={err[:300]!r}")
+        fail(f"Expected refusal with 'used by tier', got started={started}, stderr={err[:300]!r}")
 
-    # (b) provider "p" present but empty list -> refuse
+    # (b) provider "p" present but empty list -> refuse (shape)
     started, err = try_start({"p": []})
     if not started and "has no models" in err:
         pass_("Server refused to start when provider models list is empty")
@@ -4304,26 +4535,36 @@ def test_models_per_provider_validation():
     else:
         fail(f"Server refused to start although all providers had models: {err[:300]!r}")
 
-    # (d) provider "p" has a string instead of a list -> refuse
+    # (d) provider "p" has a string instead of a list -> refuse (shape)
     started, err = try_start({"p": "claude-sonnet-5"})
     if not started and "has no models" in err:
         pass_("Server refused to start when models.p is a string (not a list)")
     else:
         fail(f"Expected refusal for string models value, got started={started}, stderr={err[:300]!r}")
 
-    # (e) provider "p" has a list containing an empty string -> refuse
+    # (e) provider "p" has a list containing an empty string -> refuse (shape)
     started, err = try_start({"p": [""]})
     if not started and "has no models" in err:
         pass_("Server refused to start when models.p list contains an empty string")
     else:
         fail(f"Expected refusal for list with empty string, got started={started}, stderr={err[:300]!r}")
 
-    # (f) provider "p" has a list containing a whitespace-only string -> refuse
+    # (f) provider "p" has a list containing a whitespace-only string -> refuse (shape)
     started, err = try_start({"p": ["   "]})
     if not started and "has no models" in err:
         pass_("Server refused to start when models.p list contains a whitespace-only string")
     else:
         fail(f"Expected refusal for whitespace-only model string, got started={started}, stderr={err[:300]!r}")
+
+    # (g) provider in keys but not in models and not referenced by any tier -> starts
+    #     (config→keys validation direction: keys-index.json is not authoritative)
+    started, err = try_start({"p": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]},
+                             keys_vendors={"p": {"url": "http://127.0.0.1:1", "key": "k"},
+                                           "legacy": {"url": "http://127.0.0.1:2", "key": "k2"}})
+    if started:
+        pass_("Server started with a keys-only provider absent from models (not tier-referenced)")
+    else:
+        fail(f"Server refused to start although extra keys provider is tier-unreferenced: {err[:300]!r}")
 
 
 # ===========================================================================
@@ -6484,7 +6725,10 @@ ALL_TESTS = [
     ("two-tiers-same-model-same-provider", test_two_tiers_same_model_same_provider),
     ("config-validation-missing-tier", test_config_validation_missing_tier),
     ("config-validation-unknown-provider", test_config_validation_unknown_provider),
+    ("config-validation-models-to-keys", test_config_validation_models_to_keys),
+    ("config-validation-tier-provider-needs-models", test_config_validation_tier_provider_needs_models),
     ("models-per-provider-validation", test_models_per_provider_validation),
+    ("heartbeat-preserves-state", test_heartbeat_preserves_state),
     ("config-template-copy", test_config_template_copy),
     ("admin-page-served", test_admin_page_served),
     ("admin-api-config", test_admin_api_config),

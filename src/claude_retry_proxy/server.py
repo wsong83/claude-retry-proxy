@@ -83,6 +83,10 @@ _inflight_count = 0  # Number of requests currently in-flight
 _config_swapping = False  # True when config swap is in progress
 _swap_done = threading.Event()  # Signaled when swap completes
 
+# Startup state dict, kept in memory so the heartbeat can rewrite a
+# proxy-state.json deleted externally without losing pid/port fields.
+_startup_state = None
+
 # Decrypted vendors table (read-only after init)
 # {provider_name: {"url": ..., "key": ...}}
 _vendors = None
@@ -234,15 +238,38 @@ def validate_config(config, providers):
         if not model:
             errors.append("tier '{}' has empty model".format(tier_name))
 
-    # Check every provider has at least one model in the catalog
+    # Check every provider in config.models has a valid model list and exists
+    # in keys-index.json (config is authoritative; keys may contain inactive
+    # providers that are silently ignored).
     models = config.get("models", {})
-    for provider in providers:
-        entry = models.get(provider)
+    for provider, entry in models.items():
         if not isinstance(entry, list) or len(entry) == 0 \
                 or not all(isinstance(m, str) and m.strip() for m in entry):
             errors.append(
                 "provider '{}' has no models in config.models — add at least "
                 "one model name for this provider".format(provider))
+            continue
+        if provider not in providers:
+            errors.append(
+                "provider '{}' in config.models has no entry in keys-index.json".format(provider))
+
+    # Check every tier-referenced provider has at least one model in the catalog
+    for tier_name in required_tiers:
+        if tier_name not in tiers:
+            continue
+        tier = tiers[tier_name]
+        if not isinstance(tier, dict):
+            continue
+        provider = tier.get("provider", "")
+        if not provider or provider not in providers:
+            continue
+        entry = models.get(provider)
+        if not isinstance(entry, list) or len(entry) == 0 \
+                or not all(isinstance(m, str) and m.strip() for m in entry):
+            errors.append(
+                "provider '{}' (used by tier '{}') has no entry in "
+                "config.models — add at least one model name for this "
+                "provider".format(provider, tier_name))
 
     # Validate disable_retry_claude_count_token is a boolean if present
     if "disable_retry_claude_count_token" in config:
@@ -566,10 +593,10 @@ def heartbeat_loop():
         time.sleep(30)
         if _shutting_down:
             break
-        state = read_state()
-        state["last_heartbeat"] = time.strftime(
-            "%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        write_state(state)
+        if _startup_state is not None:
+            _startup_state["last_heartbeat"] = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            write_state(_startup_state)
 
 
 # ---------------------------------------------------------------------------
@@ -1680,7 +1707,7 @@ def main():
     args = parser.parse_args()
 
     global PROXY_PORT, PROXY_TRACE_FILE, PROXY_LOG_ALL
-    global _current_config, _vendors, _config_path
+    global _current_config, _vendors, _config_path, _startup_state
 
     if args.port is not None:
         PROXY_PORT = args.port
@@ -1773,6 +1800,7 @@ def main():
         "last_request_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     write_state(state)
+    _startup_state = state
 
     # Write start marker to trace
     write_start_marker()
