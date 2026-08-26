@@ -3,13 +3,14 @@
 Behavioral tests covering:
   - Retry/backoff: 429 and 503 retried with jittered exponential backoff,
     exhaustion paths (body preservation, synthesized upstream_unreachable)
-  - Tier routing: model resolution, provider routing, reverse-map, pattern match
-  - Response model rewriting: SSE and JSON paths, unmapped-model passthrough
+  - Tier routing: model resolution, provider routing, pattern match
+  - Response model rewriting: SSE and JSON paths, unconditional tier-name rewrite
   - Admin API: config GET, tier switch (validation, CSRF, models preservation),
     reload from disk, missing-tier/invalid-provider rejection
   - CLI: start (stdout cleanliness, missing/invalid config, template copy),
     stop (state cleanup, trace lines), reload, status
-  - Config/keys: validation, encrypted + plain keys-index.json, wrong passphrase
+  - Config/keys: validation (tiers present, providers known, models-per-provider
+    catalog), encrypted + plain keys-index.json, wrong passphrase
   - Trace log: markers, oversized-body 413, retry event enrichment, pruning
   - Streaming: response streaming, mid-stream upstream failure, disconnect
 
@@ -178,20 +179,55 @@ def find_free_port():
 # Test Case 4: Concurrent Requests
 # ===========================================================================
 
+def _derive_models_from_tiers(tiers):
+    """Derive a provider-keyed models catalog from tier mappings.
+
+    Each tier's configured model is listed under its provider. Used so that
+    generated configs satisfy the models-per-provider startup validation
+    (every provider in keys-index.json needs >=1 model in config.models).
+    """
+    models = {}
+    for tier in tiers.values():
+        if isinstance(tier, dict) and tier.get("provider") and tier.get("model"):
+            models.setdefault(tier["provider"], []).append(tier["model"])
+    return {provider: sorted(set(names)) for provider, names in models.items()}
+
+
+def _models_for_vendors(tiers, vendors):
+    """Provider-keyed models catalog covering every vendor in keys-index.json.
+
+    The proxy's startup validation requires each provider in keys to have at
+    least one model in config.models. Models from the tiers cover the providers
+    those tiers reference; vendors referenced by no tier get the union of all
+    configured model names (the catalog content only drives the admin page's
+    suggestion list, not routing).
+    """
+    derived = _derive_models_from_tiers(tiers)
+    known = sorted({name for names in derived.values() for name in names})
+    for vendor in vendors:
+        if vendor not in derived:
+            derived[vendor] = list(known)
+    return derived
+
+
 def _create_test_config(temp_dir, tiers, models=None):
     """Create a temp config.json with tier mappings.
 
     Args:
         temp_dir: Directory to create config.json in
         tiers: Dict mapping tier names to {provider, model}
-        models: Optional dict mapping provider names to model lists
+        models: Optional dict mapping provider names to model lists. When None,
+            a provider-keyed catalog is derived from the tier mappings so the
+            config passes models-per-provider startup validation.
 
     Returns:
         Path to created config.json
     """
+    if models is None:
+        models = _derive_models_from_tiers(tiers)
     config = {
         "tiers": tiers,
-        "models": models or {}
+        "models": models
     }
     path = os.path.join(temp_dir, "config.json")
     with open(path, "w") as f:
@@ -3340,8 +3376,10 @@ def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-pas
     temp_dir = tempfile.mkdtemp(prefix="proxy_tier_test_")
     proxy_port = find_free_port()
 
-    # Create config
-    config_path = _create_test_config(temp_dir, tiers_config)
+    # Create config — every vendor in keys needs >=1 model for startup validation
+    config_path = _create_test_config(
+        temp_dir, tiers_config, models=_models_for_vendors(tiers_config, vendors)
+    )
 
     # Create keys (plain or encrypted depending on passphrase)
     if default_passphrase is None:
@@ -3894,12 +3932,159 @@ def test_response_model_rewrite_streaming_non_message_start():
 
 
 # ===========================================================================
-# Test: Response Model Rewrite Unmapped Model
+# Test: Two Tiers, Same Model, Same Provider
 # ===========================================================================
 
-def test_response_model_rewrite_unmapped_model():
-    """Upstream returns model name not in reverse map → passed through unchanged, warning logged."""
-    print("\n--- Test: Response Model Rewrite Unmapped Model ---")
+def test_two_tiers_same_model_same_provider():
+    """Two tiers mapping to the same model from the same provider: the server
+    starts, each request routes to the shared model, and JSON + SSE responses
+    are rewritten to the requesting tier's name (no reverse map needed)."""
+    print("\n--- Test: Two Tiers Same Model Same Provider ---")
+
+    upstream_port = find_free_port()
+    requests = []
+
+    class CollisionHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_len) if content_len > 0 else b"{}"
+            api_key = self.headers.get("x-api-key", "")
+            requests.append({"body": body, "api_key": api_key})
+            try:
+                req_data = json.loads(body)
+                model = req_data.get("model", "unknown")
+                is_stream = bool(req_data.get("stream", False))
+            except Exception:
+                model = "unknown"
+                is_stream = False
+            if is_stream:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                event1 = json.dumps({"type": "message_start", "message": {"model": model}})
+                self.wfile.write(f"data: {event1}\n\n".encode())
+                self.wfile.flush()
+                event2 = json.dumps({"type": "content_block_delta", "delta": {"text": "Hi"}})
+                self.wfile.write(f"data: {event2}\n\n".encode())
+                self.wfile.flush()
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "id": "ok",
+                    "type": "message",
+                    "model": model,
+                    "content": [{"text": "response"}],
+                }).encode())
+
+        def log_message(self, format, *args):
+            pass
+
+    mock_server = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), CollisionHandler)
+    mock_thread = threading.Thread(target=mock_server.serve_forever, daemon=True)
+    mock_thread.start()
+    time.sleep(0.2)
+
+    tiers = {
+        "haiku": {"provider": "p", "model": "deepseek-v4-flash"},
+        "sonnet": {"provider": "p", "model": "deepseek-v4-flash"},  # collision with haiku
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+    }
+    vendors = {"p": {"url": f"http://127.0.0.1:{upstream_port}", "key": "k"}}
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_collision_test_")
+    proxy_port = find_free_port()
+    try:
+        config_path = _create_test_config(temp_dir, tiers)
+        keys_path = _create_test_keys(temp_dir, vendors)
+        trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
+        os.close(trace_fd)
+        proc, probe_ok = _start_proxy_server_directly(
+            proxy_port, config_path=config_path, keys_path=keys_path, trace_file=trace_file
+        )
+        if not probe_ok:
+            fail("Proxy failed to start with two tiers mapping to the same model")
+            return
+
+        try:
+            import http.client as _hc
+
+            # --- JSON path: each request gets its own tier name ---
+            body = json.dumps({"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+            status, resp_body = _send_proxy_request(proxy_port, body=body)
+            if status != 200:
+                fail(f"sonnet request failed: {status}")
+            else:
+                resp_data = json.loads(resp_body)
+                if resp_data.get("model") == "sonnet":
+                    pass_("sonnet request -> response model 'sonnet'")
+                else:
+                    fail(f"sonnet response model: {resp_data.get('model')!r}, expected 'sonnet'")
+
+            body = json.dumps({"model": "haiku", "messages": [{"role": "user", "content": "hi"}]})
+            status, resp_body = _send_proxy_request(proxy_port, body=body)
+            if status != 200:
+                fail(f"haiku request failed: {status}")
+            else:
+                resp_data = json.loads(resp_body)
+                if resp_data.get("model") == "haiku":
+                    pass_("haiku request -> response model 'haiku'")
+                else:
+                    fail(f"haiku response model: {resp_data.get('model')!r}, expected 'haiku'")
+
+            # Upstream received the shared configured model name for both tiers
+            if len(requests) >= 2 and all(
+                json.loads(r["body"]).get("model") == "deepseek-v4-flash"
+                for r in requests[:2]
+            ):
+                pass_("Upstream received deepseek-v4-flash for both tiers")
+            else:
+                fail(f"Upstream model names: {[json.loads(r['body']).get('model') for r in requests]}")
+
+            # --- SSE path: message_start rewritten to per-request tier ---
+            stream_body = json.dumps({"model": "sonnet", "messages": [{"role": "user", "content": "hi"}], "stream": True})
+            conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+            conn.request("POST", "/v1/messages", body=stream_body, headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            sse_data = resp.read().decode()
+            conn.close()
+
+            if '"model": "sonnet"' in sse_data or '"model":"sonnet"' in sse_data:
+                pass_("SSE message_start rewritten to 'sonnet' for sonnet request")
+            else:
+                fail(f"SSE response model not 'sonnet': {sse_data[:200]}")
+
+            stream_body = json.dumps({"model": "haiku", "messages": [{"role": "user", "content": "hi"}], "stream": True})
+            conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+            conn.request("POST", "/v1/messages", body=stream_body, headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            sse_data = resp.read().decode()
+            conn.close()
+
+            if '"model": "haiku"' in sse_data or '"model":"haiku"' in sse_data:
+                pass_("SSE message_start rewritten to 'haiku' for haiku request")
+            else:
+                fail(f"SSE response model not 'haiku': {sse_data[:200]}")
+
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    finally:
+        mock_server.shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ===========================================================================
+# Test: Response Model Rewrite Upstream Model
+# ===========================================================================
+
+def test_response_model_rewrite_upstream_model():
+    """Upstream returns an arbitrary model name → rewritten to tier name (unconditional rewrite)."""
+    print("\n--- Test: Response Model Rewrite Upstream Model ---")
 
     upstream_port = find_free_port()
 
@@ -3911,7 +4096,7 @@ def test_response_model_rewrite_unmapped_model():
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            # Return a model not in the reverse map
+            # Return a model name not configured in any tier
             self.wfile.write(b'{"id":"ok","type":"message","model":"unknown-model"}')
 
         def log_message(self, format, *args):
@@ -3943,13 +4128,13 @@ def test_response_model_rewrite_unmapped_model():
             fail(f"Request failed: {status}")
             return
 
-        # Response should have the unmapped model passed through
+        # Unconfigured upstream model is still rewritten to the tier name
         try:
             resp_data = json.loads(resp_body)
-            if resp_data.get("model") == "unknown-model":
-                pass_("Unmapped model passed through unchanged")
+            if resp_data.get("model") == "sonnet":
+                pass_("Unknown upstream model rewritten to tier name")
             else:
-                fail(f"Unmapped model was modified: {resp_data.get('model')}")
+                fail(f"Response model not rewritten: {resp_data.get('model')}")
         except:
             fail("Could not parse response")
 
@@ -3975,7 +4160,7 @@ def test_config_validation_missing_tier():
                 "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
                 "opus": {"provider": "p", "model": "claude-opus-5"},
             },
-            "models": {}
+            "models": {"p": ["claude-sonnet-5", "claude-opus-5"]}
         }
         config_path = os.path.join(temp_dir, "config.json")
         with open(config_path, "w") as f:
@@ -4018,7 +4203,8 @@ def test_config_validation_unknown_provider():
                 "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
                 "opus": {"provider": "p", "model": "claude-opus-5"},
             },
-            "models": {}
+            # "p" has models so the only validation error is the unknown provider
+            "models": {"p": ["claude-sonnet-5", "claude-opus-5"]}
         }
         config_path = os.path.join(temp_dir, "config.json")
         with open(config_path, "w") as f:
@@ -4041,6 +4227,103 @@ def test_config_validation_unknown_provider():
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ===========================================================================
+# Test: Models Per Provider Validation
+# ===========================================================================
+
+def test_models_per_provider_validation():
+    """Every provider in keys-index.json must have a non-empty models catalog.
+
+    Server refuses to start when a provider has no models entry, an empty
+    list, a string instead of a list, or a list whose entries are empty or
+    whitespace-only — with a clear "has no models" error — and starts when all
+    providers have at least one non-empty model name.
+    """
+    print("\n--- Test: Models Per Provider Validation ---")
+
+    def try_start(models):
+        temp_dir = tempfile.mkdtemp(prefix="proxy_models_val_")
+        try:
+            config = {
+                "tiers": {
+                    "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                    "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                    "opus": {"provider": "p", "model": "claude-opus-5"},
+                },
+                "models": models,
+            }
+            config_path = os.path.join(temp_dir, "config.json")
+            with open(config_path, "w") as f:
+                json.dump(config, f)
+            keys_path = _create_test_keys(temp_dir, {
+                "p": {"url": "http://127.0.0.1:1", "key": "k"}
+            })
+            proc, probe_ok = _start_proxy_server_directly(
+                find_free_port(), config_path=config_path, keys_path=keys_path
+            )
+            err = ""
+            if probe_ok:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            else:
+                # Validation refused startup — collect the error message
+                try:
+                    _, err = proc.communicate(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            return probe_ok, err or ""
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    # (a) provider "p" missing from models -> refuse with clear message
+    started, err = try_start({})
+    if not started and "has no models" in err:
+        pass_("Server refused to start with 'has no models' for missing providers entry")
+    else:
+        fail(f"Expected refusal with 'has no models', got started={started}, stderr={err[:300]!r}")
+
+    # (b) provider "p" present but empty list -> refuse
+    started, err = try_start({"p": []})
+    if not started and "has no models" in err:
+        pass_("Server refused to start when provider models list is empty")
+    else:
+        fail(f"Expected refusal for empty models list, got started={started}, stderr={err[:300]!r}")
+
+    # (c) provider "p" has >=1 model -> starts
+    started, err = try_start({"p": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]})
+    if started:
+        pass_("Server started when all providers have at least one model")
+    else:
+        fail(f"Server refused to start although all providers had models: {err[:300]!r}")
+
+    # (d) provider "p" has a string instead of a list -> refuse
+    started, err = try_start({"p": "claude-sonnet-5"})
+    if not started and "has no models" in err:
+        pass_("Server refused to start when models.p is a string (not a list)")
+    else:
+        fail(f"Expected refusal for string models value, got started={started}, stderr={err[:300]!r}")
+
+    # (e) provider "p" has a list containing an empty string -> refuse
+    started, err = try_start({"p": [""]})
+    if not started and "has no models" in err:
+        pass_("Server refused to start when models.p list contains an empty string")
+    else:
+        fail(f"Expected refusal for list with empty string, got started={started}, stderr={err[:300]!r}")
+
+    # (f) provider "p" has a list containing a whitespace-only string -> refuse
+    started, err = try_start({"p": ["   "]})
+    if not started and "has no models" in err:
+        pass_("Server refused to start when models.p list contains a whitespace-only string")
+    else:
+        fail(f"Expected refusal for whitespace-only model string, got started={started}, stderr={err[:300]!r}")
 
 
 # ===========================================================================
@@ -4241,6 +4524,9 @@ def _start_admin_proxy(tiers, vendors, models=None):
     """
     temp_dir = tempfile.mkdtemp(prefix="proxy_admin_")
     proxy_port = find_free_port()
+    if models is None:
+        # Every vendor in keys needs >=1 model for startup validation
+        models = _models_for_vendors(tiers, vendors)
     config_path = _create_test_config(temp_dir, tiers, models=models)
     keys_path = _create_test_keys_plain(temp_dir, vendors)
 
@@ -4674,48 +4960,6 @@ def test_admin_api_switch_missing_tier_rejected():
 
 
 # ===========================================================================
-# Test: Config Validation Reverse Map Collision
-# ===========================================================================
-
-def test_config_validation_reverse_map_collision():
-    """Config with two tiers mapping to same model → server refuses to start."""
-    print("\n--- Test: Config Validation Reverse Map Collision ---")
-
-    temp_dir = tempfile.mkdtemp(prefix="proxy_config_test_")
-    try:
-        # Two tiers map to same model
-        invalid_config = {
-            "tiers": {
-                "haiku": {"provider": "p", "model": "same-model"},
-                "sonnet": {"provider": "p", "model": "same-model"},  # collision!
-                "opus": {"provider": "p", "model": "claude-opus-5"},
-            },
-            "models": {}
-        }
-        config_path = os.path.join(temp_dir, "config.json")
-        with open(config_path, "w") as f:
-            json.dump(invalid_config, f)
-
-        keys_path = os.path.join(temp_dir, "keys-index.json")
-        with open(keys_path, "w") as f:
-            json.dump({"vendors": {"p": {"url": "http://127.0.0.1:9999", "key": "k"}}}, f)
-
-        proxy_port = find_free_port()
-        proc, probe_ok = _start_proxy_server_directly(
-            proxy_port, config_path=config_path, keys_path=keys_path
-        )
-
-        if not probe_ok:
-            pass_("Server refused to start with reverse map collision")
-        else:
-            fail("Server started with reverse map collision (should have refused)")
-            proc.kill()
-
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-# ===========================================================================
 # Test: Admin API Reload
 # ===========================================================================
 
@@ -4782,7 +5026,8 @@ def test_admin_api_reload():
         tiers_b = dict(tiers_a)
         tiers_b["sonnet"] = {"provider": "p", "model": "model-b"}
         with open(config_path, "w") as f:
-            json.dump({"tiers": tiers_b, "models": {}}, f)
+            # Reload re-validates: provider "p" needs >=1 model in config.models
+            json.dump({"tiers": tiers_b, "models": _derive_models_from_tiers(tiers_b)}, f)
 
         # POST /admin/api/reload
         status, data = _admin_post(proxy_port, "/admin/api/reload", {})
@@ -4869,7 +5114,8 @@ def test_cli_reload():
             tiers_b = dict(tiers_a)
             tiers_b["sonnet"] = {"provider": "p", "model": "model-b"}
             with open(config_path, "w") as f:
-                json.dump({"tiers": tiers_b, "models": {}}, f)
+                # Reload re-validates: provider "p" needs >=1 model in config.models
+                json.dump({"tiers": tiers_b, "models": _derive_models_from_tiers(tiers_b)}, f)
 
             # Run claude-retry-proxy reload (no --port; reads from proxy-state.json)
             result = subprocess.run(CLAUDE_PROXY + ["reload"],
@@ -5230,8 +5476,8 @@ def test_api_key_from_keys_index():
 # ===========================================================================
 
 def test_admin_models_provider_keyed():
-    """Admin API serves models keyed by provider; admin.html drives the model
-    dropdown from the selected provider (populateModels), not tier-keyed models."""
+    """Admin API serves models keyed by provider; admin.html model <select> is
+    populated from config.models[provider] — no placeholder or custom options."""
     print("\n--- Test: Admin Models Provider-Keyed ---")
 
     upstream_port = find_free_port()
@@ -5289,22 +5535,43 @@ def test_admin_models_provider_keyed():
             else:
                 fail(f"Provider model list missing qwen3.7-plus: {config['models']['p']}")
 
-            # 2. Admin page HTML drives dropdown from provider, not tier
+            # 2. Admin page HTML: model <select> populated from the provider's model
+            #    catalog — no placeholders, no "Custom...", no hidden input
             conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
             conn.request("GET", "/admin/")
             html_resp = conn.getresponse()
             html = html_resp.read().decode()
             conn.close()
 
-            if "populateModels" in html:
-                pass_("admin.html defines populateModels helper")
+            if '<select id="${tier}-model"' in html:
+                pass_("admin.html model field is a <select> per tier")
             else:
-                fail("admin.html missing populateModels")
+                fail("admin.html model field is not a <select>")
 
-            if "config.models?.[tier]" not in html:
-                pass_("admin.html does not reference tier-keyed config.models?.[tier]")
+            if "config.models" in html:
+                pass_("admin.html references config.models for model population")
             else:
-                fail("admin.html still references tier-keyed config.models?.[tier]")
+                fail("admin.html missing config.models reference")
+
+            if '<option value="">' in html:
+                fail("admin.html still contains an empty placeholder <option>")
+            else:
+                pass_("admin.html has no placeholder <option value=\"\">")
+
+            if "__custom__" in html:
+                fail("admin.html still contains the 'Custom...' option")
+            else:
+                pass_("admin.html has no 'Custom...' option")
+
+            if "-custom-model" in html:
+                fail("admin.html still contains a -custom-model input")
+            else:
+                pass_("admin.html has no hidden custom-model input")
+
+            if ".model-custom" in html:
+                fail("admin.html still contains .model-custom CSS")
+            else:
+                pass_("admin.html has no .model-custom CSS")
 
         finally:
             proc.terminate()
@@ -5325,7 +5592,7 @@ def _create_test_config_with_flag(temp_dir, tiers, flag_value=None):
 
     flag_value: True/False to set, or None to omit the key entirely.
     """
-    config = {"tiers": tiers, "models": {}}
+    config = {"tiers": tiers, "models": _derive_models_from_tiers(tiers)}
     if flag_value is not None:
         config["disable_retry_claude_count_token"] = flag_value
     path = os.path.join(temp_dir, "config.json")
@@ -5954,7 +6221,7 @@ def test_disable_retry_count_tokens_invalid_type():
 
     # Non-boolean values must be rejected
     for bad in ["false", 0, None]:
-        config = {"tiers": valid_tiers, "models": {}, "disable_retry_claude_count_token": bad}
+        config = {"tiers": valid_tiers, "models": _derive_models_from_tiers(valid_tiers), "disable_retry_claude_count_token": bad}
         errors = validate_config(config, set(vendors.keys()))
         if any("disable_retry_claude_count_token" in e for e in errors):
             pass_(f"validate_config rejected non-boolean value {bad!r}")
@@ -5962,7 +6229,7 @@ def test_disable_retry_count_tokens_invalid_type():
             fail(f"validate_config accepted non-boolean value {bad!r}")
 
     # Valid boolean true must be accepted
-    config = {"tiers": valid_tiers, "models": {}, "disable_retry_claude_count_token": True}
+    config = {"tiers": valid_tiers, "models": _derive_models_from_tiers(valid_tiers), "disable_retry_claude_count_token": True}
     errors = validate_config(config, set(vendors.keys()))
     if errors:
         fail(f"validate_config rejected valid boolean True: {errors}")
@@ -6213,9 +6480,11 @@ ALL_TESTS = [
     ("response-model-rewrite", test_response_model_rewrite),
     ("response-model-rewrite-streaming", test_response_model_rewrite_streaming),
     ("response-model-rewrite-streaming-non-message-start", test_response_model_rewrite_streaming_non_message_start),
-    ("response-model-rewrite-unmapped-model", test_response_model_rewrite_unmapped_model),
+    ("response-model-rewrite-upstream-model", test_response_model_rewrite_upstream_model),
+    ("two-tiers-same-model-same-provider", test_two_tiers_same_model_same_provider),
     ("config-validation-missing-tier", test_config_validation_missing_tier),
     ("config-validation-unknown-provider", test_config_validation_unknown_provider),
+    ("models-per-provider-validation", test_models_per_provider_validation),
     ("config-template-copy", test_config_template_copy),
     ("admin-page-served", test_admin_page_served),
     ("admin-api-config", test_admin_api_config),
@@ -6227,7 +6496,6 @@ ALL_TESTS = [
     ("admin-api-csrf-missing-origin-rejected", test_admin_api_csrf_missing_origin_rejected),
     ("admin-api-csrf-ipv6-loopback-accepted", test_admin_api_csrf_ipv6_loopback_accepted),
     ("admin-api-switch-missing-tier-rejected", test_admin_api_switch_missing_tier_rejected),
-    ("config-validation-reverse-map-collision", test_config_validation_reverse_map_collision),
     ("admin-api-reload", test_admin_api_reload),
     ("cli-reload", test_cli_reload),
     ("cli-start-no-config", test_cli_start_no_config),

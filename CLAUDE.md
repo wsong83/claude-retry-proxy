@@ -84,14 +84,13 @@ paths resolve against cwd), `--all` (log full request/response bodies),
      before: `PROXY_INITIAL_DELAY * 2**attempt`, capped at `PROXY_MAX_DELAY`,
      ±25% jitter, thread-local RNG). **429 retries use `PROXY_MAX_DELAY`**
      directly; 503 and connection errors use the exponential.
-  6. **Response model rewriting**: build reverse map `{actual_model: tier}`
-     at config load. For SSE (`text/event-stream`): buffer first event
-     (64 KB cap), rewrite `model` in `message_start` event, forward
-     remainder + subsequent events unchanged. For JSON
-     (`application/json`): parse body, replace `model` with tier name,
-     re-serialize. Other Content-Types pass through unchanged.
-     Content-Type checked FIRST before any buffering/parsing.
-     Unmapped model names pass through with a warning trace event.
+  6. **Response model rewriting**: the tier name is resolved from the request
+     body at entry and threaded through the call chain. For SSE
+     (`text/event-stream`): buffer first event (64 KB cap), rewrite `model` in
+     `message_start` event to the tier name, forward remainder + subsequent
+     events unchanged. For JSON (`application/json`): parse body, replace
+     `model` with tier name, re-serialize. Other Content-Types pass through
+     unchanged. Content-Type checked FIRST before any buffering/parsing.
   7. **`do_POST` streamed flag**: `streamed = (200 <= status < 300) and
      (resp_body == b"")` — streaming paths return `b""`, buffering paths
      return actual body. Only buffered responses call `_send_response`.
@@ -111,7 +110,7 @@ paths resolve against cwd), `--all` (log full request/response bodies),
     + `_inflight_count` counter + `_swap_done` Event. New requests wait if
     swap in progress. Admin waits for in-flight to drain (30s timeout,
     100ms poll), swaps under lock, signals completion. `forward_request`
-    snapshots config + reverse_map at entry under lock, uses snapshots
+    snapshots config state at entry under lock, uses snapshots
     throughout (immune to mid-request config changes).
   - CSRF: reject missing Origin, reject `null`, accept only
     `http://localhost:<port>`, `http://127.0.0.1:<port>`, `http://[::1]:<port>`.
@@ -171,8 +170,12 @@ does not block startup on failure).
   (`icacls`).
 - **Config validation is strict.** The proxy refuses to start if config.json
   is missing (copies template and tells user to populate it), has empty
-  provider/model fields, or references unknown providers. Reverse map
-  collisions (two tiers mapping to the same model name) are also rejected.
+  provider/model fields, or references unknown providers. Every provider in
+  keys-index.json must have at least one model name in config.models (the
+  proxy refuses to start otherwise). The check validates the shape of each
+  entry — it must be a non-empty list of non-empty strings; a bare string
+  value or a list containing empty/whitespace-only entries is rejected. Two tiers may map to the same model
+  name; response rewriting uses the per-request tier, not a reverse map.
 - **Admin API CSRF protection.** Admin POST endpoints validate the Origin
   header. Non-browser clients (curl, CLI `reload`) must include an Origin
   header matching `http://localhost:<port>` or `http://127.0.0.1:<port>` or
@@ -255,6 +258,8 @@ does not block startup on failure).
 - [scripts/analyze_proxy_trace.py](scripts/analyze_proxy_trace.py) — trace log
   analysis tool: calculates per-model stats (request count, retries, success
   rates, TTFT, latency) for a configurable time window, with outlier filtering.
+- [plans/](plans/) — completed implementation plans (one per feature, with
+  design rationale, issue log, and test results).
 - Design rationale for the extraction lives in
   `tmp/plans/2026-07-17-extract-retry-proxy-design.md` (gitignored — planning
   artifact, not published).

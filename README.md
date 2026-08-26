@@ -81,7 +81,7 @@ When you run `claude-retry-proxy start`:
 2. It prompts for your passphrase and decrypts `~/.claude/keys-index.json`
    (provider URLs and API keys, vim blowfish2 encrypted).
 3. It validates the config: all 3 tiers present with valid provider references,
-   no reverse map collisions.
+   every provider in keys-index.json has at least one model in config.models.
 4. It checks the trace log and prunes entries older than 5 days.
 5. It launches the proxy server, piping the passphrase via stdin.
 

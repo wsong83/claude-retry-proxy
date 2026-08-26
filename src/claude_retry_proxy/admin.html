@@ -16,7 +16,7 @@
         .tier-label.haiku { color: #4fc3f7; }
         .tier-label.sonnet { color: #81c784; }
         .tier-label.opus { color: #ffb74d; }
-        select, input { background: #0f3460; border: 1px solid #4fc3f7; color: #eee; padding: 0.5rem; border-radius: 4px; flex: 1; }
+        select { background: #0f3460; border: 1px solid #4fc3f7; color: #eee; padding: 0.5rem; border-radius: 4px; flex: 1; }
         button { background: #4fc3f7; color: #1a1a2e; border: none; padding: 0.75rem 1.5rem; border-radius: 4px; cursor: pointer; font-weight: bold; margin-right: 0.5rem; }
         button:hover { background: #81d4fa; }
         button.secondary { background: #455a64; color: #eee; }
@@ -24,8 +24,6 @@
         .status { padding: 1rem; border-radius: 4px; margin-top: 1rem; display: none; }
         .status.success { background: #1b5e20; display: block; }
         .status.error { background: #b71c1c; display: block; }
-        .model-custom { margin-top: 0.5rem; display: none; }
-        .model-custom.visible { display: block; }
     </style>
 </head>
 <body>
@@ -71,14 +69,10 @@
                 div.className = 'tier-row';
                 div.innerHTML = `
                     <span class="tier-label ${tier}">${tier}</span>
-                    <select id="${tier}-provider" onchange="onProviderChange('${tier}')">
-                        <option value="">Select provider...</option>
+                    <select id="${tier}-provider" onchange="populateModels('${tier}')">
                     </select>
-                    <select id="${tier}-model" onchange="onModelSelect('${tier}')">
-                        <option value="">Select model...</option>
-                        <option value="__custom__">Custom...</option>
+                    <select id="${tier}-model">
                     </select>
-                    <input type="text" id="${tier}-custom-model" class="model-custom" placeholder="Enter model name">
                 `;
                 container.appendChild(div);
 
@@ -93,24 +87,17 @@
                 providerSelect.value = tierConfig.provider || '';
 
                 // Populate models from selected provider
-                populateModels(tier, tierConfig.model);
+                populateModels(tier);
             });
         }
 
-        function populateModels(tier, preferredModel) {
-            const provider = document.getElementById(tier + '-provider').value;
+        function populateModels(tier) {
+            const provider = document.getElementById(`${tier}-provider`).value;
             const models = config.models?.[provider] || [];
-            const modelSelect = document.getElementById(tier + '-model');
-            const customInput = document.getElementById(tier + '-custom-model');
+            const modelSelect = document.getElementById(`${tier}-model`);
 
             // Clear and rebuild options
             modelSelect.innerHTML = '';
-
-            const placeholder = document.createElement('option');
-            placeholder.value = '';
-            placeholder.textContent = 'Select model...';
-            modelSelect.appendChild(placeholder);
-
             models.forEach(m => {
                 const opt = document.createElement('option');
                 opt.value = m;
@@ -118,43 +105,11 @@
                 modelSelect.appendChild(opt);
             });
 
-            const customOpt = document.createElement('option');
-            customOpt.value = '__custom__';
-            customOpt.textContent = 'Custom...';
-            modelSelect.appendChild(customOpt);
-
-            // Restore selection if the preferred model exists in the new list
-            if (preferredModel && models.includes(preferredModel)) {
-                modelSelect.value = preferredModel;
-                customInput.classList.remove('visible');
-            } else {
-                modelSelect.value = '';
-                customInput.classList.remove('visible');
+            // Restore selection if the saved tier model exists in the list
+            const savedModel = (config.tiers[tier] || {}).model;
+            if (savedModel && models.includes(savedModel)) {
+                modelSelect.value = savedModel;
             }
-        }
-
-        function onModelSelect(tier) {
-            const select = document.getElementById(`${tier}-model`);
-            const custom = document.getElementById(`${tier}-custom-model`);
-            if (select.value === '__custom__') {
-                custom.classList.add('visible');
-                custom.focus();
-            } else {
-                custom.classList.remove('visible');
-            }
-        }
-
-        function onProviderChange(tier) {
-            const currentModelValue = getModelValue(tier);
-            populateModels(tier, currentModelValue);
-        }
-
-        function getModelValue(tier) {
-            const select = document.getElementById(`${tier}-model`);
-            if (select.value === '__custom__') {
-                return document.getElementById(`${tier}-custom-model`).value;
-            }
-            return select.value;
         }
 
         async function saveConfig() {
@@ -164,7 +119,7 @@
             TIERS.forEach(tier => {
                 newConfig.tiers[tier] = {
                     provider: document.getElementById(`${tier}-provider`).value,
-                    model: getModelValue(tier)
+                    model: document.getElementById(`${tier}-model`).value
                 };
             });
 

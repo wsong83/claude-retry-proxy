@@ -76,7 +76,6 @@ PROXY_KEYS_PATH = _env_str("PROXY_KEYS_PATH", _default_keys)
 # Thread-safe config access (read by worker threads, written by admin API)
 _config_lock = threading.RLock()
 _current_config = None  # Set at startup after validation
-_reverse_model_map = None  # {actual_model: tier_name}, rebuilt on config change
 _config_path = None  # Path to config.json, set at startup
 
 # Drain-and-swap state for config changes (prevents race with in-flight requests)
@@ -235,6 +234,16 @@ def validate_config(config, providers):
         if not model:
             errors.append("tier '{}' has empty model".format(tier_name))
 
+    # Check every provider has at least one model in the catalog
+    models = config.get("models", {})
+    for provider in providers:
+        entry = models.get(provider)
+        if not isinstance(entry, list) or len(entry) == 0 \
+                or not all(isinstance(m, str) and m.strip() for m in entry):
+            errors.append(
+                "provider '{}' has no models in config.models — add at least "
+                "one model name for this provider".format(provider))
+
     # Validate disable_retry_claude_count_token is a boolean if present
     if "disable_retry_claude_count_token" in config:
         flag = config["disable_retry_claude_count_token"]
@@ -244,30 +253,6 @@ def validate_config(config, providers):
                 "(true/false), got {}".format(type(flag).__name__))
 
     return errors
-
-
-def build_reverse_map(config):
-    """Build reverse map from actual model names to tier names.
-
-    Returns:
-        dict mapping actual_model -> tier_name
-
-    Raises:
-        ValueError if two tiers map to the same model (collision)
-    """
-    reverse_map = {}
-    tiers = config.get("tiers", {})
-    for tier_name, tier_config in tiers.items():
-        if not isinstance(tier_config, dict):
-            continue
-        model = tier_config.get("model")
-        if model:
-            if model in reverse_map:
-                raise ValueError(
-                    "model '{}' is mapped by multiple tiers: '{}' and '{}'".format(
-                        model, reverse_map[model], tier_name))
-            reverse_map[model] = tier_name
-    return reverse_map
 
 
 def write_config(path, config):
@@ -611,8 +596,8 @@ def forward_request(method, path, headers, body, handler=None, request_id=None):
 
     # Drain-and-swap: snapshot config state at request start
     # If a config swap is in progress, wait for it to complete before proceeding
-    # Snapshot config, vendors, AND reverse_map together under the same lock
-    # to prevent race where config is read before lock but reverse_map is
+    # Snapshot config and vendors together under the same lock
+    # to prevent race where config is read before lock but vendors is
     # snapshotted inside lock (reviewer-drain-swap-race fix).
     while True:
         with _config_lock:
@@ -621,14 +606,13 @@ def forward_request(method, path, headers, body, handler=None, request_id=None):
                 _inflight_count += 1
                 config_snapshot = _current_config
                 vendors_snapshot = _vendors
-                reverse_map_snapshot = _reverse_model_map
                 break
         # Swap in progress - wait for it to complete
         _swap_done.wait()
 
     try:
         return _forward_request_impl(method, path, headers, body, handler, request_id,
-                                     config_snapshot, vendors_snapshot, reverse_map_snapshot)
+                                     config_snapshot, vendors_snapshot)
     finally:
         # Decrement counter when request completes (success or failure)
         with _config_lock:
@@ -636,8 +620,8 @@ def forward_request(method, path, headers, body, handler=None, request_id=None):
 
 
 def _forward_request_impl(method, path, headers, body, handler, request_id,
-                          config, vendors, reverse_map):
-    """Internal implementation of forward_request with snapshot reverse_map."""
+                          config, vendors):
+    """Internal implementation of forward_request with snapshot config."""
     if method not in ALLOWED_METHODS:
         return 400, {}, b'{"error":"Method not allowed"}', 0, 0, 0, "unknown", None, None
 
@@ -782,11 +766,11 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                     # SSE: stream with first-event rewriting
                     first_byte_ms = handler._stream_upstream_response(
                         resp, resp.status, resp_headers, request_id, retries,
-                        tier=tier, reverse_map=reverse_map)
+                        tier=tier)
                     conn.close()
                     return (resp.status, resp_headers, b"",
                             first_byte_ms, time.time() - total_start, retries, tier, provider_name, actual_model)
-                elif "application/json" in content_type and reverse_map:
+                elif "application/json" in content_type:
                     # JSON: buffer, parse, rewrite model, return (don't stream)
                     first_byte_start = time.time()
                     chunks = []
@@ -808,7 +792,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
 
                     # Rewrite model in JSON response
                     resp_body = _rewrite_json_response(
-                        resp_body, tier, reverse_map, request_id)
+                        resp_body, tier, request_id)
                     resp_headers["Content-Length"] = str(len(resp_body))
 
                     return (resp.status, resp_headers, resp_body,
@@ -817,7 +801,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                     # Other content types: stream unchanged
                     first_byte_ms = handler._stream_upstream_response(
                         resp, resp.status, resp_headers, request_id, retries,
-                        tier=tier, reverse_map=reverse_map)
+                        tier=tier)
                     conn.close()
                     return (resp.status, resp_headers, b"",
                             first_byte_ms, time.time() - total_start, retries, tier, provider_name, actual_model)
@@ -844,9 +828,9 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
             conn.close()
 
             # Rewrite model in JSON responses (non-2xx error path)
-            if "application/json" in content_type and reverse_map:
+            if "application/json" in content_type:
                 resp_body = _rewrite_json_response(
-                    resp_body, tier, reverse_map, request_id)
+                    resp_body, tier, request_id)
                 resp_headers["Content-Length"] = str(len(resp_body))
 
             return (resp.status, resp_headers, resp_body,
@@ -971,13 +955,12 @@ def sanitize_error(msg):
 SSE_EVENT_DELIMITER = b"\n\n"
 
 
-def _rewrite_sse_first_event(event_bytes, tier, reverse_map, request_id):
+def _rewrite_sse_first_event(event_bytes, tier, request_id):
     """Rewrite model in first SSE event if it's a message_start event.
 
     Args:
         event_bytes: raw bytes of first SSE event
         tier: tier name to rewrite model to
-        reverse_map: {actual_model: tier_name} for lookup
         request_id: for logging
 
     Returns:
@@ -1029,39 +1012,27 @@ def _rewrite_sse_first_event(event_bytes, tier, reverse_map, request_id):
     if not upstream_model:
         return event_bytes
 
-    # Look up tier from reverse map
-    if upstream_model in reverse_map:
-        # Rewrite model to tier name
-        message["model"] = reverse_map[upstream_model]
-        data["message"] = message
+    # Rewrite model to tier name
+    message["model"] = tier
+    data["message"] = message
 
-        # Rebuild SSE event - preserve original format
-        new_json = json.dumps(data)
-        if event_type:
-            # Had explicit event: line
-            new_event = "event: {}\ndata: {}\n\n".format(event_type, new_json)
-        else:
-            # Data-only format
-            new_event = "data: {}\n\n".format(new_json)
-        return new_event.encode("utf-8")
+    # Rebuild SSE event - preserve original format
+    new_json = json.dumps(data)
+    if event_type:
+        # Had explicit event: line
+        new_event = "event: {}\ndata: {}\n\n".format(event_type, new_json)
     else:
-        # Model not in reverse map - log warning and forward unchanged
-        log_trace({
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "event": "sse_unmapped_model",
-            "request_id": request_id,
-            "upstream_model": upstream_model,
-        })
-        return event_bytes
+        # Data-only format
+        new_event = "data: {}\n\n".format(new_json)
+    return new_event.encode("utf-8")
 
 
-def _rewrite_json_response(body_bytes, tier, reverse_map, request_id):
+def _rewrite_json_response(body_bytes, tier, request_id):
     """Rewrite model field in JSON response body.
 
     Args:
         body_bytes: raw response body
-        tier: tier name (unused, we use reverse_map)
-        reverse_map: {actual_model: tier_name}
+        tier: tier name to rewrite model to
         request_id: for logging
 
     Returns:
@@ -1079,18 +1050,8 @@ def _rewrite_json_response(body_bytes, tier, reverse_map, request_id):
     if not upstream_model or not isinstance(upstream_model, str):
         return body_bytes
 
-    if upstream_model in reverse_map:
-        data["model"] = reverse_map[upstream_model]
-        return json.dumps(data).encode("utf-8")
-    else:
-        # Unmapped model - log warning
-        log_trace({
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "event": "json_unmapped_model",
-            "request_id": request_id,
-            "upstream_model": upstream_model,
-        })
-        return body_bytes
+    data["model"] = tier
+    return json.dumps(data).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -1127,7 +1088,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body_bytes)
 
     def _stream_upstream_response(self, resp, status, resp_headers, request_id, retries,
-                                   tier=None, reverse_map=None):
+                                   tier=None):
         """Stream an upstream 2xx response body to the client as it arrives.
 
         For SSE (text/event-stream): buffers first event (64KB cap), rewrites
@@ -1159,7 +1120,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     self.send_header(k, v)
             self.end_headers()
 
-            if is_sse and tier and reverse_map:
+            if is_sse and tier:
                 # SSE path: buffer first event for model rewriting
                 # Buffer chunks until \n\n delimiter is found or 64KB cap is exceeded
                 first_event_buffer = bytearray()
@@ -1206,7 +1167,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     if not rewrite_skipped:
                         # Try to rewrite model in first event only
                         first_event_bytes = _rewrite_sse_first_event(
-                            first_event_bytes, tier, reverse_map, request_id)
+                            first_event_bytes, tier, request_id)
 
                     # Write rewritten first event
                     self.wfile.write(first_event_bytes)
@@ -1360,7 +1321,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self._send_response(404, b'{"error":"not found"}')
 
     def do_POST(self):
-        global _current_config, _reverse_model_map
+        global _current_config
 
         # Admin shutdown — localhost-only, graceful shutdown via server.shutdown()
         if self.path == "/admin/shutdown":
@@ -1504,19 +1465,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     for _key in ("disable_retry_claude_count_token",):
                         if _key in _current_config:
                             new_config[_key] = _current_config[_key]
-                    try:
-                        new_reverse_map = build_reverse_map(new_config)
-                    except ValueError as e:
-                        response_status = 400
-                        response_body = json.dumps({"error": str(e)}).encode("utf-8")
-
                     if response_status is None:
                         # Write to disk FIRST, then update in-memory
                         try:
                             write_config(_config_path, new_config)
                             # Only update in-memory after successful disk write
                             _current_config = new_config
-                            _reverse_model_map = new_reverse_map
                             response_status = 200
                             response_body = json.dumps({"status": "ok"}).encode("utf-8")
                         except OSError as e:
@@ -1567,13 +1521,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 }).encode("utf-8"))
                 return
 
-            # Build reverse map
-            try:
-                new_reverse_map = build_reverse_map(new_config)
-            except ValueError as e:
-                self._send_response(400, json.dumps({"error": str(e)}).encode("utf-8"))
-                return
-
             # Drain-and-swap: wait for in-flight requests to complete before swapping
             # Phase 1: Set swap flag and wait for drain
             with _config_lock:
@@ -1600,7 +1547,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             try:
                 with _config_lock:
                     _current_config = new_config
-                    _reverse_model_map = new_reverse_map
             finally:
                 # Phase 4: Clear swap flag and signal completion
                 with _config_lock:
@@ -1734,7 +1680,7 @@ def main():
     args = parser.parse_args()
 
     global PROXY_PORT, PROXY_TRACE_FILE, PROXY_LOG_ALL
-    global _current_config, _reverse_model_map, _vendors, _config_path
+    global _current_config, _vendors, _config_path
 
     if args.port is not None:
         PROXY_PORT = args.port
@@ -1804,13 +1750,6 @@ def main():
         print("[proxy] ERROR: Config validation failed:", file=sys.stderr)
         for err in errors:
             print("[proxy]   - {}".format(err), file=sys.stderr)
-        sys.exit(1)
-
-    # Build reverse model map
-    try:
-        _reverse_model_map = build_reverse_map(_current_config)
-    except ValueError as e:
-        print("[proxy] ERROR: {}".format(e), file=sys.stderr)
         sys.exit(1)
 
     # Check if another proxy is already running on this port
