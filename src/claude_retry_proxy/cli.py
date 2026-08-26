@@ -340,6 +340,7 @@ def cmd_start(args):
     import shutil
     import socket
     import subprocess
+    import threading
 
     from . import vimcrypt
 
@@ -354,6 +355,8 @@ def cmd_start(args):
                         help="Path to config.json")
     parser.add_argument("--keys-path", type=str, default=None,
                         help="Path to keys-index.json")
+    parser.add_argument("--passphrase-file", type=str, default=None,
+                        help="Read passphrase from file (for non-interactive use)")
     parsed = parser.parse_args(args)
     port = parsed.port
     config_path = parsed.config_path or CONFIG_FILE
@@ -380,33 +383,56 @@ def cmd_start(args):
         print("ERROR: {}".format(err))
         return 1
 
-    # 3. Prompt passphrase
-    try:
-        passphrase = vimcrypt.prompt_hidden("Passphrase: ")
-    except (ValueError, KeyboardInterrupt) as e:
-        print("\nERROR: {}".format(e))
-        return 1
-
-    # 4. Decrypt keys-index.json
+    # 3. Load keys file (plain JSON or encrypted)
     try:
         with open(keys_path, "rb") as f:
             keys_data = f.read()
-        plaintext = vimcrypt.decrypt(keys_data, passphrase)
-        keys_json = json.loads(plaintext.decode("utf-8"))
-        if "vendors" not in keys_json:
-            print("ERROR: keys file missing 'vendors' key")
-            return 1
-        vendors = keys_json["vendors"]
-        _trace("cmd_start: decrypted {} vendors".format(len(vendors)))
     except FileNotFoundError:
         print("ERROR: Keys file not found: {}".format(keys_path))
         return 1
-    except ValueError as e:
-        print("ERROR: Decryption failed: {}".format(e))
+
+    _keys_encrypted = keys_data.startswith(b"VimCrypt~03!")
+
+    if _keys_encrypted:
+        # Encrypted: prompt for passphrase and decrypt
+        try:
+            if parsed.passphrase_file:
+                with open(parsed.passphrase_file, "r", encoding="utf-8") as f:
+                    passphrase = f.read().rstrip("\r\n")
+                if not passphrase:
+                    print("ERROR: Empty passphrase in file")
+                    return 1
+            else:
+                passphrase = vimcrypt.prompt_hidden("Passphrase: ")
+        except OSError as e:
+            print("ERROR: Cannot read passphrase file: {}".format(e))
+            return 1
+        except (ValueError, KeyboardInterrupt) as e:
+            print("\nERROR: {}".format(e))
+            return 1
+        try:
+            plaintext = vimcrypt.decrypt(keys_data, passphrase)
+            keys_json = json.loads(plaintext.decode("utf-8"))
+        except ValueError as e:
+            print("ERROR: Decryption failed: {}".format(e))
+            return 1
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            print("ERROR: Invalid keys file: {}".format(e))
+            return 1
+    else:
+        # Plain JSON: parse directly, no passphrase needed
+        passphrase = None  # signal to skip stdin piping below
+        try:
+            keys_json = json.loads(keys_data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            print("ERROR: Invalid keys file: {}".format(e))
+            return 1
+
+    if "vendors" not in keys_json:
+        print("ERROR: keys file missing 'vendors' key")
         return 1
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        print("ERROR: Invalid keys file: {}".format(e))
-        return 1
+    vendors = keys_json["vendors"]
+    _trace("cmd_start: loaded {} vendors".format(len(vendors)))
 
     # 5. Validate config against vendors
     tiers = config.get("tiers", {})
@@ -457,6 +483,8 @@ def cmd_start(args):
                  "--port", str(port),
                  "--config-path", config_path,
                  "--keys-path", keys_path]
+    if _keys_encrypted and parsed.passphrase_file:
+        proxy_cmd.extend(["--passphrase-file", parsed.passphrase_file])
     if parsed.log:
         proxy_cmd.extend(["--log", parsed.log])
     if getattr(parsed, "all"):
@@ -478,28 +506,36 @@ def cmd_start(args):
     )
     _trace("cmd_start: proxy spawned (pid={})".format(proc.pid))
 
-    # Pipe passphrase to server
-    try:
-        proc.stdin.write((passphrase + "\n").encode("utf-8"))
-        proc.stdin.close()
-    except (BrokenPipeError, OSError) as e:
-        _trace("cmd_start: stdin write failed: {}".format(e))
-        # Read stderr for error message
-        stderr_fh.flush()
+    # Pipe passphrase to server (only when keys are encrypted and no
+    # --passphrase-file was passed through)
+    if _keys_encrypted and not parsed.passphrase_file:
         try:
-            with open(stderr_fh.name, "rb") as f:
-                tail = f.read(2048).decode("utf-8", errors="replace")
-        except OSError:
-            tail = ""
-        print("ERROR: Server failed to start: {}".format(tail))
-        # Cleanup
-        if proc.poll() is None:
-            proc.terminate()
+            proc.stdin.write((passphrase + "\n").encode("utf-8"))
+            proc.stdin.close()
+        except (BrokenPipeError, OSError) as e:
+            _trace("cmd_start: stdin write failed: {}".format(e))
+            # Read stderr for error message
+            stderr_fh.flush()
+            try:
+                with open(stderr_fh.name, "rb") as f:
+                    tail = f.read(2048).decode("utf-8", errors="replace")
+            except OSError:
+                tail = ""
+            print("ERROR: Server failed to start: {}".format(tail))
+            # Cleanup
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                os.remove(PROXY_STATE_FILE)
+            except OSError:
+                pass
+            return 1
+    else:
+        # Plain keys or --passphrase-file: close stdin so server doesn't block
         try:
-            os.remove(PROXY_STATE_FILE)
+            proc.stdin.close()
         except OSError:
             pass
-        return 1
 
     def read_tail(fh, n):
         try:
@@ -532,11 +568,27 @@ def cmd_start(args):
     # 9.5. Wait for readiness marker from server (with timeout)
     readiness_timeout = 5.0  # seconds
     readiness_start = time.time()
-    ready_received = False
-    stderr_tail = ""
+    ready_event = threading.Event()
 
-    while time.time() - readiness_start < readiness_timeout:
-        # Check if process exited
+    def _read_stdout():
+        try:
+            for raw_line in proc.stdout:
+                line_str = raw_line.decode("utf-8", errors="replace").strip()
+                _trace("cmd_start: stdout: {}".format(line_str))
+                if line_str == "READY":
+                    ready_event.set()
+                    return
+        except (OSError, ValueError):
+            pass
+
+    _stdout_thread = threading.Thread(target=_read_stdout, daemon=True)
+    _stdout_thread.start()
+
+    ready_received = ready_event.wait(timeout=readiness_timeout)
+    if ready_received:
+        _trace("cmd_start: READY received")
+
+    if not ready_received:
         if proc.poll() is not None:
             _trace("cmd_start: proxy exited before READY")
             cleanup(kill_proc=False)
@@ -544,28 +596,12 @@ def cmd_start(args):
             print("ERROR: Proxy exited during startup")
             print(tail)
             return 1
-
-        # Try to read from stdout (non-blocking)
-        try:
-            import select
-            if select.select([proc.stdout], [], [], 0.1)[0]:
-                line = proc.stdout.readline()
-                if line:
-                    line_str = line.decode("utf-8", errors="replace").strip()
-                    _trace("cmd_start: stdout: {}".format(line_str))
-                    if line_str == "READY":
-                        ready_received = True
-                        _trace("cmd_start: READY received")
-                        break
-        except (OSError, ValueError):
-            # select or readline failed
-            pass
-
-    if not ready_received:
-        _trace("cmd_start: READY timeout after {:.1f}s".format(time.time() - readiness_start))
+        _trace("cmd_start: READY timeout after {:.1f}s".format(
+            time.time() - readiness_start))
         cleanup(kill_proc=True)
         tail = read_tail(stderr_fh, 2048)
-        print("ERROR: Proxy did not become ready within {:.0f}s".format(readiness_timeout))
+        print("ERROR: Proxy did not become ready within {:.0f}s".format(
+            readiness_timeout))
         print(tail)
         return 1
 

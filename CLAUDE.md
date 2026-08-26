@@ -125,11 +125,15 @@ paths resolve against cwd), `--all` (log full request/response bodies),
     `PROXY_MAX_BODY_SIZE` via `_read_capped`) and returns it to the client.
     On connection-error exhaustion, a synthesized `upstream_unreachable`
     JSON body is returned.
-- **Passphrase pipe protocol**: CLI writes passphrase + `\n` to `proc.stdin`,
-  closes stdin. Server reads one line from stdin in `main()` before
-  `serve_forever()`. On decryption failure, server prints error to stderr
-  and exits non-zero. CLI detects `proc.poll() != 0` as startup failure.
-  Direct invocation: prompts interactively when `sys.stdin.isatty()`,
+- **Passphrase pipe protocol**: When keys are encrypted (`VimCrypt~03!`),
+  CLI writes passphrase + `\n` to `proc.stdin`, closes stdin. Server reads
+  one line from stdin in `main()` before `serve_forever()`. On decryption
+  failure, server prints error to stderr and exits non-zero. CLI detects
+  `proc.poll() != 0` as startup failure. When keys are plain JSON, no
+  passphrase is sent — CLI closes stdin immediately, and the server skips
+  stdin read entirely. `--passphrase-file` passes the passphrase via the
+  server command line (instead of stdin) for non-interactive encrypted-key
+  starts. Direct invocation: prompts interactively when `sys.stdin.isatty()`,
   supports `--passphrase-file` for non-interactive use.
 
 ## Environment Variables (server)
@@ -144,7 +148,7 @@ paths resolve against cwd), `--all` (log full request/response bodies),
 | `PROXY_MAX_RESPONSE_SIZE` | 104857600 | Streaming response size cap, bytes (1024-1GiB). Responses exceeding this are truncated with a `response_size_cap_exceeded` warning trace event. |
 | `PROXY_LOG_ALL` | "" | Set to `1` to log full request/response bodies |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | Trace log path |
-| `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | Encrypted keys file path |
+| `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | Keys file path (encrypted or plain JSON) |
 
 Runtime artifacts (all under `~/.claude/`, hardcoded — see Gotchas):
 `proxy/config.json`, `proxy/proxy-state.json`,
@@ -216,6 +220,33 @@ does not block startup on failure).
   indefinitely. The in-flight request continues with its original config
   snapshot and completes normally. Same root cause as
   `shutdown-during-retry-sleep`.
+- **Two-phase readiness protocol.** `claude-retry-proxy start` uses a
+  two-phase readiness check: (1) wait for the server to print `READY` to
+  stdout (5s timeout), detected via a daemon thread reading `proc.stdout`
+  lines (cross-platform — the prior `select.select()` approach did not
+  work with pipe fds on Windows); (2) TCP probe the listen port (2s
+  timeout). Phase 1 catches early crashes (bad passphrase, config errors)
+  before the socket is bound; Phase 2 confirms the server is accepting
+  connections. The `READY` marker is printed by `server.py main()` after
+  `ThreadingHTTPServer(...)` construction but before `serve_forever()`.
+- **`disable_retry_claude_count_token` (default `false`).** Set to `true` in
+  `config.json` to skip retrying the `count_tokens` endpoint. Most third-party
+  providers return 503/connection-errors for this Anthropic-specific endpoint.
+  Without this flag, the proxy retries up to `PROXY_MAX_RETRIES` times
+  (default 10), wasting bandwidth and provider quota. The shipped template
+  defaults to `true`. Admin Apply preserves the flag; Reload reads it from disk.
+- **Keys file can be plain JSON (no encryption).** The server and CLI
+  auto-detect the format: if the file starts with `VimCrypt~03!` it is
+  decrypted with the passphrase; otherwise it is parsed as plain JSON
+  directly (no passphrase prompt). The server emits a stderr warning
+  (`[proxy] WARNING: keys file is plain JSON — API keys are stored
+  unencrypted on disk`) when plain keys are loaded. Plain files are
+  convenient for testing and automation but leave API keys unencrypted on
+  disk — restrict the file ACL on Windows with `icacls` (on POSIX
+  `os.chmod(0o600)` is applied automatically). The recommended approach for
+  production is to encrypt with `vim -n -x` (blowfish2, `VimCrypt~03!`, the
+  default). The `--passphrase-file` CLI option is only used when keys are
+  encrypted; with plain keys it is ignored.
 
 ## Documentation
 

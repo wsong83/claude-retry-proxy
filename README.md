@@ -10,7 +10,7 @@ It works with **any** upstream provider — official Anthropic, third-party
 gateways, or self-hosted endpoints. Different tiers can route to different
 providers simultaneously.
 
-Python 3.8+. `cryptography` package required (for encrypted key storage). MIT licensed.
+Python 3.8+. `cryptography` package required (for encrypted key storage; plain JSON keys files don't need it). MIT licensed.
 
 ## Why
 
@@ -48,10 +48,12 @@ Requires `setuptools >= 64` (for PEP 660 src-layout editable installs). Python
 #    ANTHROPIC_DEFAULT_HAIKU_MODEL = haiku
 #    ANTHROPIC_API_KEY = <any value — the proxy injects the real key>
 
-# 2. Prepare ~/.claude/keys-index.json (encrypted, vim blowfish2 format)
-#    with your provider URLs and API keys
+# 2. Prepare ~/.claude/keys-index.json with your provider URLs and API keys.
+#    Can be plain JSON (convenient for testing/automation) or encrypted
+#    with `vim -n -x` (blowfish2, VimCrypt~03!, recommended for production).
 
-# 3. Start the proxy (prompts for passphrase to decrypt keys)
+# 3. Start the proxy (prompts for passphrase if keys are encrypted;
+#    starts immediately if keys are plain JSON)
 claude-retry-proxy start
 
 # 4. Use Claude Code as usual — its traffic now flows through the proxy
@@ -148,22 +150,61 @@ directly on disk (use `claude-retry-proxy reload` after manual edits).
     "opus":   { "provider": "provider-c", "model": "claude-opus-5" }
   },
   "models": {
-    "haiku": ["claude-haiku-4-5-20251001", "model-x"],
-    "sonnet": ["claude-sonnet-5", "model-y"],
-    "opus": ["claude-opus-5", "model-z"]
-  }
+    "provider-a": ["claude-haiku-4-5-20251001", "model-x"],
+    "provider-b": ["claude-sonnet-5", "model-y"],
+    "provider-c": ["claude-opus-5", "model-z"]
+  },
+  "disable_retry_claude_count_token": true
 }
 ```
 
-The `models` section populates the admin page dropdowns. Each key is a tier
-name (`haiku`, `sonnet`, `opus`); the value is a list of model names shown in
-the admin page dropdown for that tier.
+The `models` section populates the admin page dropdowns. Each key is a provider
+name (matching the provider names in the tiers section); the value is a list of
+model names shown in the admin page dropdown when that provider is selected.
 
-### Keys file (`~/.claude/keys-index.json`)
+### `disable_retry_claude_count_token` (optional, boolean)
 
-Encrypted with vim blowfish2 (same format as `claude-config`). Contains
-provider URLs and API keys. Decrypted at startup; immutable during runtime
-(restart required to change).
+When `true`, the proxy does not retry the `/v1/messages/count_tokens` endpoint
+on failure — it attempts exactly once and returns the result immediately.
+Claude Code sends this for token accounting, but most third-party providers
+don't support it. Defaults to `false` when absent (retry as normal). The
+shipped config template sets it to `true`.
+
+```json
+"disable_retry_claude_count_token": true
+```
+
+### Keys file format (`~/.claude/keys-index.json`)
+
+The keys file can be either:
+
+- **Encrypted** (recommended for production): Encrypt with `vim -n -x
+  keys-index.json` using the default blowfish2 method (`VimCrypt~03!`).
+  The server and CLI will prompt for the passphrase. Use
+  `--passphrase-file` for non-interactive starts.
+
+- **Plain JSON** (convenient for testing/automation): A standard JSON file
+  with a `"vendors"` key. No passphrase is required. The server emits a
+  warning to stderr when plain keys are loaded. On Windows, restrict the
+  file ACL with `icacls` since `chmod` is a near-no-op.
+
+The format is auto-detected by checking for the `VimCrypt~03!` magic bytes
+at the start of the file. The JSON structure is the same in both cases:
+
+```json
+{
+  "vendors": {
+    "provider-a": {
+      "url": "https://api.anthropic.com",
+      "key": "sk-ant-api03-your-key-here"
+    },
+    "provider-b": {
+      "url": "https://api.openai.com",
+      "key": "sk-your-openai-key"
+    }
+  }
+}
+```
 
 ### Admin page (`http://localhost:8080/admin/`)
 
@@ -183,7 +224,7 @@ localhost-only with CSRF protection (Origin header validation).
 | `PROXY_MAX_RESPONSE_SIZE` | `104857600` | 1024–1 GiB | Streaming response size cap (bytes); larger → truncated with a warning trace event. |
 | `PROXY_LOG_ALL` | unset | `1` to enable | Log full request bodies; response bodies on error paths only (streamed 2xx bodies are not captured) |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | path | Trace log location |
-| `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | path | Encrypted keys file location |
+| `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | path | Keys file location (encrypted or plain JSON) |
 
 Backoff is `PROXY_INITIAL_DELAY * 2**attempt`, capped at `PROXY_MAX_DELAY`.
 **429** responses retry using `PROXY_MAX_DELAY` directly (maximal latency);

@@ -235,6 +235,14 @@ def validate_config(config, providers):
         if not model:
             errors.append("tier '{}' has empty model".format(tier_name))
 
+    # Validate disable_retry_claude_count_token is a boolean if present
+    if "disable_retry_claude_count_token" in config:
+        flag = config["disable_retry_claude_count_token"]
+        if not isinstance(flag, bool):
+            errors.append(
+                "disable_retry_claude_count_token must be a boolean "
+                "(true/false), got {}".format(type(flag).__name__))
+
     return errors
 
 
@@ -319,6 +327,55 @@ def decrypt_keys(path, passphrase):
     if not isinstance(vendors, dict):
         raise ValueError("'vendors' must be an object")
     # Validate each vendor has url and key
+    for name, vendor in vendors.items():
+        if not isinstance(vendor, dict):
+            raise ValueError("vendor '{}' must be an object".format(name))
+        if "url" not in vendor:
+            raise ValueError("vendor '{}' missing 'url'".format(name))
+        if "key" not in vendor:
+            raise ValueError("vendor '{}' missing 'key'".format(name))
+    return vendors
+
+
+def load_keys_file(path, passphrase=None):
+    """Load keys-index.json (encrypted or plain) and return vendors table.
+
+    If the file starts with VimCrypt~03!, passphrase is required and the
+    file is decrypted. Otherwise, the file is parsed as plain JSON
+    (passphrase is ignored).
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+
+    if data.startswith(b"VimCrypt~03!"):
+        if not passphrase:
+            raise ValueError("passphrase required for encrypted keys file")
+        plaintext = vimcrypt.decrypt(data, passphrase)
+    else:
+        # Reject other VimCrypt~ prefixes (e.g. blowfish1) to avoid confusing
+        # "not valid JSON" errors
+        if data.startswith(b"VimCrypt~"):
+            raise ValueError(
+                "unsupported vim encryption method — only blowfish2 "
+                "(VimCrypt~03!) is supported"
+            )
+        plaintext = data
+
+    try:
+        text = plaintext.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError("keys file is not valid UTF-8: {}".format(e))
+    try:
+        keys_data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError("keys file is not valid JSON: {}".format(e))
+    if not isinstance(keys_data, dict):
+        raise ValueError("keys file must be a JSON object")
+    if "vendors" not in keys_data:
+        raise ValueError("keys file missing 'vendors' key")
+    vendors = keys_data["vendors"]
+    if not isinstance(vendors, dict):
+        raise ValueError("'vendors' must be an object")
     for name, vendor in vendors.items():
         if not isinstance(vendor, dict):
             raise ValueError("vendor '{}' must be an object".format(name))
@@ -582,13 +639,13 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                           config, vendors, reverse_map):
     """Internal implementation of forward_request with snapshot reverse_map."""
     if method not in ALLOWED_METHODS:
-        return 400, {}, b'{"error":"Method not allowed"}', 0, 0, 0, "unknown", None
+        return 400, {}, b'{"error":"Method not allowed"}', 0, 0, 0, "unknown", None, None
 
     if not ALLOWED_PATH_RE.match(path):
-        return 400, {}, b'{"error":"Path not allowed"}', 0, 0, 0, "unknown", None
+        return 400, {}, b'{"error":"Path not allowed"}', 0, 0, 0, "unknown", None, None
 
     if body and len(body) > PROXY_MAX_BODY_SIZE:
-        return 413, {}, b'{"error":"Payload too large"}', 0, 0, 0, "unknown", None
+        return 413, {}, b'{"error":"Payload too large"}', 0, 0, 0, "unknown", None, None
 
     # Resolve tier from model name
     model_name = extract_model(body)
@@ -602,7 +659,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
             "error": "Unrecognized model: {}. Valid tiers: {}".format(
                 model_name, ", ".join(valid_tiers))
         })
-        return 400, {}, err_msg.encode("utf-8"), 0, 0, 0, "unknown", None
+        return 400, {}, err_msg.encode("utf-8"), 0, 0, 0, "unknown", None, None
 
     # Look up provider and upstream info
     tier_config = config["tiers"][tier]
@@ -621,7 +678,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                 "message": "Provider '{}' has invalid URL: {}".format(provider_name, upstream_url)
             }
         })
-        return 500, {}, err_msg.encode("utf-8"), 0, 0, 0, tier, provider_name
+        return 500, {}, err_msg.encode("utf-8"), 0, 0, 0, tier, provider_name, actual_model
 
     host, port, use_ssl, path_prefix = parsed
 
@@ -653,7 +710,15 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     last_status = None
     retries = 0
 
-    for attempt in range(PROXY_MAX_RETRIES + 1):
+    # Skip retry for count_tokens when disabled (avoids wasting bandwidth
+    # on providers that don't support this Anthropic-specific endpoint)
+    disable_retry = config.get("disable_retry_claude_count_token", False)
+    _is_count_tokens = path.split("?", 1)[0].rstrip("/").endswith(
+        "/messages/count_tokens")
+    max_attempts = 1 if (disable_retry and _is_count_tokens) \
+                   else PROXY_MAX_RETRIES + 1
+
+    for attempt in range(max_attempts):
         try:
             if use_ssl:
                 conn = http.client.HTTPSConnection(host, port, timeout=300)
@@ -665,7 +730,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
 
             if resp.status in (429, 503):
                 last_status = resp.status
-                if attempt < PROXY_MAX_RETRIES:
+                if attempt < max_attempts - 1:
                     if resp.status == 429:
                         delay = compute_jittered_delay(PROXY_MAX_DELAY)
                         reason = "429"
@@ -681,14 +746,18 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                         pass
                     retries += 1
                     increment_retried()
-                    print("[proxy] {} on attempt {}/{}, retrying in {}s".format(
-                        reason, attempt + 1, PROXY_MAX_RETRIES + 1, delay), file=sys.stderr)
+                    print("[proxy] {} on attempt {}/{}, model={}, provider={}, rid={}, retrying in {}s".format(
+                        reason, attempt + 1, max_attempts, actual_model,
+                        provider_name, request_id, delay), file=sys.stderr)
                     log_trace({
                         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "event": "retry",
                         "attempt": attempt + 1,
                         "delay_s": delay,
                         "reason": reason,
+                        "model": actual_model,
+                        "provider": provider_name,
+                        "request_id": request_id,
                         "path": path,
                     })
                     time.sleep(delay)
@@ -700,7 +769,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                         conn.close()
                     except OSError:
                         pass
-                    return resp.status, {}, err_body, None, time.time() - total_start, retries, tier, provider_name
+                    return resp.status, {}, err_body, None, time.time() - total_start, retries, tier, provider_name, actual_model
 
             # Non-retryable response
             resp_headers = dict(resp.getheaders())
@@ -716,7 +785,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                         tier=tier, reverse_map=reverse_map)
                     conn.close()
                     return (resp.status, resp_headers, b"",
-                            first_byte_ms, time.time() - total_start, retries, tier, provider_name)
+                            first_byte_ms, time.time() - total_start, retries, tier, provider_name, actual_model)
                 elif "application/json" in content_type and reverse_map:
                     # JSON: buffer, parse, rewrite model, return (don't stream)
                     first_byte_start = time.time()
@@ -743,7 +812,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                     resp_headers["Content-Length"] = str(len(resp_body))
 
                     return (resp.status, resp_headers, resp_body,
-                            first_byte_elapsed, total_elapsed, retries, tier, provider_name)
+                            first_byte_elapsed, total_elapsed, retries, tier, provider_name, actual_model)
                 else:
                     # Other content types: stream unchanged
                     first_byte_ms = handler._stream_upstream_response(
@@ -751,7 +820,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                         tier=tier, reverse_map=reverse_map)
                     conn.close()
                     return (resp.status, resp_headers, b"",
-                            first_byte_ms, time.time() - total_start, retries, tier, provider_name)
+                            first_byte_ms, time.time() - total_start, retries, tier, provider_name, actual_model)
 
             # Non-2xx or no handler — buffer the body so upstream error content
             # stays in the trace log.
@@ -781,22 +850,26 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                 resp_headers["Content-Length"] = str(len(resp_body))
 
             return (resp.status, resp_headers, resp_body,
-                    first_byte_elapsed, total_elapsed, retries, tier, provider_name)
+                    first_byte_elapsed, total_elapsed, retries, tier, provider_name, actual_model)
 
         except (socket.error, ConnectionError, OSError) as e:
             last_status = 0
-            if attempt < PROXY_MAX_RETRIES:
+            if attempt < max_attempts - 1:
                 delay = compute_jittered_delay(compute_delay(attempt))
                 retries += 1
                 increment_retried()
-                print("[proxy] Connection error on attempt {}: {}, retrying in {}s".format(
-                    attempt + 1, e, delay), file=sys.stderr)
+                print("[proxy] Connection error on attempt {}/{}, model={}, provider={}, rid={}: {}, retrying in {}s".format(
+                    attempt + 1, max_attempts, actual_model, provider_name,
+                    request_id, e, delay), file=sys.stderr)
                 log_trace({
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "event": "retry",
                     "attempt": attempt + 1,
                     "delay_s": delay,
                     "reason": "connection_error",
+                    "model": actual_model,
+                    "provider": provider_name,
+                    "request_id": request_id,
                     "error": sanitize_error(str(e)),
                     "path": path,
                 })
@@ -811,10 +884,10 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                             sanitize_error(str(e)) or "connection failed", retries),
                     }
                 }).encode("utf-8")
-                return 0, {}, err_body, None, total_elapsed, retries, tier, provider_name
+                return 0, {}, err_body, None, total_elapsed, retries, tier, provider_name, actual_model
 
     total_elapsed = time.time() - total_start
-    return last_status or 0, {}, b'', None, total_elapsed, retries, tier, provider_name
+    return last_status or 0, {}, b'', None, total_elapsed, retries, tier, provider_name, actual_model
 
 
 # ---------------------------------------------------------------------------
@@ -1427,6 +1500,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         "tiers": new_tiers,
                         "models": _current_config.get("models", {})
                     }
+                    # Preserve known top-level config keys across hot-switches
+                    for _key in ("disable_retry_claude_count_token",):
+                        if _key in _current_config:
+                            new_config[_key] = _current_config[_key]
                     try:
                         new_reverse_map = build_reverse_map(new_config)
                     except ValueError as e:
@@ -1572,7 +1649,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         increment_total()
 
-        status, resp_headers, resp_body, first_byte_ms, total_sec, retries, tier, provider = \
+        status, resp_headers, resp_body, first_byte_ms, total_sec, retries, tier, provider, actual_model = \
             forward_request(self.command, self.path,
                             {k: v for k, v in self.headers.items()},
                             body, handler=self, request_id=request_id)
@@ -1590,7 +1667,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "request_id": request_id,
             "method": self.command,
             "path": self.path,
-            "model": model,
+            "model": actual_model or model,
             "tier": tier,
             "provider": provider,
             "status": "success" if success else "failure",
@@ -1657,7 +1734,7 @@ def main():
     args = parser.parse_args()
 
     global PROXY_PORT, PROXY_TRACE_FILE, PROXY_LOG_ALL
-    global _current_config, _reverse_model_map, _vendors
+    global _current_config, _reverse_model_map, _vendors, _config_path
 
     if args.port is not None:
         PROXY_PORT = args.port
@@ -1672,26 +1749,39 @@ def main():
     config_path = args.config_path or DEFAULT_CONFIG_PATH
     keys_path = args.keys_path or PROXY_KEYS_PATH
 
-    # Read passphrase
-    if args.passphrase_file:
-        try:
-            with open(args.passphrase_file, "r", encoding="utf-8") as f:
-                passphrase = f.read().rstrip("\r\n")
-        except OSError as e:
-            print("[proxy] ERROR: Cannot read passphrase file: {}".format(e), file=sys.stderr)
-            sys.exit(1)
-        if not passphrase:
-            print("[proxy] ERROR: Empty passphrase in file", file=sys.stderr)
-            sys.exit(1)
-    else:
-        passphrase = read_passphrase_from_stdin()
-
-    # Decrypt keys
+    # Read keys file and detect format
     try:
-        _vendors = decrypt_keys(keys_path, passphrase)
+        with open(keys_path, "rb") as _kf:
+            _keys_data = _kf.read()
     except FileNotFoundError:
         print("[proxy] ERROR: Keys file not found: {}".format(keys_path), file=sys.stderr)
         sys.exit(1)
+
+    _needs_passphrase = _keys_data.startswith(b"VimCrypt~03!")
+
+    if _needs_passphrase:
+        # Read passphrase (same logic as before)
+        if args.passphrase_file:
+            try:
+                with open(args.passphrase_file, "r", encoding="utf-8") as f:
+                    passphrase = f.read().rstrip("\r\n")
+            except OSError as e:
+                print("[proxy] ERROR: Cannot read passphrase file: {}".format(e), file=sys.stderr)
+                sys.exit(1)
+            if not passphrase:
+                print("[proxy] ERROR: Empty passphrase in file", file=sys.stderr)
+                sys.exit(1)
+        else:
+            passphrase = read_passphrase_from_stdin()
+    else:
+        passphrase = None
+        # Warn about plain keys at-rest exposure (mirrors --all warning)
+        print("[proxy] WARNING: keys file is plain JSON — API keys are stored "
+              "unencrypted on disk", file=sys.stderr)
+
+    # Load keys (decrypts if encrypted, parses plain JSON otherwise)
+    try:
+        _vendors = load_keys_file(keys_path, passphrase)
     except ValueError as e:
         print("[proxy] ERROR: Key decryption failed: {}".format(e), file=sys.stderr)
         sys.exit(1)

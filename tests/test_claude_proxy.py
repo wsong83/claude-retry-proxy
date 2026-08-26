@@ -1,58 +1,26 @@
-"""Test suite for claude-retry-proxy — HTTP retry proxy with URL swapping.
+"""Test suite for claude-retry-proxy — HTTP retry proxy with tier routing.
 
-Covers 36 test cases:
-  1-11 from plan 2026-07-15-manual-proxy Guidance for Tester:
-    1. URL swapping: start replaces URL in settings, stop restores it
-    2. Crash recovery: stale lock recovery on restart
-    3. Race conditions: concurrent start calls rejected while proxy runs
-    4. Concurrent requests: 10+ parallel requests complete
-    5. Retry logic: 429 and 503 retried with jittered exponential backoff
-    6. Trace markers: start/end events logged with counters
-    7. URL validation: rejects localhost URLs at startup
-    8. Manual edit detection: stop after manual edit warns
-    9. Thread safety: N parallel requests produce N trace entries
-    10. PID in lock: lock contains server PID, second start detects 'already running'
-  11-12 from plan 2026-07-16-fix-proxy-start-silent-failure Guidance for Tester:
-    11. Relative log path: '-l relative.jsonl' with cwd resolves to temp dir
-    12. Start early-exit rollback: port pre-occupied, rollback restores settings and removes lock
-  13-19 from plan 2026-07-16-fix-proxy-stop-cleanup Guidance for Tester:
-    13. Stop cleans proxy-state.json: taskkill /F bypasses server cleanup, stop compensates
-    14. Stop cleans lock on write failure: write_settings_url raises, lock still deleted, stderr has URL
-    15. Stop kills proxy with non-localhost URL: kill moved before early-return check
-    16. release_swap_lock retries: os.remove fails 3x then succeeds, function retries
-    17. release_swap_lock warns on final failure: os.remove always fails, warning to stderr
-    18. Trace logs oversized body: 413 logged with status:failure, http_status:413
-  19-22 from plan 2026-07-16-fix-proxy-stop-tracing Guidance for Tester:
-    19. Stop trace no proxy: stop with no proxy prints trace to stderr, exits 0
-    20. Stop trace with proxy: stop with running proxy shows full kill→cleanup→restore sequence
-    21. Stop cleans proxy-state.lock: cmd_stop removes orphaned proxy-state.lock
-    22. Start stdout not contaminated: stdout is DEVNULL (no auth token), trace on stderr only
-  23-24 from plan 2026-07-16-remove-proxy-auth Guidance for Tester:
-    23. Start no auth header required: POST without X-Proxy-Auth returns 200 (not 401)
-    24. Proxy state no auth token: proxy-state.json does not contain auth_token field
-  25-28b from plan 2026-07-19-fix-giveup-body-and-trace-prune Guidance for Tester:
-    25. Exhaust 429 preserves body: client receives 429 with body containing 'rate_limited' (not empty)
-    26. Exhaust connection error synthesizes body: trace 'error' field contains 'upstream_unreachable'
-    27. Client disconnect no traceback: stderr has no Traceback, contains disconnect message
-    28. Start prunes old trace entries: prune_trace_file returns (2, 1), removes old entries
-    28b. Prune trace file edge cases: nonexistent file → (0, 0), empty file → (0, 0)
-  29-32 from plan 2026-08-12-streaming-proxy Guidance for Tester:
-    29. Streaming response body: 5 chunks streamed with delays reach client in order, first byte fast
-    30. Streaming mid-stream upstream failure: truncated upstream → partial body, no traceback, no client_disconnect event
-    31. Empty body 429 exhaust: client receives proper 429 status line (streamed-flag regression guard)
-    32. CRLF header filter: _crlf_safe drops CR/LF headers, keeps clean ones
+Behavioral tests covering:
+  - Retry/backoff: 429 and 503 retried with jittered exponential backoff,
+    exhaustion paths (body preservation, synthesized upstream_unreachable)
+  - Tier routing: model resolution, provider routing, reverse-map, pattern match
+  - Response model rewriting: SSE and JSON paths, unmapped-model passthrough
+  - Admin API: config GET, tier switch (validation, CSRF, models preservation),
+    reload from disk, missing-tier/invalid-provider rejection
+  - CLI: start (stdout cleanliness, missing/invalid config, template copy),
+    stop (state cleanup, trace lines), reload, status
+  - Config/keys: validation, encrypted + plain keys-index.json, wrong passphrase
+  - Trace log: markers, oversized-body 413, retry event enrichment, pruning
+  - Streaming: response streaming, mid-stream upstream failure, disconnect
 
 Run: pip install -e .  then  python tests/test_claude_proxy.py
 Requires: Python 3.8+, no external dependencies (stdlib-only tests).
 
-WARNING: Tests 1-3, 7-10, 11-17 modify the user's ~/.claude/settings.json.
-         They save/restore the original settings state. Do not run casually
-         by third-party installers — these tests mutate live config.
-
-PUBLIC PACKAGE NOTE: This is a pip-installable public package. Tests that
-start the proxy via the CLI (tests 1-3, 7-10, 12-17) modify the real
-~/.claude/settings.json. The backup/restore helpers protect your config,
-but these tests should not be run casually by third-party installers.
+NOTE: CLI tests use hardcoded ~/.claude/proxy/proxy-state.json (the CLI's
+state path). They back up/restore that file and isolate config/keys/log via
+--config-path/--keys-path/--log, so the user's real proxy config is not
+touched. Tests should not be run while a production proxy on the same state
+file is active.
 """
 
 import argparse
@@ -80,6 +48,7 @@ PROXY_SERVER = [sys.executable, "-m", "claude_retry_proxy.server"]
 
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
 PROXY_DIR = os.path.join(os.path.expanduser("~"), ".claude", "proxy")
+PROXY_STATE_FILE = os.path.join(PROXY_DIR, "proxy-state.json")
 URL_LOCK_FILE = os.path.join(PROXY_DIR, "base-url.lock")
 URL_SWAP_LOCK_FILE = os.path.join(PROXY_DIR, "url-swap.lock")
 
@@ -105,52 +74,6 @@ def pass_(msg):
     print(f"  PASS: {msg}")
 
 
-# ---------------------------------------------------------------------------
-# Settings backup/restore (protects user's real config)
-# ---------------------------------------------------------------------------
-
-_settings_backup = None
-
-
-def backup_settings():
-    """Save current settings.json content for later restoration."""
-    global _settings_backup
-    if os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE) as f:
-            _settings_backup = f.read()
-
-
-def restore_settings():
-    """Restore settings.json to its backed-up state."""
-    if _settings_backup is not None:
-        with open(SETTINGS_FILE, "w") as f:
-            f.write(_settings_backup)
-
-
-def read_settings():
-    with open(SETTINGS_FILE) as f:
-        return json.load(f)
-
-
-def write_settings(data):
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
-
-
-def get_base_url():
-    data = read_settings()
-    return data.get("env", {}).get("ANTHROPIC_BASE_URL", "")
-
-
-def set_base_url(url):
-    data = read_settings()
-    if "env" not in data:
-        data["env"] = {}
-    data["env"]["ANTHROPIC_BASE_URL"] = url
-    write_settings(data)
-
-
 def cleanup_lock_files():
     """Remove proxy lock files left from previous test runs."""
     for f in [URL_LOCK_FILE, URL_SWAP_LOCK_FILE]:
@@ -158,6 +81,51 @@ def cleanup_lock_files():
             os.remove(f)
         except OSError:
             pass
+
+
+def _backup_proxy_state():
+    """Back up proxy-state.json, return backup content or None."""
+    if os.path.exists(PROXY_STATE_FILE):
+        with open(PROXY_STATE_FILE) as f:
+            return f.read()
+    return None
+
+
+def _restore_proxy_state(backup):
+    """Restore proxy-state.json from backup, or delete if None."""
+    if backup is not None:
+        os.makedirs(PROXY_DIR, exist_ok=True)
+        with open(PROXY_STATE_FILE, "w") as f:
+            f.write(backup)
+    else:
+        try:
+            os.remove(PROXY_STATE_FILE)
+        except OSError:
+            pass
+
+
+def _cli_start_with_plain_keys(port, config_path, keys_path, trace_file):
+    """Start proxy via CLI with plain keys. Returns (proc, stdout, stderr, returncode)."""
+    cmd = CLAUDE_PROXY + [
+        "start", "--port", str(port),
+        "--config-path", config_path,
+        "--keys-path", keys_path,
+        "--log", trace_file
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.PIPE, text=True)
+    # Close stdin — plain keys, no passphrase needed
+    try:
+        proc.stdin.close()
+    except OSError:
+        pass
+    try:
+        stdout, stderr = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        return proc, "", "", "timeout"
+    return proc, stdout, stderr, proc.returncode
 
 
 def start_proxy(port=19876, extra_args=None, timeout=30):
@@ -293,6 +261,14 @@ def _create_test_keys(temp_dir, vendors, passphrase="test-passphrase"):
     return path
 
 
+def _create_test_keys_plain(temp_dir, vendors):
+    """Create a plain (unencrypted) keys-index.json for testing."""
+    path = os.path.join(temp_dir, "keys-index.json")
+    with open(path, "w") as f:
+        json.dump({"vendors": vendors}, f)
+    return path
+
+
 def _start_proxy_server_directly(port, config_path=None, keys_path=None,
                                   passphrase="test-passphrase", trace_file=None, cwd=None):
     """Start proxy server directly (not via claude-retry-proxy CLI) for testing.
@@ -330,13 +306,21 @@ def _start_proxy_server_directly(port, config_path=None, keys_path=None,
         text=True, cwd=cwd
     )
 
-    # Pipe passphrase to server
-    if proc.stdin:
-        try:
-            proc.stdin.write(passphrase + "\n")
-            proc.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
+    # Pipe passphrase to server (or close stdin for plain keys)
+    if passphrase is not None:
+        if proc.stdin:
+            try:
+                proc.stdin.write(passphrase + "\n")
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+    else:
+        # Plain keys: close stdin so server doesn't block on read
+        if proc.stdin:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
 
     # Wait for server to be ready
     deadline = time.time() + 10
@@ -373,6 +357,22 @@ def _send_proxy_request(port, path="/v1/messages", body=None):
     except Exception as e:
         conn.close()
         return 0, str(e).encode()
+
+
+def _admin_post(proxy_port, path, body, origin=None):
+    """POST to admin API with CSRF Origin header. Returns (status, data)."""
+    import http.client as _hc
+    conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+    headers = {"Content-Type": "application/json"}
+    if origin is not None:
+        headers["Origin"] = origin
+    else:
+        headers["Origin"] = "http://127.0.0.1:{}".format(proxy_port)
+    conn.request("POST", path, body=json.dumps(body), headers=headers)
+    resp = conn.getresponse()
+    data = resp.read().decode()
+    conn.close()
+    return resp.status, data
 
 
 def test_concurrent_requests():
@@ -1502,37 +1502,52 @@ def test_relative_log_path():
 # ===========================================================================
 
 def test_stop_cleans_proxy_state():
-    """Start proxy, kill server with taskkill /F, run stop, verify proxy-state.json deleted."""
+    """Start proxy, force-kill server, run stop, verify proxy-state.json deleted."""
     print("\n--- Test 13: Stop Cleans proxy-state.json ---")
-    backup_settings()
+    state_backup = _backup_proxy_state()
     cleanup_lock_files()
 
-    STATE_FILE = os.path.join(PROXY_DIR, "proxy-state.json")
-
     try:
+        # Ensure cmd_start doesn't refuse with "Proxy already running"
+        try:
+            os.remove(PROXY_STATE_FILE)
+        except OSError:
+            pass
+
         port = find_free_port()
+        temp_dir = tempfile.mkdtemp(prefix="proxy_stop_state_")
+        try:
+            config_path = _create_test_config(temp_dir, {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            })
+            keys_path = _create_test_keys_plain(temp_dir, {
+                "p": {"url": f"http://127.0.0.1:{find_free_port()}", "key": "k"}
+            })
+            trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
+            os.close(trace_fd)
 
-        # Start proxy
-        info(f"Starting proxy on port {port}...")
-        result = subprocess.run(
-            CLAUDE_PROXY + ["start", "--port", str(port)],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            fail(f"Start failed: {result.stdout} {result.stderr}")
-            return
+            # Start proxy via CLI (writes proxy-state.json)
+            info(f"Starting proxy on port {port}...")
+            proc, stdout, stderr, rc = _cli_start_with_plain_keys(
+                port, config_path, keys_path, trace_file)
+            if rc != 0:
+                fail(f"Start failed (exit {rc}): {stdout} {stderr}")
+                return
 
-        # Verify proxy-state.json exists (server creates it on startup)
-        if not os.path.exists(STATE_FILE):
-            fail("proxy-state.json not found after start — server may not have created it")
-            return
-        pass_("proxy-state.json exists after proxy start")
+            # Verify proxy-state.json exists (server creates it on startup)
+            if not os.path.exists(PROXY_STATE_FILE):
+                fail("proxy-state.json not found after start — server may not have created it")
+                return
+            pass_("proxy-state.json exists after proxy start")
 
-        # Kill the server process forcefully (simulating Windows taskkill /F)
-        if os.path.exists(URL_LOCK_FILE):
-            with open(URL_LOCK_FILE) as f:
-                lock_data = json.load(f)
-            pid = lock_data.get("pid")
+            # Read PID from proxy-state.json
+            with open(PROXY_STATE_FILE) as f:
+                state = json.load(f)
+            pid = state.get("pid")
+
+            # Force-kill the server process (simulating Windows taskkill /F)
             if pid:
                 info(f"Force-killing proxy process PID {pid}...")
                 if sys.platform == "win32":
@@ -1544,30 +1559,47 @@ def test_stop_cleans_proxy_state():
                         pass
                 time.sleep(0.5)
 
-        # Verify proxy-state.json still exists (force kill bypasses server finally block)
-        if os.path.exists(STATE_FILE):
-            pass_("proxy-state.json still exists after taskkill /F (server cleanup bypassed)")
-        else:
-            warn("proxy-state.json already gone — server may have cleaned up; test may be inconclusive")
+            # Verify proxy-state.json still exists (force kill bypasses server finally block)
+            if os.path.exists(PROXY_STATE_FILE):
+                pass_("proxy-state.json still exists after taskkill /F (server cleanup bypassed)")
+            else:
+                warn("proxy-state.json already gone — server may have cleaned up; test may be inconclusive")
 
-        # Run stop — should clean up proxy-state.json
-        info("Running claude-retry-proxy stop...")
-        result = subprocess.run(
-            CLAUDE_PROXY + ["stop"],
-            capture_output=True, text=True, timeout=10
-        )
+            # Run stop — should clean up proxy-state.json
+            info("Running claude-retry-proxy stop...")
+            stop_result = subprocess.run(
+                CLAUDE_PROXY + ["stop"],
+                capture_output=True, text=True, timeout=10
+            )
+            stderr = stop_result.stderr
 
-        # Verify proxy-state.json is deleted
-        if not os.path.exists(STATE_FILE):
-            pass_("proxy-state.json deleted by claude-retry-proxy stop")
-        else:
-            fail("proxy-state.json still exists after stop — not cleaned up by cmd_stop")
+            # Verify proxy-state.json is deleted
+            if not os.path.exists(PROXY_STATE_FILE):
+                pass_("proxy-state.json deleted by claude-retry-proxy stop")
+            else:
+                fail("proxy-state.json still exists after stop — not cleaned up by cmd_stop")
 
-        # Verify lock is also cleaned up
-        if not os.path.exists(URL_LOCK_FILE):
-            pass_("base-url.lock also cleaned up")
-        else:
-            fail("base-url.lock still exists after stop")
+            # Assert trace lines (dead-PID flow: force-kill, no graceful shutdown)
+            if "cmd_stop: entering" in stderr:
+                pass_("stderr trace shows 'cmd_stop: entering'")
+            else:
+                fail(f"stderr missing 'cmd_stop: entering'. stderr: {stderr[:300]}")
+            if "cmd_stop: returning 0" in stderr:
+                pass_("stderr trace shows 'cmd_stop: returning 0'")
+            else:
+                fail(f"stderr missing 'cmd_stop: returning 0'. stderr: {stderr[:300]}")
+            if "proxy-state.json removed" in stderr or "proxy-state.json not found" in stderr:
+                pass_("stderr trace shows proxy-state.json cleanup")
+            else:
+                fail(f"stderr missing proxy-state.json cleanup line. stderr: {stderr[:300]}")
+
+            if stop_result.returncode != 0:
+                fail(f"stop exited {stop_result.returncode}: {stop_result.stdout} {stderr}")
+            else:
+                pass_(f"stop exit code 0 ({stop_result.returncode})")
+
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     finally:
         cleanup_lock_files()
@@ -1575,333 +1607,15 @@ def test_stop_cleans_proxy_state():
             CLAUDE_PROXY + ["stop"],
             capture_output=True, text=True, timeout=10
         )
-        restore_settings()
-
-
-# ===========================================================================
-# Test Case 14: Stop Cleans Lock on write_settings_url Failure
-# ===========================================================================
-
-def test_stop_cleans_lock_on_write_failure():
-    """Mock write_settings_url to raise; verify base-url.lock deleted and stderr has original URL."""
-    print("\n--- Test 14: Stop Cleans Lock on write_settings_url Failure ---")
-    backup_settings()
-    cleanup_lock_files()
-
-    try:
-        import claude_retry_proxy.cli as cpm
-
-        # Set up state: create a valid base-url.lock and point settings to localhost
-        original_url = get_base_url()
-        if not original_url:
-            fail("ANTHROPIC_BASE_URL is not set — cannot test")
-            return
-
-        port = find_free_port()
-
-        # Start proxy first to create proper lock state
-        info(f"Starting proxy on port {port}...")
-        result = subprocess.run(
-            CLAUDE_PROXY + ["start", "--port", str(port)],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            fail(f"Start failed: {result.stdout} {result.stderr}")
-            return
-
-        # Kill the proxy process (we only need the lock file state)
-        if os.path.exists(URL_LOCK_FILE):
-            with open(URL_LOCK_FILE) as f:
-                lock_data = json.load(f)
-            pid = lock_data.get("pid")
-            if pid:
-                if sys.platform == "win32":
-                    subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
-                else:
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except OSError:
-                        pass
-                time.sleep(0.3)
-
-        # Mock write_settings_url (module already loaded via import)
-        original_write = None
+        # Remove the stale state file so the restore reliably puts back the
+        # pre-test backup (server wrote state on startup, force-kill bypassed
+        # its cleanup, leaving a dead test PID).
         try:
-            original_write = cpm.write_settings_url
+            os.remove(PROXY_STATE_FILE)
+        except OSError:
+            pass
+        _restore_proxy_state(state_backup)
 
-            # Replace write_settings_url with a version that always raises
-            def _failing_write(url):
-                raise PermissionError("Simulated write failure for testing")
-
-            cpm.write_settings_url = _failing_write
-
-            # Capture stderr
-            import io
-            saved_stderr = sys.stderr
-            sys.stderr = io.StringIO()
-
-            try:
-                exit_code = cpm.cmd_stop([])
-            finally:
-                stderr_output = sys.stderr.getvalue()
-                sys.stderr = saved_stderr
-
-            # Restore original
-            cpm.write_settings_url = original_write
-
-            # Verify: base-url.lock is deleted
-            if not os.path.exists(URL_LOCK_FILE):
-                pass_("base-url.lock deleted even though write_settings_url failed")
-            else:
-                fail("base-url.lock NOT deleted after write_settings_url failure")
-
-            # Verify: stderr contains the original URL
-            if original_url in stderr_output:
-                pass_(f"stderr contains original URL: '{original_url}'")
-            else:
-                fail(f"stderr does NOT contain original URL. stderr: {stderr_output[:200]}")
-
-            # Verify: error message on stderr
-            if stderr_output.strip():
-                pass_("Error message printed to stderr on write failure")
-            else:
-                fail("No error message on stderr — failure was silent")
-
-        finally:
-            if original_write:
-                cpm.write_settings_url = original_write
-
-    finally:
-        cleanup_lock_files()
-        subprocess.run(
-            CLAUDE_PROXY + ["stop"],
-            capture_output=True, text=True, timeout=10
-        )
-        restore_settings()
-
-
-# ===========================================================================
-# Test Case 15: Stop Kills Proxy with Non-localhost URL
-# ===========================================================================
-
-def test_stop_kills_proxy_with_non_localhost_url():
-    """Set settings to non-localhost URL, start proxy, run stop — verify proxy process killed."""
-    print("\n--- Test 15: Stop Kills Proxy with Non-localhost URL ---")
-    backup_settings()
-    cleanup_lock_files()
-
-    try:
-        original_url = get_base_url()
-        if not original_url:
-            fail("ANTHROPIC_BASE_URL is not set — cannot test")
-            return
-
-        port = find_free_port()
-
-        # Start proxy normally
-        info(f"Starting proxy on port {port}...")
-        result = subprocess.run(
-            CLAUDE_PROXY + ["start", "--port", str(port)],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            fail(f"Start failed: {result.stdout} {result.stderr}")
-            return
-
-        # Read lock to get the proxy PID
-        if not os.path.exists(URL_LOCK_FILE):
-            fail("base-url.lock not found after start")
-            return
-        with open(URL_LOCK_FILE) as f:
-            lock_data = json.load(f)
-        proxy_pid = lock_data.get("pid")
-        info(f"Proxy PID from lock: {proxy_pid}")
-
-        # Verify proxy is alive
-        if not proxy_pid:
-            fail("No PID in lock file")
-            return
-
-        import subprocess as sp
-        if sys.platform == "win32":
-            r = sp.run(["tasklist", "/FI", f"PID eq {proxy_pid}"], capture_output=True, text=True)
-            if str(proxy_pid) not in r.stdout:
-                fail(f"Proxy PID {proxy_pid} not alive before stop — cannot test")
-                return
-        else:
-            try:
-                os.kill(proxy_pid, 0)
-            except OSError:
-                fail(f"Proxy PID {proxy_pid} not alive before stop — cannot test")
-                return
-        pass_(f"Proxy PID {proxy_pid} confirmed alive before stop")
-
-        # Simulate manual edit: set settings URL to a non-localhost URL
-        set_base_url("https://manual-edit.example.com")
-
-        # Run stop
-        info("Running claude-retry-proxy stop with non-localhost URL in settings...")
-        result = subprocess.run(
-            CLAUDE_PROXY + ["stop"],
-            capture_output=True, text=True, timeout=10
-        )
-
-        output = result.stdout + result.stderr
-
-        # Verify: proxy process is killed (the fix moves kill BEFORE the non-localhost check)
-        time.sleep(0.5)
-        if sys.platform == "win32":
-            r = sp.run(["tasklist", "/FI", f"PID eq {proxy_pid}"], capture_output=True, text=True)
-            pid_alive_after = str(proxy_pid) in r.stdout
-        else:
-            try:
-                os.kill(proxy_pid, 0)
-                pid_alive_after = True
-            except OSError:
-                pid_alive_after = False
-
-        if not pid_alive_after:
-            pass_(f"Proxy PID {proxy_pid} killed despite non-localhost URL in settings")
-        else:
-            fail(f"Proxy PID {proxy_pid} still alive after stop — "
-                 "kill block was skipped due to non-localhost early return")
-
-        # Verify: manual edit warning appears
-        if "manual" in output.lower() or "not modifying" in output.lower():
-            pass_("Manual edit warning present in stop output")
-        else:
-            info(f"Stop output: {output[:200]}")
-
-        # Verify: lock is cleaned up
-        if not os.path.exists(URL_LOCK_FILE):
-            pass_("base-url.lock cleaned up after stop")
-        else:
-            fail("base-url.lock still exists after stop")
-
-        # Verify: settings NOT overwritten (manual edit preserved)
-        current_url = get_base_url()
-        if "manual-edit.example.com" in current_url:
-            pass_("Manual edit preserved — settings NOT overwritten by stop")
-        else:
-            info(f"Settings URL after stop: '{current_url}'")
-
-    finally:
-        cleanup_lock_files()
-        subprocess.run(
-            CLAUDE_PROXY + ["stop"],
-            capture_output=True, text=True, timeout=10
-        )
-        restore_settings()
-
-
-# ===========================================================================
-# Test Case 16: release_swap_lock Retries on Transient Failure
-# ===========================================================================
-
-def test_release_swap_lock_retries():
-    """Mock os.remove to fail 3x then succeed; verify function retries and returns cleanly."""
-    print("\n--- Test 16: release_swap_lock Retries ---")
-    cleanup_lock_files()
-
-    try:
-        import claude_retry_proxy.cli as cpm
-
-        # Create the swap lock file so it exists to be removed
-        os.makedirs(PROXY_DIR, exist_ok=True)
-        with open(cpm.URL_SWAP_LOCK_FILE, "w") as f:
-            f.write("")
-
-        # Build a mock os.remove that fails 3 times then succeeds
-        call_count = [0]
-        original_remove = os.remove
-
-        def _mock_remove(path):
-            call_count[0] += 1
-            if call_count[0] <= 3 and path == cpm.URL_SWAP_LOCK_FILE:
-                raise OSError("Simulated transient failure")
-            # On 4th call, actually remove
-            original_remove(path)
-
-        # Patch os.remove on the module
-        cpm.os.remove = _mock_remove
-
-        try:
-            cpm.release_swap_lock()
-        finally:
-            cpm.os.remove = original_remove
-
-        # Verify: os.remove was called at least 4 times (3 failures + 1 success)
-        if call_count[0] >= 4:
-            pass_(f"os.remove called {call_count[0]} times (3 failures + 1 success)")
-        else:
-            fail(f"os.remove called only {call_count[0]} times; expected at least 4 (3 retries + success)")
-
-        # Verify: swap lock file is gone
-        if not os.path.exists(cpm.URL_SWAP_LOCK_FILE):
-            pass_("Swap lock file removed after retries")
-        else:
-            fail("Swap lock file still exists after release_swap_lock")
-
-        # Verify: no exception raised
-        pass_("release_swap_lock returned without raising")
-
-    finally:
-        cleanup_lock_files()
-
-
-# ===========================================================================
-# Test Case 17: release_swap_lock Warns on Final Failure
-# ===========================================================================
-
-def test_release_swap_lock_warns_on_final_failure():
-    """Mock os.remove to always fail; verify warning printed to stderr."""
-    print("\n--- Test 17: release_swap_lock Warns on Final Failure ---")
-    cleanup_lock_files()
-
-    try:
-        import claude_retry_proxy.cli as cpm
-        import io
-
-        # Create the swap lock file
-        os.makedirs(PROXY_DIR, exist_ok=True)
-        with open(cpm.URL_SWAP_LOCK_FILE, "w") as f:
-            f.write("")
-
-        # Build a mock os.remove that always fails
-        original_remove = os.remove
-
-        def _always_fail_remove(path):
-            raise OSError("Simulated permanent failure")
-
-        cpm.os.remove = _always_fail_remove
-
-        # Capture stderr
-        saved_stderr = sys.stderr
-        sys.stderr = io.StringIO()
-
-        try:
-            cpm.release_swap_lock()
-        finally:
-            stderr_output = sys.stderr.getvalue()
-            sys.stderr = saved_stderr
-            cpm.os.remove = original_remove
-
-        # Verify: warning on stderr
-        if "WARNING" in stderr_output or "Could not release" in stderr_output:
-            pass_("Warning printed to stderr on final failure")
-        else:
-            fail(f"No warning on stderr. stderr: {stderr_output[:200]}")
-
-        # Verify: no exception raised
-        pass_("release_swap_lock returned without raising (failure is logged, not thrown)")
-
-    finally:
-        cleanup_lock_files()
-
-
-# ===========================================================================
-# Test Case 18: Trace Logs Oversized Body (413)
-# ===========================================================================
 
 def test_trace_logs_oversized_body():
     """Send POST with body exceeding PROXY_MAX_BODY_SIZE; verify 413 AND trace entry."""
@@ -2050,129 +1764,95 @@ def test_trace_logs_oversized_body():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-# ===========================================================================
-# Test Case 19: Stop Trace Output with No Proxy Running
-# ===========================================================================
-
-def test_stop_trace_no_proxy():
-    """Run claude-retry-proxy stop with no proxy running; verify trace lines on stderr."""
-    print("\n--- Test 19: Stop Trace with No Proxy ---")
-    cleanup_lock_files()
-
-    try:
-        result = subprocess.run(
-            CLAUDE_PROXY + ["stop"],
-            capture_output=True, text=True, timeout=10
-        )
-
-        # Assert exit code 0
-        if result.returncode == 0:
-            pass_("stop exited 0 with no proxy running")
-        else:
-            fail(f"stop exited {result.returncode}, expected 0")
-
-        stderr = result.stderr
-
-        # Assert: stderr contains trace lines
-        if "cmd_stop: entering" in stderr:
-            pass_("stderr contains 'cmd_stop: entering'")
-        else:
-            fail(f"stderr missing 'cmd_stop: entering'. stderr: {stderr[:300]}")
-
-        if "read_url_lock" in stderr:
-            pass_("stderr contains read_url_lock trace")
-        else:
-            fail(f"stderr missing read_url_lock trace. stderr: {stderr[:300]}")
-
-        if "returning 0" in stderr:
-            pass_("stderr contains 'returning 0'")
-        else:
-            fail(f"stderr missing 'returning 0'. stderr: {stderr[:300]}")
-
-        # Assert: trace format uses [claude-retry-proxy] prefix
-        if "[claude-retry-proxy]" in stderr:
-            pass_("stderr trace lines use [claude-retry-proxy] prefix")
-        else:
-            fail(f"stderr missing [claude-retry-proxy] prefix. stderr: {stderr[:300]}")
-
-    finally:
-        cleanup_lock_files()
-
-
-# ===========================================================================
-# Test Case 20: Stop Trace Output with Proxy Running (Full Sequence)
-# ===========================================================================
-
 def test_stop_trace_with_proxy():
-    """Start proxy, run claude-retry-proxy stop; verify stderr shows full stop sequence."""
+    """Start proxy, run claude-retry-proxy stop; verify stderr shows graceful-stop sequence."""
     print("\n--- Test 20: Stop Trace with Proxy Running ---")
-    backup_settings()
+    state_backup = _backup_proxy_state()
     cleanup_lock_files()
 
     try:
+        # Ensure cmd_start doesn't refuse with "Proxy already running"
+        try:
+            os.remove(PROXY_STATE_FILE)
+        except OSError:
+            pass
+
         port = find_free_port()
+        temp_dir = tempfile.mkdtemp(prefix="proxy_stop_trace_")
+        try:
+            config_path = _create_test_config(temp_dir, {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            })
+            keys_path = _create_test_keys_plain(temp_dir, {
+                "p": {"url": f"http://127.0.0.1:{find_free_port()}", "key": "k"}
+            })
+            trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
+            os.close(trace_fd)
 
-        # Start proxy
-        info(f"Starting proxy on port {port}...")
-        result = subprocess.run(
-            CLAUDE_PROXY + ["start", "--port", str(port)],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            fail(f"Start failed (exit {result.returncode}): {result.stdout} {result.stderr}")
-            return
+            # Start proxy via CLI
+            info(f"Starting proxy on port {port}...")
+            proc, stdout, stderr_start, rc = _cli_start_with_plain_keys(
+                port, config_path, keys_path, trace_file)
+            if rc != 0:
+                fail(f"Start failed (exit {rc}): {stdout} {stderr_start}")
+                return
 
-        # Verify proxy is running (lock exists with live PID)
-        if not os.path.exists(URL_LOCK_FILE):
-            fail("base-url.lock not created after start")
-            return
+            # Verify proxy is running (state file has live PID)
+            if not os.path.exists(PROXY_STATE_FILE):
+                fail("proxy-state.json not created after start")
+                return
 
-        # Run stop, capturing stderr separately
-        info("Running claude-retry-proxy stop...")
-        stop_result = subprocess.run(
-            CLAUDE_PROXY + ["stop"],
-            capture_output=True, text=True, timeout=30
-        )
-        stderr = stop_result.stderr
+            # Run stop, capturing stderr separately
+            info("Running claude-retry-proxy stop...")
+            stop_result = subprocess.run(
+                CLAUDE_PROXY + ["stop"],
+                capture_output=True, text=True, timeout=30
+            )
+            stderr = stop_result.stderr
 
-        if stop_result.returncode != 0:
-            fail(f"stop exited {stop_result.returncode}: {stop_result.stdout} {stderr}")
+            if stop_result.returncode != 0:
+                fail(f"stop exited {stop_result.returncode}: {stop_result.stdout} {stderr}")
 
-        # Assert: trace shows kill step
-        if "killing" in stderr.lower() or "kill" in stderr.lower():
-            pass_("stderr trace shows kill step")
-        else:
-            fail(f"stderr missing kill step. stderr: {stderr[:500]}")
+            # Assert: deterministic graceful-shutdown trace lines (live proxy,
+            # /admin/shutdown succeeds). Do NOT assert "force-killing" or
+            # "proxy-state.json removed" — in the graceful path the server's
+            # finally block removes proxy-state.json first, and the PID is dead.
+            if "cmd_stop: entering" in stderr:
+                pass_("stderr contains 'cmd_stop: entering'")
+            else:
+                fail(f"stderr missing 'cmd_stop: entering'. stderr: {stderr[:300]}")
 
-        # Assert: trace shows state cleanup (proxy-state removal)
-        if "proxy-state" in stderr.lower():
-            pass_("stderr trace shows proxy-state cleanup")
-        else:
-            warn("stderr missing proxy-state reference — may be expected if file didn't exist")
+            if "cmd_stop: shutdown request accepted" in stderr:
+                pass_("stderr contains 'cmd_stop: shutdown request accepted'")
+            else:
+                fail(f"stderr missing 'cmd_stop: shutdown request accepted'. stderr: {stderr[:300]}")
 
-        # Assert: trace shows URL restore step
-        if "restoring" in stderr.lower() or "original" in stderr.lower():
-            pass_("stderr trace shows URL restore step")
-        else:
-            fail(f"stderr missing URL restore step. stderr: {stderr[:500]}")
+            if "cmd_stop: proxy exited gracefully" in stderr:
+                pass_("stderr contains 'cmd_stop: proxy exited gracefully'")
+            else:
+                fail(f"stderr missing 'cmd_stop: proxy exited gracefully'. stderr: {stderr[:300]}")
 
-        # Assert: trace shows lock removal (finally block)
-        if "base-url.lock" in stderr or "removing" in stderr.lower():
-            pass_("stderr trace shows lock removal step")
-        else:
-            fail(f"stderr missing lock removal step. stderr: {stderr[:500]}")
+            if "cmd_stop: returning 0" in stderr:
+                pass_("stderr contains 'cmd_stop: returning 0'")
+            else:
+                fail(f"stderr missing 'cmd_stop: returning 0'. stderr: {stderr[:300]}")
 
-        # Assert: trace shows exit code
-        if "returning 0" in stderr:
-            pass_("stderr trace shows 'returning 0'")
-        else:
-            fail(f"stderr missing 'returning 0'. stderr: {stderr[:500]}")
+            # Assert: trace format uses [claude-retry-proxy] prefix
+            if "[claude-retry-proxy]" in stderr:
+                pass_("stderr trace lines use [claude-retry-proxy] prefix")
+            else:
+                fail(f"stderr missing [claude-retry-proxy] prefix. stderr: {stderr[:300]}")
 
-        # Assert: lock files cleaned up
-        if not os.path.exists(URL_LOCK_FILE):
-            pass_("base-url.lock removed after stop")
-        else:
-            fail("base-url.lock still exists after stop")
+            # Assert: stdout reports stopped
+            if "Proxy: stopped" in stop_result.stdout:
+                pass_("stdout contains 'Proxy: stopped'")
+            else:
+                fail(f"stdout missing 'Proxy: stopped'. stdout: {stop_result.stdout[:300]}")
+
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     finally:
         cleanup_lock_files()
@@ -2180,80 +1860,85 @@ def test_stop_trace_with_proxy():
             CLAUDE_PROXY + ["stop"],
             capture_output=True, text=True, timeout=10
         )
-        restore_settings()
+        _restore_proxy_state(state_backup)
 
 
 # ===========================================================================
-# Test Case 21: Stop Cleans proxy-state.lock
+# Test Case 21: Stop Cleans proxy-state.json (dead PID)
 # ===========================================================================
 
 def test_stop_cleans_proxy_state_lock():
-    """Create dummy proxy-state.lock; run stop with dead-PID lock; verify file deleted."""
-    print("\n--- Test 21: Stop Cleans proxy-state.lock ---")
-    backup_settings()
+    """Create proxy-state.json with a dead PID; run stop; verify state file deleted."""
+    print("\n--- Test 21: Stop Cleans proxy-state.json (dead PID) ---")
+    state_backup = _backup_proxy_state()
     cleanup_lock_files()
-
-    STATE_LOCK_FILE = os.path.join(PROXY_DIR, "proxy-state.lock")
 
     try:
         # Create proxy directory if needed
         os.makedirs(PROXY_DIR, exist_ok=True)
 
-        # Create a fake base-url.lock with a dead PID so cmd_stop enters the
-        # kill/cleanup block where proxy-state.lock removal lives.
+        # Create proxy-state.json with a dead PID so cmd_stop enters the
+        # kill/cleanup block and removes the state file.
         dead_pid = 99999  # Almost certainly not a real PID
-        fake_lock = {
-            "original_url": "https://api.anthropic.com",
-            "proxy_port": 18080,
-            "locked_at": "2020-01-01T00:00:00Z",
-            "locked_at_epoch": 1577836800.0,
-            "pid": dead_pid
+        fake_state = {
+            "pid": dead_pid,
+            "port": 19999,
+            "start_time": "2020-01-01T00:00:00Z",
+            "config_path": "/nonexistent",
+            "keys_path": "/nonexistent"
         }
-        with open(URL_LOCK_FILE, "w") as f:
-            json.dump(fake_lock, f)
-        pass_("Created fake base-url.lock with dead PID")
+        with open(PROXY_STATE_FILE, "w") as f:
+            json.dump(fake_state, f)
+        pass_("Created proxy-state.json with dead PID")
 
-        # Create the dummy proxy-state.lock file
-        with open(STATE_LOCK_FILE, "w") as f:
-            f.write("dummy lock content")
-        if os.path.exists(STATE_LOCK_FILE):
-            pass_("Created dummy proxy-state.lock")
-        else:
-            fail("Failed to create proxy-state.lock")
-            return
-
-        # Run stop — should enter kill block, attempt kill (dead PID = no-op),
-        # then clean up both proxy-state.json and proxy-state.lock
+        # Run stop — dead PID = no-op kill, then state file removed
         info("Running claude-retry-proxy stop...")
         result = subprocess.run(
             CLAUDE_PROXY + ["stop"],
             capture_output=True, text=True, timeout=10
         )
+        stderr = result.stderr
 
-        # Assert: proxy-state.lock is deleted
-        if not os.path.exists(STATE_LOCK_FILE):
-            pass_("proxy-state.lock deleted by claude-retry-proxy stop")
+        # Assert: proxy-state.json is deleted
+        if not os.path.exists(PROXY_STATE_FILE):
+            pass_("proxy-state.json deleted by claude-retry-proxy stop")
         else:
-            fail("proxy-state.lock still exists after stop — not cleaned up by cmd_stop")
+            fail("proxy-state.json still exists after stop — not cleaned up by cmd_stop")
 
-        # Assert: base-url.lock also cleaned up
-        if not os.path.exists(URL_LOCK_FILE):
-            pass_("base-url.lock also cleaned up")
+        # Assert: trace lines — dead-PID flow skips graceful shutdown, so the
+        # server's finally block never runs and cmd_stop's own os.remove
+        # succeeds ("proxy-state.json removed" is deterministic here).
+        if "cmd_stop: entering" in stderr:
+            pass_("stderr trace shows 'cmd_stop: entering'")
         else:
-            fail("base-url.lock still exists after stop")
+            fail(f"stderr missing 'cmd_stop: entering'. stderr: {stderr[:300]}")
+        if "cmd_stop: proxy-state.json removed" in stderr:
+            pass_("stderr trace shows 'cmd_stop: proxy-state.json removed'")
+        else:
+            fail(f"stderr missing 'cmd_stop: proxy-state.json removed'. stderr: {stderr[:300]}")
+        if "cmd_stop: returning 0" in stderr:
+            pass_("stderr trace shows 'cmd_stop: returning 0'")
+        else:
+            fail(f"stderr missing 'cmd_stop: returning 0'. stderr: {stderr[:300]}")
+
+        # Assert: stdout reports stopped
+        if "Proxy: stopped" in result.stdout:
+            pass_("stdout contains 'Proxy: stopped'")
+        else:
+            fail(f"stdout missing 'Proxy: stopped'. stdout: {result.stdout[:300]}")
+
+        if result.returncode != 0:
+            fail(f"stop exited {result.returncode}: {result.stdout} {stderr}")
+        else:
+            pass_(f"stop exit code 0 ({result.returncode})")
 
     finally:
-        # Clean up any remaining files
-        try:
-            os.remove(STATE_LOCK_FILE)
-        except OSError:
-            pass
         cleanup_lock_files()
         subprocess.run(
             CLAUDE_PROXY + ["stop"],
             capture_output=True, text=True, timeout=10
         )
-        restore_settings()
+        _restore_proxy_state(state_backup)
 
 
 # ===========================================================================
@@ -2261,72 +1946,86 @@ def test_stop_cleans_proxy_state_lock():
 # ===========================================================================
 
 def test_start_stdout_not_contaminated():
-    """Start proxy; assert stdout has startup messages, no trace lines or auth token."""
+    """Start proxy with plain keys; assert stdout clean (no trace, no key material)."""
     print("\n--- Test 22: Start Stdout Not Contaminated ---")
-    backup_settings()
+    state_backup = _backup_proxy_state()
     cleanup_lock_files()
 
     try:
-        original_url = get_base_url()
-        if not original_url:
-            fail("ANTHROPIC_BASE_URL is not set — cannot test")
-            return
+        # Ensure cmd_start doesn't refuse with "Proxy already running"
+        try:
+            os.remove(PROXY_STATE_FILE)
+        except OSError:
+            pass
 
         port = find_free_port()
-
-        # Start proxy, capturing stdout and stderr separately
-        info(f"Starting proxy on port {port}...")
-        proc = subprocess.Popen(
-            CLAUDE_PROXY + ["start", "--port", str(port)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
+        temp_dir = tempfile.mkdtemp(prefix="proxy_stdout_")
         try:
-            stdout, stderr = proc.communicate(timeout=30)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            fail("claude-retry-proxy start timed out")
-            return
+            config_path = _create_test_config(temp_dir, {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            })
+            keys_path = _create_test_keys_plain(temp_dir, {
+                "p": {"url": f"http://127.0.0.1:{find_free_port()}", "key": "test-api-key"}
+            })
+            trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
+            os.close(trace_fd)
 
-        if proc.returncode != 0:
-            fail(f"Start failed (exit {proc.returncode}): {stdout} {stderr}")
-            return
+            # Start proxy via CLI with plain keys
+            info(f"Starting proxy on port {port}...")
+            proc, stdout, stderr, rc = _cli_start_with_plain_keys(
+                port, config_path, keys_path, trace_file)
 
-        # Assert: stdout contains startup messages (Proxy started, Original URL)
-        if "Proxy started" in stdout:
-            pass_("stdout contains 'Proxy started'")
-        else:
-            fail(f"stdout missing 'Proxy started'. stdout: {stdout[:300]}")
+            if rc != 0:
+                fail(f"Start failed (exit {rc}): {stdout} {stderr}")
+                return
 
-        if "Original URL" in stdout:
-            pass_("stdout contains 'Original URL'")
-        else:
-            fail(f"stdout missing 'Original URL'. stdout: {stdout[:300]}")
+            # Assert: stdout contains startup messages
+            if "Proxy started" in stdout:
+                pass_("stdout contains 'Proxy started'")
+            else:
+                fail(f"stdout missing 'Proxy started'. stdout: {stdout[:300]}")
 
-        # Assert: NO "Auth token:" on stdout (auth removed)
-        if "Auth token:" in stdout:
-            fail("stdout contains 'Auth token:' — auth should be removed")
-        else:
-            pass_("stdout does NOT contain 'Auth token:'")
+            if "Tiers:" in stdout:
+                pass_("stdout contains 'Tiers:'")
+            else:
+                fail(f"stdout missing 'Tiers:'. stdout: {stdout[:300]}")
 
-        # Assert: NO trace lines on stdout (trace goes to stderr)
-        if "[claude-retry-proxy]" in stdout:
-            fail("stdout contains [claude-retry-proxy] trace lines — trace leaked to stdout")
-        else:
-            pass_("stdout does NOT contain [claude-retry-proxy] trace prefix")
+            # Assert: NO "Auth token:" on stdout (auth removed)
+            if "Auth token:" in stdout:
+                fail("stdout contains 'Auth token:' — auth should be removed")
+            else:
+                pass_("stdout does NOT contain 'Auth token:'")
 
-        # Assert: trace IS on stderr (proves trace is working, just on the right stream)
-        if "[claude-retry-proxy]" in stderr:
-            pass_("stderr contains [claude-retry-proxy] trace lines (trace on correct stream)")
-        else:
-            warn("stderr missing [claude-retry-proxy] trace — tracing may not be active")
+            # Assert: NO key material on stdout
+            if "test-api-key" in stdout:
+                fail("stdout contains API key material — key leaked to stdout")
+            else:
+                pass_("stdout does NOT contain API key material")
 
-        # Verify the proxy actually started (URL was swapped)
-        current_url = get_base_url()
-        if f"localhost:{port}" in current_url:
-            pass_(f"URL swapped to localhost:{port} — proxy started successfully")
-        else:
-            fail(f"URL not swapped: '{current_url}'")
+            # Assert: NO trace lines on stdout (trace goes to stderr)
+            if "[claude-retry-proxy]" in stdout:
+                fail("stdout contains [claude-retry-proxy] trace lines — trace leaked to stdout")
+            else:
+                pass_("stdout does NOT contain [claude-retry-proxy] trace prefix")
+
+            # Assert: trace IS on stderr (proves trace is working, just on the right stream)
+            if "[claude-retry-proxy]" in stderr:
+                pass_("stderr contains [claude-retry-proxy] trace lines (trace on correct stream)")
+            else:
+                warn("stderr missing [claude-retry-proxy] trace — tracing may not be active")
+
+            # Clean up the running proxy
+            stop_result = subprocess.run(
+                CLAUDE_PROXY + ["stop"],
+                capture_output=True, text=True, timeout=10
+            )
+            if stop_result.returncode != 0:
+                fail(f"stop after start failed: {stop_result.stdout} {stop_result.stderr}")
+
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     finally:
         cleanup_lock_files()
@@ -2334,7 +2033,7 @@ def test_start_stdout_not_contaminated():
             CLAUDE_PROXY + ["stop"],
             capture_output=True, text=True, timeout=10
         )
-        restore_settings()
+        _restore_proxy_state(state_backup)
 
 
 # ===========================================================================
@@ -2445,70 +2144,6 @@ def test_start_no_auth_header_required():
         mock_server.shutdown()
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-
-# ===========================================================================
-# Test Case 24: Proxy State No Auth Token
-# ===========================================================================
-
-def test_proxy_state_no_auth_token():
-    """Start proxy, read proxy-state.json; assert auth_token key is absent."""
-    print("\n--- Test 24: Proxy State No Auth Token ---")
-    backup_settings()
-    cleanup_lock_files()
-
-    STATE_FILE = os.path.join(PROXY_DIR, "proxy-state.json")
-
-    try:
-        port = find_free_port()
-
-        # Start proxy
-        info(f"Starting proxy on port {port}...")
-        result = subprocess.run(
-            CLAUDE_PROXY + ["start", "--port", str(port)],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            fail(f"Start failed (exit {result.returncode}): {result.stdout} {result.stderr}")
-            return
-
-        # Verify proxy-state.json exists
-        if not os.path.exists(STATE_FILE):
-            fail("proxy-state.json not found after start")
-            return
-        pass_("proxy-state.json exists after proxy start")
-
-        # Read and verify no auth_token field
-        with open(STATE_FILE) as f:
-            state = json.load(f)
-
-        if "auth_token" in state:
-            fail(f"proxy-state.json contains auth_token field: '{state['auth_token'][:20]}...'")
-        else:
-            pass_("proxy-state.json does NOT contain auth_token field")
-
-        # Verify other expected fields are still present
-        if "port" in state:
-            pass_(f"proxy-state.json has port={state['port']}")
-        else:
-            warn("proxy-state.json missing 'port' field")
-
-        if "pid" in state:
-            pass_(f"proxy-state.json has pid={state['pid']}")
-        else:
-            warn("proxy-state.json missing 'pid' field")
-
-    finally:
-        cleanup_lock_files()
-        subprocess.run(
-            CLAUDE_PROXY + ["stop"],
-            capture_output=True, text=True, timeout=10
-        )
-        restore_settings()
-
-
-# ===========================================================================
-# Test Case 25: Exhaust 429 Preserves Body (Step 1 — Fix B, 429 path)
-# ===========================================================================
 
 def test_exhaust_429_preserves_body():
     """Mock upstream always returns 429 with body '{"error":"rate_limited"}';
@@ -3708,8 +3343,11 @@ def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-pas
     # Create config
     config_path = _create_test_config(temp_dir, tiers_config)
 
-    # Create keys
-    keys_path = _create_test_keys(temp_dir, vendors, default_passphrase)
+    # Create keys (plain or encrypted depending on passphrase)
+    if default_passphrase is None:
+        keys_path = _create_test_keys_plain(temp_dir, vendors)
+    else:
+        keys_path = _create_test_keys(temp_dir, vendors, default_passphrase)
 
     # Start mock upstreams
     mock_servers = {}
@@ -4412,10 +4050,55 @@ def test_config_validation_unknown_provider():
 def test_config_template_copy():
     """Missing config.json → template copied, start fails with message."""
     print("\n--- Test: Config Template Copy ---")
+    state_backup = _backup_proxy_state()
+    cleanup_lock_files()
 
-    # This test requires CLI, which may not be implemented yet
-    # Skip for now — will be tested via CLI integration
-    print("SKIP: Requires CLI implementation")
+    try:
+        try:
+            os.remove(PROXY_STATE_FILE)
+        except OSError:
+            pass
+
+        temp_dir = tempfile.mkdtemp(prefix="proxy_template_copy_")
+        try:
+            nonexistent_config = os.path.join(temp_dir, "config.json")
+            keys_path = _create_test_keys_plain(temp_dir, {
+                "p": {"url": "http://127.0.0.1:1", "key": "k"}
+            })
+
+            proc = subprocess.Popen(
+                CLAUDE_PROXY + ["start", "--config-path", nonexistent_config,
+                                "--keys-path", keys_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE, text=True
+            )
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            stdout, stderr = proc.communicate(timeout=30)
+
+            if proc.returncode == 1:
+                pass_("Start without config exited 1")
+            else:
+                fail(f"Start without config exited {proc.returncode} (expected 1): {stdout} {stderr}")
+
+            if os.path.exists(nonexistent_config):
+                pass_("Template created at config path")
+            else:
+                fail("Template NOT created at config path")
+
+            if "Created config template" in stdout:
+                pass_("stdout mentions 'Created config template'")
+            else:
+                fail(f"stdout missing 'Created config template'. stdout: {stdout[:300]}")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    finally:
+        cleanup_lock_files()
+        subprocess.run(CLAUDE_PROXY + ["stop"], capture_output=True, text=True, timeout=10)
+        _restore_proxy_state(state_backup)
 
 
 # ===========================================================================
@@ -4519,10 +4202,164 @@ def test_admin_api_config():
 # Test: Admin API Switch
 # ===========================================================================
 
+def _start_mock_upstream(port, req_list):
+    """Start a mock upstream server recording requests into req_list."""
+    class MockHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_len) if content_len > 0 else b"{}"
+            api_key = self.headers.get("x-api-key", "")
+            req_list.append({"body": body, "api_key": api_key})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            try:
+                req_data = json.loads(body)
+                model = req_data.get("model", "unknown")
+            except Exception:
+                model = "unknown"
+            self.wfile.write(json.dumps({
+                "id": "ok",
+                "type": "message",
+                "model": model,
+                "content": [{"text": "response"}]
+            }).encode())
+
+        def log_message(self, format, *args):
+            pass
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), MockHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.1)
+    return server
+
+
+def _start_admin_proxy(tiers, vendors, models=None):
+    """Start proxy via _start_proxy_server_directly with plain keys.
+
+    Returns (proxy_port, proc, mock_servers, temp_dir, cleanup).
+    """
+    temp_dir = tempfile.mkdtemp(prefix="proxy_admin_")
+    proxy_port = find_free_port()
+    config_path = _create_test_config(temp_dir, tiers, models=models)
+    keys_path = _create_test_keys_plain(temp_dir, vendors)
+
+    mock_servers = {}
+    for vendor_name, vendor_info in vendors.items():
+        from urllib.parse import urlparse
+        parsed = urlparse(vendor_info["url"])
+        port = parsed.port
+        req_list = []
+        mock_servers[vendor_name] = {
+            "server": _start_mock_upstream(port, req_list),
+            "requests": req_list,
+        }
+
+    trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
+    os.close(trace_fd)
+
+    proc, probe_ok = _start_proxy_server_directly(
+        proxy_port, config_path=config_path, keys_path=keys_path,
+        passphrase=None, trace_file=trace_file
+    )
+
+    if not probe_ok:
+        for ms in mock_servers.values():
+            ms["server"].shutdown()
+        proc.kill()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return None, None, None, None, None
+
+    def cleanup():
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        for ms in mock_servers.values():
+            ms["server"].shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return proxy_port, proc, mock_servers, temp_dir, cleanup
+
+
+# ===========================================================================
+# Test: Admin API Switch
+# ===========================================================================
+
 def test_admin_api_switch():
     """POST /admin/api/switch updates tier, subsequent request routes to new provider."""
     print("\n--- Test: Admin API Switch ---")
-    print("SKIP: Requires admin API implementation")
+
+    p1_port = find_free_port()
+    p2_port = find_free_port()
+    tiers = {
+        "haiku": {"provider": "p1", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "p1", "model": "claude-sonnet-5"},
+        "opus": {"provider": "p1", "model": "claude-opus-5"},
+    }
+    vendors = {
+        "p1": {"url": f"http://127.0.0.1:{p1_port}", "key": "k1"},
+        "p2": {"url": f"http://127.0.0.1:{p2_port}", "key": "k2"},
+    }
+
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+
+    try:
+        # Baseline: sonnet routes to p1
+        status, resp_body = _send_proxy_request(proxy_port, body=json.dumps({
+            "model": "sonnet", "messages": [{"role": "user", "content": "hi"}]}))
+        if status != 200:
+            fail(f"Baseline request returned {status}")
+            return
+        p1_count_before = len(mock_servers["p1"]["requests"])
+        pass_(f"Baseline sonnet request routed to p1 ({p1_count_before} requests)")
+
+        # Switch sonnet from p1 to p2
+        switch_body = {
+            "tiers": {
+                "haiku": {"provider": "p1", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p2", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p1", "model": "claude-opus-5"},
+            }
+        }
+        status, data = _admin_post(proxy_port, "/admin/api/switch", switch_body)
+        if status != 200:
+            fail(f"Switch returned {status}: {data}")
+            return
+        try:
+            resp = json.loads(data)
+            if resp.get("status") == "ok":
+                pass_("Admin API switch returned {'status': 'ok'} (200)")
+            else:
+                fail(f"Switch response missing 'status': 'ok': {data}")
+        except Exception:
+            fail(f"Switch response not valid JSON: {data}")
+
+        # Post-switch: sonnet routes to p2
+        status, resp_body = _send_proxy_request(proxy_port, body=json.dumps({
+            "model": "sonnet", "messages": [{"role": "user", "content": "hi"}]}))
+        if status != 200:
+            fail(f"Post-switch request returned {status}")
+            return
+
+        p2_count = len(mock_servers["p2"]["requests"])
+        if p2_count >= 1:
+            pass_(f"Post-switch sonnet request routed to p2 ({p2_count} requests)")
+        else:
+            fail("Post-switch sonnet request did NOT route to p2")
+
+        p1_count_after = len(mock_servers["p1"]["requests"])
+        if p1_count_after == p1_count_before:
+            pass_("p1 received zero further sonnet requests")
+        else:
+            fail(f"p1 received further requests after switch: before={p1_count_before} after={p1_count_after}")
+
+    finally:
+        cleanup()
 
 
 # ===========================================================================
@@ -4532,7 +4369,39 @@ def test_admin_api_switch():
 def test_admin_api_switch_invalid_provider():
     """POST with unknown provider → error response."""
     print("\n--- Test: Admin API Switch Invalid Provider ---")
-    print("SKIP: Requires admin API implementation")
+
+    p_port = find_free_port()
+    tiers = {
+        "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+    }
+    vendors = {"p": {"url": f"http://127.0.0.1:{p_port}", "key": "k"}}
+
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+
+    try:
+        switch_body = {
+            "tiers": {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "nonexistent", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            }
+        }
+        status, data = _admin_post(proxy_port, "/admin/api/switch", switch_body)
+        if status == 400:
+            pass_(f"Switch with invalid provider returned 400")
+        else:
+            fail(f"Switch with invalid provider returned {status}: {data}")
+        if "unknown provider" in data:
+            pass_(f"Error mentions 'unknown provider': {data}")
+        else:
+            fail(f"Error missing 'unknown provider': {data}")
+    finally:
+        cleanup()
 
 
 # ===========================================================================
@@ -4542,7 +4411,62 @@ def test_admin_api_switch_invalid_provider():
 def test_admin_api_switch_preserves_models():
     """Switch tiers, verify models section unchanged in config.json."""
     print("\n--- Test: Admin API Switch Preserves Models ---")
-    print("SKIP: Requires admin API implementation")
+
+    p_port = find_free_port()
+    tiers = {
+        "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+    }
+    models = {"p": ["claude-sonnet-5", "claude-haiku-4-5", "claude-opus-5"]}
+    vendors = {"p": {"url": f"http://127.0.0.1:{p_port}", "key": "k"}}
+
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(
+        tiers, vendors, models=models)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+
+    try:
+        # POST switch with tiers only (no models field)
+        switch_body = {
+            "tiers": {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            }
+        }
+        status, data = _admin_post(proxy_port, "/admin/api/switch", switch_body)
+        if status != 200:
+            fail(f"Switch returned {status}: {data}")
+            return
+
+        # GET /admin/api/config → models section unchanged
+        import http.client as _hc
+        conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+        conn.request("GET", "/admin/api/config")
+        resp = conn.getresponse()
+        body = resp.read().decode()
+        conn.close()
+        if resp.status != 200:
+            fail(f"GET /admin/api/config returned {resp.status}")
+            return
+        config = json.loads(body)
+        if config.get("models") == models:
+            pass_("Models section unchanged in /admin/api/config response")
+        else:
+            fail(f"Models section changed: {config.get('models')}")
+
+        # On-disk config.json still has models section
+        config_path = os.path.join(temp_dir, "config.json")
+        with open(config_path) as f:
+            disk_config = json.load(f)
+        if disk_config.get("models") == models:
+            pass_("Models section still present in on-disk config.json")
+        else:
+            fail(f"Models section missing from on-disk config.json: {disk_config.get('models')}")
+    finally:
+        cleanup()
 
 
 # ===========================================================================
@@ -4552,7 +4476,36 @@ def test_admin_api_switch_preserves_models():
 def test_admin_api_csrf_rejected():
     """POST with foreign Origin header → rejected."""
     print("\n--- Test: Admin API CSRF Rejected ---")
-    print("SKIP: Requires admin API implementation")
+
+    p_port = find_free_port()
+    tiers = {
+        "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+    }
+    vendors = {"p": {"url": f"http://127.0.0.1:{p_port}", "key": "k"}}
+
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+
+    try:
+        switch_body = {
+            "tiers": {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            }
+        }
+        status, data = _admin_post(proxy_port, "/admin/api/switch", switch_body,
+                                   origin="http://evil.com:9999")
+        if status == 403:
+            pass_("Foreign Origin rejected with 403")
+        else:
+            fail(f"Foreign Origin returned {status} (expected 403): {data}")
+    finally:
+        cleanup()
 
 
 # ===========================================================================
@@ -4562,7 +4515,36 @@ def test_admin_api_csrf_rejected():
 def test_admin_api_csrf_null_origin_rejected():
     """POST with Origin: null → rejected."""
     print("\n--- Test: Admin API CSRF Null Origin Rejected ---")
-    print("SKIP: Requires admin API implementation")
+
+    p_port = find_free_port()
+    tiers = {
+        "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+    }
+    vendors = {"p": {"url": f"http://127.0.0.1:{p_port}", "key": "k"}}
+
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+
+    try:
+        switch_body = {
+            "tiers": {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            }
+        }
+        status, data = _admin_post(proxy_port, "/admin/api/switch", switch_body,
+                                   origin="null")
+        if status == 403:
+            pass_("Origin: null rejected with 403")
+        else:
+            fail(f"Origin: null returned {status} (expected 403): {data}")
+    finally:
+        cleanup()
 
 
 # ===========================================================================
@@ -4572,7 +4554,42 @@ def test_admin_api_csrf_null_origin_rejected():
 def test_admin_api_csrf_missing_origin_rejected():
     """POST without Origin header → rejected."""
     print("\n--- Test: Admin API CSRF Missing Origin Rejected ---")
-    print("SKIP: Requires admin API implementation")
+
+    p_port = find_free_port()
+    tiers = {
+        "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+    }
+    vendors = {"p": {"url": f"http://127.0.0.1:{p_port}", "key": "k"}}
+
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+
+    try:
+        import http.client as _hc
+        switch_body = {
+            "tiers": {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            }
+        }
+        conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+        conn.request("POST", "/admin/api/switch",
+                     body=json.dumps(switch_body),
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        data = resp.read().decode()
+        conn.close()
+        if resp.status == 403:
+            pass_("Missing Origin rejected with 403")
+        else:
+            fail(f"Missing Origin returned {resp.status} (expected 403): {data}")
+    finally:
+        cleanup()
 
 
 # ===========================================================================
@@ -4582,7 +4599,37 @@ def test_admin_api_csrf_missing_origin_rejected():
 def test_admin_api_csrf_ipv6_loopback_accepted():
     """POST with Origin: http://[::1]:<port> → accepted."""
     print("\n--- Test: Admin API CSRF IPv6 Loopback Accepted ---")
-    print("SKIP: Requires admin API implementation")
+
+    p_port = find_free_port()
+    tiers = {
+        "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+    }
+    vendors = {"p": {"url": f"http://127.0.0.1:{p_port}", "key": "k"}}
+
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+
+    try:
+        switch_body = {
+            "tiers": {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            }
+        }
+        origin = "http://[::1]:{}".format(proxy_port)
+        status, data = _admin_post(proxy_port, "/admin/api/switch", switch_body,
+                                   origin=origin)
+        if status == 200:
+            pass_("IPv6 loopback Origin accepted (200) — validates Origin allowlist")
+        else:
+            fail(f"IPv6 loopback Origin returned {status} (expected 200): {data}")
+    finally:
+        cleanup()
 
 
 # ===========================================================================
@@ -4592,7 +4639,38 @@ def test_admin_api_csrf_ipv6_loopback_accepted():
 def test_admin_api_switch_missing_tier_rejected():
     """POST with only 2 tiers → 400 error listing missing tier."""
     print("\n--- Test: Admin API Switch Missing Tier Rejected ---")
-    print("SKIP: Requires admin API implementation")
+
+    p_port = find_free_port()
+    tiers = {
+        "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+    }
+    vendors = {"p": {"url": f"http://127.0.0.1:{p_port}", "key": "k"}}
+
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+
+    try:
+        switch_body = {
+            "tiers": {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+            }
+        }
+        status, data = _admin_post(proxy_port, "/admin/api/switch", switch_body)
+        if status == 400:
+            pass_(f"Switch with 2 tiers returned 400")
+        else:
+            fail(f"Switch with 2 tiers returned {status} (expected 400): {data}")
+        if "missing tiers" in data:
+            pass_(f"Error mentions 'missing tiers': {data}")
+        else:
+            fail(f"Error missing 'missing tiers': {data}")
+    finally:
+        cleanup()
 
 
 # ===========================================================================
@@ -4644,7 +4722,88 @@ def test_config_validation_reverse_map_collision():
 def test_admin_api_reload():
     """Modify config.json on disk, POST /admin/api/reload, verify new mapping active."""
     print("\n--- Test: Admin API Reload ---")
-    print("SKIP: Requires admin API implementation")
+
+    p_port = find_free_port()
+    tiers_a = {
+        "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "p", "model": "model-a"},
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+    }
+    vendors = {"p": {"url": f"http://127.0.0.1:{p_port}", "key": "k"}}
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_admin_reload_")
+    proxy_port = find_free_port()
+    config_path = _create_test_config(temp_dir, tiers_a)
+    keys_path = _create_test_keys_plain(temp_dir, vendors)
+
+    req_list = []
+    mock_servers = {"p": {
+        "server": _start_mock_upstream(p_port, req_list),
+        "requests": req_list,
+    }}
+
+    trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
+    os.close(trace_fd)
+
+    proc, probe_ok = _start_proxy_server_directly(
+        proxy_port, config_path=config_path, keys_path=keys_path,
+        passphrase=None, trace_file=trace_file
+    )
+
+    if not probe_ok:
+        mock_servers["p"]["server"].shutdown()
+        proc.kill()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        fail("Failed to set up test")
+        return
+
+    def cleanup():
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        mock_servers["p"]["server"].shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    try:
+        # Baseline: sonnet routes to model-a
+        status, resp_body = _send_proxy_request(proxy_port, body=json.dumps({
+            "model": "sonnet", "messages": [{"role": "user", "content": "hi"}]}))
+        if status != 200:
+            fail(f"Baseline request returned {status}")
+            return
+        if req_list and b"model-a" in req_list[-1]["body"]:
+            pass_("Baseline sonnet request routed to model-a")
+        else:
+            fail(f"Baseline sonnet request did not route to model-a. last: {req_list[-1] if req_list else 'none'}")
+
+        # Modify config.json on disk: sonnet → model-b
+        tiers_b = dict(tiers_a)
+        tiers_b["sonnet"] = {"provider": "p", "model": "model-b"}
+        with open(config_path, "w") as f:
+            json.dump({"tiers": tiers_b, "models": {}}, f)
+
+        # POST /admin/api/reload
+        status, data = _admin_post(proxy_port, "/admin/api/reload", {})
+        if status == 200:
+            pass_("Admin API reload returned 200")
+        else:
+            fail(f"Admin API reload returned {status}: {data}")
+            return
+
+        # Post-reload: sonnet routes to model-b
+        status, resp_body = _send_proxy_request(proxy_port, body=json.dumps({
+            "model": "sonnet", "messages": [{"role": "user", "content": "hi"}]}))
+        if status != 200:
+            fail(f"Post-reload request returned {status}")
+            return
+        if req_list and b"model-b" in req_list[-1]["body"]:
+            pass_("Post-reload sonnet request routed to model-b")
+        else:
+            fail(f"Post-reload sonnet request did not route to model-b. last: {req_list[-1] if req_list else 'none'}")
+    finally:
+        cleanup()
 
 
 # ===========================================================================
@@ -4654,7 +4813,98 @@ def test_admin_api_reload():
 def test_cli_reload():
     """claude-retry-proxy reload sends reload request to running proxy."""
     print("\n--- Test: CLI Reload ---")
-    print("SKIP: Requires CLI implementation")
+    state_backup = _backup_proxy_state()
+    cleanup_lock_files()
+
+    try:
+        try:
+            os.remove(PROXY_STATE_FILE)
+        except OSError:
+            pass
+
+        port = find_free_port()
+        p_port = find_free_port()
+        temp_dir = tempfile.mkdtemp(prefix="proxy_cli_reload_")
+        try:
+            tiers_a = {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "model-a"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            }
+            config_path = _create_test_config(temp_dir, tiers_a)
+            keys_path = _create_test_keys_plain(temp_dir, {
+                "p": {"url": f"http://127.0.0.1:{p_port}", "key": "k"}
+            })
+            trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
+            os.close(trace_fd)
+
+            req_list = []
+            mock_server = _start_mock_upstream(p_port, req_list)
+            mock_started = True
+
+            proc, stdout, stderr, rc = _cli_start_with_plain_keys(
+                port, config_path, keys_path, trace_file)
+            if rc != 0:
+                fail(f"Start failed (exit {rc}): {stdout} {stderr}")
+                return
+
+            # Probe the port to confirm proxy is ready
+            probe_ok = False
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(1)
+                    sock.connect(("127.0.0.1", port))
+                    sock.close()
+                    probe_ok = True
+                    break
+                except (socket.error, ConnectionRefusedError):
+                    time.sleep(0.1)
+            if not probe_ok:
+                fail("Proxy did not become ready on port")
+                return
+
+            # Modify config.json on disk: sonnet → model-b
+            tiers_b = dict(tiers_a)
+            tiers_b["sonnet"] = {"provider": "p", "model": "model-b"}
+            with open(config_path, "w") as f:
+                json.dump({"tiers": tiers_b, "models": {}}, f)
+
+            # Run claude-retry-proxy reload (no --port; reads from proxy-state.json)
+            result = subprocess.run(CLAUDE_PROXY + ["reload"],
+                                    capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                fail(f"reload exited {result.returncode}: {result.stdout} {result.stderr}")
+                return
+            pass_("claude-retry-proxy reload exited 0")
+
+            # Verify reload took effect: sonnet routes to model-b
+            status, resp_body = _send_proxy_request(port, body=json.dumps({
+                "model": "sonnet", "messages": [{"role": "user", "content": "hi"}]}))
+            if status != 200:
+                fail(f"Post-reload request returned {status}")
+                return
+            if req_list and b"model-b" in req_list[-1]["body"]:
+                pass_("Post-reload sonnet request routed to model-b")
+            else:
+                fail(f"Post-reload sonnet request did not route to model-b. last: {req_list[-1] if req_list else 'none'}")
+
+            # Clean up the proxy
+            stop_result = subprocess.run(CLAUDE_PROXY + ["stop"],
+                                         capture_output=True, text=True, timeout=10)
+            if stop_result.returncode != 0:
+                fail(f"stop failed: {stop_result.stdout} {stop_result.stderr}")
+
+        finally:
+            if 'mock_started' in dir():
+                mock_server.shutdown()
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    finally:
+        cleanup_lock_files()
+        subprocess.run(CLAUDE_PROXY + ["stop"], capture_output=True, text=True, timeout=10)
+        _restore_proxy_state(state_backup)
 
 
 # ===========================================================================
@@ -4664,7 +4914,55 @@ def test_cli_reload():
 def test_cli_start_no_config():
     """Start without config.json → template created, exit 1, message printed."""
     print("\n--- Test: CLI Start No Config ---")
-    print("SKIP: Requires CLI implementation")
+    state_backup = _backup_proxy_state()
+    cleanup_lock_files()
+
+    try:
+        try:
+            os.remove(PROXY_STATE_FILE)
+        except OSError:
+            pass
+
+        temp_dir = tempfile.mkdtemp(prefix="proxy_cli_noconfig_")
+        try:
+            nonexistent_config = os.path.join(temp_dir, "config.json")
+            keys_path = _create_test_keys_plain(temp_dir, {
+                "p": {"url": "http://127.0.0.1:1", "key": "k"}
+            })
+
+            proc = subprocess.Popen(
+                CLAUDE_PROXY + ["start", "--config-path", nonexistent_config,
+                                "--keys-path", keys_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE, text=True
+            )
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            stdout, stderr = proc.communicate(timeout=30)
+
+            if proc.returncode == 1:
+                pass_("Start without config exited 1")
+            else:
+                fail(f"Start without config exited {proc.returncode} (expected 1): {stdout} {stderr}")
+
+            if os.path.exists(nonexistent_config):
+                pass_("Template created at config path")
+            else:
+                fail("Template NOT created at config path")
+
+            if "Created config template" in stdout:
+                pass_("stdout mentions 'Created config template'")
+            else:
+                fail(f"stdout missing 'Created config template'. stdout: {stdout[:300]}")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    finally:
+        cleanup_lock_files()
+        subprocess.run(CLAUDE_PROXY + ["stop"], capture_output=True, text=True, timeout=10)
+        _restore_proxy_state(state_backup)
 
 
 # ===========================================================================
@@ -4674,7 +4972,53 @@ def test_cli_start_no_config():
 def test_cli_start_invalid_config():
     """Start with broken config → exit 1, specific error."""
     print("\n--- Test: CLI Start Invalid Config ---")
-    print("SKIP: Requires CLI implementation")
+    state_backup = _backup_proxy_state()
+    cleanup_lock_files()
+
+    try:
+        try:
+            os.remove(PROXY_STATE_FILE)
+        except OSError:
+            pass
+
+        temp_dir = tempfile.mkdtemp(prefix="proxy_cli_invalidcfg_")
+        try:
+            invalid_config_path = os.path.join(temp_dir, "config.json")
+            with open(invalid_config_path, "w") as f:
+                f.write("not valid json {{{")
+            keys_path = _create_test_keys_plain(temp_dir, {
+                "p": {"url": "http://127.0.0.1:1", "key": "k"}
+            })
+
+            proc = subprocess.Popen(
+                CLAUDE_PROXY + ["start", "--config-path", invalid_config_path,
+                                "--keys-path", keys_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE, text=True
+            )
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            stdout, stderr = proc.communicate(timeout=30)
+
+            if proc.returncode == 1:
+                pass_("Start with invalid config exited 1")
+            else:
+                fail(f"Start with invalid config exited {proc.returncode} (expected 1): {stdout} {stderr}")
+
+            combined = stdout + stderr
+            if "Invalid config" in combined or "ERROR" in combined:
+                pass_("Error message mentions 'Invalid config' or 'ERROR'")
+            else:
+                fail(f"Error message missing 'Invalid config'/'ERROR'. stdout={stdout[:200]} stderr={stderr[:200]}")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    finally:
+        cleanup_lock_files()
+        subprocess.run(CLAUDE_PROXY + ["stop"], capture_output=True, text=True, timeout=10)
+        _restore_proxy_state(state_backup)
 
 
 # ===========================================================================
@@ -4684,7 +5028,74 @@ def test_cli_start_invalid_config():
 def test_cli_status_shows_tiers():
     """Status output includes tier → provider → model mapping."""
     print("\n--- Test: CLI Status Shows Tiers ---")
-    print("SKIP: Requires CLI implementation")
+    state_backup = _backup_proxy_state()
+    cleanup_lock_files()
+
+    try:
+        try:
+            os.remove(PROXY_STATE_FILE)
+        except OSError:
+            pass
+
+        port = find_free_port()
+        p_port = find_free_port()
+        temp_dir = tempfile.mkdtemp(prefix="proxy_cli_status_")
+        try:
+            tiers = {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            }
+            config_path = _create_test_config(temp_dir, tiers)
+            keys_path = _create_test_keys_plain(temp_dir, {
+                "p": {"url": f"http://127.0.0.1:{p_port}", "key": "k"}
+            })
+            trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
+            os.close(trace_fd)
+
+            mock_server = _start_mock_upstream(p_port, [])
+
+            proc, stdout, stderr, rc = _cli_start_with_plain_keys(
+                port, config_path, keys_path, trace_file)
+            if rc != 0:
+                fail(f"Start failed (exit {rc}): {stdout} {stderr}")
+                return
+
+            # Run claude-retry-proxy status
+            stdout, stderr, status_rc = proxy_status()
+            if status_rc == 0:
+                pass_("claude-retry-proxy status exited 0")
+            else:
+                fail(f"status exited {status_rc}: {stdout} {stderr}")
+                return
+
+            for tier in ("haiku", "sonnet", "opus"):
+                if tier in stdout:
+                    pass_(f"status shows tier '{tier}'")
+                else:
+                    fail(f"status missing tier '{tier}'. stdout: {stdout[:300]}")
+
+            # Provider/model info shown (e.g. "sonnet -> claude-sonnet-5 (p)")
+            for needle in ("claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5", "(p)"):
+                if needle in stdout:
+                    pass_(f"status shows provider/model info '{needle}'")
+                else:
+                    fail(f"status missing '{needle}'. stdout: {stdout[:300]}")
+
+            # Clean up the proxy
+            stop_result = subprocess.run(CLAUDE_PROXY + ["stop"],
+                                         capture_output=True, text=True, timeout=10)
+            if stop_result.returncode != 0:
+                fail(f"stop failed: {stop_result.stdout} {stop_result.stderr}")
+            mock_server.shutdown()
+
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    finally:
+        cleanup_lock_files()
+        subprocess.run(CLAUDE_PROXY + ["stop"], capture_output=True, text=True, timeout=10)
+        _restore_proxy_state(state_backup)
 
 
 # ===========================================================================
@@ -4815,6 +5226,956 @@ def test_api_key_from_keys_index():
 
 
 # ===========================================================================
+# Test: Admin API Serves Provider-Keyed Models (plan Step 3)
+# ===========================================================================
+
+def test_admin_models_provider_keyed():
+    """Admin API serves models keyed by provider; admin.html drives the model
+    dropdown from the selected provider (populateModels), not tier-keyed models."""
+    print("\n--- Test: Admin Models Provider-Keyed ---")
+
+    upstream_port = find_free_port()
+    tiers = {
+        "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+    }
+    vendors = {"p": {"url": f"http://127.0.0.1:{upstream_port}", "key": "k"}}
+    # Models keyed by PROVIDER name (matching config.json layout), not by tier
+    models = {
+        "p": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5", "qwen3.7-plus"]
+    }
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_admin_models_test_")
+    try:
+        config_path = _create_test_config(temp_dir, tiers, models=models)
+        keys_path = _create_test_keys(temp_dir, vendors)
+
+        proxy_port = find_free_port()
+        proc, probe_ok = _start_proxy_server_directly(
+            proxy_port, config_path=config_path, keys_path=keys_path
+        )
+        if not probe_ok:
+            fail("Proxy server failed to start")
+            return
+
+        try:
+            import http.client as _hc
+
+            # 1. Admin API serves provider-keyed models
+            conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+            conn.request("GET", "/admin/api/config")
+            resp = conn.getresponse()
+            status = resp.status
+            body = resp.read().decode()
+            conn.close()
+
+            if status != 200:
+                fail(f"GET /admin/api/config returned {status}")
+                return
+
+            config = json.loads(body)
+            if "models" not in config:
+                fail("Admin config missing 'models' key")
+                return
+
+            if "p" in config["models"] and isinstance(config["models"]["p"], list):
+                pass_("config.models is keyed by provider name (models.p present)")
+            else:
+                fail(f"config.models not provider-keyed: {list(config['models'].keys())}")
+
+            if "qwen3.7-plus" in config["models"]["p"]:
+                pass_("Provider model list contains expected model")
+            else:
+                fail(f"Provider model list missing qwen3.7-plus: {config['models']['p']}")
+
+            # 2. Admin page HTML drives dropdown from provider, not tier
+            conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+            conn.request("GET", "/admin/")
+            html_resp = conn.getresponse()
+            html = html_resp.read().decode()
+            conn.close()
+
+            if "populateModels" in html:
+                pass_("admin.html defines populateModels helper")
+            else:
+                fail("admin.html missing populateModels")
+
+            if "config.models?.[tier]" not in html:
+                pass_("admin.html does not reference tier-keyed config.models?.[tier]")
+            else:
+                fail("admin.html still references tier-keyed config.models?.[tier]")
+
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ===========================================================================
+# Part B (Steps 9-15): disable_retry_claude_count_token
+# ===========================================================================
+
+def _create_test_config_with_flag(temp_dir, tiers, flag_value=None):
+    """Create a config.json with an optional disable_retry_claude_count_token.
+
+    flag_value: True/False to set, or None to omit the key entirely.
+    """
+    config = {"tiers": tiers, "models": {}}
+    if flag_value is not None:
+        config["disable_retry_claude_count_token"] = flag_value
+    path = os.path.join(temp_dir, "config.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(config, f)
+    return path
+
+
+def _start_proxy_with_flag(proxy_port, temp_dir, flag_value, extra_env=None):
+    """Start the proxy server with a config carrying the flag.
+
+    Returns (proc, probe_ok). Config/keys written to temp_dir.
+    """
+    tiers = {
+        "haiku": {"provider": "test-provider", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "test-provider", "model": "claude-sonnet-5"},
+        "opus": {"provider": "test-provider", "model": "claude-opus-5"},
+    }
+    vendors = {
+        "test-provider": {"url": f"http://127.0.0.1:{find_free_port()}", "key": "test-api-key"}
+    }
+    config_path = _create_test_config_with_flag(temp_dir, tiers, flag_value)
+    keys_path = _create_test_keys(temp_dir, vendors)
+
+    env = os.environ.copy()
+    env["PROXY_PORT"] = str(proxy_port)
+    env["PROXY_MAX_RETRIES"] = "3"
+    env["PROXY_INITIAL_DELAY"] = "1"
+    env["PROXY_MAX_DELAY"] = "1"
+    if extra_env:
+        env.update(extra_env)
+
+    proc = subprocess.Popen(
+        PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
+    )
+    if proc.stdin:
+        try:
+            proc.stdin.write("test-passphrase\n")
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    probe_ok = False
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            sock.connect(("127.0.0.1", proxy_port))
+            sock.close()
+            probe_ok = True
+            break
+        except (socket.error, ConnectionRefusedError):
+            time.sleep(0.1)
+    return proc, probe_ok
+
+
+def test_disable_retry_count_tokens_503():
+    """Flag=true, upstream 503s /count_tokens → exactly 1 attempt, drained body returned."""
+    print("\n--- Test: Disable Retry Count Tokens (503, flag=true) ---")
+
+    upstream_port = find_free_port()
+    proxy_port = find_free_port()
+    request_count = [0]
+    count_lock = threading.Lock()
+
+    class CountTokens503Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            content_len = int(self.headers.get("Content-Length", 0))
+            if content_len > 0:
+                self.rfile.read(content_len)
+            with count_lock:
+                request_count[0] += 1
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"Service Unavailable"}')
+        def log_message(self, format, *args):
+            pass
+
+    mock_server = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), CountTokens503Handler)
+    threading.Thread(target=mock_server.serve_forever, daemon=True).start()
+    time.sleep(0.3)
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_drct_503_test_")
+    tiers = {
+        "haiku": {"provider": "test-provider", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "test-provider", "model": "claude-sonnet-5"},
+        "opus": {"provider": "test-provider", "model": "claude-opus-5"},
+    }
+    vendors = {"test-provider": {"url": f"http://127.0.0.1:{upstream_port}", "key": "test-api-key"}}
+    config_path = _create_test_config_with_flag(temp_dir, tiers, True)
+    keys_path = _create_test_keys(temp_dir, vendors)
+
+    env = os.environ.copy()
+    env["PROXY_PORT"] = str(proxy_port)
+    env["PROXY_MAX_RETRIES"] = "3"
+
+    proc = subprocess.Popen(
+        PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
+    )
+    if proc.stdin:
+        try:
+            proc.stdin.write("test-passphrase\n")
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    probe_ok = False
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            sock.connect(("127.0.0.1", proxy_port))
+            sock.close()
+            probe_ok = True
+            break
+        except (socket.error, ConnectionRefusedError):
+            time.sleep(0.1)
+
+    if not probe_ok:
+        proc.kill()
+        mock_server.shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        fail("Proxy server failed to start")
+        return
+
+    try:
+        body = json.dumps({"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        conn = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+        conn.request("POST", "/v1/messages/count_tokens?beta=true", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        status = resp.status
+        resp_body = resp.read()
+        conn.close()
+
+        with count_lock:
+            total = request_count[0]
+
+        if total == 1:
+            pass_(f"count_tokens attempted exactly once (total={total})")
+        else:
+            fail(f"count_tokens attempted {total} times, expected 1 (retry should be skipped)")
+
+        if status == 503:
+            pass_("Client received 503 (upstream status preserved)")
+        else:
+            fail(f"Client received {status}, expected 503")
+
+        if resp_body:
+            pass_("Upstream error body drained and returned (non-empty)")
+        else:
+            fail("Upstream error body is empty — expected drained body returned")
+
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        mock_server.shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_disable_retry_count_tokens_conn_error():
+    """Flag=true, upstream connection reset → 1 attempt, upstream_unreachable body."""
+    print("\n--- Test: Disable Retry Count Tokens (conn error, flag=true) ---")
+
+    dead_port = find_free_port()
+    test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    test_sock.bind(("127.0.0.1", dead_port))
+    test_sock.close()
+
+    proxy_port = find_free_port()
+    temp_dir = tempfile.mkdtemp(prefix="proxy_drct_conn_test_")
+
+    tiers = {
+        "haiku": {"provider": "test-provider", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "test-provider", "model": "claude-sonnet-5"},
+        "opus": {"provider": "test-provider", "model": "claude-opus-5"},
+    }
+    vendors = {"test-provider": {"url": f"http://127.0.0.1:{dead_port}", "key": "test-api-key"}}
+    config_path = _create_test_config_with_flag(temp_dir, tiers, True)
+    keys_path = _create_test_keys(temp_dir, vendors)
+
+    trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
+    os.close(trace_fd)
+
+    env = os.environ.copy()
+    env["PROXY_PORT"] = str(proxy_port)
+    env["PROXY_MAX_RETRIES"] = "3"
+    env["PROXY_INITIAL_DELAY"] = "1"
+    env["PROXY_MAX_DELAY"] = "1"
+    env["PROXY_TRACE_FILE"] = trace_file
+
+    proc = subprocess.Popen(
+        PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
+    )
+    if proc.stdin:
+        try:
+            proc.stdin.write("test-passphrase\n")
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    probe_ok = False
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            sock.connect(("127.0.0.1", proxy_port))
+            sock.close()
+            probe_ok = True
+            break
+        except (socket.error, ConnectionRefusedError):
+            time.sleep(0.1)
+
+    if not probe_ok:
+        proc.kill()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        fail("Proxy server failed to start")
+        return
+
+    try:
+        body = json.dumps({"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        status, resp_body = _send_proxy_request(
+            proxy_port, path="/v1/messages/count_tokens?beta=true", body=body)
+
+        if status == 0:
+            pass_("Client received status 0 (connection error path)")
+        else:
+            fail(f"Client received {status}, expected 0 (connection error)")
+
+        # Client cannot parse HTTP/1.0 0, so the upstream_unreachable body is
+        # asserted via the trace (mirrors test_exhaust_connection_error_synthesizes_body).
+        time.sleep(0.3)
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        time.sleep(0.3)
+
+        if not os.path.exists(trace_file):
+            fail("Trace file not created")
+            return
+
+        with open(trace_file) as f:
+            entries = [json.loads(line) for line in f if line.strip()]
+        request_events = [e for e in entries if e.get("event") == "request"]
+        if request_events:
+            error_field = request_events[0].get("error", "")
+            if error_field and "upstream_unreachable" in str(error_field):
+                pass_("Trace 'error' field contains 'upstream_unreachable'")
+            else:
+                fail(f"Trace 'error' field missing 'upstream_unreachable': {error_field}")
+        else:
+            fail("No request event in trace")
+
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_disable_retry_count_tokens_normal_path_unaffected():
+    """Flag=true, /v1/messages still retries normally (503 then 200)."""
+    print("\n--- Test: Disable Retry Count Tokens (normal path unaffected) ---")
+
+    upstream_port = find_free_port()
+    proxy_port = find_free_port()
+    request_count = [0]
+    count_lock = threading.Lock()
+
+    class FlakyHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            content_len = int(self.headers.get("Content-Length", 0))
+            if content_len > 0:
+                self.rfile.read(content_len)
+            with count_lock:
+                request_count[0] += 1
+                current = request_count[0]
+            if current <= 2:
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"Service Unavailable"}')
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"id":"ok","type":"message"}')
+        def log_message(self, format, *args):
+            pass
+
+    mock_server = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), FlakyHandler)
+    threading.Thread(target=mock_server.serve_forever, daemon=True).start()
+    time.sleep(0.3)
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_drct_normal_test_")
+    tiers = {
+        "haiku": {"provider": "test-provider", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "test-provider", "model": "claude-sonnet-5"},
+        "opus": {"provider": "test-provider", "model": "claude-opus-5"},
+    }
+    vendors = {"test-provider": {"url": f"http://127.0.0.1:{upstream_port}", "key": "test-api-key"}}
+    config_path = _create_test_config_with_flag(temp_dir, tiers, True)
+    keys_path = _create_test_keys(temp_dir, vendors)
+
+    env = os.environ.copy()
+    env["PROXY_PORT"] = str(proxy_port)
+    env["PROXY_MAX_RETRIES"] = "3"
+
+    proc = subprocess.Popen(
+        PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
+    )
+    if proc.stdin:
+        try:
+            proc.stdin.write("test-passphrase\n")
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    probe_ok = False
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            sock.connect(("127.0.0.1", proxy_port))
+            sock.close()
+            probe_ok = True
+            break
+        except (socket.error, ConnectionRefusedError):
+            time.sleep(0.1)
+
+    if not probe_ok:
+        proc.kill()
+        mock_server.shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        fail("Proxy server failed to start")
+        return
+
+    try:
+        status, resp_body = _send_proxy_request(proxy_port)
+
+        with count_lock:
+            total = request_count[0]
+
+        if total >= 2:
+            pass_(f"/v1/messages retried normally (attempts={total})")
+        else:
+            fail(f"/v1/messages only attempted {total} time(s), expected retry")
+
+        if status == 200:
+            pass_("Client eventually received 200")
+        else:
+            fail(f"Client received {status}, expected 200 after retry")
+
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        mock_server.shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_disable_retry_count_tokens_false_retries():
+    """Flag=false, count_tokens still retries (503 then 200)."""
+    print("\n--- Test: Disable Retry Count Tokens (false retries normally) ---")
+
+    upstream_port = find_free_port()
+    proxy_port = find_free_port()
+    request_count = [0]
+    count_lock = threading.Lock()
+
+    class CountTokensFlakyHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            content_len = int(self.headers.get("Content-Length", 0))
+            if content_len > 0:
+                self.rfile.read(content_len)
+            with count_lock:
+                request_count[0] += 1
+                current = request_count[0]
+            if current <= 1:
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"Service Unavailable"}')
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"id":"ok","type":"message"}')
+        def log_message(self, format, *args):
+            pass
+
+    mock_server = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), CountTokensFlakyHandler)
+    threading.Thread(target=mock_server.serve_forever, daemon=True).start()
+    time.sleep(0.3)
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_drct_false_test_")
+    tiers = {
+        "haiku": {"provider": "test-provider", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "test-provider", "model": "claude-sonnet-5"},
+        "opus": {"provider": "test-provider", "model": "claude-opus-5"},
+    }
+    vendors = {"test-provider": {"url": f"http://127.0.0.1:{upstream_port}", "key": "test-api-key"}}
+    config_path = _create_test_config_with_flag(temp_dir, tiers, False)
+    keys_path = _create_test_keys(temp_dir, vendors)
+
+    env = os.environ.copy()
+    env["PROXY_PORT"] = str(proxy_port)
+    env["PROXY_MAX_RETRIES"] = "3"
+
+    proc = subprocess.Popen(
+        PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
+    )
+    if proc.stdin:
+        try:
+            proc.stdin.write("test-passphrase\n")
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    probe_ok = False
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            sock.connect(("127.0.0.1", proxy_port))
+            sock.close()
+            probe_ok = True
+            break
+        except (socket.error, ConnectionRefusedError):
+            time.sleep(0.1)
+
+    if not probe_ok:
+        proc.kill()
+        mock_server.shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        fail("Proxy server failed to start")
+        return
+
+    try:
+        body = json.dumps({"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        conn = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+        conn.request("POST", "/v1/messages/count_tokens?beta=true", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+
+        with count_lock:
+            total = request_count[0]
+
+        if total >= 2:
+            pass_(f"count_tokens retried with flag=false (attempts={total})")
+        else:
+            fail(f"count_tokens only attempted {total} time(s), expected retry")
+
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        mock_server.shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_disable_retry_count_tokens_path_anchoring():
+    """Flag=true: only /v1/messages/count_tokens* is affected; /v1/messages,
+    /v1/messages?x=count_tokens, /v1/messages/count_tokens_batch retry normally."""
+    print("\n--- Test: Disable Retry Count Tokens (path anchoring) ---")
+
+    upstream_port = find_free_port()
+    proxy_port = find_free_port()
+    request_count = [0]
+    count_lock = threading.Lock()
+
+    class FlakyPathHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            content_len = int(self.headers.get("Content-Length", 0))
+            if content_len > 0:
+                self.rfile.read(content_len)
+            with count_lock:
+                request_count[0] += 1
+                current = request_count[0]
+            if current <= 1:
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"Service Unavailable"}')
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"id":"ok","type":"message"}')
+        def log_message(self, format, *args):
+            pass
+
+    mock_server = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), FlakyPathHandler)
+    threading.Thread(target=mock_server.serve_forever, daemon=True).start()
+    time.sleep(0.3)
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_drct_anchor_test_")
+    tiers = {
+        "haiku": {"provider": "test-provider", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "test-provider", "model": "claude-sonnet-5"},
+        "opus": {"provider": "test-provider", "model": "claude-opus-5"},
+    }
+    vendors = {"test-provider": {"url": f"http://127.0.0.1:{upstream_port}", "key": "test-api-key"}}
+    config_path = _create_test_config_with_flag(temp_dir, tiers, True)
+    keys_path = _create_test_keys(temp_dir, vendors)
+
+    env = os.environ.copy()
+    env["PROXY_PORT"] = str(proxy_port)
+    env["PROXY_MAX_RETRIES"] = "3"
+
+    proc = subprocess.Popen(
+        PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
+    )
+    if proc.stdin:
+        try:
+            proc.stdin.write("test-passphrase\n")
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    probe_ok = False
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            sock.connect(("127.0.0.1", proxy_port))
+            sock.close()
+            probe_ok = True
+            break
+        except (socket.error, ConnectionRefusedError):
+            time.sleep(0.1)
+
+    if not probe_ok:
+        proc.kill()
+        mock_server.shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        fail("Proxy server failed to start")
+        return
+
+    try:
+        # These three paths must ALL retry (attempt >= 2 each) despite flag=true
+        paths = ["/v1/messages", "/v1/messages?x=count_tokens", "/v1/messages/count_tokens_batch"]
+        all_retried = True
+        for p in paths:
+            with count_lock:
+                request_count[0] = 0
+            body = json.dumps({"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+            conn = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+            conn.request("POST", p, body=body, headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            with count_lock:
+                attempts = request_count[0]
+            if attempts >= 2:
+                pass_(f"path '{p}' retried normally (attempts={attempts})")
+            else:
+                fail(f"path '{p}' only attempted {attempts} time(s), expected retry")
+                all_retried = False
+
+        # The real count_tokens path must NOT retry
+        with count_lock:
+            request_count[0] = 0
+        body = json.dumps({"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        conn = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+        conn.request("POST", "/v1/messages/count_tokens?beta=true", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        with count_lock:
+            ct_attempts = request_count[0]
+        if ct_attempts == 1:
+            pass_("count_tokens path did NOT retry (exactly 1 attempt)")
+        else:
+            fail(f"count_tokens attempted {ct_attempts} times, expected 1")
+
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        mock_server.shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_disable_retry_count_tokens_invalid_type():
+    """validate_config rejects non-boolean disable_retry_claude_count_token."""
+    print("\n--- Test: Disable Retry Count Tokens (invalid type rejected) ---")
+
+    from claude_retry_proxy.server import validate_config
+
+    vendors = {"p": {"url": "http://127.0.0.1:1", "key": "k"}}
+    valid_tiers = {
+        "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+    }
+
+    # Non-boolean values must be rejected
+    for bad in ["false", 0, None]:
+        config = {"tiers": valid_tiers, "models": {}, "disable_retry_claude_count_token": bad}
+        errors = validate_config(config, set(vendors.keys()))
+        if any("disable_retry_claude_count_token" in e for e in errors):
+            pass_(f"validate_config rejected non-boolean value {bad!r}")
+        else:
+            fail(f"validate_config accepted non-boolean value {bad!r}")
+
+    # Valid boolean true must be accepted
+    config = {"tiers": valid_tiers, "models": {}, "disable_retry_claude_count_token": True}
+    errors = validate_config(config, set(vendors.keys()))
+    if errors:
+        fail(f"validate_config rejected valid boolean True: {errors}")
+    else:
+        pass_("validate_config accepted boolean True")
+
+
+def test_admin_switch_preserves_disable_retry_flag():
+    """Admin Apply preserves disable_retry_claude_count_token in returned + on-disk config."""
+    print("\n--- Test: Admin Switch Preserves Disable Retry Flag ---")
+
+    upstream_port = find_free_port()
+    proxy_port = find_free_port()
+
+    tiers = {
+        "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+    }
+    vendors = {"p": {"url": f"http://127.0.0.1:{upstream_port}", "key": "k"}}
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_drct_admin_test_")
+    try:
+        config_path = _create_test_config_with_flag(temp_dir, tiers, True)
+        keys_path = _create_test_keys(temp_dir, vendors)
+
+        proc, probe_ok = _start_proxy_server_directly(
+            proxy_port, config_path=config_path, keys_path=keys_path
+        )
+        if not probe_ok:
+            fail("Proxy server failed to start")
+            return
+
+        try:
+            import http.client as _hc
+            # Apply a tier switch (swap sonnet to a new model on same provider)
+            switch_body = json.dumps({
+                "tiers": {
+                    "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                    "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                    "opus": {"provider": "p", "model": "claude-opus-5"},
+                }
+            })
+            conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+            conn.request("POST", "/admin/api/switch", body=switch_body,
+                         headers={"Content-Type": "application/json", "Origin": f"http://localhost:{proxy_port}"})
+            resp = conn.getresponse()
+            switch_status = resp.status
+            resp.read()
+            conn.close()
+
+            if switch_status != 200:
+                fail(f"Admin switch returned {switch_status}, expected 200")
+                return
+
+            # Check returned config
+            conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+            conn.request("GET", "/admin/api/config")
+            resp = conn.getresponse()
+            config = json.loads(resp.read().decode())
+            conn.close()
+
+            if config.get("disable_retry_claude_count_token") is True:
+                pass_("Returned config preserves disable_retry_claude_count_token=true")
+            else:
+                fail(f"Returned config missing/preserved flag: {config.get('disable_retry_claude_count_token')}")
+
+            # Check on-disk config.json
+            with open(config_path) as f:
+                disk_config = json.load(f)
+            if disk_config.get("disable_retry_claude_count_token") is True:
+                pass_("On-disk config preserves disable_retry_claude_count_token=true")
+            else:
+                fail(f"On-disk config missing/preserved flag: {disk_config.get('disable_retry_claude_count_token')}")
+
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_retry_trace_event_enriched():
+    """Retry trace events include model, provider, request_id."""
+    print("\n--- Test: Retry Trace Event Enriched ---")
+
+    upstream_port = find_free_port()
+    proxy_port = find_free_port()
+    request_count = [0]
+    count_lock = threading.Lock()
+
+    class FlakyTraceHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            content_len = int(self.headers.get("Content-Length", 0))
+            if content_len > 0:
+                self.rfile.read(content_len)
+            with count_lock:
+                request_count[0] += 1
+                current = request_count[0]
+            if current <= 1:
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"Service Unavailable"}')
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"id":"ok","type":"message"}')
+        def log_message(self, format, *args):
+            pass
+
+    mock_server = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), FlakyTraceHandler)
+    threading.Thread(target=mock_server.serve_forever, daemon=True).start()
+    time.sleep(0.3)
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_drct_trace_test_")
+    tiers = {
+        "haiku": {"provider": "test-provider", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "test-provider", "model": "claude-sonnet-5"},
+        "opus": {"provider": "test-provider", "model": "claude-opus-5"},
+    }
+    vendors = {"test-provider": {"url": f"http://127.0.0.1:{upstream_port}", "key": "test-api-key"}}
+    config_path = _create_test_config_with_flag(temp_dir, tiers, None)  # no flag
+    keys_path = _create_test_keys(temp_dir, vendors)
+
+    trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
+    os.close(trace_fd)
+
+    env = os.environ.copy()
+    env["PROXY_PORT"] = str(proxy_port)
+    env["PROXY_MAX_RETRIES"] = "3"
+    env["PROXY_TRACE_FILE"] = trace_file
+
+    proc = subprocess.Popen(
+        PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
+    )
+    if proc.stdin:
+        try:
+            proc.stdin.write("test-passphrase\n")
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    probe_ok = False
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            sock.connect(("127.0.0.1", proxy_port))
+            sock.close()
+            probe_ok = True
+            break
+        except (socket.error, ConnectionRefusedError):
+            time.sleep(0.1)
+
+    if not probe_ok:
+        proc.kill()
+        mock_server.shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        fail("Proxy server failed to start")
+        return
+
+    try:
+        status, resp_body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail(f"Request did not succeed (status={status})")
+            return
+
+        # Give the trace a moment to flush
+        time.sleep(0.3)
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        time.sleep(0.3)
+
+        with open(trace_file) as f:
+            entries = [json.loads(line) for line in f if line.strip()]
+
+        retry_events = [e for e in entries if e.get("event") == "retry"]
+        if not retry_events:
+            fail("No retry trace events found")
+            return
+
+        retry = retry_events[0]
+        if "model" in retry and "provider" in retry and "request_id" in retry:
+            pass_(f"Retry event has model={retry['model']!r}, provider={retry['provider']!r}, request_id={retry['request_id']!r}")
+        else:
+            fail(f"Retry event missing model/provider/request_id: {retry}")
+
+        if "reason" in retry:
+            pass_(f"Retry event has reason={retry['reason']!r}")
+        else:
+            fail("Retry event missing 'reason'")
+
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        mock_server.shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ===========================================================================
 # Test runner
 # ===========================================================================
 
@@ -4872,9 +6233,22 @@ ALL_TESTS = [
     ("cli-start-no-config", test_cli_start_no_config),
     ("cli-start-invalid-config", test_cli_start_invalid_config),
     ("cli-status-shows-tiers", test_cli_status_shows_tiers),
+    ("cli-stop-cleans-proxy-state-lock", test_stop_cleans_proxy_state_lock),
+    ("cli-stop-cleans-proxy-state", test_stop_cleans_proxy_state),
+    ("cli-stop-trace-with-proxy", test_stop_trace_with_proxy),
+    ("cli-start-stdout-not-contaminated", test_start_stdout_not_contaminated),
     ("key-decryption-wrong-passphrase", test_key_decryption_wrong_passphrase),
     ("key-decryption-missing-file", test_key_decryption_missing_file),
     ("api-key-from-keys-index", test_api_key_from_keys_index),
+    ("admin-models-provider-keyed", test_admin_models_provider_keyed),
+    ("disable-retry-count-tokens-503", test_disable_retry_count_tokens_503),
+    ("disable-retry-count-tokens-conn-error", test_disable_retry_count_tokens_conn_error),
+    ("disable-retry-count-tokens-normal-path-unaffected", test_disable_retry_count_tokens_normal_path_unaffected),
+    ("disable-retry-count-tokens-false-retries", test_disable_retry_count_tokens_false_retries),
+    ("disable-retry-count-tokens-path-anchoring", test_disable_retry_count_tokens_path_anchoring),
+    ("disable-retry-count-tokens-invalid-type", test_disable_retry_count_tokens_invalid_type),
+    ("admin-switch-preserves-disable-retry-flag", test_admin_switch_preserves_disable_retry_flag),
+    ("retry-trace-event-enriched", test_retry_trace_event_enriched),
 ]
 
 

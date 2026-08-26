@@ -35,15 +35,15 @@
             <h2>Tier Configuration</h2>
             <div id="tiers-container"></div>
             <div style="margin-top: 1.5rem;">
-                <button onclick="saveConfig()">Save Configuration</button>
-                <button class="secondary" onclick="reloadConfig()">Reload from Disk</button>
+                <button onclick="saveConfig()">Apply</button>
+                <button class="secondary" onclick="reloadConfig()">Reload</button>
             </div>
             <div id="status" class="status"></div>
         </div>
     </div>
 
     <script>
-        const TIERS = ['haiku', 'sonnet', 'opus'];
+        const TIERS = ['opus', 'sonnet', 'haiku'];
         let config = null;
         let providers = [];
 
@@ -67,7 +67,6 @@
             container.innerHTML = '';
             TIERS.forEach(tier => {
                 const tierConfig = config.tiers[tier] || { provider: '', model: '' };
-                const models = config.models?.[tier] || [];
                 const div = document.createElement('div');
                 div.className = 'tier-row';
                 div.innerHTML = `
@@ -93,16 +92,45 @@
                 });
                 providerSelect.value = tierConfig.provider || '';
 
-                // Populate models
-                const modelSelect = document.getElementById(`${tier}-model`);
-                models.forEach(m => {
-                    const opt = document.createElement('option');
-                    opt.value = m;
-                    opt.textContent = m;
-                    modelSelect.appendChild(opt);
-                });
-                modelSelect.value = tierConfig.model || '';
+                // Populate models from selected provider
+                populateModels(tier, tierConfig.model);
             });
+        }
+
+        function populateModels(tier, preferredModel) {
+            const provider = document.getElementById(tier + '-provider').value;
+            const models = config.models?.[provider] || [];
+            const modelSelect = document.getElementById(tier + '-model');
+            const customInput = document.getElementById(tier + '-custom-model');
+
+            // Clear and rebuild options
+            modelSelect.innerHTML = '';
+
+            const placeholder = document.createElement('option');
+            placeholder.value = '';
+            placeholder.textContent = 'Select model...';
+            modelSelect.appendChild(placeholder);
+
+            models.forEach(m => {
+                const opt = document.createElement('option');
+                opt.value = m;
+                opt.textContent = m;
+                modelSelect.appendChild(opt);
+            });
+
+            const customOpt = document.createElement('option');
+            customOpt.value = '__custom__';
+            customOpt.textContent = 'Custom...';
+            modelSelect.appendChild(customOpt);
+
+            // Restore selection if the preferred model exists in the new list
+            if (preferredModel && models.includes(preferredModel)) {
+                modelSelect.value = preferredModel;
+                customInput.classList.remove('visible');
+            } else {
+                modelSelect.value = '';
+                customInput.classList.remove('visible');
+            }
         }
 
         function onModelSelect(tier) {
@@ -117,7 +145,8 @@
         }
 
         function onProviderChange(tier) {
-            // Could refresh model list based on provider
+            const currentModelValue = getModelValue(tier);
+            populateModels(tier, currentModelValue);
         }
 
         function getModelValue(tier) {
