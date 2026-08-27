@@ -40,6 +40,15 @@ import time
 import uuid
 
 
+# Tests must never write into the user's live proxy trace. server.py binds
+# PROXY_TRACE_FILE at import time (in-process transforms log via log_trace),
+# and subprocess spawn helpers inherit the test runner's env via
+# os.environ.copy(). Force it to a session temp file before any server module
+# is imported, so both routes stay isolated from ~/.claude/logs.
+os.environ["PROXY_TRACE_FILE"] = os.path.join(
+    tempfile.gettempdir(), "claude-retry-proxy-test-trace.jsonl")
+
+
 # ---------------------------------------------------------------------------
 # Test infrastructure
 # ---------------------------------------------------------------------------
@@ -306,7 +315,8 @@ def _create_test_keys_plain(temp_dir, vendors):
 
 
 def _start_proxy_server_directly(port, config_path=None, keys_path=None,
-                                  passphrase="test-passphrase", trace_file=None, cwd=None):
+                                  passphrase="test-passphrase", trace_file=None, cwd=None,
+                                  extra_env=None):
     """Start proxy server directly (not via claude-retry-proxy CLI) for testing.
 
     New flow: uses config.json + keys-index.json + passphrase instead of settings.json.
@@ -326,6 +336,8 @@ def _start_proxy_server_directly(port, config_path=None, keys_path=None,
     env["PROXY_PORT"] = str(port)
     if trace_file:
         env["PROXY_TRACE_FILE"] = trace_file
+    if extra_env:
+        env.update(extra_env)
 
     extra_args = []
     if config_path:
@@ -6684,6 +6696,1914 @@ def test_retry_trace_event_enriched():
 
 
 # ===========================================================================
+# Mode dispatch tests (plan 2026-08-27-support-three-endpoint-modes)
+# ===========================================================================
+
+def _require_server_func(name):
+    """Import claude_retry_proxy.server and return the named function.
+
+    Returns None (with a recorded failure) if the module or function does not
+    exist yet so the rest of the suite still runs cleanly.
+    """
+    try:
+        import claude_retry_proxy.server as srv
+    except Exception as e:
+        fail("cannot import claude_retry_proxy.server: {}".format(e))
+        return None
+    fn = getattr(srv, name, None)
+    if fn is None:
+        fail("server.py does not define {} (not implemented yet)".format(name))
+        return None
+    return fn
+
+
+def _mode_tiers(provider="p", model="claude-sonnet-5"):
+    """Three-tier config mapping for mode-dispatch tests."""
+    return {
+        "haiku": {"provider": provider, "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": provider, "model": model},
+        "opus": {"provider": provider, "model": "claude-opus-5"},
+    }
+
+
+def _start_mode_mock_upstream(port, req_list, responder):
+    """Start a mock upstream for mode-dispatch tests.
+
+    responder(info) -> (status, content_type, body_bytes). info is a dict with
+    keys path, body, api_key, authorization. Every request (all retries
+    included) is appended to req_list.
+    """
+    class MockHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_len) if content_len > 0 else b""
+            info = {
+                "path": self.path,
+                "body": body,
+                "api_key": self.headers.get("x-api-key", ""),
+                "authorization": self.headers.get("authorization", ""),
+            }
+            req_list.append(info)
+            status, content_type, resp_body = responder(info)
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(resp_body)))
+            self.end_headers()
+            self.wfile.write(resp_body)
+
+        def log_message(self, format, *args):
+            pass
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), MockHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.1)
+    return server
+
+
+def _mode_default_responder(info):
+    """Default responder: 200 JSON echoing the request's model (anthropic shape)."""
+    try:
+        model = json.loads(info["body"]).get("model", "unknown")
+    except Exception:
+        model = "unknown"
+    body = json.dumps({
+        "id": "msg_ok",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": "hello"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }).encode()
+    return 200, "application/json", body
+
+
+def _start_mode_proxy(tiers, vendors, responders=None, extra_env=None):
+    """Start proxy + mode-aware mock upstreams (plain keys).
+
+    vendors maps vendor -> {url, key, mode?}. responders maps vendor ->
+    responder(info). extra_env passes additional env vars to the proxy
+    subprocess (e.g. reduced PROXY_MAX_DELAY for fast retry tests). Returns
+    (temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup).
+    """
+    temp_dir = tempfile.mkdtemp(prefix="proxy_mode_")
+    proxy_port = find_free_port()
+    config_path = _create_test_config(
+        temp_dir, tiers, models=_models_for_vendors(tiers, vendors))
+    keys_path = _create_test_keys_plain(temp_dir, vendors)
+
+    responders = responders or {}
+    mock_servers = {}
+    for vendor_name, vendor_info in vendors.items():
+        from urllib.parse import urlparse
+        port = urlparse(vendor_info["url"]).port
+        req_list = []
+        responder = responders.get(vendor_name, _mode_default_responder)
+        server = _start_mode_mock_upstream(port, req_list, responder)
+        mock_servers[vendor_name] = {"server": server, "requests": req_list}
+
+    trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
+    os.close(trace_fd)
+
+    proc, probe_ok = _start_proxy_server_directly(
+        proxy_port, config_path=config_path, keys_path=keys_path,
+        passphrase=None, trace_file=trace_file, extra_env=extra_env
+    )
+
+    if not probe_ok:
+        for ms in mock_servers.values():
+            ms["server"].shutdown()
+        proc.kill()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return None, None, None, None, None, None
+
+    def cleanup():
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        for ms in mock_servers.values():
+            ms["server"].shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup
+
+
+def _send_proxy_request_stream(port, body, path="/v1/messages"):
+    """POST to the proxy and read the full response until close (SSE).
+
+    Returns (status, content_type, raw_body_bytes).
+    """
+    import http.client as _hc
+    conn = _hc.HTTPConnection("127.0.0.1", port, timeout=30)
+    conn.request("POST", path, body=json.dumps(body),
+                 headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    status = resp.status
+    content_type = resp.getheader("Content-Type", "")
+    chunks = []
+    while True:
+        chunk = resp.read(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    conn.close()
+    return status, content_type, b"".join(chunks)
+
+
+def _parse_sse_frames(raw):
+    """Split an SSE byte stream into [(event_type_or_None, data_or_raw)] frames."""
+    frames = []
+    text = raw.decode("utf-8", errors="replace")
+    for block in text.split("\n\n"):
+        block = block.strip("\n").strip("\r")
+        if not block:
+            continue
+        event_type = None
+        data_val = None
+        for line in block.split("\n"):
+            line = line.strip("\r")
+            if line.startswith("event:"):
+                event_type = line[6:].strip()
+            elif line.startswith("data:"):
+                payload = line[5:].strip()
+                try:
+                    data_val = json.loads(payload)
+                except Exception:
+                    data_val = payload
+        frames.append((event_type, data_val))
+    return frames
+
+
+def _sse_frame_type(frame):
+    """Effective SSE frame type: event: line if present, else data JSON type field."""
+    name, data = frame
+    if name:
+        return name
+    if isinstance(data, dict):
+        return data.get("type")
+    return None
+
+
+def _sse_frames_with_type(frames, wanted):
+    """Return data dicts of frames whose effective type equals wanted."""
+    out = []
+    for name, data in frames:
+        if _sse_frame_type((name, data)) == wanted and isinstance(data, dict):
+            out.append(data)
+    return out
+
+
+def _sse_types(frames):
+    return [_sse_frame_type(f) for f in frames]
+
+
+def _admin_get(proxy_port, path, source_ip=None):
+    """GET an admin endpoint; returns (status, body_bytes, status_text)."""
+    import http.client as _hc
+    kwargs = {"timeout": 10}
+    if source_ip is not None:
+        kwargs["source_address"] = (source_ip, 0)
+    conn = _hc.HTTPConnection("127.0.0.1", proxy_port, **kwargs)
+    try:
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        status = resp.status
+        stat = resp.reason
+        conn.close()
+        return status, body, stat
+    except Exception as e:
+        conn.close()
+        return 0, str(e).encode(), "connect-error"
+
+
+# --- Step 1: mode read from vendor entry ---
+
+def test_mode_defaults_to_anthropic():
+    """Vendor without a mode field is treated as anthropic (x-api-key used)."""
+    print("\n--- Test: Mode Defaults To Anthropic ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K-1"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        reqs = mock_servers["p"]["requests"]
+        if not reqs:
+            fail("upstream received no requests")
+            return
+        if reqs[0]["api_key"] != "K-1":
+            fail("expected x-api-key=K-1 (anthropic default), got {!r}".format(reqs[0]["api_key"]))
+        else:
+            pass_("vendor without mode uses x-api-key (anthropic default)")
+    finally:
+        cleanup()
+
+
+def test_mode_null_defaults_to_anthropic():
+    """Vendor with mode: null is treated as anthropic."""
+    print("\n--- Test: Mode Null Defaults To Anthropic ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K-2", "mode": None}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        reqs = mock_servers["p"]["requests"]
+        if not reqs:
+            fail("upstream received no requests")
+            return
+        if reqs[0]["api_key"] != "K-2":
+            fail("expected x-api-key with mode=null (anthropic default), got {!r}".format(reqs[0]["api_key"]))
+        else:
+            pass_("vendor with mode:null uses x-api-key")
+    finally:
+        cleanup()
+
+
+def test_mode_invalid_rejected():
+    """Vendor with an unknown mode returns 500 invalid_provider_mode."""
+    print("\n--- Test: Mode Invalid Rejected ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K-3", "mode": "watermelon"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 500:
+            fail("expected 500 for invalid mode, got {}".format(status))
+        elif b"invalid_provider_mode" not in body:
+            fail("expected invalid_provider_mode in error body, got {}".format(body.decode(errors="replace")))
+        else:
+            pass_("invalid mode returns 500 invalid_provider_mode")
+    finally:
+        cleanup()
+
+
+# --- Step 2: auth header dispatch by mode ---
+
+def test_auth_header_anthropic_mode():
+    """Anthropic mode forwards with x-api-key, no Authorization header."""
+    print("\n--- Test: Auth Header Anthropic Mode ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "auth-K-ant"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        reqs = mock_servers["p"]["requests"]
+        if not reqs:
+            fail("upstream received no requests")
+            return
+        r = reqs[0]
+        if r["api_key"] != "auth-K-ant":
+            fail("anthropic mode: expected x-api-key=auth-K-ant, got {!r}".format(r["api_key"]))
+        if r["authorization"] != "":
+            fail("anthropic mode: expected no Authorization header, got {!r}".format(r["authorization"]))
+        if r["api_key"] == "auth-K-ant" and r["authorization"] == "":
+            pass_("anthropic mode uses x-api-key and drops Authorization")
+    finally:
+        cleanup()
+
+
+def test_auth_header_chat_mode():
+    """Chat mode forwards with Authorization: Bearer, no x-api-key."""
+    print("\n--- Test: Auth Header Chat Mode ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "auth-K-chat", "mode": "chat"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        reqs = mock_servers["p"]["requests"]
+        if not reqs:
+            fail("upstream received no requests")
+            return
+        r = reqs[0]
+        if r["authorization"] != "Bearer auth-K-chat":
+            fail("chat mode: expected 'Authorization: Bearer auth-K-chat', got {!r}".format(r["authorization"]))
+        if r["api_key"] != "":
+            fail("chat mode: expected no x-api-key, got {!r}".format(r["api_key"]))
+        if r["authorization"] == "Bearer auth-K-chat" and r["api_key"] == "":
+            pass_("chat mode uses Authorization: Bearer")
+    finally:
+        cleanup()
+
+
+def test_auth_header_response_mode():
+    """Response mode forwards with Authorization: Bearer, no x-api-key."""
+    print("\n--- Test: Auth Header Response Mode ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "auth-K-resp", "mode": "response"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        reqs = mock_servers["p"]["requests"]
+        if not reqs:
+            fail("upstream received no requests")
+            return
+        r = reqs[0]
+        if r["authorization"] != "Bearer auth-K-resp":
+            fail("response mode: expected 'Authorization: Bearer auth-K-resp', got {!r}".format(r["authorization"]))
+        if r["api_key"] != "":
+            fail("response mode: expected no x-api-key, got {!r}".format(r["api_key"]))
+        if r["authorization"] == "Bearer auth-K-resp" and r["api_key"] == "":
+            pass_("response mode uses Authorization: Bearer")
+    finally:
+        cleanup()
+
+
+# --- Step 3: path construction by mode ---
+
+def test_path_anthropic_mode():
+    """Anthropic mode appends the original request path to the upstream URL."""
+    print("\n--- Test: Path Anthropic Mode ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        reqs = mock_servers["p"]["requests"]
+        if not reqs:
+            fail("upstream received no requests")
+            return
+        if reqs[0]["path"] != "/v1/messages":
+            fail("anthropic mode: expected upstream path /v1/messages, got {!r}".format(reqs[0]["path"]))
+        else:
+            pass_("anthropic mode forwards the original request path")
+    finally:
+        cleanup()
+
+
+def test_path_chat_mode():
+    """Chat mode upstream path is path_prefix + /v1/chat/completions."""
+    print("\n--- Test: Path Chat Mode ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        reqs = mock_servers["p"]["requests"]
+        if not reqs:
+            fail("upstream received no requests")
+            return
+        if reqs[0]["path"] != "/v1/chat/completions":
+            fail("chat mode: expected upstream path /v1/chat/completions, got {!r}".format(reqs[0]["path"]))
+        else:
+            pass_("chat mode upstream path ends in /v1/chat/completions")
+    finally:
+        cleanup()
+
+
+def test_path_response_mode():
+    """Response mode upstream path is path_prefix + /v1/responses."""
+    print("\n--- Test: Path Response Mode ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "response"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        reqs = mock_servers["p"]["requests"]
+        if not reqs:
+            fail("upstream received no requests")
+            return
+        if reqs[0]["path"] != "/v1/responses":
+            fail("response mode: expected upstream path /v1/responses, got {!r}".format(reqs[0]["path"]))
+        else:
+            pass_("response mode upstream path ends in /v1/responses")
+    finally:
+        cleanup()
+
+
+def test_path_double_v1_prevention():
+    """A vendor URL ending in /v1 must not produce a /v1/v1/ upstream path."""
+    print("\n--- Test: Path Double V1 Prevention ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}/v1".format(upstream_port), "key": "K", "mode": "chat"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        reqs = mock_servers["p"]["requests"]
+        if not reqs:
+            fail("upstream received no requests")
+            return
+        p = reqs[0]["path"]
+        if p == "/v1/v1/chat/completions":
+            fail("chat mode produced double /v1/v1 upstream path: {!r}".format(p))
+        elif p != "/v1/chat/completions":
+            fail("expected /v1/chat/completions, got {!r}".format(p))
+        else:
+            pass_("trailing /v1 in vendor URL is not duplicated: {}".format(p))
+    finally:
+        cleanup()
+
+
+def test_count_tokens_rejected_chat_mode():
+    """count_tokens returns 400 in chat mode."""
+    print("\n--- Test: Count Tokens Rejected Chat Mode ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(
+            proxy_port, path="/v1/messages/count_tokens",
+            body=json.dumps({"model": "sonnet"}))
+        if status != 400:
+            fail("chat mode count_tokens: expected 400, got {}".format(status))
+        elif b"count_tokens" not in body:
+            fail("expected count_tokens rejection message, got {}".format(body.decode(errors="replace")))
+        else:
+            pass_("chat mode rejects count_tokens with 400")
+    finally:
+        cleanup()
+
+
+def test_count_tokens_rejected_response_mode():
+    """count_tokens returns 400 in response mode."""
+    print("\n--- Test: Count Tokens Rejected Response Mode ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "response"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(
+            proxy_port, path="/v1/messages/count_tokens",
+            body=json.dumps({"model": "sonnet"}))
+        if status != 400:
+            fail("response mode count_tokens: expected 400, got {}".format(status))
+        elif b"count_tokens" not in body:
+            fail("expected count_tokens rejection message, got {}".format(body.decode(errors="replace")))
+        else:
+            pass_("response mode rejects count_tokens with 400")
+    finally:
+        cleanup()
+
+
+# --- Step 4: _anthropic_to_chat ---
+
+def test_anthropic_to_chat_basic():
+    """messages, model, max_tokens, temperature map through."""
+    print("\n--- Test: Anthropic To Chat Basic ---")
+    fn = _require_server_func("_anthropic_to_chat")
+    if fn is None:
+        return
+    inp = {"model": "sonnet",
+           "messages": [{"role": "user", "content": "hi"}],
+           "max_tokens": 100,
+           "temperature": 0.5}
+    out = fn(dict(inp))
+    if not isinstance(out, dict):
+        fail("_anthropic_to_chat must return a dict, got {!r}".format(type(out)))
+        return
+    checks = [
+        (out.get("model") == "sonnet", "model pass-through"),
+        (out.get("messages") == [{"role": "user", "content": "hi"}], "messages pass-through"),
+        (out.get("max_tokens") == 100, "max_tokens pass-through"),
+        (out.get("temperature") == 0.5, "temperature pass-through"),
+    ]
+    for ok, label in checks:
+        if not ok:
+            fail("basic mapping failed: {}".format(label))
+    if all(ok for ok, _ in checks):
+        pass_("anthropic->chat basic mapping correct")
+
+
+def test_anthropic_to_chat_system_string():
+    """system string becomes the first system message."""
+    print("\n--- Test: Anthropic To Chat System String ---")
+    fn = _require_server_func("_anthropic_to_chat")
+    if fn is None:
+        return
+    inp = {"model": "sonnet", "system": "You are helpful",
+           "messages": [{"role": "user", "content": "hi"}]}
+    out = fn(inp)
+    msgs = out.get("messages")
+    if not isinstance(msgs, list) or len(msgs) < 2:
+        fail("expected system message prepended to messages")
+    elif not isinstance(msgs[0], dict) or msgs[0].get("role") != "system" or msgs[0].get("content") != "You are helpful":
+        fail("expected first message to be the system message, got {!r}".format(msgs[0]))
+    else:
+        pass_("system string prepended as system message")
+
+
+def test_anthropic_to_chat_system_list():
+    """system content blocks are concatenated with newlines; non-text dropped."""
+    print("\n--- Test: Anthropic To Chat System List ---")
+    fn = _require_server_func("_anthropic_to_chat")
+    if fn is None:
+        return
+    inp = {"model": "sonnet",
+           "system": [{"type": "text", "text": "First"},
+                      {"type": "text", "text": "Second"},
+                      {"type": "image", "source": {"type": "base64", "data": "x"}}],
+           "messages": [{"role": "user", "content": "hi"}]}
+    out = fn(inp)
+    msgs = out.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        fail("messages missing from output")
+        return
+    if msgs[0].get("role") != "system" or msgs[0].get("content") != "First\nSecond":
+        fail("expected system message content 'First\\nSecond', got {!r}".format(msgs[0]))
+    if len(msgs) != 2:
+        fail("expected exactly user message after system (image block dropped), got {} messages".format(len(msgs)))
+    if msgs[0].get("role") == "system" and msgs[0].get("content") == "First\nSecond" and len(msgs) == 2:
+        pass_("system list concatenated; non-text blocks dropped")
+
+
+def test_anthropic_to_chat_dropped_fields():
+    """thinking, tools, tool_choice, metadata, top_k are absent from output."""
+    print("\n--- Test: Anthropic To Chat Dropped Fields ---")
+    fn = _require_server_func("_anthropic_to_chat")
+    if fn is None:
+        return
+    inp = {"model": "sonnet",
+           "messages": [{"role": "user", "content": "hi"}],
+           "thinking": {"type": "enabled", "budget_tokens": 100},
+           "tools": [{"name": "t", "input_schema": {}}],
+           "tool_choice": {"type": "auto"},
+           "metadata": {"user_id": "x"},
+           "top_k": 5}
+    out = fn(inp)
+    for key in ("thinking", "tools", "tool_choice", "metadata", "top_k"):
+        if key in out:
+            fail("expected {!r} dropped from output, present: {}".format(key, sorted(out.keys())))
+    if "messages" not in out:
+        fail("messages missing from output")
+    if all(key not in out for key in ("thinking", "tools", "tool_choice", "metadata", "top_k")):
+        pass_("fields dropped: thinking, tools, tool_choice, metadata, top_k")
+
+
+def test_anthropic_to_chat_stop_sequences():
+    """stop_sequences is renamed to stop."""
+    print("\n--- Test: Anthropic To Chat Stop Sequences ---")
+    fn = _require_server_func("_anthropic_to_chat")
+    if fn is None:
+        return
+    inp = {"model": "sonnet",
+           "messages": [{"role": "user", "content": "hi"}],
+           "stop_sequences": ["END", "</s>"]}
+    out = fn(inp)
+    if "stop_sequences" in out:
+        fail("stop_sequences should be renamed, still present")
+    if out.get("stop") != ["END", "</s>"]:
+        fail("expected stop=['END', '</s>'], got {!r}".format(out.get("stop")))
+    if "stop_sequences" not in out and out.get("stop") == ["END", "</s>"]:
+        pass_("stop_sequences renamed to stop")
+
+
+# --- Step 5: _chat_to_anthropic ---
+
+def test_chat_to_anthropic_basic():
+    """content, model, stop_reason, usage mapped correctly."""
+    print("\n--- Test: Chat To Anthropic Basic ---")
+    fn = _require_server_func("_chat_to_anthropic")
+    if fn is None:
+        return
+    chat = {"id": "chatcmpl-123", "object": "chat.completion", "model": "gpt-4o",
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": "Hello"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}
+    out = fn(chat, "sonnet")
+    if not isinstance(out, dict):
+        fail("_chat_to_anthropic must return a dict")
+        return
+    checks = [
+        (out.get("id") == "msg_chatcmpl-123", "id prefixed with msg_"),
+        (out.get("model") == "sonnet", "model rewritten to tier"),
+        (out.get("type") == "message", "type hardcoded to message"),
+        (out.get("role") == "assistant", "role hardcoded to assistant"),
+        (out.get("content") == [{"type": "text", "text": "Hello"}], "content string wrapped"),
+        (out.get("stop_reason") == "end_turn", "stop->end_turn"),
+        (out.get("stop_sequence") is None, "stop_sequence null"),
+        (out.get("usage") == {"input_tokens": 5, "output_tokens": 3}, "usage mapped"),
+    ]
+    for ok, label in checks:
+        if not ok:
+            fail("basic mapping failed: {} (out={!r})".format(label, out))
+    if all(ok for ok, _ in checks):
+        pass_("chat->anthropic basic mapping correct")
+
+
+def test_chat_to_anthropic_empty_choices():
+    """Empty choices returns a minimal valid Anthropic message."""
+    print("\n--- Test: Chat To Anthropic Empty Choices ---")
+    fn = _require_server_func("_chat_to_anthropic")
+    if fn is None:
+        return
+    chat = {"id": "chatcmpl-1", "choices": [], "model": "gpt-4o"}
+    out = fn(chat, "sonnet")
+    if not isinstance(out, dict):
+        fail("empty choices must still return a dict")
+        return
+    if out.get("type") != "message":
+        fail("minimal response missing type=message")
+    if out.get("role") != "assistant":
+        fail("minimal response missing role=assistant")
+    if out.get("model") != "sonnet":
+        fail("minimal response missing model=tier")
+    if out.get("content") != []:
+        fail("minimal response expected content=[], got {!r}".format(out.get("content")))
+    if out.get("type") == "message" and out.get("role") == "assistant" and out.get("content") == []:
+        pass_("empty choices returns minimal valid message")
+
+
+def test_chat_to_anthropic_tool_calls():
+    """tool_calls map to tool_use content blocks."""
+    print("\n--- Test: Chat To Anthropic Tool Calls ---")
+    fn = _require_server_func("_chat_to_anthropic")
+    if fn is None:
+        return
+    chat = {"id": "chatcmpl-1",
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": "",
+                                     "tool_calls": [
+                                         {"id": "call_1", "type": "function",
+                                          "function": {"name": "get_weather",
+                                                       "arguments": '{"city": "SF"}'}}]},
+                         "finish_reason": "tool_calls"}]}
+    out = fn(chat, "sonnet")
+    content = out.get("content") if isinstance(out.get("content"), list) else []
+    tools = [b for b in content if b.get("type") == "tool_use"]
+    if not tools:
+        fail("expected a tool_use content block, content={!r}".format(out.get("content")))
+        return
+    t = tools[0]
+    if t.get("name") != "get_weather":
+        fail("tool_use name mismatch: {!r}".format(t.get("name")))
+    if t.get("input") != {"city": "SF"}:
+        fail("tool_use input mismatch: {!r}".format(t.get("input")))
+    if t.get("id") != "call_1":
+        fail("tool_use id mismatch: {!r}".format(t.get("id")))
+    if out.get("stop_reason") != "tool_use":
+        fail("finish_reason tool_calls should map to stop_reason tool_use, got {!r}".format(out.get("stop_reason")))
+    if tools and t.get("name") == "get_weather" and t.get("input") == {"city": "SF"}:
+        pass_("tool_calls mapped to tool_use blocks")
+
+
+def test_chat_to_anthropic_finish_reason_mapping():
+    """All finish_reason values map to the correct stop_reason."""
+    print("\n--- Test: Chat To Anthropic Finish Reason Mapping ---")
+    fn = _require_server_func("_chat_to_anthropic")
+    if fn is None:
+        return
+    cases = [("stop", "end_turn"), ("length", "max_tokens"), ("tool_calls", "tool_use"),
+             ("content_filter", None), ("weird_thing", None)]
+    ok = True
+    for fr, expected in cases:
+        chat = {"id": "x", "choices": [{"index": 0,
+                                        "message": {"role": "assistant", "content": "hi"},
+                                        "finish_reason": fr}]}
+        out = fn(chat, "sonnet")
+        actual = out.get("stop_reason")
+        if actual != expected:
+            fail("finish_reason {!r} -> stop_reason {!r}, expected {!r}".format(fr, actual, expected))
+            ok = False
+    chat_missing = {"id": "x", "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}]}
+    out = fn(chat_missing, "sonnet")
+    if out.get("stop_reason") is not None:
+        fail("missing finish_reason should map to null, got {!r}".format(out.get("stop_reason")))
+        ok = False
+    if ok:
+        pass_("finish_reason->stop_reason mapping correct")
+
+
+def test_chat_to_anthropic_usage_absent():
+    """Missing usage maps to zero input/output tokens."""
+    print("\n--- Test: Chat To Anthropic Usage Absent ---")
+    fn = _require_server_func("_chat_to_anthropic")
+    if fn is None:
+        return
+    chat = {"id": "x", "choices": [{"index": 0,
+                                    "message": {"role": "assistant", "content": "hi"},
+                                    "finish_reason": "stop"}]}
+    out = fn(chat, "sonnet")
+    if out.get("usage") != {"input_tokens": 0, "output_tokens": 0}:
+        fail("expected usage {input_tokens:0, output_tokens:0}, got {!r}".format(out.get("usage")))
+    else:
+        pass_("missing usage handled with zero defaults")
+
+
+def test_chat_to_anthropic_content_array():
+    """Array content blocks map individually."""
+    print("\n--- Test: Chat To Anthropic Content Array ---")
+    fn = _require_server_func("_chat_to_anthropic")
+    if fn is None:
+        return
+    chat = {"id": "x", "choices": [{"index": 0,
+                                    "message": {"role": "assistant", "content": [
+                                        {"type": "text", "text": "part1"},
+                                        {"type": "text", "text": "part2"}]},
+                                    "finish_reason": "stop"}]}
+    out = fn(chat, "sonnet")
+    expected = [{"type": "text", "text": "part1"}, {"type": "text", "text": "part2"}]
+    if out.get("content") != expected:
+        fail("array content not preserved: {!r}".format(out.get("content")))
+    else:
+        pass_("array content mapped block by block")
+
+
+def test_chat_to_anthropic_malformed_tool_args():
+    """Malformed JSON tool arguments do not crash and fall back to {}."""
+    print("\n--- Test: Chat To Anthropic Malformed Tool Args ---")
+    fn = _require_server_func("_chat_to_anthropic")
+    if fn is None:
+        return
+    chat = {"id": "x",
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": "",
+                                     "tool_calls": [
+                                         {"id": "call_1", "type": "function",
+                                          "function": {"name": "f", "arguments": "{not json"}}]},
+                         "finish_reason": "tool_calls"}]}
+    out = fn(chat, "sonnet")
+    content = out.get("content") if isinstance(out.get("content"), list) else []
+    tools = [b for b in content if b.get("type") == "tool_use"]
+    if not tools:
+        fail("malformed tool args: expected a tool_use block, content={!r}".format(out.get("content")))
+        return
+    if tools[0].get("input") != {}:
+        fail("malformed arguments should fall back to {{}}, got {!r}".format(tools[0].get("input")))
+    else:
+        pass_("malformed tool arguments fall back to {}")
+
+
+# --- Step 6: _anthropic_to_response ---
+
+def test_anthropic_to_response_basic():
+    """model, input, instructions, max_output_tokens, stream mapped correctly."""
+    print("\n--- Test: Anthropic To Response Basic ---")
+    fn = _require_server_func("_anthropic_to_response")
+    if fn is None:
+        return
+    inp = {"model": "sonnet",
+           "messages": [{"role": "user", "content": "hi"}],
+           "system": "Be concise",
+           "max_tokens": 50,
+           "temperature": 0.5,
+           "top_p": 0.9,
+           "stream": True}
+    out = fn(inp)
+    if not isinstance(out, dict):
+        fail("_anthropic_to_response must return a dict")
+        return
+    checks = [
+        (out.get("model") == "sonnet", "model pass-through"),
+        (out.get("stream") is False, "stream forced false"),
+        (out.get("input") == "hi", "input from user message"),
+        (out.get("instructions") == "Be concise", "system -> instructions"),
+        (out.get("max_output_tokens") == 50, "max_tokens -> max_output_tokens"),
+        (out.get("temperature") == 0.5, "temperature pass-through"),
+        (out.get("top_p") == 0.9, "top_p pass-through"),
+        ("messages" not in out, "messages dropped"),
+    ]
+    for ok, label in checks:
+        if not ok:
+            fail("basic response mapping failed: {}".format(label))
+    if all(ok for ok, _ in checks):
+        pass_("anthropic->response basic mapping correct")
+
+
+def test_anthropic_to_response_system_list():
+    """system content block list concatenates into instructions."""
+    print("\n--- Test: Anthropic To Response System List ---")
+    fn = _require_server_func("_anthropic_to_response")
+    if fn is None:
+        return
+    inp = {"model": "sonnet",
+           "messages": [{"role": "user", "content": "hi"}],
+           "system": [{"type": "text", "text": "A"}, {"type": "text", "text": "B"}]}
+    out = fn(inp)
+    if out.get("instructions") != "A\nB":
+        fail("expected instructions 'A\\nB', got {!r}".format(out.get("instructions")))
+    else:
+        pass_("system list concatenated to instructions")
+
+
+def test_anthropic_to_response_multiple_user_messages():
+    """Last user message provides input; text content blocks joined with newline."""
+    print("\n--- Test: Anthropic To Response Multiple User Messages ---")
+    fn = _require_server_func("_anthropic_to_response")
+    if fn is None:
+        return
+    inp = {"model": "sonnet",
+           "messages": [{"role": "user", "content": "first"},
+                        {"role": "assistant", "content": "resp"},
+                        {"role": "user", "content": [{"type": "text", "text": "secX"},
+                                                      {"type": "text", "text": "secY"}]}]}
+    out = fn(inp)
+    if out.get("input") != "secX\nsecY":
+        fail("expected input 'secX\\nsecY', got {!r}".format(out.get("input")))
+    else:
+        pass_("last user message used for input")
+
+
+def test_anthropic_to_response_no_user_message():
+    """No user message yields input: ''."""
+    print("\n--- Test: Anthropic To Response No User Message ---")
+    fn = _require_server_func("_anthropic_to_response")
+    if fn is None:
+        return
+    inp = {"model": "sonnet", "messages": [{"role": "assistant", "content": "hi"}]}
+    out = fn(inp)
+    if out.get("input") != "":
+        fail("expected input '', got {!r}".format(out.get("input")))
+    else:
+        pass_("no user message -> input empty string")
+
+
+def test_anthropic_to_response_stream_forced_false():
+    """stream is always false regardless of the client's stream flag."""
+    print("\n--- Test: Anthropic To Response Stream Forced False ---")
+    fn = _require_server_func("_anthropic_to_response")
+    if fn is None:
+        return
+    ok = True
+    for stream_flag in (True, False):
+        inp = {"model": "sonnet",
+               "messages": [{"role": "user", "content": "hi"}],
+               "stream": stream_flag}
+        out = fn(inp)
+        if out.get("stream") is not False:
+            fail("stream should be false, input flag was {!r}".format(stream_flag))
+            ok = False
+    inp_missing = {"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]}
+    out = fn(inp_missing)
+    if out.get("stream") is not False:
+        fail("stream should be false when flag absent")
+        ok = False
+    if ok:
+        pass_("response mode always forces stream:false")
+
+
+# --- Step 7: _response_to_anthropic ---
+
+def test_response_to_anthropic_basic():
+    """content, model, id, usage mapped correctly."""
+    print("\n--- Test: Response To Anthropic Basic ---")
+    fn = _require_server_func("_response_to_anthropic")
+    if fn is None:
+        return
+    resp = {"id": "resp_123", "object": "response", "created_at": 1, "model": "gpt-4o",
+            "status": "completed",
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Hello", "annotations": []}]}],
+            "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}}
+    out = fn(resp, "sonnet")
+    if not isinstance(out, dict):
+        fail("_response_to_anthropic must return a dict")
+        return
+    checks = [
+        (out.get("id") == "resp_123", "id passed through"),
+        (out.get("model") == "sonnet", "model rewritten to tier"),
+        (out.get("type") == "message", "type hardcoded"),
+        (out.get("role") == "assistant", "role hardcoded"),
+        (out.get("content") == [{"type": "text", "text": "Hello"}], "output_text -> text block"),
+        (out.get("stop_reason") == "end_turn", "status completed -> end_turn"),
+        (out.get("usage") == {"input_tokens": 4, "output_tokens": 2}, "usage mapped"),
+    ]
+    for ok, label in checks:
+        if not ok:
+            fail("basic response->anthropic mapping failed: {}".format(label))
+    if all(ok for ok, _ in checks):
+        pass_("response->anthropic basic mapping correct")
+
+
+def test_response_to_anthropic_empty_output():
+    """Empty output returns a minimal valid Anthropic message."""
+    print("\n--- Test: Response To Anthropic Empty Output ---")
+    fn = _require_server_func("_response_to_anthropic")
+    if fn is None:
+        return
+    resp = {"id": "resp_1", "output": [], "status": "completed", "model": "gpt-4o"}
+    out = fn(resp, "sonnet")
+    if not isinstance(out, dict):
+        fail("empty output must still return a dict")
+        return
+    if out.get("type") != "message" or out.get("role") != "assistant" or out.get("model") != "sonnet":
+        fail("minimal response missing core fields: {!r}".format(out))
+    if out.get("content") != []:
+        fail("minimal response expected content=[], got {!r}".format(out.get("content")))
+    if out.get("type") == "message" and out.get("role") == "assistant" and out.get("content") == []:
+        pass_("empty output returns minimal valid message")
+
+
+def test_response_to_anthropic_multiple_output():
+    """First message output is used for content (per tester spec)."""
+    print("\n--- Test: Response To Anthropic Multiple Output ---")
+    fn = _require_server_func("_response_to_anthropic")
+    if fn is None:
+        return
+    resp = {"id": "resp_1", "status": "completed", "model": "gpt-4o",
+            "output": [
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "First", "annotations": []}]},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "Second", "annotations": []}]},
+                {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+            ]}
+    out = fn(resp, "sonnet")
+    content = out.get("content") if isinstance(out.get("content"), list) else []
+    texts = [b.get("text") for b in content if b.get("type") == "text"]
+    if texts != ["First"]:
+        fail("expected only first message output content, got {!r}".format(texts))
+    else:
+        pass_("first message output used for content")
+
+
+def test_response_to_anthropic_status_completed():
+    """stop_reason derived from the status field."""
+    print("\n--- Test: Response To Anthropic Status Completed ---")
+    fn = _require_server_func("_response_to_anthropic")
+    if fn is None:
+        return
+    cases = [("completed", "end_turn"), ("incomplete", None), ("failed", None), (None, None)]
+    ok = True
+    for status, expected in cases:
+        resp = {"id": "r", "status": status,
+                "output": [{"type": "message", "role": "assistant",
+                            "content": [{"type": "output_text", "text": "hi"}]}]}
+        out = fn(resp, "sonnet")
+        if out.get("stop_reason") != expected:
+            fail("status {!r} -> stop_reason {!r}, expected {!r}".format(status, out.get("stop_reason"), expected))
+            ok = False
+    if ok:
+        pass_("status->stop_reason mapping correct")
+
+
+def test_response_to_anthropic_usage_absent():
+    """Missing usage maps to zero input/output tokens."""
+    print("\n--- Test: Response To Anthropic Usage Absent ---")
+    fn = _require_server_func("_response_to_anthropic")
+    if fn is None:
+        return
+    resp = {"id": "r", "status": "completed",
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hi"}]}]}
+    out = fn(resp, "sonnet")
+    if out.get("usage") != {"input_tokens": 0, "output_tokens": 0}:
+        fail("expected usage {input_tokens:0, output_tokens:0}, got {!r}".format(out.get("usage")))
+    else:
+        pass_("missing usage handled with zero defaults")
+
+
+# --- Step 8: chat-mode SSE transformation ---
+
+def _sse_stream_chunks(chunks):
+    return "".join("data: {}\n\n".format(json.dumps(c)) for c in chunks).encode()
+
+
+def test_chat_sse_basic_streaming():
+    """Simulated OpenAI SSE chunks produce valid Anthropic SSE events."""
+    print("\n--- Test: Chat SSE Basic Streaming ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    chunks = [
+        {"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+        {"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"content": "Hel"}, "finish_reason": None}]},
+        {"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"content": "lo"}, "finish_reason": None}]},
+        {"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+    sse_body = _sse_stream_chunks(chunks) + b"data: [DONE]\n\n"
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}], "stream": True})
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        frames = _parse_sse_frames(raw)
+        types = _sse_types(frames)
+        required = ("message_start", "content_block_start", "content_block_delta",
+                    "content_block_stop", "message_delta", "message_stop")
+        missing = [t for t in required if t not in types]
+        if missing:
+            fail("missing SSE events {}; got {}".format(missing, types))
+            return
+        order_idx = {t: types.index(t) for t in required}
+        if [order_idx[t] for t in required] != sorted(order_idx.values()):
+            fail("SSE event ordering wrong: {}".format(types))
+        if types.count("message_delta") != 1 or types.count("message_stop") != 1:
+            fail("expected exactly one message_delta/message_stop, got {}".format(types))
+        start = _sse_frames_with_type(frames, "message_start")
+        if start:
+            msg = start[0].get("message", {})
+            if not (msg.get("id", "").startswith("msg_") and msg.get("model") == "sonnet"):
+                fail("synthetic message_start wrong: {!r}".format(start[0]))
+        if b"[DONE]" in raw:
+            fail("[DONE] sentinel leaked into client stream")
+        if not missing and [order_idx[t] for t in required] == sorted(order_idx.values()):
+            pass_("chat SSE produces valid Anthropic event sequence")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_finish_reason_mapping():
+    """finish_reason maps to stop_reason in the terminal message_delta."""
+    print("\n--- Test: Chat SSE Finish Reason Mapping ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    chunks = [
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hi"}, "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]},
+    ]
+    sse_body = _sse_stream_chunks(chunks) + b"data: [DONE]\n\n"
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        frames = _parse_sse_frames(raw)
+        deltas = _sse_frames_with_type(frames, "message_delta")
+        if not deltas:
+            fail("no message_delta event in stream")
+            return
+        delta_obj = deltas[0].get("delta", {})
+        stop_reason = delta_obj.get("stop_reason")
+        if stop_reason != "max_tokens":
+            fail("finish_reason length should map to stop_reason max_tokens, got {!r}".format(stop_reason))
+        else:
+            pass_("SSE finish_reason length -> stop_reason max_tokens")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_no_content_delta():
+    """Chunks without content delta produce no content_block_delta events."""
+    print("\n--- Test: Chat SSE No Content Delta ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    chunks = [
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+    sse_body = _sse_stream_chunks(chunks) + b"data: [DONE]\n\n"
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        frames = _parse_sse_frames(raw)
+        types = _sse_types(frames)
+        if "content_block_delta" in types:
+            fail("chunks without content produced content_block_delta: {}".format(types))
+        else:
+            pass_("no content_block_delta when chunks carry no content")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_empty_choices_usage_chunk():
+    """An empty-choices usage chunk does not crash and its usage is accumulated."""
+    print("\n--- Test: Chat SSE Empty Choices Usage Chunk ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    chunks = [
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hi"}, "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+    sse_body = _sse_stream_chunks(chunks) + b"data: [DONE]\n\n"
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        frames = _parse_sse_frames(raw)
+        deltas = _sse_frames_with_type(frames, "message_delta")
+        if not deltas:
+            fail("no message_delta in stream")
+            return
+        usage = deltas[0].get("usage", {})
+        if usage.get("input_tokens") != 10 or usage.get("output_tokens") != 5:
+            fail("expected usage input_tokens=10 output_tokens=5 in message_delta, got {!r}".format(usage))
+        else:
+            pass_("empty-choices usage chunk accumulated into message_delta")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_eof_without_finish_reason():
+    """Terminal events are synthesized when the stream ends without finish_reason."""
+    print("\n--- Test: Chat SSE EOF Without Finish Reason ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    chunks = [
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hello"}, "finish_reason": None}]},
+    ]
+    sse_body = _sse_stream_chunks(chunks)
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        frames = _parse_sse_frames(raw)
+        types = _sse_types(frames)
+        missing = [t for t in ("content_block_stop", "message_delta", "message_stop") if t not in types]
+        if missing:
+            fail("EOF without finish_reason should synthesize terminal events; missing {}".format(missing))
+        else:
+            pass_("terminal events synthesized on EOF")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_first_event_has_content():
+    """A first chunk that carries real content emits a content_block_delta."""
+    print("\n--- Test: Chat SSE First Event Has Content ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    chunks = [
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Deep"}, "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+    sse_body = _sse_stream_chunks(chunks) + b"data: [DONE]\n\n"
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        frames = _parse_sse_frames(raw)
+        deltas = _sse_frames_with_type(frames, "content_block_delta")
+        texts = []
+        for d in deltas:
+            dd = d.get("delta", {})
+            if isinstance(dd.get("text"), str):
+                texts.append(dd.get("text"))
+        if not any("Deep" in t for t in texts):
+            fail("first-chunk content should appear in a content_block_delta, texts={!r}".format(texts))
+        else:
+            pass_("first-chunk content emitted as content_block_delta")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_injection_prevented():
+    """Provider-controlled newline/event/data text cannot inject extra SSE events."""
+    print("\n--- Test: Chat SSE Injection Prevented ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    injected = "line1\nevent: message_stop\ndata: fake\n\nline2"
+    chunks = [
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"content": injected}, "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+    sse_body = _sse_stream_chunks(chunks) + b"data: [DONE]\n\n"
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        # The injection must be confined inside a single JSON payload: a real
+        # \n event: line only ever appears as an SSE frame boundary emitted by
+        # the proxy itself. The terminal message_stop legitimately emits one
+        # event: line, so assert exact count 1 and no injected line survives.
+        n_real_events = raw.count(b"\nevent: message_stop")
+        if b"\ndata: fake" in raw:
+            fail("raw data: injection leaked into the client stream")
+            return
+        if n_real_events != 1:
+            fail("injected event: line leaked into the client stream (count={})".format(n_real_events))
+            return
+        frames = _parse_sse_frames(raw)
+        if _sse_types(frames).count("message_stop") != 1:
+            fail("message_stop should appear exactly once; injected frame leaked: {}".format(_sse_types(frames)))
+            return
+        deltas = _sse_frames_with_type(frames, "content_block_delta")
+        texts = [d.get("delta", {}).get("text") for d in deltas if isinstance(d.get("delta", {}).get("text"), str)]
+        if injected not in texts:
+            fail("delta content should arrive intact inside one payload, texts={!r}".format(texts))
+        elif _sse_types(frames).count("message_stop") == 1:
+            pass_("provider-controlled newlines cannot inject SSE events")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_event_line_present():
+    """Every data-bearing SSE frame has an event: line matching the JSON type field.
+
+    The Anthropic SDKs dispatch streaming events on the SSE `event:` field
+    against a hardcoded whitelist; a data-only frame arrives with event=None and
+    is silently dropped. This test inspects the raw wire format (not the JSON
+    `type` fallback in _sse_frame_type) so a missing event: line fails the test.
+    """
+    print("\n--- Test: Chat SSE Event Line Present ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    chunks = [
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+    sse_body = _sse_stream_chunks(chunks) + b"data: [DONE]\n\n"
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        # Parse the raw wire format: extract event: lines and data: JSON independently.
+        text = raw.decode("utf-8", errors="replace")
+        wire_frames = []
+        for block in text.split("\n\n"):
+            block = block.strip("\n").strip("\r")
+            if not block:
+                continue
+            event_line = None
+            data_payload = None
+            for line in block.split("\n"):
+                line = line.strip("\r")
+                if line.startswith("event:"):
+                    event_line = line[6:].strip()
+                elif line.startswith("data:"):
+                    data_payload = line[5:].strip()
+            if data_payload is not None:
+                wire_frames.append((event_line, data_payload))
+        if not wire_frames:
+            fail("no data-bearing SSE frames found in client stream")
+            return
+        bad = []
+        for event_line, data_payload in wire_frames:
+            try:
+                parsed = json.loads(data_payload)
+            except Exception:
+                continue
+            if not isinstance(parsed, dict) or "type" not in parsed:
+                continue
+            json_type = parsed.get("type")
+            if not event_line or event_line != json_type:
+                bad.append((event_line, json_type))
+        if bad:
+            fail("SSE frames missing/mismatched event: line: {}".format(bad))
+            return
+        # A data-only frame (no event: line) must never be emitted — it would be
+        # silently dropped by the Anthropic SDK.
+        for event_line, data_payload in wire_frames:
+            if event_line is None:
+                fail("data-only SSE frame emitted (no event: line): {!r}".format(data_payload))
+                return
+        pass_("every data-bearing SSE frame has an event: line matching JSON type")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_tool_calls_stop_reason_null():
+    """tool_calls finish_reason maps to null stop_reason when tool deltas were seen.
+
+    The SSE path does not transform delta.tool_calls into tool_use content
+    blocks, so claiming stop_reason='tool_use' would make Claude Code hang
+    waiting for tool_use blocks that never arrive. When tool_calls deltas were
+    seen but not transformed, the terminal stop_reason degrades to null.
+    """
+    print("\n--- Test: Chat SSE Tool Calls Stop Reason Null ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    chunks = [
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                      "function": {"name": "get_weather", "arguments": "{\"city\":\"NYC\"}"}}]}, "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+    ]
+    sse_body = _sse_stream_chunks(chunks) + b"data: [DONE]\n\n"
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        frames = _parse_sse_frames(raw)
+        deltas = _sse_frames_with_type(frames, "message_delta")
+        if not deltas:
+            fail("no message_delta in stream")
+            return
+        stop_reason = deltas[0].get("delta", {}).get("stop_reason")
+        if stop_reason is not None:
+            fail("tool_calls finish_reason with tool_calls deltas seen should map to null stop_reason, got {!r}".format(stop_reason))
+            return
+        # Control: tool_calls finish_reason WITHOUT tool_calls deltas seen maps to tool_use.
+        upstream2_port = find_free_port()
+        vendors2 = {"p": {"url": "http://127.0.0.1:{}".format(upstream2_port), "key": "K", "mode": "chat"}}
+        chunks2 = [
+            {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+             "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": None}]},
+            {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+             "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+        sse2 = _sse_stream_chunks(chunks2) + b"data: [DONE]\n\n"
+        responders2 = {"p": lambda info: (200, "text/event-stream", sse2)}
+        temp_dir2, proxy_port2, proc2, mock2, trace2, cleanup2 = _start_mode_proxy(tiers, vendors2, responders=responders2)
+        if proc2 is None:
+            fail("Failed to set up control test")
+            return
+        try:
+            status2, content_type2, raw2 = _send_proxy_request_stream(
+                proxy_port2, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+            if status2 != 200:
+                fail("control expected 200, got {}".format(status2))
+                return
+            frames2 = _parse_sse_frames(raw2)
+            deltas2 = _sse_frames_with_type(frames2, "message_delta")
+            if not deltas2:
+                fail("control: no message_delta in stream")
+                return
+            sr2 = deltas2[0].get("delta", {}).get("stop_reason")
+            if sr2 != "tool_use":
+                fail("control: tool_calls finish_reason WITHOUT tool deltas seen should map to tool_use, got {!r}".format(sr2))
+                return
+        finally:
+            cleanup2()
+        pass_("tool_calls deltas seen -> null stop_reason; control (no deltas) -> tool_use")
+    finally:
+        cleanup()
+
+
+# --- Step 9: wiring / e2e ---
+
+def test_chat_mode_e2e_json():
+    """End-to-end chat mode request/response through the live proxy."""
+    print("\n--- Test: Chat Mode E2E JSON ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    chat_ok = json.dumps({
+        "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "gpt-4o",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello"},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+    }).encode()
+    responders = {"p": lambda info: (200, "application/json", chat_ok)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        try:
+            data = json.loads(body)
+        except Exception:
+            fail("response is not valid JSON: {!r}".format(body[:200]))
+            return
+        if data.get("type") != "message" or data.get("role") != "assistant":
+            fail("response not anthropic-shaped: {!r}".format(data))
+        if data.get("model") != "sonnet":
+            fail("expected model tier 'sonnet', got {!r}".format(data.get("model")))
+        if data.get("content") != [{"type": "text", "text": "Hello"}]:
+            fail("expected content [text Hello], got {!r}".format(data.get("content")))
+        if data.get("stop_reason") != "end_turn":
+            fail("expected stop_reason end_turn, got {!r}".format(data.get("stop_reason")))
+        reqs = mock_servers["p"]["requests"]
+        if not reqs:
+            fail("upstream received no requests")
+            return
+        try:
+            upstream_body = json.loads(reqs[0]["body"])
+        except Exception:
+            fail("upstream request body is not JSON: {!r}".format(reqs[0]["body"][:200]))
+            return
+        if upstream_body.get("model") != "claude-sonnet-5":
+            fail("upstream should receive the actual model name, got {!r}".format(upstream_body.get("model")))
+        if not isinstance(upstream_body.get("messages"), list):
+            fail("upstream should receive messages array, got {!r}".format(upstream_body.get("messages")))
+        if data.get("type") == "message" and data.get("content") == [{"type": "text", "text": "Hello"}] and isinstance(upstream_body.get("messages"), list):
+            pass_("chat mode e2e transform round-trips")
+    finally:
+        cleanup()
+
+
+def test_response_mode_e2e_json():
+    """End-to-end response mode request/response through the live proxy."""
+    print("\n--- Test: Response Mode E2E JSON ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "response"}}
+    resp_ok = json.dumps({
+        "id": "resp_1", "object": "response", "created_at": 1, "model": "gpt-4o",
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hello", "annotations": []}]}],
+        "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+    }).encode()
+    responders = {"p": lambda info: (200, "application/json", resp_ok)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        body = json.dumps({"model": "sonnet",
+                           "system": "Be concise",
+                           "messages": [{"role": "user", "content": "one"},
+                                        {"role": "assistant", "content": "two"},
+                                        {"role": "user", "content": "three"}],
+                           "stream": True})
+        status, resp_body = _send_proxy_request(proxy_port, body=body)
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        try:
+            data = json.loads(resp_body)
+        except Exception:
+            fail("response is not valid JSON: {!r}".format(resp_body[:200]))
+            return
+        if data.get("model") != "sonnet":
+            fail("expected model tier 'sonnet', got {!r}".format(data.get("model")))
+        if data.get("content") != [{"type": "text", "text": "Hello"}]:
+            fail("expected content [text Hello], got {!r}".format(data.get("content")))
+        reqs = mock_servers["p"]["requests"]
+        if not reqs:
+            fail("upstream received no requests")
+            return
+        try:
+            ubody = json.loads(reqs[0]["body"])
+        except Exception:
+            fail("upstream request body not JSON: {!r}".format(reqs[0]["body"][:200]))
+            return
+        if ubody.get("stream") is not False:
+            fail("upstream should receive stream=false, got {!r}".format(ubody.get("stream")))
+        if ubody.get("input") != "three":
+            fail("upstream input should be last user message 'three', got {!r}".format(ubody.get("input")))
+        if ubody.get("instructions") != "Be concise":
+            fail("upstream instructions mismatch: {!r}".format(ubody.get("instructions")))
+        if "messages" in ubody:
+            fail("upstream body should drop messages, got {!r}".format(sorted(ubody.keys())))
+        if data.get("model") == "sonnet" and data.get("content") == [{"type": "text", "text": "Hello"}] and "messages" not in ubody:
+            pass_("response mode e2e transform round-trips")
+    finally:
+        cleanup()
+
+
+def test_anthropic_mode_unchanged():
+    """Existing anthropic behavior is preserved (no mode field)."""
+    print("\n--- Test: Anthropic Mode Unchanged ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        try:
+            data = json.loads(body)
+        except Exception:
+            fail("response not JSON: {!r}".format(body[:200]))
+            return
+        # x-api-key used (anthropic default)
+        reqs = mock_servers["p"]["requests"]
+        if not reqs or reqs[0]["api_key"] != "K":
+            fail("anthropic mode should use x-api-key=K")
+        # model rewritten to tier name
+        if data.get("model") != "sonnet":
+            fail("expected model rewritten to 'sonnet', got {!r}".format(data.get("model")))
+        if data.get("content") == [{"type": "text", "text": "hello"}] and reqs and reqs[0]["api_key"] == "K":
+            pass_("anthropic mode preserves existing behavior")
+    finally:
+        cleanup()
+
+
+def test_chat_mode_non_2xx_passthrough():
+    """Chat-mode non-2xx error body passes through untransformed."""
+    print("\n--- Test: Chat Mode Non 2xx Passthrough ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    err_body = json.dumps({"error": {"message": "Nothing here", "type": "invalid_request_error"}}).encode()
+    responders = {"p": lambda info: (404, "application/json", err_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 404:
+            fail("expected 404, got {}".format(status))
+            return
+        if body != err_body:
+            fail("non-2xx body should pass through byte-for-byte, got {!r}".format(body[:200]))
+        else:
+            pass_("chat-mode non-2xx body passes through untransformed")
+    finally:
+        cleanup()
+
+
+def test_transform_failure_passthrough():
+    """Malformed JSON response body passes through with a transform_failure trace event."""
+    print("\n--- Test: Transform Failure Passthrough ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    bad_body = b"this is not json at all"
+    responders = {"p": lambda info: (200, "application/json", bad_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        if body != bad_body:
+            fail("malformed JSON body should pass through unchanged, got {!r}".format(body[:200]))
+            return
+        found = False
+        with open(trace_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if ev.get("event") == "transform_failure":
+                    found = True
+        if not found:
+            fail("expected a transform_failure trace event, none found")
+        else:
+            pass_("malformed JSON passes through with transform_failure trace event")
+    finally:
+        cleanup()
+
+
+def test_retry_does_not_double_transform():
+    """A 429 retry sends the same single-transformed body, not double-encoded."""
+    print("\n--- Test: Retry Does Not Double Transform ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    chat_ok = json.dumps({
+        "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "gpt-4o",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello"},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+    }).encode()
+    err_body = json.dumps({"error": {"message": "too many", "type": "rate_limit"}}).encode()
+    attempts = {"n": 0}
+
+    def responder(info):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return 429, "application/json", err_body
+        return 200, "application/json", chat_ok
+
+    responders = {"p": responder}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, responders=responders,
+        extra_env={"PROXY_MAX_RETRIES": "2", "PROXY_MAX_DELAY": "2", "PROXY_INITIAL_DELAY": "1"})
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200 after retry, got {}".format(status))
+            return
+        reqs = mock_servers["p"]["requests"]
+        if len(reqs) < 2:
+            fail("expected upstream to receive at least 2 requests (429 then 200), got {}".format(len(reqs)))
+            return
+        bodies = [json.loads(r["body"]) for r in reqs]
+        for rb in bodies:
+            if not isinstance(rb, dict) or not isinstance(rb.get("messages"), list):
+                fail("transformed body should be single-pass JSON with messages list, got {!r}".format(rb))
+                return
+        if reqs[0]["body"] != reqs[1]["body"]:
+            fail("retry should reuse the same pre-built transformed body")
+        else:
+            pass_("retry sends the single-transformed body, unchanged across attempts")
+    finally:
+        cleanup()
+
+
+# --- Step 10: admin providers-detail endpoint ---
+
+def test_admin_providers_detail():
+    """providers-detail returns mode per provider without keys."""
+    print("\n--- Test: Admin Providers Detail ---")
+    p1, p2, p3 = find_free_port(), find_free_port(), find_free_port()
+    tiers = _mode_tiers("anthro")
+    vendors = {
+        "anthro": {"url": "http://127.0.0.1:{}".format(p1), "key": "KEY-AAA"},
+        "chat_p": {"url": "http://127.0.0.1:{}".format(p2), "key": "KEY-BBB", "mode": "chat"},
+        "resp_p": {"url": "http://127.0.0.1:{}".format(p3), "key": "KEY-CCC", "mode": "response"},
+    }
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body, _ = _admin_get(proxy_port, "/admin/api/providers-detail")
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        try:
+            data = json.loads(body)
+        except Exception:
+            fail("providers-detail not JSON: {!r}".format(body[:200]))
+            return
+        providers = data.get("providers", {})
+        if providers.get("anthro", {}).get("mode") != "anthropic":
+            fail("expected anthro mode anthropic, got {!r}".format(providers))
+        if providers.get("chat_p", {}).get("mode") != "chat":
+            fail("expected chat_p mode chat, got {!r}".format(providers))
+        if providers.get("resp_p", {}).get("mode") != "response":
+            fail("expected resp_p mode response, got {!r}".format(providers))
+        text = body.decode("utf-8", errors="replace")
+        for key in ("KEY-AAA", "KEY-BBB", "KEY-CCC"):
+            if key in text:
+                fail("providers-detail leaked key material: {}".format(key))
+        if providers.get("chat_p", {}).get("mode") == "chat" and "KEY-BBB" not in text:
+            pass_("providers-detail returns modes without keys")
+    finally:
+        cleanup()
+
+
+def test_admin_providers_detail_no_mode():
+    """Providers without a mode return anthropic."""
+    print("\n--- Test: Admin Providers Detail No Mode ---")
+    p1 = find_free_port()
+    tiers = _mode_tiers("anthro")
+    vendors = {"anthro": {"url": "http://127.0.0.1:{}".format(p1), "key": "K"}}
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body, _ = _admin_get(proxy_port, "/admin/api/providers-detail")
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        try:
+            data = json.loads(body)
+        except Exception:
+            fail("providers-detail not JSON: {!r}".format(body[:200]))
+            return
+        mode = data.get("providers", {}).get("anthro", {}).get("mode")
+        if mode != "anthropic":
+            fail("expected mode anthropic for mode-less provider, got {!r}".format(mode))
+        else:
+            pass_("mode-less provider reports anthropic")
+    finally:
+        cleanup()
+
+
+def test_admin_providers_detail_forbidden():
+    """providers-detail is rejected for non-localhost clients."""
+    print("\n--- Test: Admin Providers Detail Forbidden ---")
+    p1 = find_free_port()
+    tiers = _mode_tiers("anthro")
+    vendors = {"anthro": {"url": "http://127.0.0.1:{}".format(p1), "key": "K"}}
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        try:
+            status, body, _ = _admin_get(proxy_port, "/admin/api/providers-detail", source_ip="127.0.0.2")
+        except OSError as e:
+            fail("cannot bind alternate loopback source: {} — environment limited".format(e))
+            return
+        if status != 403:
+            fail("expected 403 for non-localhost client, got {} ({})".format(status, body[:100]))
+        else:
+            pass_("non-localhost providers-detail request rejected")
+    finally:
+        cleanup()
+
+
+def test_admin_providers_detail_invalid_mode_normalized():
+    """Unknown mode in keys is normalized to anthropic in the admin endpoint."""
+    print("\n--- Test: Admin Providers Detail Invalid Mode Normalized ---")
+    p1 = find_free_port()
+    tiers = _mode_tiers("anthro")
+    vendors = {"anthro": {"url": "http://127.0.0.1:{}".format(p1), "key": "K", "mode": "watermelon"}}
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        # Server must still start (mode validation is warn-only) and normalize display
+        status, body, _ = _admin_get(proxy_port, "/admin/api/providers-detail")
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        try:
+            data = json.loads(body)
+        except Exception:
+            fail("providers-detail not JSON: {!r}".format(body[:200]))
+            return
+        mode = data.get("providers", {}).get("anthro", {}).get("mode")
+        if mode != "anthropic":
+            fail("expected unknown mode normalized to anthropic, got {!r}".format(mode))
+        else:
+            pass_("unknown mode displayed as anthropic")
+    finally:
+        cleanup()
+
+
+# ===========================================================================
 # Test runner
 # ===========================================================================
 
@@ -6761,6 +8681,61 @@ ALL_TESTS = [
     ("disable-retry-count-tokens-invalid-type", test_disable_retry_count_tokens_invalid_type),
     ("admin-switch-preserves-disable-retry-flag", test_admin_switch_preserves_disable_retry_flag),
     ("retry-trace-event-enriched", test_retry_trace_event_enriched),
+
+    # Mode dispatch tests (plan 2026-08-27-support-three-endpoint-modes)
+    ("mode-defaults-to-anthropic", test_mode_defaults_to_anthropic),
+    ("mode-null-defaults-to-anthropic", test_mode_null_defaults_to_anthropic),
+    ("mode-invalid-rejected", test_mode_invalid_rejected),
+    ("auth-header-anthropic-mode", test_auth_header_anthropic_mode),
+    ("auth-header-chat-mode", test_auth_header_chat_mode),
+    ("auth-header-response-mode", test_auth_header_response_mode),
+    ("path-anthropic-mode", test_path_anthropic_mode),
+    ("path-chat-mode", test_path_chat_mode),
+    ("path-response-mode", test_path_response_mode),
+    ("path-double-v1-prevention", test_path_double_v1_prevention),
+    ("count-tokens-rejected-chat-mode", test_count_tokens_rejected_chat_mode),
+    ("count-tokens-rejected-response-mode", test_count_tokens_rejected_response_mode),
+    ("anthropic-to-chat-basic", test_anthropic_to_chat_basic),
+    ("anthropic-to-chat-system-string", test_anthropic_to_chat_system_string),
+    ("anthropic-to-chat-system-list", test_anthropic_to_chat_system_list),
+    ("anthropic-to-chat-dropped-fields", test_anthropic_to_chat_dropped_fields),
+    ("anthropic-to-chat-stop-sequences", test_anthropic_to_chat_stop_sequences),
+    ("chat-to-anthropic-basic", test_chat_to_anthropic_basic),
+    ("chat-to-anthropic-empty-choices", test_chat_to_anthropic_empty_choices),
+    ("chat-to-anthropic-tool-calls", test_chat_to_anthropic_tool_calls),
+    ("chat-to-anthropic-finish-reason-mapping", test_chat_to_anthropic_finish_reason_mapping),
+    ("chat-to-anthropic-usage-absent", test_chat_to_anthropic_usage_absent),
+    ("chat-to-anthropic-content-array", test_chat_to_anthropic_content_array),
+    ("chat-to-anthropic-malformed-tool-args", test_chat_to_anthropic_malformed_tool_args),
+    ("anthropic-to-response-basic", test_anthropic_to_response_basic),
+    ("anthropic-to-response-system-list", test_anthropic_to_response_system_list),
+    ("anthropic-to-response-multiple-user-messages", test_anthropic_to_response_multiple_user_messages),
+    ("anthropic-to-response-no-user-message", test_anthropic_to_response_no_user_message),
+    ("anthropic-to-response-stream-forced-false", test_anthropic_to_response_stream_forced_false),
+    ("response-to-anthropic-basic", test_response_to_anthropic_basic),
+    ("response-to-anthropic-empty-output", test_response_to_anthropic_empty_output),
+    ("response-to-anthropic-multiple-output", test_response_to_anthropic_multiple_output),
+    ("response-to-anthropic-status-completed", test_response_to_anthropic_status_completed),
+    ("response-to-anthropic-usage-absent", test_response_to_anthropic_usage_absent),
+    ("chat-sse-basic-streaming", test_chat_sse_basic_streaming),
+    ("chat-sse-finish-reason-mapping", test_chat_sse_finish_reason_mapping),
+    ("chat-sse-no-content-delta", test_chat_sse_no_content_delta),
+    ("chat-sse-empty-choices-usage-chunk", test_chat_sse_empty_choices_usage_chunk),
+    ("chat-sse-eof-without-finish-reason", test_chat_sse_eof_without_finish_reason),
+    ("chat-sse-first-event-has-content", test_chat_sse_first_event_has_content),
+    ("chat-sse-injection-prevented", test_chat_sse_injection_prevented),
+    ("chat-sse-event-line-present", test_chat_sse_event_line_present),
+    ("chat-sse-tool-calls-stop-reason-null", test_chat_sse_tool_calls_stop_reason_null),
+    ("chat-mode-e2e-json", test_chat_mode_e2e_json),
+    ("response-mode-e2e-json", test_response_mode_e2e_json),
+    ("anthropic-mode-unchanged", test_anthropic_mode_unchanged),
+    ("chat-mode-non-2xx-passthrough", test_chat_mode_non_2xx_passthrough),
+    ("transform-failure-passthrough", test_transform_failure_passthrough),
+    ("retry-does-not-double-transform", test_retry_does_not_double_transform),
+    ("admin-providers-detail", test_admin_providers_detail),
+    ("admin-providers-detail-no-mode", test_admin_providers_detail_no_mode),
+    ("admin-providers-detail-forbidden", test_admin_providers_detail_forbidden),
+    ("admin-providers-detail-invalid-mode-normalized", test_admin_providers_detail_invalid_mode_normalized),
 ]
 
 

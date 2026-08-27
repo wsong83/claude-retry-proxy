@@ -88,7 +88,7 @@ _swap_done = threading.Event()  # Signaled when swap completes
 _startup_state = None
 
 # Decrypted vendors table (read-only after init)
-# {provider_name: {"url": ..., "key": ...}}
+# {provider_name: {"url": ..., "key": ..., "mode": "anthropic|chat|response"}}
 _vendors = None
 
 # Thread-local RNG — the module-global random is not thread-safe under
@@ -151,6 +151,9 @@ ALLOWED_METHODS = {"POST", "OPTIONS"}
 # Headers forwarded to upstream
 FORWARD_HEADERS = {"authorization", "x-api-key", "content-type",
                    "anthropic-version", "accept"}
+
+# Provider endpoint modes
+MODE_VALUES = ("anthropic", "chat", "response")
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +398,14 @@ def load_keys_file(path, passphrase=None):
             raise ValueError("vendor '{}' missing 'url'".format(name))
         if "key" not in vendor:
             raise ValueError("vendor '{}' missing 'key'".format(name))
+        mode = vendor.get("mode")
+        if mode is None or mode == "":
+            print("[proxy] WARNING: provider '{}' has no 'mode' field — "
+                  "defaulting to 'anthropic'".format(name), file=sys.stderr)
+        elif not isinstance(mode, str) or mode not in MODE_VALUES:
+            print("[proxy] WARNING: provider '{}' has unknown mode '{}' — "
+                  "requests will fail with invalid_provider_mode".format(
+                      name, mode), file=sys.stderr)
     return vendors
 
 
@@ -680,6 +691,28 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     upstream_url = vendor["url"]
     api_key = vendor["key"]
 
+    # Read endpoint mode (None/''/missing normalize to "anthropic")
+    mode = vendor.get("mode") or "anthropic"
+    if mode not in MODE_VALUES:
+        err_msg = json.dumps({
+            "error": {
+                "type": "invalid_provider_mode",
+                "message": "Provider '{}' has invalid mode '{}'. Valid modes: {}".format(
+                    provider_name, mode, ", ".join(MODE_VALUES))
+            }
+        })
+        return 500, {}, err_msg.encode("utf-8"), 0, 0, 0, tier, provider_name, actual_model
+
+    if mode != "anthropic":
+        log_trace({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "mode_dispatch",
+            "request_id": request_id,
+            "tier": tier,
+            "provider": provider_name,
+            "mode": mode,
+        })
+
     # Parse upstream URL
     parsed = parse_upstream(upstream_url)
     if parsed is None:
@@ -693,29 +726,68 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
 
     host, port, use_ssl, path_prefix = parsed
 
-    # Rewrite request body with actual model name
+    # count_tokens has no equivalent on the OpenAI endpoints — reject it for
+    # chat/response modes gated on the same tolerant path check used below.
+    _is_count_tokens = path.split("?", 1)[0].rstrip("/").endswith(
+        "/messages/count_tokens")
+    if mode != "anthropic" and _is_count_tokens:
+        err_msg = json.dumps({
+            "error": "count_tokens not supported in chat/response mode"
+        })
+        return 400, {}, err_msg.encode("utf-8"), 0, 0, 0, tier, provider_name, actual_model
+
+    # Build request body once before the retry loop (never re-transformed per
+    # attempt). Anthropic mode does a model-only rewrite; chat/response modes
+    # run the full body transform. On any failure fall back to the original
+    # body and log a transform_failure trace event.
     rewritten_body = body
     if body:
         try:
             body_json = json.loads(body)
             body_json["model"] = actual_model
-            rewritten_body = json.dumps(body_json).encode("utf-8")
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            pass  # Keep original body if parsing fails
+            if mode == "chat":
+                rewritten_body = json.dumps(_anthropic_to_chat(body_json)).encode("utf-8")
+            elif mode == "response":
+                rewritten_body = json.dumps(_anthropic_to_response(body_json)).encode("utf-8")
+            else:
+                rewritten_body = json.dumps(body_json).encode("utf-8")
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError,
+                KeyError, IndexError, AttributeError, ValueError):
+            if mode != "anthropic":
+                log_trace({
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "event": "transform_failure",
+                    "request_id": request_id,
+                    "provider": provider_name,
+                    "tier": tier,
+                    "mode": mode,
+                })
+            rewritten_body = body  # Keep original body if transform/parse fails
 
     # Build headers for forwarding
     fwd_headers = {}
     for k, v in headers.items():
         if k.lower() in FORWARD_HEADERS:
-            # Skip authorization (we inject provider's key)
-            if k.lower() == "authorization":
-                continue
-            # Skip x-api-key (we inject provider's key)
-            if k.lower() == "x-api-key":
+            # Skip authorization and x-api-key (we inject provider's key)
+            if k.lower() in ("authorization", "x-api-key"):
                 continue
             fwd_headers[k] = v
-    # Inject provider's API key
-    fwd_headers["x-api-key"] = api_key
+    # Inject provider's API key per mode
+    if mode == "anthropic":
+        fwd_headers["x-api-key"] = api_key
+    else:
+        fwd_headers["Authorization"] = "Bearer {}".format(api_key)
+
+    # Dispatch upstream path per mode. chat/response modes strip a trailing
+    # /v1 from the configured base URL so an OpenAI-style base does not
+    # produce a doubled /v1/v1/ prefix.
+    if mode == "anthropic":
+        upstream_path = path_prefix + path if path_prefix else path
+    else:
+        if path_prefix.endswith("/v1"):
+            path_prefix = path_prefix[:-3]
+        endpoint = "/v1/chat/completions" if mode == "chat" else "/v1/responses"
+        upstream_path = path_prefix + endpoint
 
     total_start = time.time()
     last_status = None
@@ -724,8 +796,6 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     # Skip retry for count_tokens when disabled (avoids wasting bandwidth
     # on providers that don't support this Anthropic-specific endpoint)
     disable_retry = config.get("disable_retry_claude_count_token", False)
-    _is_count_tokens = path.split("?", 1)[0].rstrip("/").endswith(
-        "/messages/count_tokens")
     max_attempts = 1 if (disable_retry and _is_count_tokens) \
                    else PROXY_MAX_RETRIES + 1
 
@@ -735,7 +805,6 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                 conn = http.client.HTTPSConnection(host, port, timeout=300)
             else:
                 conn = http.client.HTTPConnection(host, port, timeout=300)
-            upstream_path = path_prefix + path if path_prefix else path
             conn.request(method, upstream_path, body=rewritten_body, headers=fwd_headers)
             resp = conn.getresponse()
 
@@ -790,15 +859,15 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
             if handler is not None and 200 <= resp.status < 300:
                 # 2xx response - check Content-Type to decide streaming vs buffering
                 if "text/event-stream" in content_type:
-                    # SSE: stream with first-event rewriting
+                    # SSE: stream with mode-appropriate rewriting/transform
                     first_byte_ms = handler._stream_upstream_response(
                         resp, resp.status, resp_headers, request_id, retries,
-                        tier=tier)
+                        tier=tier, mode=mode)
                     conn.close()
                     return (resp.status, resp_headers, b"",
                             first_byte_ms, time.time() - total_start, retries, tier, provider_name, actual_model)
                 elif "application/json" in content_type:
-                    # JSON: buffer, parse, rewrite model, return (don't stream)
+                    # JSON: buffer, then dispatch mode-appropriate transform
                     first_byte_start = time.time()
                     chunks = []
                     first_byte = True
@@ -817,21 +886,52 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                     resp_body = b"".join(chunks)
                     conn.close()
 
-                    # Rewrite model in JSON response
-                    resp_body = _rewrite_json_response(
-                        resp_body, tier, request_id)
+                    if mode == "chat":
+                        resp_body = _transform_and_guard(
+                            resp_body, tier, _chat_to_anthropic, request_id, mode)
+                    elif mode == "response":
+                        resp_body = _transform_and_guard(
+                            resp_body, tier, _response_to_anthropic, request_id, mode)
+                    else:
+                        resp_body = _rewrite_json_response(
+                            resp_body, tier, request_id)
                     resp_headers["Content-Length"] = str(len(resp_body))
 
                     return (resp.status, resp_headers, resp_body,
                             first_byte_elapsed, total_elapsed, retries, tier, provider_name, actual_model)
                 else:
-                    # Other content types: stream unchanged
-                    first_byte_ms = handler._stream_upstream_response(
-                        resp, resp.status, resp_headers, request_id, retries,
-                        tier=tier)
-                    conn.close()
-                    return (resp.status, resp_headers, b"",
-                            first_byte_ms, time.time() - total_start, retries, tier, provider_name, actual_model)
+                    # Other content types: chat/response modes buffer and
+                    # transform as JSON (OpenAI APIs return JSON or SSE);
+                    # anthropic mode streams unchanged (existing behavior).
+                    if mode in ("chat", "response"):
+                        first_byte_start = time.time()
+                        chunks = []
+                        first_byte = True
+                        first_byte_elapsed = None
+                        while True:
+                            chunk = resp.read(8192)
+                            if not chunk:
+                                break
+                            if first_byte:
+                                first_byte_elapsed = (time.time() - first_byte_start) * 1000
+                                first_byte = False
+                            chunks.append(chunk)
+                        total_elapsed = time.time() - total_start
+                        resp_body = b"".join(chunks)
+                        conn.close()
+                        transform_fn = _chat_to_anthropic if mode == "chat" else _response_to_anthropic
+                        resp_body = _transform_and_guard(
+                            resp_body, tier, transform_fn, request_id, mode)
+                        resp_headers["Content-Length"] = str(len(resp_body))
+                        return (resp.status, resp_headers, resp_body,
+                                first_byte_elapsed, total_elapsed, retries, tier, provider_name, actual_model)
+                    else:
+                        first_byte_ms = handler._stream_upstream_response(
+                            resp, resp.status, resp_headers, request_id, retries,
+                            tier=tier, mode=mode)
+                        conn.close()
+                        return (resp.status, resp_headers, b"",
+                                first_byte_ms, time.time() - total_start, retries, tier, provider_name, actual_model)
 
             # Non-2xx or no handler — buffer the body so upstream error content
             # stays in the trace log.
@@ -854,8 +954,10 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
             resp_body = b"".join(chunks)
             conn.close()
 
-            # Rewrite model in JSON responses (non-2xx error path)
-            if "application/json" in content_type:
+            # Non-2xx error path: anthropic mode keeps the model rewrite it had before;
+            # chat/response modes pass upstream error bodies through
+            # byte-for-byte untransformed.
+            if "application/json" in content_type and mode == "anthropic":
                 resp_body = _rewrite_json_response(
                     resp_body, tier, request_id)
                 resp_headers["Content-Length"] = str(len(resp_body))
@@ -1082,6 +1184,258 @@ def _rewrite_json_response(body_bytes, tier, request_id):
 
 
 # ---------------------------------------------------------------------------
+# Endpoint-mode request/response transformations
+# ---------------------------------------------------------------------------
+
+def _transform_and_guard(raw_body, tier, transform_fn, request_id, mode):
+    """Run a response transform on raw JSON bytes with passthrough-on-failure.
+
+    json.loads runs INSIDE the guard: any parse or shape failure logs a
+    transform_failure trace event (metadata only — never body content) and
+    returns the original raw bytes unchanged.
+    """
+    try:
+        parsed = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+        log_trace({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "transform_failure",
+            "request_id": request_id,
+            "mode": mode,
+        })
+        return raw_body
+    try:
+        return json.dumps(transform_fn(parsed, tier)).encode("utf-8")
+    except (json.JSONDecodeError, KeyError, TypeError, IndexError,
+            AttributeError, ValueError):
+        log_trace({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "transform_failure",
+            "request_id": request_id,
+            "mode": mode,
+        })
+        return raw_body
+
+
+def _anthropic_to_chat(body_json):
+    """Transform an Anthropic Messages request into OpenAI Chat Completions."""
+    out = {}
+    if "model" in body_json:
+        out["model"] = body_json["model"]
+    if "messages" in body_json:
+        out["messages"] = body_json["messages"]
+
+    system = body_json.get("system")
+    system_text = None
+    if isinstance(system, str):
+        system_text = system
+    elif isinstance(system, list):
+        parts = [b.get("text") for b in system
+                 if isinstance(b, dict) and isinstance(b.get("text"), str)]
+        system_text = "\n".join(parts)
+    if system_text:
+        messages = out.get("messages")
+        if not isinstance(messages, list):
+            messages = []
+        messages.insert(0, {"role": "system", "content": system_text})
+        out["messages"] = messages
+
+    for field in ("max_tokens", "temperature", "stream", "top_p"):
+        if field in body_json:
+            out[field] = body_json[field]
+    if "stop_sequences" in body_json:
+        out["stop"] = body_json["stop_sequences"]
+    return out
+
+
+def _map_chat_finish_reason(finish_reason):
+    """Map an OpenAI finish_reason to an Anthropic stop_reason (null for no map)."""
+    mapping = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
+    if isinstance(finish_reason, str) and finish_reason in mapping:
+        return mapping[finish_reason]
+    return None
+
+
+def _chat_to_anthropic(chat_body, tier):
+    """Transform an OpenAI Chat Completions JSON response into Anthropic Messages.
+
+    All field access is guarded with .get()/truthiness defaults; the whole
+    body is wrapped so any shape failure passes through unchanged.
+    """
+    try:
+        _id = chat_body.get("id") or str(uuid.uuid4())
+        choices = chat_body.get("choices") or []
+        usage = chat_body.get("usage") or {}
+        result = {
+            "id": "msg_" + _id,
+            "model": tier,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": usage.get("prompt_tokens") or 0,
+                "output_tokens": usage.get("completion_tokens") or 0,
+            },
+        }
+        if not choices:
+            return result
+
+        choice = choices[0] or {}
+        message = choice.get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str):
+            result["content"] = [{"type": "text", "text": content}]
+        elif isinstance(content, list):
+            result["content"] = [
+                {"type": "text", "text": part.get("text")}
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+            ]
+        else:
+            result["content"] = []
+
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, dict):
+                    parsed_args = args
+                elif isinstance(args, str):
+                    try:
+                        parsed_args = json.loads(args)
+                    except json.JSONDecodeError:
+                        parsed_args = {}
+                        log_trace({
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "event": "tool_args_parse_failure",
+                            "request_id": None,
+                        })
+                else:
+                    parsed_args = {}
+                if not isinstance(parsed_args, dict):
+                    parsed_args = {}
+                result["content"].append({
+                    "type": "tool_use",
+                    "id": tc.get("id") or str(uuid.uuid4()),
+                    "name": fn.get("name") or None,
+                    "input": parsed_args,
+                })
+
+        result["stop_reason"] = _map_chat_finish_reason(choice.get("finish_reason"))
+        return result
+    except (json.JSONDecodeError, KeyError, TypeError, IndexError, AttributeError):
+        log_trace({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "transform_failure",
+            "request_id": None,
+        })
+        return chat_body
+
+
+def _anthropic_to_response(body_json):
+    """Transform an Anthropic Messages request into OpenAI Responses.
+
+    Single-turn only: `input` is the text of the last user message. `stream`
+    is forced false — response-mode SSE is not implemented, so the upstream
+    must return buffered JSON.
+    """
+    out = {}
+    if "model" in body_json:
+        out["model"] = body_json["model"]
+    out["stream"] = False
+
+    user_text = ""
+    messages = body_json.get("messages")
+    if isinstance(messages, list):
+        user_msgs = [m for m in messages
+                     if isinstance(m, dict) and m.get("role") == "user"]
+        if user_msgs:
+            content = user_msgs[-1].get("content")
+            if isinstance(content, str):
+                user_text = content
+            elif isinstance(content, list):
+                parts = [c.get("text") for c in content
+                         if isinstance(c, dict) and c.get("type") == "text"
+                         and isinstance(c.get("text"), str)]
+                user_text = "\n".join(parts)
+    out["input"] = user_text
+
+    system = body_json.get("system")
+    system_text = None
+    if isinstance(system, str):
+        system_text = system
+    elif isinstance(system, list):
+        parts = [b.get("text") for b in system
+                 if isinstance(b, dict) and isinstance(b.get("text"), str)]
+        system_text = "\n".join(parts)
+    if system_text:
+        out["instructions"] = system_text
+
+    if "max_tokens" in body_json:
+        out["max_output_tokens"] = body_json["max_tokens"]
+    if "temperature" in body_json:
+        out["temperature"] = body_json["temperature"]
+    if "top_p" in body_json:
+        out["top_p"] = body_json["top_p"]
+    return out
+
+
+def _response_to_anthropic(resp_body, tier):
+    """Transform an OpenAI Responses JSON response into Anthropic Messages.
+
+    Same defensive conventions as _chat_to_anthropic: guarded .get() access
+    and an outer try/except falling back to the original body.
+    """
+    try:
+        output = resp_body.get("output") or []
+        usage = resp_body.get("usage") or {}
+        result = {
+            "id": resp_body.get("id"),
+            "model": tier,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": usage.get("input_tokens") or 0,
+                "output_tokens": usage.get("output_tokens") or 0,
+            },
+        }
+        if not output:
+            return result
+
+        # First message-type output provides the content (the Responses API
+        # normally returns a single message output per request).
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            for cb in (item.get("content") or []):
+                if not isinstance(cb, dict) or cb.get("type") != "output_text":
+                    continue
+                text = cb.get("text")
+                if isinstance(text, str):
+                    result["content"].append({"type": "text", "text": text})
+            break
+
+        result["stop_reason"] = "end_turn" if resp_body.get("status") == "completed" else None
+        return result
+    except (json.JSONDecodeError, KeyError, TypeError, IndexError, AttributeError):
+        log_trace({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "transform_failure",
+            "request_id": None,
+        })
+        return resp_body
+
+
+# ---------------------------------------------------------------------------
 # HTTP request handler
 # ---------------------------------------------------------------------------
 
@@ -1115,12 +1469,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body_bytes)
 
     def _stream_upstream_response(self, resp, status, resp_headers, request_id, retries,
-                                   tier=None):
+                                   tier=None, mode=None):
         """Stream an upstream 2xx response body to the client as it arrives.
 
-        For SSE (text/event-stream): buffers first event (64KB cap), rewrites
-        model in message_start event to tier name. Subsequent events forwarded
-        unchanged.
+        For SSE (text/event-stream):
+          - anthropic mode: buffers first event (64KB cap), rewrites model in
+            message_start event to tier name. Subsequent events forwarded
+            unchanged.
+          - chat mode: transforms the OpenAI chat-completions SSE stream into
+            synthetic Anthropic Messages SSE events.
+          - response mode: upstream SSE is unexpected (the request transform
+            forces stream:false); handled by a defensive terminal-only fallback.
 
         For other content types: streams unchanged.
 
@@ -1148,8 +1507,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
             if is_sse and tier:
-                # SSE path: buffer first event for model rewriting
-                # Buffer chunks until \n\n delimiter is found or 64KB cap is exceeded
+                if mode == "chat":
+                    return self._stream_chat_sse_to_anthropic(
+                        resp, request_id, tier, first_byte_start)
+                if mode == "response":
+                    return self._stream_response_sse_fallback(
+                        resp, request_id, tier, first_byte_start)
+                # SSE path (anthropic mode): buffer first event for model
+                # rewriting. Buffer chunks until \n\n delimiter is found or
+                # 64KB cap is exceeded.
                 first_event_buffer = bytearray()
                 MAX_FIRST_EVENT_BUFFER = 64 * 1024  # 64 KB cap
                 first_event_found = False
@@ -1264,6 +1630,279 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return None
         return first_byte_ms
 
+    def _sse_event(self, payload):
+        """Serialize one SSE frame — `event: <type>` + `data: <json>` lines.
+
+        The Anthropic SDKs dispatch streaming events on the SSE `event:` field
+        against a hardcoded whitelist; a data-only frame arrives with
+        event=None and is silently dropped. The type is taken from
+        payload["type"], and provider-controlled bytes only ever flow through
+        json.dumps (SSE injection guard).
+        """
+        etype = payload.get("type")
+        if not isinstance(etype, str) or not etype:
+            etype = "message"
+        return ("event: " + etype + "\n"
+                "data: " + json.dumps(payload) + "\n\n").encode("utf-8")
+
+    def _stream_chat_sse_to_anthropic(self, resp, request_id, tier, first_byte_start):
+        """Transform an OpenAI chat-completions SSE stream into Anthropic Messages SSE.
+
+        Frames are assembled on the \\n\\n delimiter (CRLF-normalized) — never
+        split mid-frame. A synthetic message_start/content_block_start open the
+        stream, deltas become content_block_delta, and terminal events
+        (content_block_stop, message_delta, message_stop) are emitted exactly
+        once — on the finish_reason chunk, or synthesized at EOF/truncation so
+        the Anthropic client never hangs. [DONE] and non-data frames are
+        skipped.
+        """
+        MAX_EVENT_BUFFER = 64 * 1024
+        buf = bytearray()
+        usage = {}
+        chat_id = None
+        message_started = False
+        first_frame = True
+        tool_calls_seen = False
+        bytes_streamed = 0
+        first_byte_ms = None
+
+        def write(payload):
+            nonlocal bytes_streamed, first_byte_ms
+            data = self._sse_event(payload)
+            self.wfile.write(data)
+            self.wfile.flush()
+            bytes_streamed += len(data)
+            if first_byte_ms is None:
+                first_byte_ms = (time.time() - first_byte_start) * 1000
+
+        def start_message():
+            nonlocal message_started
+            if message_started:
+                return
+            mid = ("msg_" + chat_id) if chat_id else ("msg_" + str(uuid.uuid4()))
+            write({
+                "type": "message_start",
+                "message": {
+                    "id": mid,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": tier,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            })
+            write({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            })
+            message_started = True
+
+        def terminal(stop_reason):
+            write({"type": "content_block_stop", "index": 0})
+            delta_usage = {"input_tokens": 0, "output_tokens": 0}
+            if usage.get("prompt_tokens") is not None:
+                delta_usage["input_tokens"] = usage.get("prompt_tokens")
+            if usage.get("completion_tokens") is not None:
+                delta_usage["output_tokens"] = usage.get("completion_tokens")
+            write({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": delta_usage,
+            })
+            write({"type": "message_stop"})
+
+        def handle_frame(frame):
+            nonlocal chat_id, usage, first_frame, tool_calls_seen
+            text = frame.decode("utf-8", errors="replace")
+            data_lines = [ln[5:].strip() for ln in text.splitlines()
+                          if ln.startswith("data:")]
+            if not data_lines:
+                return None  # comment/event-only frame — skip silently
+            raw = "\n".join(data_lines).strip()
+            if raw == "[DONE]":
+                return "done"
+            try:
+                chunk = json.loads(raw)
+            except json.JSONDecodeError:
+                log_trace({
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "event": "chat_sse_malformed_json",
+                    "request_id": request_id,
+                })
+                return None
+            if not isinstance(chunk, dict):
+                return None
+            u = chunk.get("usage")
+            if isinstance(u, dict):
+                usage = u
+            choices = chunk.get("choices") or []
+            if not choices:
+                return None
+            choice = choices[0] or {}
+            delta = choice.get("delta") or {}
+            if first_frame:
+                first_frame = False
+                cid = chunk.get("id")
+                if isinstance(cid, str) and cid:
+                    chat_id = cid
+                start_message()
+            if isinstance(delta, dict):
+                if delta.get("tool_calls") is not None:
+                    tool_calls_seen = True
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    write({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": content},
+                    })
+            finish_reason = choice.get("finish_reason")
+            if finish_reason is not None:
+                return ("finish", finish_reason)
+            return None
+
+        try:
+            while True:
+                try:
+                    chunk = resp.read1(8192)
+                except (http.client.IncompleteRead, http.client.RemoteDisconnected,
+                        socket.error, OSError):
+                    break
+                if not chunk:
+                    break
+                if first_byte_ms is None:
+                    first_byte_ms = (time.time() - first_byte_start) * 1000
+                # Degraded mode (first-frame cap exceeded): forward raw bytes
+                if buf is None:
+                    bytes_streamed += len(chunk)
+                    if bytes_streamed > PROXY_MAX_RESPONSE_SIZE:
+                        self._log_response_cap_exceeded(request_id, bytes_streamed)
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    continue
+                chunk = chunk.replace(b"\r\n", b"\n")
+                buf.extend(chunk)
+                while True:
+                    idx = buf.find(SSE_EVENT_DELIMITER)
+                    if idx < 0:
+                        break
+                    frame = bytes(buf[:idx])
+                    del buf[:idx + 2]
+                    result = handle_frame(frame)
+                    if result == "done":
+                        continue
+                    if isinstance(result, tuple) and result[0] == "finish":
+                        sr = _map_chat_finish_reason(result[1])
+                        if tool_calls_seen and sr == "tool_use":
+                            sr = None  # tool deltas untransformed — don't claim tool_use
+                        terminal(sr)
+                        return first_byte_ms
+                # Memory guards for frames without a delimiter
+                if len(buf) > MAX_EVENT_BUFFER:
+                    if not message_started:
+                        # First event exceeded cap before \\n\\n: degrade to
+                        # raw passthrough with a synthetic start (accepted
+                        # residual for the chat-mode 64KB-cap edge case).
+                        log_trace({
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "event": "chat_sse_buffer_cap_exceeded",
+                            "request_id": request_id,
+                        })
+                        start_message()
+                        raw_splice = bytes(buf)
+                        buf.clear()
+                        bytes_streamed += len(raw_splice)
+                        self.wfile.write(raw_splice)
+                        self.wfile.flush()
+                        first_byte_ms = (time.time() - first_byte_start) * 1000
+                        buf = None  # switch to raw forwarding
+                    else:
+                        log_trace({
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "event": "chat_sse_frame_cap_exceeded",
+                            "request_id": request_id,
+                            "bytes": len(buf),
+                        })
+                        buf.clear()
+                if bytes_streamed > PROXY_MAX_RESPONSE_SIZE:
+                    self._log_response_cap_exceeded(request_id, bytes_streamed)
+                    break
+        except _DISCONNECT_ERRORS:
+            raise
+        # EOF reached without a finish_reason chunk: synthesize a clean
+        # terminal sequence so the client stream never hangs.
+        if not message_started:
+            start_message()
+        log_trace({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "chat_sse_truncated",
+            "request_id": request_id,
+            "pending_bytes": len(buf) if isinstance(buf, bytearray) else 0,
+        })
+        sr = "end_turn"
+        if tool_calls_seen:
+            sr = None
+        terminal(sr)
+        return first_byte_ms
+
+    def _stream_response_sse_fallback(self, resp, request_id, tier, first_byte_start):
+        """Handle unexpected Responses-mode upstream SSE defensively.
+
+        The request transform forces stream:false, so SSE here means a provider
+        ignored the flag. Drain the unexpected stream and synthesize a clean,
+        empty Anthropic terminal sequence instead of leaking raw OpenAI SSE.
+        """
+        first_byte_ms = None
+        try:
+            log_trace({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "event": "response_sse_unexpected",
+                "request_id": request_id,
+            })
+            try:
+                while resp.read1(8192):
+                    pass
+            except (http.client.IncompleteRead, http.client.RemoteDisconnected,
+                    socket.error, OSError):
+                pass
+            mid = "msg_" + str(uuid.uuid4())
+            events = [
+                {"type": "message_start",
+                 "message": {"id": mid, "type": "message", "role": "assistant",
+                             "content": [], "model": tier, "stop_reason": None,
+                             "stop_sequence": None,
+                             "usage": {"input_tokens": 0, "output_tokens": 0}}},
+                {"type": "content_block_start", "index": 0,
+                 "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta",
+                 "delta": {"stop_reason": None, "stop_sequence": None},
+                 "usage": {"input_tokens": 0, "output_tokens": 0}},
+                {"type": "message_stop"},
+            ]
+            for ev in events:
+                self.wfile.write(self._sse_event(ev))
+            self.wfile.flush()
+            first_byte_ms = (time.time() - first_byte_start) * 1000
+        except _DISCONNECT_ERRORS:
+            return None
+        return first_byte_ms
+
+    def _log_response_cap_exceeded(self, request_id, bytes_streamed):
+        log_trace({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "response_size_cap_exceeded",
+            "request_id": request_id,
+            "bytes_streamed": bytes_streamed,
+            "limit": PROXY_MAX_RESPONSE_SIZE,
+        })
+        print("[proxy] Response size limit exceeded ({} bytes)".format(
+            bytes_streamed), file=sys.stderr)
+
     def _log_client_disconnect(self, request_id, status, retries):
         """Record a client_disconnect event; suppress the traceback.
 
@@ -1342,6 +1981,27 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
             providers = list(_vendors.keys()) if _vendors else []
             self._send_response(200, json.dumps({"providers": providers}).encode("utf-8"))
+            return
+
+        # Admin API: get per-provider mode detail (mode only — never url/key)
+        if self.path == "/admin/api/providers-detail":
+            # localhost-only check
+            if self.client_address[0] not in ("127.0.0.1", "::1"):
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"forbidden"}')
+                return
+
+            providers_detail = {}
+            for name, vendor in (_vendors or {}).items():
+                mode = vendor.get("mode")
+                if mode not in MODE_VALUES:
+                    mode = "anthropic"
+                providers_detail[name] = {"mode": mode}
+            self._send_response(200, json.dumps({
+                "providers": providers_detail
+            }).encode("utf-8"))
             return
 
         # Default: 404

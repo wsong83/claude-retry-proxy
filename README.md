@@ -201,12 +201,43 @@ at the start of the file. The JSON structure is the same in both cases:
       "key": "sk-ant-api03-your-key-here"
     },
     "provider-b": {
-      "url": "https://api.openai.com",
-      "key": "sk-your-openai-key"
+      "url": "https://api.openai.com/v1",
+      "key": "sk-your-openai-key",
+      "mode": "chat"
     }
   }
 }
 ```
+
+### Provider Modes
+
+Each vendor entry in `keys-index.json` may carry an optional `mode` field
+controlling which API format the proxy uses when routing to that provider.
+Three modes are supported:
+
+| Mode | API Endpoint | Auth Header | Description |
+|------|-------------|-------------|-------------|
+| `anthropic` | `{url}/v1/messages` | `x-api-key` | Anthropic Messages API (default). Request/response body is model-name-rewritten only. SSE streaming forwarded+rewritten verbatim. |
+| `chat` | `{url}/v1/chat/completions` | `Authorization: Bearer` | OpenAI Chat Completions API. Request body transformed from Anthropic Messages to Chat Completions format; response body transformed back to Anthropic Messages. SSE streaming is synthesized from OpenAI SSE. `count_tokens` returns 400. |
+| `response` | `{url}/v1/responses` | `Authorization: Bearer` | OpenAI Responses API. Request body transformed from Anthropic Messages to Responses format (single-turn, stream forced false); response body transformed back to Anthropic Messages. `count_tokens` returns 400. |
+
+When `mode` is absent, `null`, or empty, it defaults to `"anthropic"`.
+Invalid modes return a 500 error at request time. Startup validates the
+mode enum and emits a stderr warning for each vendor without an explicit
+mode.
+
+**URL configuration:** For chat and response modes, the proxy appends the
+API endpoint path (`/v1/chat/completions` or `/v1/responses`) to the
+vendor's `url`. If the URL already ends in `/v1`, the trailing `/v1` is
+stripped first to avoid doubling (e.g., `https://api.openai.com/v1` →
+`https://api.openai.com/v1/chat/completions`, not
+`/v1/v1/chat/completions`).
+
+**Limitations:** Response mode is single-turn only (extracts only the last
+user message as `input`, discards conversation history). Tool-use SSE
+deltas are not transformed in chat-mode streaming (stop_reason is degraded
+to null when tool calls are detected). Error responses (non-2xx) pass
+through untransformed in the upstream format.
 
 ### Admin page (`http://localhost:8080/admin/`)
 

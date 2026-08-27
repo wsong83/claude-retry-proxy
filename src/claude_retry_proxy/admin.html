@@ -44,6 +44,19 @@
         const TIERS = ['opus', 'sonnet', 'haiku'];
         let config = null;
         let providers = [];
+        let providerModes = {};
+
+        async function loadProviderModes() {
+            try {
+                const resp = await fetch('/admin/api/providers-detail');
+                if (resp.ok) {
+                    const data = await resp.json();
+                    providerModes = (data && data.providers) || {};
+                }
+            } catch (e) {
+                providerModes = {};
+            }
+        }
 
         async function loadConfig() {
             try {
@@ -54,6 +67,8 @@
                 config = await configResp.json();
                 const providersData = await providersResp.json();
                 providers = providersData.providers || [];
+                // Optional endpoint — a failing fetch must not brick the page.
+                await loadProviderModes();
                 renderTiers();
             } catch (e) {
                 showStatus('error', 'Failed to load config: ' + e.message);
@@ -81,7 +96,11 @@
                 providers.forEach(p => {
                     const opt = document.createElement('option');
                     opt.value = p;
-                    opt.textContent = p;
+                    const mode = providerModes[p] && providerModes[p].mode;
+                    // Label shows mode only when it differs from the anthropic
+                    // default; value stays the raw provider name so switch
+                    // validation matches. textContent only (XSS guard).
+                    opt.textContent = (mode && mode !== 'anthropic') ? `${p} (${mode})` : p;
                     providerSelect.appendChild(opt);
                 });
                 providerSelect.value = tierConfig.provider || '';

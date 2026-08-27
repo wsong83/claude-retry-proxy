@@ -76,30 +76,47 @@ paths resolve against cwd), `--all` (log full request/response bodies),
   1. Extract model name from request body → `resolve_tier` (direct name,
      reverse lookup, pattern match, or 400 error for unknown)
   2. Config lookup: tier → (provider, model name)
-  3. Keys lookup: provider → (url, api_key) from decrypted vendors table
-  4. Rewrite request: replace `"model"` field with actual model name,
-     inject provider's `x-api-key`, drop `authorization` header
+  3. Keys lookup: provider → (url, api_key, mode) from decrypted vendors table.
+     `mode` defaults to `"anthropic"` when absent; valid values are `"anthropic"`,
+     `"chat"`, `"response"`.
+  4. **Mode dispatch** — auth header, path, and body transforms depend on mode:
+     - **Auth:** `x-api-key` for anthropic; `Authorization: Bearer` for chat/response.
+     - **Path:** original path for anthropic; `/v1/chat/completions` for chat;
+       `/v1/responses` for response (trailing `/v1` stripped from URL prefix).
+       `count_tokens` returns 400 for chat/response modes.
+     - **Request body:** model-only rewrite for anthropic; full
+       Anthropic→Chat-Completions transform for chat; Anthropic→Responses
+       transform for response (stream forced false, single-turn).
+     - **Response body (2xx only):** model-only rewrite for anthropic;
+       Chat-Completions→Anthropic transform for chat; Responses→Anthropic
+       transform for response. Error responses (non-2xx) pass through untransformed.
+     - **SSE streaming:** anthropic mode forwards+rewrites upstream SSE; chat mode
+       synthesizes Anthropic SSE from OpenAI SSE (frame-assembled, terminal
+       synthesized on EOF); response mode forces `stream: false` and returns JSON.
   5. Forward to resolved upstream, retry on **429** and **503** /
      connection error with jittered exponential backoff (same logic as
      before: `PROXY_INITIAL_DELAY * 2**attempt`, capped at `PROXY_MAX_DELAY`,
      ±25% jitter, thread-local RNG). **429 retries use `PROXY_MAX_DELAY`**
-     directly; 503 and connection errors use the exponential.
+     directly; 503 and connection errors use the exponential. Request body is
+     built once before the retry loop — never re-transformed on retry.
   6. **Response model rewriting**: the tier name is resolved from the request
-     body at entry and threaded through the call chain. For SSE
+     body at entry and threaded through the call chain. For anthropic-mode SSE
      (`text/event-stream`): buffer first event (64 KB cap), rewrite `model` in
      `message_start` event to the tier name, forward remainder + subsequent
-     events unchanged. For JSON (`application/json`): parse body, replace
-     `model` with tier name, re-serialize. Other Content-Types pass through
-     unchanged. Content-Type checked FIRST before any buffering/parsing.
+     events unchanged. For anthropic-mode JSON (`application/json`): parse body,
+     replace `model` with tier name, re-serialize. Chat/response modes use full
+     body transforms (see Step 4). Other Content-Types pass through unchanged.
+     Content-Type checked FIRST before any buffering/parsing.
   7. **`do_POST` streamed flag**: `streamed = (200 <= status < 300) and
      (resp_body == b"")` — streaming paths return `b""`, buffering paths
      return actual body. Only buffered responses call `_send_response`.
-  8. Log a JSONL trace entry with `tier` and `provider` fields.
+  8. Log a JSONL trace entry with `tier`, `provider`, and `mode` fields.
   - `/admin/shutdown` (localhost-only) triggers graceful shutdown.
   - **Admin page** (`GET /admin/`): serves `admin.html` from package data.
   - **Admin API** (localhost-only, CSRF-protected via Origin validation):
     - `GET /admin/api/config` — return current tiers + models
     - `GET /admin/api/providers` — return list of available provider names
+    - `GET /admin/api/providers-detail` — return mode per provider (read-only, no keys)
     - `POST /admin/api/switch` — update tier mappings (preserves models
       catalog), validate all 3 tiers present, validate provider names,
       drain-and-swap pattern (block new queries, drain in-flight, swap,
@@ -257,6 +274,19 @@ does not block startup on failure).
   production is to encrypt with `vim -n -x` (blowfish2, `VimCrypt~03!`, the
   default). The `--passphrase-file` CLI option is only used when keys are
   encrypted; with plain keys it is ignored.
+- **Provider mode dispatch.** Each vendor entry in `keys-index.json` may
+  carry a `mode` field (`"anthropic"`, `"chat"`, or `"response"`). Defaults
+  to `"anthropic"` when absent. Startup validates the mode enum and emits a
+  stderr warning for each vendor without an explicit mode. Invalid modes
+  return 500 at request time. Chat mode transforms the request to OpenAI
+  Chat Completions format and the response back to Anthropic Messages
+  format; response mode transforms to OpenAI Responses format (single-turn,
+  stream forced false). Error responses (non-2xx) pass through untransformed.
+  `count_tokens` returns 400 for chat/response modes (no OpenAI equivalent).
+  Tool-use SSE deltas are not transformed (stop_reason degraded to null when
+  tool_calls are seen). Response mode is usable only by non-streaming clients
+  (forces `stream: false`). Chat-mode SSE is synthesized from OpenAI SSE
+  (frame-assembled on `\n\n`, terminal synthesized on EOF).
 
 ## Documentation
 
@@ -267,6 +297,9 @@ does not block startup on failure).
   rates, TTFT, latency) for a configurable time window, with outlier filtering.
 - [plans/](plans/) — completed implementation plans (one per feature, with
   design rationale, issue log, and test results).
+- [plans/2026-08-27-support-three-endpoint-modes.md](plans/2026-08-27-support-three-endpoint-modes.md) — three-endpoint-mode
+  dispatch (anthropic/chat/response) with full request/response transformation
+  and SSE streaming.
 - Design rationale for the extraction lives in
   `tmp/plans/2026-07-17-extract-retry-proxy-design.md` (gitignored — planning
   artifact, not published).
