@@ -165,8 +165,9 @@ paths resolve against cwd), `--all` (log full request/response bodies),
 | `PROXY_LOG_ALL` | "" | Set to `1` to log full request/response bodies |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | Trace log path |
 | `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | Keys file path (encrypted or plain JSON) |
+| `PROXY_STATE_FILE` | `~/.claude/proxy/proxy-state.json` | State file path override (added 2026-08-28). The server heartbeat writes PID/port/start_time to this file; `claude-retry-proxy stop`/`status`/`reload` read it. Override for test isolation. |
 
-Runtime artifacts (all under `~/.claude/`, hardcoded — see Gotchas):
+Runtime artifacts (all under `~/.claude/`, paths overridable via env vars — see table above):
 `proxy/config.json`, `proxy/proxy-state.json`,
 `proxy/proxy-stderr.log`, `logs/proxy-trace.jsonl`. The trace log is pruned of
 entries older than 5 days on each `claude-retry-proxy start` (best-effort;
@@ -287,6 +288,8 @@ does not block startup on failure).
   tool_calls are seen). Response mode is usable only by non-streaming clients
   (forces `stream: false`). Chat-mode SSE is synthesized from OpenAI SSE
   (frame-assembled on `\n\n`, terminal synthesized on EOF).
+- **Malformed tool arguments in chat mode.** When `_chat_to_anthropic` encounters tool-call arguments that cannot be parsed as a JSON dict (including `json.JSONDecodeError`, non-dict parse results, empty dicts, non-dict `function` values, and non-dict tool-call entries), it now emits a user-visible text block `[Tool call failed: arguments for '<name>' (call <id>) could not be parsed as JSON]` instead of a `tool_use` block with `input: {}`. A `tool_args_parse_failure` trace event is also logged with the now-threaded `request_id`/`mode`/`provider`/`tier` fields. When all tool calls in a response are malformed, `stop_reason` is forced to `None` to prevent the client from hanging on `stop_reason: "tool_use"` with zero tool_use blocks (behavior change landed 2026-08-28).
+- **Test suite is safe alongside a live proxy.** The test suite now sets `os.environ["PROXY_STATE_FILE"]` to a session temp path at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read `PROXY_STATE_FILE` from the env, so test proxies use an isolated state file and can never touch the live proxy's `~/.claude/proxy/proxy-state.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite (123 tests) passes with the live proxy up (landed 2026-08-28).
 
 ## Documentation
 

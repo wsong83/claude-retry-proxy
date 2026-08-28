@@ -439,8 +439,9 @@ def read_passphrase_from_stdin():
         return passphrase
 
 
-STATE_FILE = os.path.join(os.path.expanduser("~"), ".claude", "proxy",
-                          "proxy-state.json")
+STATE_FILE = os.environ.get("PROXY_STATE_FILE",
+                            os.path.join(os.path.expanduser("~"), ".claude", "proxy",
+                                         "proxy-state.json"))
 
 
 def read_state():
@@ -888,10 +889,10 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
 
                     if mode == "chat":
                         resp_body = _transform_and_guard(
-                            resp_body, tier, _chat_to_anthropic, request_id, mode)
+                            resp_body, tier, _chat_to_anthropic, request_id, mode, provider_name)
                     elif mode == "response":
                         resp_body = _transform_and_guard(
-                            resp_body, tier, _response_to_anthropic, request_id, mode)
+                            resp_body, tier, _response_to_anthropic, request_id, mode, provider_name)
                     else:
                         resp_body = _rewrite_json_response(
                             resp_body, tier, request_id)
@@ -921,7 +922,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                         conn.close()
                         transform_fn = _chat_to_anthropic if mode == "chat" else _response_to_anthropic
                         resp_body = _transform_and_guard(
-                            resp_body, tier, transform_fn, request_id, mode)
+                            resp_body, tier, transform_fn, request_id, mode, provider_name)
                         resp_headers["Content-Length"] = str(len(resp_body))
                         return (resp.status, resp_headers, resp_body,
                                 first_byte_elapsed, total_elapsed, retries, tier, provider_name, actual_model)
@@ -1187,7 +1188,7 @@ def _rewrite_json_response(body_bytes, tier, request_id):
 # Endpoint-mode request/response transformations
 # ---------------------------------------------------------------------------
 
-def _transform_and_guard(raw_body, tier, transform_fn, request_id, mode):
+def _transform_and_guard(raw_body, tier, transform_fn, request_id, mode, provider):
     """Run a response transform on raw JSON bytes with passthrough-on-failure.
 
     json.loads runs INSIDE the guard: any parse or shape failure logs a
@@ -1202,10 +1203,12 @@ def _transform_and_guard(raw_body, tier, transform_fn, request_id, mode):
             "event": "transform_failure",
             "request_id": request_id,
             "mode": mode,
+            "provider": provider,
+            "tier": tier,
         })
         return raw_body
     try:
-        return json.dumps(transform_fn(parsed, tier)).encode("utf-8")
+        return json.dumps(transform_fn(parsed, tier, request_id=request_id, mode=mode, provider=provider)).encode("utf-8")
     except (json.JSONDecodeError, KeyError, TypeError, IndexError,
             AttributeError, ValueError):
         log_trace({
@@ -1213,6 +1216,8 @@ def _transform_and_guard(raw_body, tier, transform_fn, request_id, mode):
             "event": "transform_failure",
             "request_id": request_id,
             "mode": mode,
+            "provider": provider,
+            "tier": tier,
         })
         return raw_body
 
@@ -1256,7 +1261,7 @@ def _map_chat_finish_reason(finish_reason):
     return None
 
 
-def _chat_to_anthropic(chat_body, tier):
+def _chat_to_anthropic(chat_body, tier, request_id=None, mode=None, provider=None):
     """Transform an OpenAI Chat Completions JSON response into Anthropic Messages.
 
     All field access is guarded with .get()/truthiness defaults; the whole
@@ -1299,10 +1304,25 @@ def _chat_to_anthropic(chat_body, tier):
 
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list):
+            emitted_tool_use = False
             for tc in tool_calls:
                 if not isinstance(tc, dict):
+                    log_trace({
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "event": "tool_args_parse_failure",
+                        "request_id": request_id,
+                        "mode": mode,
+                        "provider": provider,
+                        "tier": tier,
+                    })
+                    result["content"].append({
+                        "type": "text",
+                        "text": "[Tool call failed: tool call entry is not a dict (call {})]".format(
+                            tc.get("id") if isinstance(tc, dict) else "<unknown>"),
+                    })
                     continue
-                fn = tc.get("function") or {}
+                fn = tc.get("function")
+                fn = fn if isinstance(fn, dict) else {}
                 args = fn.get("arguments")
                 if isinstance(args, dict):
                     parsed_args = args
@@ -1310,30 +1330,53 @@ def _chat_to_anthropic(chat_body, tier):
                     try:
                         parsed_args = json.loads(args)
                     except json.JSONDecodeError:
-                        parsed_args = {}
-                        log_trace({
-                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                            "event": "tool_args_parse_failure",
-                            "request_id": None,
-                        })
+                        parsed_args = None
+                    if not isinstance(parsed_args, dict):
+                        parsed_args = None
                 else:
-                    parsed_args = {}
-                if not isinstance(parsed_args, dict):
-                    parsed_args = {}
+                    parsed_args = None
+                if parsed_args is None or parsed_args == {}:
+                    log_trace({
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "event": "tool_args_parse_failure",
+                        "request_id": request_id,
+                        "mode": mode,
+                        "provider": provider,
+                        "tier": tier,
+                    })
+                    result["content"].append({
+                        "type": "text",
+                        "text": "[Tool call failed: arguments for '{}' (call {}) could not be parsed as JSON]".format(
+                            fn.get("name") or "<unknown>", tc.get("id") or "<unknown>"),
+                    })
+                    continue
                 result["content"].append({
                     "type": "tool_use",
                     "id": tc.get("id") or str(uuid.uuid4()),
                     "name": fn.get("name") or None,
                     "input": parsed_args,
                 })
+                emitted_tool_use = True
 
-        result["stop_reason"] = _map_chat_finish_reason(choice.get("finish_reason"))
+            if not emitted_tool_use:
+                result["stop_reason"] = None
+            else:
+                result["stop_reason"] = _map_chat_finish_reason(choice.get("finish_reason"))
+
+        if not isinstance(tool_calls, list):
+            sr = _map_chat_finish_reason(choice.get("finish_reason"))
+            if sr == "tool_use":
+                sr = None  # tool_calls null/absent — don't claim tool_use
+            result["stop_reason"] = sr
         return result
     except (json.JSONDecodeError, KeyError, TypeError, IndexError, AttributeError):
         log_trace({
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "event": "transform_failure",
-            "request_id": None,
+            "request_id": request_id,
+            "mode": mode,
+            "provider": provider,
+            "tier": tier,
         })
         return chat_body
 
@@ -1386,7 +1429,7 @@ def _anthropic_to_response(body_json):
     return out
 
 
-def _response_to_anthropic(resp_body, tier):
+def _response_to_anthropic(resp_body, tier, request_id=None, mode=None, provider=None):
     """Transform an OpenAI Responses JSON response into Anthropic Messages.
 
     Same defensive conventions as _chat_to_anthropic: guarded .get() access
@@ -1430,7 +1473,10 @@ def _response_to_anthropic(resp_body, tier):
         log_trace({
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "event": "transform_failure",
-            "request_id": None,
+            "request_id": request_id,
+            "mode": mode,
+            "provider": provider,
+            "tier": tier,
         })
         return resp_body
 

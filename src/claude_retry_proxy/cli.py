@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
 PROXY_DIR = os.path.join(HOME, ".claude", "proxy")
-PROXY_STATE_FILE = os.path.join(PROXY_DIR, "proxy-state.json")
+PROXY_STATE_FILE = os.environ.get("PROXY_STATE_FILE", os.path.join(PROXY_DIR, "proxy-state.json"))
 CONFIG_FILE = os.path.join(PROXY_DIR, "config.json")
 KEYS_FILE = os.path.join(HOME, ".claude", "keys-index.json")
 CONFIG_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "config-template.json")

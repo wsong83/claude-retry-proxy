@@ -17,11 +17,12 @@ Behavioral tests covering:
 Run: pip install -e .  then  python tests/test_claude_proxy.py
 Requires: Python 3.8+, no external dependencies (stdlib-only tests).
 
-NOTE: CLI tests use hardcoded ~/.claude/proxy/proxy-state.json (the CLI's
-state path). They back up/restore that file and isolate config/keys/log via
---config-path/--keys-path/--log, so the user's real proxy config is not
-touched. Tests should not be run while a production proxy on the same state
-file is active.
+NOTE: CLI tests use PROXY_STATE_FILE isolation (module-scope env var set to a
+session temp path before any CLI/server module import). cli.py and server.py
+read PROXY_STATE_FILE from the env, so test proxies use an isolated state file
+and can never touch the live proxy's ~/.claude/proxy/proxy-state.json. Config,
+keys, and trace log are isolated via --config-path/--keys-path/--log. The suite
+is safe to run alongside a live proxy (landed 2026-08-28).
 """
 
 import argparse
@@ -48,6 +49,15 @@ import uuid
 os.environ["PROXY_TRACE_FILE"] = os.path.join(
     tempfile.gettempdir(), "claude-retry-proxy-test-trace.jsonl")
 
+# Same isolation for the CLI/state file. cli.py and server.py read
+# PROXY_STATE_FILE from the env (added 2026-08-28 to fix the
+# test-suite-kills-live-proxy hazard). Force it to a session temp path before
+# any CLI subprocess or server module is spawned, so the dummy proxies the
+# tests launch read/write an isolated state file and can never stop or touch
+# the live proxy's ~/.claude/proxy/proxy-state.json.
+os.environ["PROXY_STATE_FILE"] = os.path.join(
+    tempfile.gettempdir(), "claude-retry-proxy-test-state.json")
+
 
 # ---------------------------------------------------------------------------
 # Test infrastructure
@@ -58,7 +68,9 @@ PROXY_SERVER = [sys.executable, "-m", "claude_retry_proxy.server"]
 
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
 PROXY_DIR = os.path.join(os.path.expanduser("~"), ".claude", "proxy")
-PROXY_STATE_FILE = os.path.join(PROXY_DIR, "proxy-state.json")
+# Isolated test state path (set above); must match what cli.py/server.py read
+# from PROXY_STATE_FILE so CLI subprocesses and the tests' own checks agree.
+PROXY_STATE_FILE = os.environ["PROXY_STATE_FILE"]
 URL_LOCK_FILE = os.path.join(PROXY_DIR, "base-url.lock")
 URL_SWAP_LOCK_FILE = os.path.join(PROXY_DIR, "url-swap.lock")
 
@@ -7459,7 +7471,7 @@ def test_chat_to_anthropic_finish_reason_mapping():
     fn = _require_server_func("_chat_to_anthropic")
     if fn is None:
         return
-    cases = [("stop", "end_turn"), ("length", "max_tokens"), ("tool_calls", "tool_use"),
+    cases = [("stop", "end_turn"), ("length", "max_tokens"),
              ("content_filter", None), ("weird_thing", None)]
     ok = True
     for fr, expected in cases:
@@ -7471,6 +7483,27 @@ def test_chat_to_anthropic_finish_reason_mapping():
         if actual != expected:
             fail("finish_reason {!r} -> stop_reason {!r}, expected {!r}".format(fr, actual, expected))
             ok = False
+    # finish_reason 'tool_calls' only maps to 'tool_use' when a tool_use block
+    # is actually emitted (Step 6a: null/absent tool_calls must not claim
+    # tool_use, or the client hangs waiting for tool_use blocks).
+    chat_tool = {"id": "x", "choices": [{"index": 0,
+                                         "message": {"role": "assistant", "content": "hi",
+                                                     "tool_calls": [
+                                                         {"id": "call_1", "type": "function",
+                                                          "function": {"name": "f", "arguments": '{"city": "SF"}'}}]},
+                                         "finish_reason": "tool_calls"}]}
+    out = fn(chat_tool, "sonnet")
+    if out.get("stop_reason") != "tool_use":
+        fail("finish_reason 'tool_calls' with emitted tool_use -> stop_reason {!r}, expected 'tool_use'".format(out.get("stop_reason")))
+        ok = False
+    chat_null_tc = {"id": "x", "choices": [{"index": 0,
+                                            "message": {"role": "assistant", "content": "hi",
+                                                        "tool_calls": None},
+                                            "finish_reason": "tool_calls"}]}
+    out = fn(chat_null_tc, "sonnet")
+    if out.get("stop_reason") is not None:
+        fail("null tool_calls + finish_reason 'tool_calls' -> stop_reason {!r}, expected None".format(out.get("stop_reason")))
+        ok = False
     chat_missing = {"id": "x", "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}]}
     out = fn(chat_missing, "sonnet")
     if out.get("stop_reason") is not None:
@@ -7515,9 +7548,102 @@ def test_chat_to_anthropic_content_array():
         pass_("array content mapped block by block")
 
 
-def test_chat_to_anthropic_malformed_tool_args():
-    """Malformed JSON tool arguments do not crash and fall back to {}."""
-    print("\n--- Test: Chat To Anthropic Malformed Tool Args ---")
+def test_chat_to_anthropic_malformed_tool_args_text_block():
+    """Malformed tool args degrade to a text block, not a tool_use with input {}.
+
+    Option C (plan 2026-08-28-thread-request-id-to-transform-functions):
+    when tool arguments cannot produce a valid dict, emit a text block
+    "[Tool call failed: arguments for '<name>' (call <id>) could not be
+    parsed as JSON]" instead of a tool_use block with input {}. stop_reason
+    is forced to None when no tool_use block is emitted. The transform also
+    accepts request_id, mode, provider kwargs.
+    """
+    print("\n--- Test: Chat To Anthropic Malformed Tool Args Text Block ---")
+    fn = _require_server_func("_chat_to_anthropic")
+    if fn is None:
+        return
+    cases = [
+        # (label, arguments value)
+        ("string-fails-json", "{not json"),
+        ("string-parses-to-non-dict-int", "42"),
+        ("string-parses-to-non-dict-array", "[1,2]"),
+        ("non-string-null", None),
+    ]
+    for label, args_val in cases:
+        chat = {"id": "x",
+                "choices": [{"index": 0,
+                             "message": {"role": "assistant", "content": "",
+                                         "tool_calls": [
+                                             {"id": "call_1", "type": "function",
+                                              "function": {"name": "f", "arguments": args_val}}]},
+                             "finish_reason": "tool_calls"}]}
+        out = fn(chat, "sonnet", request_id="R1", mode="chat", provider="p")
+        content = out.get("content") if isinstance(out.get("content"), list) else []
+        tools = [b for b in content if b.get("type") == "tool_use"]
+        if tools:
+            fail("[{}] malformed args should NOT emit a tool_use block, content={!r}".format(label, content))
+            continue
+        text_blocks = [b for b in content if b.get("type") == "text"]
+        if not any("f" in (b.get("text") or "") and "call_1" in (b.get("text") or "")
+                   for b in text_blocks):
+            fail("[{}] expected a text block naming tool 'f' and call 'call_1', content={!r}".format(label, content))
+            continue
+        if out.get("stop_reason") is not None:
+            fail("[{}] all-malformed tool calls should force stop_reason None, got {!r}".format(label, out.get("stop_reason")))
+            continue
+    # Non-dict parses to a valid dict (no dict -> dict is fine) is NOT a failure.
+    chat_ok = {"id": "x",
+               "choices": [{"index": 0,
+                            "message": {"role": "assistant", "content": "",
+                                        "tool_calls": [
+                                            {"id": "call_1", "type": "function",
+                                             "function": {"name": "f", "arguments": '{"city": "SF"}'}}]},
+                            "finish_reason": "tool_calls"}]}
+    out_ok = fn(chat_ok, "sonnet", request_id="R2", mode="chat", provider="p")
+    tools_ok = [b for b in (out_ok.get("content") or []) if b.get("type") == "tool_use"]
+    if not tools_ok or tools_ok[0].get("input") != {"city": "SF"} or out_ok.get("stop_reason") != "tool_use":
+        fail("valid tool args should still emit a tool_use block with parsed input, content={!r}".format(out_ok.get("content")))
+        return
+    # Step 6c: verify a tool_args_parse_failure trace event from THIS test
+    # (request_id R1, from the malformed cases) carries the threaded
+    # request_id/mode/provider/tier fields — the unit-level proof that
+    # _transform_and_guard threads the correlation context through. The trace
+    # file is session-shared and appended, so assert on the matching event
+    # (request_id R1) rather than a count.
+    trace_file = os.environ.get("PROXY_TRACE_FILE")
+    if not trace_file or not os.path.exists(trace_file):
+        fail("expected PROXY_TRACE_FILE to be set to an existing temp path, got {!r}".format(trace_file))
+        return
+    matched = None
+    with open(trace_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("event") == "tool_args_parse_failure" and ev.get("request_id") == "R1":
+                matched = ev
+                break
+    if matched is None:
+        fail("expected a tool_args_parse_failure trace event with request_id R1, none found")
+        return
+    if (matched.get("mode") != "chat" or matched.get("provider") != "p"
+            or matched.get("tier") != "sonnet"):
+        fail("tool_args_parse_failure event missing mode/provider/tier, got {!r}".format(matched))
+        return
+    pass_("malformed tool args produce a text block, no input {}, stop_reason None")
+
+
+def test_chat_to_anthropic_malformed_tool_args_mixed():
+    """Mixed valid + malformed tool calls: valid tool_use kept, malformed degrades.
+
+    Guards the emitted_tool_use flag introduced by Option C: when at least one
+    tool_use block is emitted, stop_reason still maps from finish_reason.
+    """
+    print("\n--- Test: Chat To Anthropic Malformed Tool Args Mixed ---")
     fn = _require_server_func("_chat_to_anthropic")
     if fn is None:
         return
@@ -7526,18 +7652,27 @@ def test_chat_to_anthropic_malformed_tool_args():
                          "message": {"role": "assistant", "content": "",
                                      "tool_calls": [
                                          {"id": "call_1", "type": "function",
-                                          "function": {"name": "f", "arguments": "{not json"}}]},
+                                          "function": {"name": "good", "arguments": '{"city": "SF"}'}},
+                                         {"id": "call_2", "type": "function",
+                                          "function": {"name": "bad", "arguments": "{not json"}}]},
                          "finish_reason": "tool_calls"}]}
-    out = fn(chat, "sonnet")
+    out = fn(chat, "sonnet", request_id="R3", mode="chat", provider="p")
     content = out.get("content") if isinstance(out.get("content"), list) else []
     tools = [b for b in content if b.get("type") == "tool_use"]
-    if not tools:
-        fail("malformed tool args: expected a tool_use block, content={!r}".format(out.get("content")))
+    if len(tools) != 1:
+        fail("expected exactly one tool_use block, got {!r}".format(content))
         return
-    if tools[0].get("input") != {}:
-        fail("malformed arguments should fall back to {{}}, got {!r}".format(tools[0].get("input")))
-    else:
-        pass_("malformed tool arguments fall back to {}")
+    if tools[0].get("name") != "good" or tools[0].get("input") != {"city": "SF"}:
+        fail("valid tool call should be preserved, got {!r}".format(tools[0]))
+        return
+    text_blocks = [b for b in content if b.get("type") == "text"]
+    if not any("bad" in (b.get("text") or "") and "call_2" in (b.get("text") or "") for b in text_blocks):
+        fail("malformed tool call should produce a text block naming 'bad' and 'call_2', content={!r}".format(content))
+        return
+    if out.get("stop_reason") != "tool_use":
+        fail("with a valid tool_use emitted, stop_reason should map to tool_use, got {!r}".format(out.get("stop_reason")))
+        return
+    pass_("mixed valid + malformed tool calls: valid tool_use kept, malformed degrades")
 
 
 # --- Step 6: _anthropic_to_response ---
@@ -8408,6 +8543,7 @@ def test_transform_failure_passthrough():
             fail("malformed JSON body should pass through unchanged, got {!r}".format(body[:200]))
             return
         found = False
+        fields_ok = False
         with open(trace_file) as f:
             for line in f:
                 line = line.strip()
@@ -8419,10 +8555,87 @@ def test_transform_failure_passthrough():
                     continue
                 if ev.get("event") == "transform_failure":
                     found = True
+                    if (ev.get("provider") == "p" and ev.get("tier") == "sonnet"
+                            and ev.get("request_id") and ev.get("mode") == "chat"):
+                        fields_ok = True
         if not found:
             fail("expected a transform_failure trace event, none found")
+        elif not fields_ok:
+            fail("transform_failure event missing provider/tier/request_id/mode, got {!r}".format(ev))
         else:
-            pass_("malformed JSON passes through with transform_failure trace event")
+            pass_("malformed JSON passes through with transform_failure trace event carrying provider/tier")
+    finally:
+        cleanup()
+
+
+def test_tool_args_parse_failure_trace_has_request_id():
+    """End-to-end: tool_args_parse_failure trace event carries request_id/mode/provider/tier.
+
+    Chat-mode proxy with a mock upstream returning malformed tool-call
+    arguments. The proxy's response transform degrades the malformed call to
+    a text block and logs tool_args_parse_failure with the full correlation
+    context threaded through _transform_and_guard.
+    """
+    print("\n--- Test: Tool Args Parse Failure Trace Has Request ID ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    chat_malformed = json.dumps({
+        "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "gpt-4o",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "",
+                                             "tool_calls": [
+                                                 {"id": "call_1", "type": "function",
+                                                  "function": {"name": "f", "arguments": "{not json"}}]},
+                     "finish_reason": "tool_calls"}],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+    }).encode()
+    responders = {"p": lambda info: (200, "application/json", chat_malformed)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        try:
+            data = json.loads(body)
+        except Exception:
+            fail("response is not valid JSON: {!r}".format(body[:200]))
+            return
+        content = data.get("content") if isinstance(data.get("content"), list) else []
+        if any(b.get("type") == "tool_use" for b in content):
+            fail("malformed tool args must not produce a tool_use block, content={!r}".format(content))
+            return
+        if data.get("stop_reason") is not None:
+            fail("all-malformed tool calls should force stop_reason None, got {!r}".format(data.get("stop_reason")))
+            return
+        found = False
+        fields_ok = False
+        matched_ev = None
+        with open(trace_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if ev.get("event") == "tool_args_parse_failure":
+                    found = True
+                    matched_ev = ev
+                    if (ev.get("request_id") and ev.get("mode") == "chat"
+                            and ev.get("provider") == "p" and ev.get("tier") == "sonnet"):
+                        fields_ok = True
+        if not found:
+            fail("expected a tool_args_parse_failure trace event, none found")
+        elif not fields_ok:
+            fail("tool_args_parse_failure event missing request_id/mode/provider/tier, got {!r}".format(matched_ev))
+        else:
+            pass_("tool_args_parse_failure trace event carries request_id/mode/provider/tier")
     finally:
         cleanup()
 
@@ -8706,7 +8919,8 @@ ALL_TESTS = [
     ("chat-to-anthropic-finish-reason-mapping", test_chat_to_anthropic_finish_reason_mapping),
     ("chat-to-anthropic-usage-absent", test_chat_to_anthropic_usage_absent),
     ("chat-to-anthropic-content-array", test_chat_to_anthropic_content_array),
-    ("chat-to-anthropic-malformed-tool-args", test_chat_to_anthropic_malformed_tool_args),
+    ("chat-to-anthropic-malformed-tool-args-text-block", test_chat_to_anthropic_malformed_tool_args_text_block),
+    ("chat-to-anthropic-malformed-tool-args-mixed", test_chat_to_anthropic_malformed_tool_args_mixed),
     ("anthropic-to-response-basic", test_anthropic_to_response_basic),
     ("anthropic-to-response-system-list", test_anthropic_to_response_system_list),
     ("anthropic-to-response-multiple-user-messages", test_anthropic_to_response_multiple_user_messages),
@@ -8731,6 +8945,7 @@ ALL_TESTS = [
     ("anthropic-mode-unchanged", test_anthropic_mode_unchanged),
     ("chat-mode-non-2xx-passthrough", test_chat_mode_non_2xx_passthrough),
     ("transform-failure-passthrough", test_transform_failure_passthrough),
+    ("tool-args-parse-failure-trace-has-request-id", test_tool_args_parse_failure_trace_has_request_id),
     ("retry-does-not-double-transform", test_retry_does_not_double_transform),
     ("admin-providers-detail", test_admin_providers_detail),
     ("admin-providers-detail-no-mode", test_admin_providers_detail_no_mode),

@@ -258,6 +258,7 @@ localhost-only with CSRF protection (Origin header validation).
 | `PROXY_LOG_ALL` | unset | `1` to enable | Log full request bodies; response bodies on error paths only (streamed 2xx bodies are not captured) |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | path | Trace log location |
 | `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | path | Keys file location (encrypted or plain JSON) |
+| `PROXY_STATE_FILE` | `~/.claude/proxy/proxy-state.json` | path | State file path override. The server heartbeat writes PID/port/start_time here; `claude-retry-proxy stop`/`status`/`reload` read it. Override for test isolation. |
 
 Backoff is `PROXY_INITIAL_DELAY * 2**attempt`, capped at `PROXY_MAX_DELAY`.
 **429** responses retry using `PROXY_MAX_DELAY` directly (maximal latency);
