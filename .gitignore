@@ -10,6 +10,7 @@ dist/
 venv/
 env/
 tmp/
+tests/temp/
 *.swp
 *.swo
 *~

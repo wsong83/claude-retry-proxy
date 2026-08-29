@@ -7421,7 +7421,8 @@ def test_anthropic_to_chat_messages_transform():
     ]
     out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
     expected = [
-        {"role": "assistant", "content": "Let me check."},
+        {"role": "assistant", "content": "Let me check.",
+         "reasoning_content": "hidden", "reasoning": "hidden"},
         {"role": "assistant", "content": None, "tool_calls": [
             {"id": "toolu_1", "type": "function",
              "function": {"name": "get_weather", "arguments": '{"city": "SF"}'}}]},
@@ -7435,7 +7436,7 @@ def test_anthropic_to_chat_messages_transform():
 
 
 def test_anthropic_to_chat_messages_thinking_stripped():
-    """thinking and redacted_thinking blocks are removed from assistant messages."""
+    """thinking is converted to reasoning_content; redacted_thinking non-empty data -> placeholder."""
     print("\n--- Test: Anthropic To Chat Messages Thinking Stripped ---")
     fn = _require_server_func("_transform_anthropic_messages_to_chat")
     if fn is None:
@@ -7448,10 +7449,90 @@ def test_anthropic_to_chat_messages_thinking_stripped():
         ]},
     ]
     out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
-    if out != [{"role": "assistant", "content": "visible"}]:
-        fail("thinking/redacted_thinking not stripped, got {!r}".format(out))
+    expected = [{"role": "assistant", "content": "visible",
+                 "reasoning_content": "hidden", "reasoning": "hidden"}]
+    if out != expected:
+        fail("thinking should convert to reasoning_content (real thinking wins over redacted placeholder), got {!r}".format(out))
     else:
-        pass_("thinking and redacted_thinking stripped, text kept")
+        pass_("thinking converted to reasoning_content; redacted_thinking placeholder suppressed by real thinking")
+
+
+def test_anthropic_to_chat_messages_redacted_thinking_trace():
+    """redacted_thinking with non-empty data -> placeholder reasoning_content + passthrough trace event.
+
+    Real thinking text wins over the placeholder. Empty data is stripped and
+    counted in dropped.redacted_thinking, not passed through.
+    """
+    print("\n--- Test: Anthropic To Chat Messages Redacted Thinking Trace ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    rid = "T-" + uuid.uuid4().hex[:8]
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "redacted_thinking", "data": "enc", "signature": "s2"},
+            {"type": "text", "text": "visible"},
+        ]},
+    ]
+    out = fn(messages, request_id=rid, mode="chat", provider="p", tier="sonnet")
+    expected = [{"role": "assistant", "content": "visible",
+                 "reasoning_content": "[redacted_thinking: data not available]",
+                 "reasoning": "[redacted_thinking: data not available]"}]
+    if out != expected:
+        fail("redacted_thinking non-empty data should set placeholder reasoning_content, got {!r}".format(out))
+        return
+    evs = [e for e in _trace_events_for_request(rid) if e.get("event") == "redacted_thinking_passthrough"]
+    if len(evs) != 1:
+        fail("expected exactly ONE redacted_thinking_passthrough event, got {}: {!r}".format(len(evs), evs))
+        return
+    ev = evs[0]
+    if not (ev.get("mode") == "chat" and ev.get("provider") == "p"
+            and ev.get("tier") == "sonnet" and ev.get("request_id") == rid):
+        fail("redacted_thinking_passthrough missing correlation fields, got {!r}".format(ev))
+        return
+    if ev.get("data_length") != 3:
+        fail("redacted_thinking_passthrough data_length should be len('enc')=3, got {!r}".format(ev.get("data_length")))
+        return
+    # Real thinking text wins over the redacted placeholder.
+    rid2 = "T-" + uuid.uuid4().hex[:8]
+    messages2 = [
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "real", "signature": "s"},
+            {"type": "redacted_thinking", "data": "enc", "signature": "s2"},
+        ]},
+    ]
+    out2 = fn(messages2, request_id=rid2, mode="chat", provider="p", tier="sonnet")
+    if out2 != [{"role": "assistant", "content": "",
+                 "reasoning_content": "real", "reasoning": "real"}]:
+        fail("real thinking should win over redacted placeholder, got {!r}".format(out2))
+        return
+    evs2 = [e for e in _trace_events_for_request(rid2) if e.get("event") == "redacted_thinking_passthrough"]
+    if evs2:
+        fail("real thinking present should suppress redacted_thinking_passthrough event, got {!r}".format(evs2))
+        return
+    # Empty/missing data is stripped and counted in dropped, not passed through.
+    rid3 = "T-" + uuid.uuid4().hex[:8]
+    messages3 = [
+        {"role": "assistant", "content": [
+            {"type": "redacted_thinking", "data": "", "signature": "s2"},
+            {"type": "redacted_thinking", "signature": "s3"},
+            {"type": "text", "text": "x"},
+        ]},
+    ]
+    out3 = fn(messages3, request_id=rid3, mode="chat", provider="p", tier="sonnet")
+    if out3 != [{"role": "assistant", "content": "x"}]:
+        fail("empty-data redacted_thinking should be stripped, got {!r}".format(out3))
+        return
+    evs3 = [e for e in _trace_events_for_request(rid3) if e.get("event") == "redacted_thinking_passthrough"]
+    if evs3:
+        fail("empty-data redacted_thinking must not log passthrough event, got {!r}".format(evs3))
+        return
+    dropped3 = [e for e in _trace_events_for_request(rid3) if e.get("event") == "content_block_dropped"]
+    counts3 = (dropped3[0].get("dropped_counts") or {}) if dropped3 else {}
+    if counts3.get("redacted_thinking") != 2:
+        fail("empty-data redacted_thinking should count in dropped.redacted_thinking, got {!r}".format(counts3))
+        return
+    pass_("redacted_thinking non-empty -> placeholder + passthrough trace; empty -> stripped")
 
 
 def test_anthropic_to_chat_messages_tool_use_to_tool_calls():
@@ -7575,7 +7656,8 @@ def test_anthropic_to_chat_messages_interleaved_thinking_tool_use():
     out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
     expected = [
         {"role": "assistant",
-         "content": "Let me look up the weather for San Francisco.\nI found the forecast."},
+         "content": "Let me look up the weather for San Francisco.\nI found the forecast.",
+         "reasoning_content": "reasoning...", "reasoning": "reasoning..."},
         {"role": "assistant", "content": None, "tool_calls": [
             {"id": "toolu_weather", "type": "function",
              "function": {"name": "get_weather", "arguments": '{"city": "San Francisco"}'}}]},
@@ -7584,7 +7666,7 @@ def test_anthropic_to_chat_messages_interleaved_thinking_tool_use():
     if out != expected:
         fail("interleaved pattern mismatch, got {!r}".format(out))
     else:
-        pass_("interleaved thinking/text/tool_use pattern transformed")
+        pass_("interleaved thinking/text/tool_use pattern transformed with reasoning_content on text message")
 
 
 def test_anthropic_to_chat_messages_string_content_passthrough():
@@ -7881,7 +7963,8 @@ def test_anthropic_to_chat_integration():
     expected_messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "What's the weather in SF?"},
-        {"role": "assistant", "content": "Let me look it up."},
+        {"role": "assistant", "content": "Let me look it up.",
+         "reasoning_content": "hidden", "reasoning": "hidden"},
         {"role": "assistant", "content": None, "tool_calls": [
             {"id": "toolu_1", "type": "function",
              "function": {"name": "get_weather", "arguments": '{"city": "SF"}'}}]},
@@ -7936,7 +8019,7 @@ def test_anthropic_to_chat_content_block_dropped_trace():
         (ev.get("provider") == "p", "provider field"),
         (ev.get("tier") == "sonnet", "tier field"),
         (ev.get("request_id") == rid, "request_id field"),
-        (counts.get("thinking") == 2, "thinking count 2"),
+        (counts.get("thinking") == 0, "thinking no longer counted as dropped"),
         (counts.get("image") == 1, "image count 1"),
     ]
     for ok, label in checks:
@@ -8177,6 +8260,126 @@ def test_chat_to_anthropic_basic():
             fail("basic mapping failed: {} (out={!r})".format(label, out))
     if all(ok for ok, _ in checks):
         pass_("chat->anthropic basic mapping correct")
+
+
+def test_chat_to_anthropic_reasoning_content_to_thinking():
+    """reasoning_content in the chat message becomes a thinking block first in content."""
+    print("\n--- Test: Chat To Anthropic Reasoning Content To Thinking ---")
+    fn = _require_server_func("_chat_to_anthropic")
+    if fn is None:
+        return
+    chat = {"id": "c1", "model": "gpt-4o",
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": "Answer",
+                                     "reasoning_content": "Let me think"},
+                         "finish_reason": "stop"}]}
+    out = fn(chat, "sonnet")
+    content = out.get("content") if isinstance(out, dict) else None
+    expected = [
+        {"type": "thinking", "thinking": "Let me think", "signature": ""},
+        {"type": "text", "text": "Answer"},
+    ]
+    if content != expected:
+        fail("reasoning_content should become a thinking block first, got content={!r}".format(content))
+        return
+    if not isinstance(content, list) or content[0].get("type") != "thinking" \
+            or content[0].get("signature") != "":
+        fail("thinking block must carry signature:'', got {!r}".format(content))
+        return
+    pass_("reasoning_content -> thinking block first with signature:''")
+
+
+def test_chat_to_anthropic_reasoning_field_compat():
+    """vLLM 'reasoning' field is also recognized; reasoning_content wins when both present."""
+    print("\n--- Test: Chat To Anthropic Reasoning Field Compat ---")
+    fn = _require_server_func("_chat_to_anthropic")
+    if fn is None:
+        return
+    # 'reasoning' alone (vLLM compat)
+    chat = {"id": "c1", "model": "gpt-4o",
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": "A",
+                                     "reasoning": "vllm-reason"},
+                         "finish_reason": "stop"}]}
+    out = fn(chat, "sonnet")
+    content = out.get("content") if isinstance(out, dict) else None
+    if content != [{"type": "thinking", "thinking": "vllm-reason", "signature": ""},
+                   {"type": "text", "text": "A"}]:
+        fail("reasoning field (vLLM) should map to thinking block, got {!r}".format(content))
+        return
+    # Both present: reasoning_content wins
+    chat2 = {"id": "c2", "model": "gpt-4o",
+             "choices": [{"index": 0,
+                          "message": {"role": "assistant", "content": "A",
+                                      "reasoning_content": "rc", "reasoning": "r"},
+                          "finish_reason": "stop"}]}
+    out2 = fn(chat2, "sonnet")
+    content2 = out2.get("content") if isinstance(out2, dict) else None
+    if content2 != [{"type": "thinking", "thinking": "rc", "signature": ""},
+                    {"type": "text", "text": "A"}]:
+        fail("reasoning_content must take precedence over reasoning, got {!r}".format(content2))
+        return
+    pass_("reasoning field recognized; reasoning_content wins precedence")
+
+
+def test_chat_to_anthropic_reasoning_content_empty():
+    """Empty reasoning_content produces no thinking block."""
+    print("\n--- Test: Chat To Anthropic Reasoning Content Empty ---")
+    fn = _require_server_func("_chat_to_anthropic")
+    if fn is None:
+        return
+    chat = {"id": "c1", "model": "gpt-4o",
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": "A",
+                                     "reasoning_content": ""},
+                         "finish_reason": "stop"}]}
+    out = fn(chat, "sonnet")
+    content = out.get("content") if isinstance(out, dict) else None
+    if content != [{"type": "text", "text": "A"}]:
+        fail("empty reasoning_content should emit no thinking block, got {!r}".format(content))
+        return
+    # Non-string reasoning_content is also skipped
+    chat2 = {"id": "c2", "model": "gpt-4o",
+             "choices": [{"index": 0,
+                          "message": {"role": "assistant", "content": "A",
+                                      "reasoning_content": None},
+                          "finish_reason": "stop"}]}
+    out2 = fn(chat2, "sonnet")
+    content2 = out2.get("content") if isinstance(out2, dict) else None
+    if content2 != [{"type": "text", "text": "A"}]:
+        fail("non-string reasoning_content should be skipped, got {!r}".format(content2))
+        return
+    pass_("empty/non-string reasoning_content emits no thinking block")
+
+
+def test_chat_to_anthropic_reasoning_content_with_tool_calls():
+    """reasoning_content + tool_calls -> thinking block first, then tool_use blocks."""
+    print("\n--- Test: Chat To Anthropic Reasoning Content With Tool Calls ---")
+    fn = _require_server_func("_chat_to_anthropic")
+    if fn is None:
+        return
+    chat = {"id": "c1", "model": "gpt-4o",
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": None,
+                                     "reasoning_content": "thinking",
+                                     "tool_calls": [
+                                         {"id": "call_1", "type": "function",
+                                          "function": {"name": "get_weather",
+                                                       "arguments": '{"city": "SF"}'}}]},
+                         "finish_reason": "tool_calls"}]}
+    out = fn(chat, "sonnet")
+    content = out.get("content") if isinstance(out, dict) else None
+    expected = [
+        {"type": "thinking", "thinking": "thinking", "signature": ""},
+        {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "SF"}},
+    ]
+    if content != expected:
+        fail("reasoning_content + tool_calls should be thinking first then tool_use, got {!r}".format(content))
+        return
+    if out.get("stop_reason") != "tool_use":
+        fail("tool_calls finish_reason should map to stop_reason tool_use, got {!r}".format(out.get("stop_reason")))
+        return
+    pass_("reasoning_content + tool_calls -> thinking block then tool_use blocks")
 
 
 def test_chat_to_anthropic_empty_choices():
@@ -9117,6 +9320,188 @@ def test_chat_sse_tool_calls_stop_reason_null():
         cleanup()
 
 
+def test_chat_sse_reasoning_delta_to_thinking_delta():
+    """reasoning_content delta -> thinking block at index 0, then text block at index 1.
+
+    The Anthropic client expects unique, increasing block indices across
+    content_block_start / content_block_delta / content_block_stop events.
+    """
+    print("\n--- Test: Chat SSE Reasoning Delta To Thinking Delta ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    chunks = [
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "Let me"},
+                      "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"reasoning_content": " think"}, "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"content": "Hi"}, "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+    sse_body = _sse_stream_chunks(chunks) + b"data: [DONE]\n\n"
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        frames = _parse_sse_frames(raw)
+        starts = _sse_frames_with_type(frames, "content_block_start")
+        deltas = _sse_frames_with_type(frames, "content_block_delta")
+        stops = _sse_frames_with_type(frames, "content_block_stop")
+        if len(starts) != 2:
+            fail("expected 2 content_block_start events (thinking + text), got {}: {!r}".format(len(starts), starts))
+            return
+        if starts[0].get("index") != 0 or starts[0].get("content_block", {}).get("type") != "thinking":
+            fail("first content_block_start should be thinking at index 0, got {!r}".format(starts[0]))
+            return
+        if starts[1].get("index") != 1 or starts[1].get("content_block", {}).get("type") != "text":
+            fail("second content_block_start should be text at index 1, got {!r}".format(starts[1]))
+            return
+        thinking_deltas = [d for d in deltas if d.get("delta", {}).get("type") == "thinking_delta"]
+        text_deltas = [d for d in deltas if d.get("delta", {}).get("type") == "text_delta"]
+        if not thinking_deltas:
+            fail("expected thinking_delta events, got {!r}".format(deltas))
+            return
+        for d in thinking_deltas:
+            if d.get("index") != 0:
+                fail("thinking_delta must use index 0, got {!r}".format(d))
+                return
+        if not text_deltas or text_deltas[0].get("index") != 1:
+            fail("text_delta should use index 1, got {!r}".format(text_deltas))
+            return
+        joined_reasoning = "".join(d.get("delta", {}).get("thinking", "") for d in thinking_deltas)
+        if "Let me think" != joined_reasoning:
+            fail("reasoning text mismatch, joined={!r}".format(joined_reasoning))
+            return
+        if len(stops) != 2:
+            fail("expected 2 content_block_stop events, got {}: {!r}".format(len(stops), stops))
+            return
+        indices = [s.get("index") for s in starts] + [d.get("index") for d in deltas] + [s.get("index") for s in stops]
+        if len(set(indices)) != 2 or set(indices) != {0, 1}:
+            fail("block indices should be exactly {{0, 1}}, got {!r}".format(indices))
+            return
+        pass_("reasoning delta -> thinking block index 0, text index 1, unique indices")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_reasoning_delta_no_content():
+    """A stream with only reasoning deltas still emits valid thinking blocks and terminal events.
+
+    One content_block_stop for the thinking block; the client never hangs.
+    """
+    print("\n--- Test: Chat SSE Reasoning Delta No Content ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    chunks = [
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "r1"},
+                      "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"reasoning_content": "r2"}, "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+    sse_body = _sse_stream_chunks(chunks) + b"data: [DONE]\n\n"
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        frames = _parse_sse_frames(raw)
+        types = _sse_types(frames)
+        starts = _sse_frames_with_type(frames, "content_block_start")
+        stops = _sse_frames_with_type(frames, "content_block_stop")
+        if len(starts) != 1 or starts[0].get("content_block", {}).get("type") != "thinking":
+            fail("expected exactly one thinking content_block_start, got {!r}".format(starts))
+            return
+        if starts[0].get("index") != 0:
+            fail("thinking block should be at index 0, got {!r}".format(starts[0]))
+            return
+        if len(stops) != 1 or stops[0].get("index") != 0:
+            fail("expected one content_block_stop at index 0, got {!r}".format(stops))
+            return
+        missing = [t for t in ("content_block_start", "content_block_delta",
+                               "content_block_stop", "message_delta", "message_stop") if t not in types]
+        if missing:
+            fail("missing terminal SSE events {}; got {}".format(missing, types))
+            return
+        deltas = _sse_frames_with_type(frames, "content_block_delta")
+        if not all(d.get("delta", {}).get("type") == "thinking_delta" for d in deltas):
+            fail("all deltas should be thinking_delta, got {!r}".format(deltas))
+            return
+        pass_("reasoning-only stream -> valid thinking block + terminal events")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_reasoning_then_text_transition():
+    """thinking content_block_stop(index 0) precedes text content_block_start(index 1)."""
+    print("\n--- Test: Chat SSE Reasoning Then Text Transition ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    chunks = [
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "r"},
+                      "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {"content": "text"}, "finish_reason": None}]},
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    ]
+    sse_body = _sse_stream_chunks(chunks) + b"data: [DONE]\n\n"
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        frames = _parse_sse_frames(raw)
+        starts = _sse_frames_with_type(frames, "content_block_start")
+        stops = _sse_frames_with_type(frames, "content_block_stop")
+        if len(starts) != 2 or len(stops) != 2:
+            fail("expected 2 starts and 2 stops, got starts={!r} stops={!r}".format(starts, stops))
+            return
+        thinking_stop = stops[0]
+        text_start = starts[1]
+        if thinking_stop.get("index") != 0:
+            fail("thinking stop should be at index 0, got {!r}".format(thinking_stop))
+            return
+        if text_start.get("index") != 1 or text_start.get("content_block", {}).get("type") != "text":
+            fail("text start should be at index 1, got {!r}".format(text_start))
+            return
+        stop_pos = next(i for i, f in enumerate(frames) if _sse_frame_type(f) == "content_block_stop" and isinstance(f[1], dict) and f[1].get("index") == 0)
+        start_pos = next(i for i, f in enumerate(frames) if _sse_frame_type(f) == "content_block_start" and isinstance(f[1], dict) and f[1].get("index") == 1)
+        if not (stop_pos < start_pos):
+            fail("thinking stop (pos {}) must precede text start (pos {})".format(stop_pos, start_pos))
+            return
+        pass_("thinking stop(index 0) precedes text start(index 1)")
+    finally:
+        cleanup()
+
+
 # --- Step 9: wiring / e2e ---
 
 def test_chat_mode_e2e_json():
@@ -9687,6 +10072,7 @@ ALL_TESTS = [
     # Chat-mode request transform tests (plan 2026-08-29-fix-chat-mode-request-transform)
     ("anthropic-to-chat-messages-transform", test_anthropic_to_chat_messages_transform),
     ("anthropic-to-chat-messages-thinking-stripped", test_anthropic_to_chat_messages_thinking_stripped),
+    ("anthropic-to-chat-messages-redacted-thinking-trace", test_anthropic_to_chat_messages_redacted_thinking_trace),
     ("anthropic-to-chat-messages-tool-use-to-tool-calls", test_anthropic_to_chat_messages_tool_use_to_tool_calls),
     ("anthropic-to-chat-messages-tool-result-to-role-tool", test_anthropic_to_chat_messages_tool_result_to_role_tool),
     ("anthropic-to-chat-messages-mixed-text-and-tool-use", test_anthropic_to_chat_messages_mixed_text_and_tool_use),
@@ -9714,6 +10100,10 @@ ALL_TESTS = [
     ("anthropic-to-chat-tool-result-list-content", test_anthropic_to_chat_tool_result_list_content),
     ("anthropic-to-chat-no-input-mutation", test_anthropic_to_chat_no_input_mutation),
     ("chat-to-anthropic-basic", test_chat_to_anthropic_basic),
+    ("chat-to-anthropic-reasoning-content-to-thinking", test_chat_to_anthropic_reasoning_content_to_thinking),
+    ("chat-to-anthropic-reasoning-field-compat", test_chat_to_anthropic_reasoning_field_compat),
+    ("chat-to-anthropic-reasoning-content-empty", test_chat_to_anthropic_reasoning_content_empty),
+    ("chat-to-anthropic-reasoning-content-with-tool-calls", test_chat_to_anthropic_reasoning_content_with_tool_calls),
     ("chat-to-anthropic-empty-choices", test_chat_to_anthropic_empty_choices),
     ("chat-to-anthropic-tool-calls", test_chat_to_anthropic_tool_calls),
     ("chat-to-anthropic-finish-reason-mapping", test_chat_to_anthropic_finish_reason_mapping),
@@ -9740,6 +10130,9 @@ ALL_TESTS = [
     ("chat-sse-injection-prevented", test_chat_sse_injection_prevented),
     ("chat-sse-event-line-present", test_chat_sse_event_line_present),
     ("chat-sse-tool-calls-stop-reason-null", test_chat_sse_tool_calls_stop_reason_null),
+    ("chat-sse-reasoning-delta-to-thinking-delta", test_chat_sse_reasoning_delta_to_thinking_delta),
+    ("chat-sse-reasoning-delta-no-content", test_chat_sse_reasoning_delta_no_content),
+    ("chat-sse-reasoning-then-text-transition", test_chat_sse_reasoning_then_text_transition),
     ("chat-mode-e2e-json", test_chat_mode_e2e_json),
     ("response-mode-e2e-json", test_response_mode_e2e_json),
     ("anthropic-mode-unchanged", test_anthropic_mode_unchanged),

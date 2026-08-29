@@ -1295,17 +1295,20 @@ def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
                                           cache_stripped_out=None):
     """Convert an Anthropic messages array into OpenAI Chat messages.
 
-    Always returns a new list (never mutates the input). thinking /
-    redacted_thinking / image / unknown blocks are stripped; tool_use and
-    tool_result are converted to OpenAI tool_calls / role:tool messages;
-    cache_control is stripped from kept blocks. cache_control_stripped is
-    reported to the caller via the optional cache_stripped_out list rather
-    than logged here, so _anthropic_to_chat can coalesce one event per request.
+    Always returns a new list (never mutates the input). thinking blocks are
+    converted to reasoning_content on the assistant message; redacted_thinking
+    blocks with non-empty data are converted to a placeholder; image / unknown
+    blocks are stripped; tool_use and tool_result are converted to OpenAI
+    tool_calls / role:tool messages; cache_control is stripped from kept
+    blocks. cache_control_stripped is reported to the caller via the optional
+    cache_stripped_out list rather than logged here, so _anthropic_to_chat can
+    coalesce one event per request.
     """
     if not isinstance(messages, list):
         return []
     dropped = {"thinking": 0, "redacted_thinking": 0, "image": 0,
                "tool_result": 0, "unknown": 0}
+    passthrough = {"redacted_thinking": 0}
     cache_stripped = False
     tool_use_ids = set()
     out = []
@@ -1325,6 +1328,7 @@ def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
         if role == "assistant":
             text_parts = []
             tool_calls = []
+            reasoning_text = None
             for block in content:
                 if not isinstance(block, dict):
                     dropped["unknown"] += 1
@@ -1333,10 +1337,28 @@ def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
                     cache_stripped = True
                 btype = block.get("type")
                 if btype == "thinking":
-                    dropped["thinking"] += 1
+                    thinking = block.get("thinking")
+                    if isinstance(thinking, str) and thinking:
+                        reasoning_text = thinking
+                    else:
+                        dropped["thinking"] += 1
                     continue
                 if btype == "redacted_thinking":
-                    dropped["redacted_thinking"] += 1
+                    data = block.get("data")
+                    if isinstance(data, str) and data and reasoning_text is None:
+                        reasoning_text = "[redacted_thinking: data not available]"
+                        passthrough["redacted_thinking"] += 1
+                        log_trace({
+                            "timestamp": _request_transform_timestamp(),
+                            "event": "redacted_thinking_passthrough",
+                            "request_id": request_id,
+                            "mode": mode,
+                            "provider": provider,
+                            "tier": tier,
+                            "data_length": len(data) if isinstance(data, str) else -1,
+                        })
+                    else:
+                        dropped["redacted_thinking"] += 1
                     continue
                 if btype == "tool_use":
                     tool_name = block.get("name")
@@ -1397,19 +1419,29 @@ def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
                     text_parts.append(block.get("text"))
                     continue
                 dropped["unknown"] += 1
+            def _assistant_msg(content):
+                m = {"role": "assistant", "content": content}
+                if reasoning_text is not None:
+                    m["reasoning_content"] = reasoning_text
+                    m["reasoning"] = reasoning_text
+                return m
+
             if tool_calls and text_parts:
-                out.append({"role": "assistant",
-                            "content": "\n".join(
-                                t for t in text_parts if isinstance(t, str))})
-            if tool_calls:
+                # Split structure: reasoning_content rides on the text message;
+                # the content:null tool_calls message stays clean.
+                out.append(_assistant_msg("\n".join(
+                    t for t in text_parts if isinstance(t, str))))
                 out.append({"role": "assistant", "content": None,
                             "tool_calls": tool_calls})
+            elif tool_calls:
+                m = _assistant_msg(None)
+                m["tool_calls"] = tool_calls
+                out.append(m)
             elif text_parts:
-                out.append({"role": "assistant",
-                            "content": "\n".join(
-                                t for t in text_parts if isinstance(t, str))})
+                out.append(_assistant_msg("\n".join(
+                    t for t in text_parts if isinstance(t, str))))
             else:
-                out.append({"role": "assistant", "content": ""})
+                out.append(_assistant_msg(""))
         elif role == "user":
             tool_messages = []
             text_parts = []
@@ -1580,7 +1612,7 @@ def _chat_to_anthropic(chat_body, tier, request_id=None, mode=None, provider=Non
         choice = choices[0] or {}
         message = choice.get("message") or {}
         content = message.get("content")
-        if isinstance(content, str):
+        if isinstance(content, str) and content:
             result["content"] = [{"type": "text", "text": content}]
         elif isinstance(content, list):
             result["content"] = [
@@ -1591,6 +1623,16 @@ def _chat_to_anthropic(chat_body, tier, request_id=None, mode=None, provider=Non
             ]
         else:
             result["content"] = []
+
+        reasoning = message.get("reasoning_content")
+        if not (isinstance(reasoning, str) and reasoning):
+            reasoning = message.get("reasoning")
+        if isinstance(reasoning, str) and reasoning:
+            result["content"].insert(0, {
+                "type": "thinking",
+                "thinking": reasoning,
+                "signature": "",
+            })
 
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list):
@@ -1985,12 +2027,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         """Transform an OpenAI chat-completions SSE stream into Anthropic Messages SSE.
 
         Frames are assembled on the \\n\\n delimiter (CRLF-normalized) — never
-        split mid-frame. A synthetic message_start/content_block_start open the
-        stream, deltas become content_block_delta, and terminal events
-        (content_block_stop, message_delta, message_stop) are emitted exactly
-        once — on the finish_reason chunk, or synthesized at EOF/truncation so
-        the Anthropic client never hangs. [DONE] and non-data frames are
-        skipped.
+        split mid-frame. A synthetic message_start opens the stream; the first
+        content_block_start is deferred until the first delta's type is known
+        (reasoning_content/reasoning deltas open a thinking block at index 0,
+        content deltas a text block). Deltas become content_block_delta, and
+        terminal events (content_block_stop, message_delta, message_stop) are
+        emitted exactly once — on the finish_reason chunk, or synthesized at
+        EOF/truncation so the Anthropic client never hangs. [DONE] and
+        non-data frames are skipped.
         """
         MAX_EVENT_BUFFER = 64 * 1024
         buf = bytearray()
@@ -2001,6 +2045,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         tool_calls_seen = False
         bytes_streamed = 0
         first_byte_ms = None
+        block_index = 0
+        current_block_type = None
+        first_content_block = True
+        open_blocks = []
 
         def write(payload):
             nonlocal bytes_streamed, first_byte_ms
@@ -2029,15 +2077,47 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     "usage": {"input_tokens": 0, "output_tokens": 0},
                 },
             })
-            write({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""},
-            })
             message_started = True
 
+        def open_text_block():
+            nonlocal block_index, current_block_type, first_content_block
+            if current_block_type == "text":
+                return
+            if current_block_type is not None:
+                write({"type": "content_block_stop", "index": block_index})
+                open_blocks.pop()
+                block_index += 1
+            write({
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {"type": "text", "text": ""},
+            })
+            open_blocks.append(block_index)
+            current_block_type = "text"
+            first_content_block = False
+
+        def open_thinking_block():
+            nonlocal block_index, current_block_type, first_content_block
+            if current_block_type == "thinking":
+                return
+            if current_block_type is not None:
+                write({"type": "content_block_stop", "index": block_index})
+                open_blocks.pop()
+                block_index += 1
+            write({
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {"type": "thinking", "thinking": "",
+                                  "signature": ""},
+            })
+            open_blocks.append(block_index)
+            current_block_type = "thinking"
+            first_content_block = False
+
         def terminal(stop_reason):
-            write({"type": "content_block_stop", "index": 0})
+            while open_blocks:
+                idx = open_blocks.pop()
+                write({"type": "content_block_stop", "index": idx})
             delta_usage = {"input_tokens": 0, "output_tokens": 0}
             if usage.get("prompt_tokens") is not None:
                 delta_usage["input_tokens"] = usage.get("prompt_tokens")
@@ -2088,11 +2168,24 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if isinstance(delta, dict):
                 if delta.get("tool_calls") is not None:
                     tool_calls_seen = True
-                content = delta.get("content")
-                if isinstance(content, str) and content:
+                reasoning = delta.get("reasoning_content")
+                if not (isinstance(reasoning, str) and reasoning):
+                    reasoning = delta.get("reasoning")
+                if isinstance(reasoning, str) and reasoning:
+                    if current_block_type != "thinking":
+                        open_thinking_block()
                     write({
                         "type": "content_block_delta",
-                        "index": 0,
+                        "index": block_index,
+                        "delta": {"type": "thinking_delta", "thinking": reasoning},
+                    })
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    if current_block_type != "text":
+                        open_text_block()
+                    write({
+                        "type": "content_block_delta",
+                        "index": block_index,
                         "delta": {"type": "text_delta", "text": content},
                     })
             finish_reason = choice.get("finish_reason")

@@ -236,7 +236,7 @@ stripped first to avoid doubling (e.g., `https://api.openai.com/v1` →
 **Limitations:** Response mode is single-turn only (extracts only the last
 user message as `input`, discards conversation history). Chat-mode
 non-streaming requests correctly transform tool_use/tool_result in both
-directions (thinking blocks stripped, tool_use→tool_calls, tool_result→role:tool).
+directions (thinking blocks converted to reasoning_content, tool_use→tool_calls, tool_result→role:tool).
 Tool-use SSE deltas are not transformed in chat-mode streaming (stop_reason is
 degraded to null when tool calls are detected). Image content blocks are not
 mapped between Anthropic and OpenAI formats. Error responses (non-2xx) pass
