@@ -7335,7 +7335,7 @@ def test_anthropic_to_chat_system_list():
 
 
 def test_anthropic_to_chat_dropped_fields():
-    """thinking, tools, tool_choice, metadata, top_k are absent from output."""
+    """thinking, metadata, top_k absent; tools and tool_choice now transformed (plan 2026-08-29)."""
     print("\n--- Test: Anthropic To Chat Dropped Fields ---")
     fn = _require_server_func("_anthropic_to_chat")
     if fn is None:
@@ -7348,13 +7348,20 @@ def test_anthropic_to_chat_dropped_fields():
            "metadata": {"user_id": "x"},
            "top_k": 5}
     out = fn(inp)
-    for key in ("thinking", "tools", "tool_choice", "metadata", "top_k"):
+    for key in ("thinking", "metadata", "top_k"):
         if key in out:
             fail("expected {!r} dropped from output, present: {}".format(key, sorted(out.keys())))
     if "messages" not in out:
         fail("messages missing from output")
-    if all(key not in out for key in ("thinking", "tools", "tool_choice", "metadata", "top_k")):
-        pass_("fields dropped: thinking, tools, tool_choice, metadata, top_k")
+    if out.get("tools") != [{"type": "function", "function": {"name": "t", "parameters": {}}}]:
+        fail("expected transformed tools, got {!r}".format(out.get("tools")))
+    if out.get("tool_choice") != "auto":
+        fail("expected tool_choice 'auto' (transformed), got {!r}".format(out.get("tool_choice")))
+    if (all(key not in out for key in ("thinking", "metadata", "top_k"))
+            and "messages" in out
+            and out.get("tools") == [{"type": "function", "function": {"name": "t", "parameters": {}}}]
+            and out.get("tool_choice") == "auto"):
+        pass_("thinking/metadata/top_k dropped; tools/tool_choice transformed")
 
 
 def test_anthropic_to_chat_stop_sequences():
@@ -7373,6 +7380,769 @@ def test_anthropic_to_chat_stop_sequences():
         fail("expected stop=['END', '</s>'], got {!r}".format(out.get("stop")))
     if "stop_sequences" not in out and out.get("stop") == ["END", "</s>"]:
         pass_("stop_sequences renamed to stop")
+
+
+def _trace_events_for_request(request_id):
+    """Read the session trace file, return events matching request_id (or [] if unavailable)."""
+    trace_file = os.environ.get("PROXY_TRACE_FILE")
+    if not trace_file or not os.path.exists(trace_file):
+        return []
+    out = []
+    with open(trace_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("request_id") == request_id:
+                out.append(ev)
+    return out
+
+
+def test_anthropic_to_chat_messages_transform():
+    """Full message array (thinking/text/tool_use/tool_result) -> valid OpenAI Chat messages."""
+    print("\n--- Test: Anthropic To Chat Messages Transform ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "hidden", "signature": "sig1"},
+            {"type": "text", "text": "Let me check."},
+            {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "SF"}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "60F"},
+            {"type": "text", "text": "thanks"},
+        ]},
+    ]
+    out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
+    expected = [
+        {"role": "assistant", "content": "Let me check."},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "toolu_1", "type": "function",
+             "function": {"name": "get_weather", "arguments": '{"city": "SF"}'}}]},
+        {"role": "tool", "tool_call_id": "toolu_1", "content": "60F"},
+        {"role": "user", "content": "thanks"},
+    ]
+    if out != expected:
+        fail("full transform mismatch, got {!r}".format(out))
+    else:
+        pass_("full message array transformed correctly")
+
+
+def test_anthropic_to_chat_messages_thinking_stripped():
+    """thinking and redacted_thinking blocks are removed from assistant messages."""
+    print("\n--- Test: Anthropic To Chat Messages Thinking Stripped ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "hidden", "signature": "s"},
+            {"type": "redacted_thinking", "data": "enc", "signature": "s2"},
+            {"type": "text", "text": "visible"},
+        ]},
+    ]
+    out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
+    if out != [{"role": "assistant", "content": "visible"}]:
+        fail("thinking/redacted_thinking not stripped, got {!r}".format(out))
+    else:
+        pass_("thinking and redacted_thinking stripped, text kept")
+
+
+def test_anthropic_to_chat_messages_tool_use_to_tool_calls():
+    """tool_use block converts to tool_calls with JSON-stringified arguments."""
+    print("\n--- Test: Anthropic To Chat Messages Tool Use To Tool Calls ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_x", "name": "lookup", "input": {"key": "a", "n": 1}},
+        ]},
+    ]
+    out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
+    expected = [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "toolu_x", "type": "function",
+             "function": {"name": "lookup", "arguments": '{"key": "a", "n": 1}'}}]},
+    ]
+    if out != expected:
+        fail("tool_use -> tool_calls mismatch, got {!r}".format(out))
+    else:
+        pass_("tool_use converted to tool_calls with JSON arguments")
+
+
+def test_anthropic_to_chat_messages_tool_result_to_role_tool():
+    """tool_result block in a user message becomes a separate role:tool message."""
+    print("\n--- Test: Anthropic To Chat Messages Tool Result To Role Tool ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "the answer"},
+        ]},
+    ]
+    out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
+    expected = [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "toolu_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "toolu_1", "content": "the answer"},
+    ]
+    if out != expected:
+        fail("tool_result -> role:tool mismatch, got {!r}".format(out))
+    else:
+        pass_("tool_result emitted as role:tool message")
+
+
+def test_anthropic_to_chat_messages_mixed_text_and_tool_use():
+    """Assistant with both text and tool_use -> text message first, then content:null + tool_calls."""
+    print("\n--- Test: Anthropic To Chat Messages Mixed Text And Tool Use ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "I'll look that up."},
+            {"type": "tool_use", "id": "toolu_2", "name": "f", "input": {}},
+        ]},
+    ]
+    out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
+    expected = [
+        {"role": "assistant", "content": "I'll look that up."},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "toolu_2", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+    ]
+    if out != expected:
+        fail("text must be preserved as a separate message before tool_calls, got {!r}".format(out))
+    else:
+        pass_("text preserved + content:null tool_calls message when both present")
+
+
+def test_anthropic_to_chat_messages_mixed_text_and_tool_result():
+    """User with both text and tool_result -> tool message first, then user text message."""
+    print("\n--- Test: Anthropic To Chat Messages Mixed Text And Tool Result ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "res"},
+            {"type": "text", "text": "Thanks"},
+        ]},
+    ]
+    out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
+    expected = [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "toolu_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "toolu_1", "content": "res"},
+        {"role": "user", "content": "Thanks"},
+    ]
+    if out != expected:
+        fail("tool messages must precede user text, got {!r}".format(out))
+    else:
+        pass_("tool messages first, then user text message")
+
+
+def test_anthropic_to_chat_messages_interleaved_thinking_tool_use():
+    """Real-world interleaved pattern: thinking, text, tool_use, text in one assistant turn."""
+    print("\n--- Test: Anthropic To Chat Messages Interleaved Thinking Tool Use ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "reasoning...", "signature": "sig"},
+            {"type": "text", "text": "Let me look up the weather for San Francisco."},
+            {"type": "tool_use", "id": "toolu_weather", "name": "get_weather", "input": {"city": "San Francisco"}},
+            {"type": "text", "text": "I found the forecast."},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_weather", "content": "Sunny, 72F"},
+        ]},
+    ]
+    out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
+    expected = [
+        {"role": "assistant",
+         "content": "Let me look up the weather for San Francisco.\nI found the forecast."},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "toolu_weather", "type": "function",
+             "function": {"name": "get_weather", "arguments": '{"city": "San Francisco"}'}}]},
+        {"role": "tool", "tool_call_id": "toolu_weather", "content": "Sunny, 72F"},
+    ]
+    if out != expected:
+        fail("interleaved pattern mismatch, got {!r}".format(out))
+    else:
+        pass_("interleaved thinking/text/tool_use pattern transformed")
+
+
+def test_anthropic_to_chat_messages_string_content_passthrough():
+    """String content passes through unchanged in a NEW message dict (input not reused)."""
+    print("\n--- Test: Anthropic To Chat Messages String Content Passthrough ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    msg = {"role": "user", "content": "hi there"}
+    out = fn([msg], request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
+    if not isinstance(out, list) or len(out) != 1:
+        fail("expected one output message, got {!r}".format(out))
+        return
+    out_msg = out[0]
+    if out_msg.get("role") != "user" or out_msg.get("content") != "hi there":
+        fail("string content not preserved, got {!r}".format(out_msg))
+    elif out_msg is msg:
+        fail("input message dict must not be reused")
+    else:
+        pass_("string content passed through in a new dict")
+
+
+def test_anthropic_to_chat_messages_cache_control_stripped():
+    """Block-level cache_control removed from blocks; cache_control_stripped trace event logged."""
+    print("\n--- Test: Anthropic To Chat Messages Cache Control Stripped ---")
+    fn = _require_server_func("_anthropic_to_chat")
+    if fn is None:
+        return
+    rid = "T-" + uuid.uuid4().hex[:8]
+    body = {
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "b", "cache_control": {"type": "ephemeral"}},
+            ]},
+        ],
+    }
+    out = fn(body, request_id=rid, mode="chat", provider="p", tier="sonnet")
+    # Multiple user text blocks with cache_control stripped are joined to a string.
+    expected = {"messages": [{"role": "user", "content": "a\nb"}]}
+    if out != expected:
+        fail("cache_control not stripped from blocks, got {!r}".format(out))
+        return
+    evs = [e for e in _trace_events_for_request(rid) if e.get("event") == "cache_control_stripped"]
+    if not evs:
+        fail("expected cache_control_stripped trace event, none found")
+    elif evs[0].get("locations") != ["messages"]:
+        fail("expected locations ['messages'], got {!r}".format(evs[0].get("locations")))
+    else:
+        pass_("block-level cache_control stripped and coalesced trace event logged")
+
+
+def test_anthropic_to_chat_messages_non_list_guarded():
+    """Non-list messages input returns []."""
+    print("\n--- Test: Anthropic To Chat Messages Non List Guarded ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    for bad in (None, "notalist", {"role": "user", "content": "x"}, 42):
+        out = fn(bad, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
+        if out != []:
+            fail("expected [] for {!r}, got {!r}".format(bad, out))
+            return
+    pass_("non-list messages returns []")
+
+
+def test_anthropic_to_chat_messages_non_dict_entries_skipped():
+    """Non-dict message entries are skipped."""
+    print("\n--- Test: Anthropic To Chat Messages Non Dict Entries Skipped ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    messages = [{"role": "user", "content": "ok"}, "garbage", 42, None, ["nested"]]
+    out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
+    if out != [{"role": "user", "content": "ok"}]:
+        fail("non-dict entries not skipped, got {!r}".format(out))
+    else:
+        pass_("non-dict message entries skipped")
+
+
+def test_anthropic_to_chat_messages_null_user_content():
+    """Null user content becomes '' (OpenAI requires non-null user content)."""
+    print("\n--- Test: Anthropic To Chat Messages Null User Content ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    messages = [{"role": "user", "content": None}]
+    out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
+    if out != [{"role": "user", "content": ""}]:
+        fail("null user content not replaced with '', got {!r}".format(out))
+    else:
+        pass_("null user content -> ''")
+
+
+def test_anthropic_to_chat_tools_transform():
+    """Anthropic tools -> OpenAI tools (input_schema -> parameters)."""
+    print("\n--- Test: Anthropic To Chat Tools Transform ---")
+    fn = _require_server_func("_transform_anthropic_tools_to_chat")
+    if fn is None:
+        return
+    tools = [
+        {"name": "get_weather", "description": "Get weather",
+         "input_schema": {"type": "object", "properties": {}}},
+        {"name": "get_time", "input_schema": {}},
+    ]
+    out = fn(tools, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
+    expected = [
+        {"type": "function", "function": {
+            "name": "get_weather", "description": "Get weather",
+            "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "get_time", "parameters": {}}},
+    ]
+    if out != expected:
+        fail("tools transform mismatch, got {!r}".format(out))
+    else:
+        pass_("tools transformed (input_schema -> parameters)")
+
+
+def test_anthropic_to_chat_tools_cache_control_stripped():
+    """cache_control on tool definitions is stripped; cache_control_stripped trace event logged."""
+    print("\n--- Test: Anthropic To Chat Tools Cache Control Stripped ---")
+    fn = _require_server_func("_anthropic_to_chat")
+    if fn is None:
+        return
+    rid = "T-" + uuid.uuid4().hex[:8]
+    body = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "t", "input_schema": {}, "cache_control": {"type": "ephemeral"}}],
+    }
+    out = fn(body, request_id=rid, mode="chat", provider="p", tier="sonnet")
+    expected_tools = [{"type": "function", "function": {"name": "t", "parameters": {}}}]
+    if out.get("tools") != expected_tools:
+        fail("cache_control not stripped from tool, got {!r}".format(out.get("tools")))
+        return
+    evs = [e for e in _trace_events_for_request(rid) if e.get("event") == "cache_control_stripped"]
+    if not evs:
+        fail("expected cache_control_stripped trace event for tool, none found")
+    elif evs[0].get("locations") != ["tools"]:
+        fail("expected locations ['tools'], got {!r}".format(evs[0].get("locations")))
+    else:
+        pass_("tool cache_control stripped and coalesced trace event logged")
+
+
+def test_anthropic_to_chat_tools_non_list_guarded():
+    """Non-list tools returns [] (tools: null treated as absent)."""
+    print("\n--- Test: Anthropic To Chat Tools Non List Guarded ---")
+    fn = _require_server_func("_transform_anthropic_tools_to_chat")
+    if fn is None:
+        return
+    for bad in (None, "tools", {"name": "x"}, 42):
+        out = fn(bad, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
+        if out != []:
+            fail("expected [] for {!r}, got {!r}".format(bad, out))
+            return
+    pass_("non-list tools returns []")
+
+
+def test_anthropic_to_chat_tools_malformed_entries_skipped():
+    """Entries missing name or input_schema are skipped with a content_block_dropped trace event."""
+    print("\n--- Test: Anthropic To Chat Tools Malformed Entries Skipped ---")
+    fn = _require_server_func("_transform_anthropic_tools_to_chat")
+    if fn is None:
+        return
+    rid = "T-" + uuid.uuid4().hex[:8]
+    tools = [
+        {"name": "good", "input_schema": {}},
+        {"name": "no-schema"},
+        {"input_schema": {}},
+        "garbage",
+        42,
+        None,
+    ]
+    out = fn(tools, request_id=rid, mode="chat", provider="p", tier="sonnet")
+    expected = [{"type": "function", "function": {"name": "good", "parameters": {}}}]
+    if out != expected:
+        fail("malformed tool entries not skipped, got {!r}".format(out))
+        return
+    evs = [e for e in _trace_events_for_request(rid) if e.get("event") == "content_block_dropped"]
+    if not evs:
+        fail("expected content_block_dropped trace event for malformed tools, none found")
+    else:
+        pass_("malformed tool entries skipped with trace event")
+
+
+def test_anthropic_to_chat_tool_choice_mapping():
+    """All 4 tool_choice variants map correctly."""
+    print("\n--- Test: Anthropic To Chat Tool Choice Mapping ---")
+    fn = _require_server_func("_transform_anthropic_tool_choice_to_chat")
+    if fn is None:
+        return
+    cases = [
+        ({"type": "none"}, "none"),
+        ({"type": "auto"}, "auto"),
+        ({"type": "any"}, "required"),
+        ({"type": "tool", "name": "x"}, {"type": "function", "function": {"name": "x"}}),
+    ]
+    for tc, expected in cases:
+        out = fn(tc)
+        if out != expected:
+            fail("tool_choice {!r} -> {!r}, expected {!r}".format(tc, out, expected))
+            return
+    pass_("all tool_choice variants mapped")
+
+
+def test_anthropic_to_chat_tool_choice_none_omitted():
+    """None/absent tool_choice is omitted from output."""
+    print("\n--- Test: Anthropic To Chat Tool Choice None Omitted ---")
+    fn_choice = _require_server_func("_transform_anthropic_tool_choice_to_chat")
+    if fn_choice is not None and fn_choice(None) is not None:
+        fail("None tool_choice should map to None")
+        return
+    fn = _require_server_func("_anthropic_to_chat")
+    if fn is None:
+        return
+    inp = {"model": "sonnet",
+           "messages": [{"role": "user", "content": "hi"}],
+           "tools": [{"name": "t", "input_schema": {}}]}
+    out = fn(dict(inp))
+    if "tool_choice" in out:
+        fail("tool_choice should be absent when not provided, keys={!r}".format(sorted(out.keys())))
+    else:
+        pass_("absent tool_choice omitted")
+
+
+def test_anthropic_to_chat_tool_choice_malformed_omitted():
+    """Malformed/unknown tool_choice maps to None (omitted, defensive)."""
+    print("\n--- Test: Anthropic To Chat Tool Choice Malformed Omitted ---")
+    fn = _require_server_func("_transform_anthropic_tool_choice_to_chat")
+    if fn is None:
+        return
+    for bad in ("auto", {"type": "weird"}, {}, {"type": "tool"}, {"type": "tool", "name": None}, 42, []):
+        out = fn(bad)
+        if out is not None:
+            fail("malformed tool_choice {!r} should map to None, got {!r}".format(bad, out))
+            return
+    pass_("malformed tool_choice omitted")
+
+
+def test_anthropic_to_chat_tool_choice_only_with_tools():
+    """tool_choice is omitted when the tools array is empty or absent."""
+    print("\n--- Test: Anthropic To Chat Tool Choice Only With Tools ---")
+    fn = _require_server_func("_anthropic_to_chat")
+    if fn is None:
+        return
+    inp_empty = {"model": "sonnet",
+                 "messages": [{"role": "user", "content": "hi"}],
+                 "tools": [],
+                 "tool_choice": {"type": "auto"}}
+    out_empty = fn(dict(inp_empty))
+    if "tool_choice" in out_empty:
+        fail("tool_choice should be omitted when tools array is empty, got {!r}".format(out_empty.get("tool_choice")))
+        return
+    inp_no_tools = {"model": "sonnet",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tool_choice": {"type": "auto"}}
+    out_no_tools = fn(dict(inp_no_tools))
+    if "tool_choice" in out_no_tools:
+        fail("tool_choice should be omitted when tools absent, got {!r}".format(out_no_tools.get("tool_choice")))
+        return
+    pass_("tool_choice omitted when tools empty/absent")
+
+
+def test_anthropic_to_chat_integration():
+    """Full Anthropic request (system, tools, tool_choice, multi-turn) -> valid OpenAI Chat request."""
+    print("\n--- Test: Anthropic To Chat Integration ---")
+    fn = _require_server_func("_anthropic_to_chat")
+    if fn is None:
+        return
+    inp = {
+        "model": "sonnet",
+        "system": "You are a helpful assistant.",
+        "max_tokens": 256,
+        "temperature": 0.2,
+        "stream": False,
+        "tools": [
+            {"name": "get_weather", "description": "Weather lookup",
+             "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}},
+        ],
+        "tool_choice": {"type": "auto"},
+        "messages": [
+            {"role": "user", "content": "What's the weather in SF?"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "hidden", "signature": "s"},
+                {"type": "text", "text": "Let me look it up."},
+                {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "SF"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "Sunny, 72F"},
+                {"type": "text", "text": "Great, thanks!"},
+            ]},
+        ],
+    }
+    out = fn(dict(inp))
+    expected_messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What's the weather in SF?"},
+        {"role": "assistant", "content": "Let me look it up."},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "toolu_1", "type": "function",
+             "function": {"name": "get_weather", "arguments": '{"city": "SF"}'}}]},
+        {"role": "tool", "tool_call_id": "toolu_1", "content": "Sunny, 72F"},
+        {"role": "user", "content": "Great, thanks!"},
+    ]
+    expected_tools = [{"type": "function", "function": {
+        "name": "get_weather", "description": "Weather lookup",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]
+    checks = [
+        (out.get("model") == "sonnet", "model passthrough"),
+        (out.get("max_tokens") == 256, "max_tokens passthrough"),
+        (out.get("temperature") == 0.2, "temperature passthrough"),
+        (out.get("stream") is False, "stream passthrough"),
+        (out.get("messages") == expected_messages, "messages transformed"),
+        (out.get("tools") == expected_tools, "tools transformed"),
+        (out.get("tool_choice") == "auto", "tool_choice mapped"),
+    ]
+    for ok, label in checks:
+        if not ok:
+            fail("integration failed: {} (out={!r})".format(label, out))
+            return
+    pass_("full chat-mode request transformed correctly")
+
+
+def test_anthropic_to_chat_content_block_dropped_trace():
+    """Coalesced content_block_dropped trace event with dropped_counts (not per-block)."""
+    print("\n--- Test: Anthropic To Chat Content Block Dropped Trace ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    rid = "T-" + uuid.uuid4().hex[:8]
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "a", "signature": "s"},
+            {"type": "thinking", "thinking": "b", "signature": "s"},
+        ]},
+        {"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "data": "x"}},
+            {"type": "text", "text": "hi"},
+        ]},
+    ]
+    fn(messages, request_id=rid, mode="chat", provider="p", tier="sonnet")
+    evs = [e for e in _trace_events_for_request(rid) if e.get("event") == "content_block_dropped"]
+    if len(evs) != 1:
+        fail("expected exactly ONE coalesced content_block_dropped event, got {}: {!r}".format(len(evs), evs))
+        return
+    ev = evs[0]
+    counts = ev.get("dropped_counts") or {}
+    checks = [
+        (ev.get("mode") == "chat", "mode field"),
+        (ev.get("provider") == "p", "provider field"),
+        (ev.get("tier") == "sonnet", "tier field"),
+        (ev.get("request_id") == rid, "request_id field"),
+        (counts.get("thinking") == 2, "thinking count 2"),
+        (counts.get("image") == 1, "image count 1"),
+    ]
+    for ok, label in checks:
+        if not ok:
+            fail("content_block_dropped event wrong: {} (ev={!r})".format(label, ev))
+            return
+    pass_("coalesced content_block_dropped event with dropped_counts")
+
+
+def test_anthropic_to_chat_cache_control_stripped_trace():
+    """cache_control_stripped logged once per request (coalesced), not per block."""
+    print("\n--- Test: Anthropic To Chat Cache Control Stripped Trace ---")
+    fn = _require_server_func("_anthropic_to_chat")
+    if fn is None:
+        return
+    rid = "T-" + uuid.uuid4().hex[:8]
+    body = {
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "b", "cache_control": {"type": "ephemeral"}},
+            ]},
+        ],
+        "tools": [{"name": "t", "input_schema": {}, "cache_control": {"type": "ephemeral"}}],
+    }
+    fn(body, request_id=rid, mode="chat", provider="p", tier="sonnet")
+    evs = [e for e in _trace_events_for_request(rid) if e.get("event") == "cache_control_stripped"]
+    if len(evs) != 1:
+        fail("expected exactly ONE cache_control_stripped event, got {}: {!r}".format(len(evs), evs))
+        return
+    ev = evs[0]
+    if ev.get("locations") not in (["messages", "tools"], ["tools", "messages"]):
+        fail("cache_control_stripped missing valid locations, got {!r}".format(ev))
+        return
+    if (ev.get("mode") != "chat" or ev.get("provider") != "p"
+            or ev.get("tier") != "sonnet" or ev.get("request_id") != rid):
+        fail("cache_control_stripped missing correlation fields, got {!r}".format(ev))
+        return
+    pass_("cache_control_stripped logged once per request with coalesced locations")
+
+
+def test_anthropic_to_chat_nan_infinity_arguments_rejected():
+    """NaN/Infinity tool_use.input degrades to a text placeholder, not silently dropped."""
+    print("\n--- Test: Anthropic To Chat NaN Infinity Arguments Rejected ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    rid = "T-" + uuid.uuid4().hex[:8]
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_nan", "name": "f", "input": {"value": float("nan")}},
+        ]},
+    ]
+    out = fn(messages, request_id=rid, mode="chat", provider="p", tier="sonnet")
+    msg = out[0] if out else {}
+    tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+    if tool_calls:
+        fail("NaN tool_use must not produce a tool_calls entry, got {!r}".format(out))
+        return
+    content = msg.get("content") if isinstance(msg, dict) else None
+    expected_placeholder = ("[Tool call failed: arguments for 'f' (call toolu_nan) "
+                            "could not be serialized as JSON]")
+    if content != expected_placeholder:
+        fail("NaN tool_use should degrade to a text placeholder, got content={!r}".format(content))
+        return
+    evs = [e for e in _trace_events_for_request(rid) if e.get("event") == "tool_args_parse_failure"]
+    if not evs:
+        fail("expected tool_args_parse_failure trace event, none found")
+        return
+    ev = evs[0]
+    if ev.get("tool_name") != "f" or ev.get("tool_id") != "toolu_nan":
+        fail("tool_args_parse_failure missing tool_name/tool_id, got {!r}".format(ev))
+        return
+    pass_("NaN tool_use degraded to placeholder with tool_args_parse_failure event")
+
+
+def test_anthropic_to_chat_tool_use_non_dict_input():
+    """tool_use.input with non-dict value (string/None/number) degrades to placeholder, no non-object arguments."""
+    print("\n--- Test: Anthropic To Chat Tool Use Non Dict Input ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    rid = "T-" + uuid.uuid4().hex[:8]
+    for bad in ("hello", None, 42, [1, 2]):
+        messages = [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_bad", "name": "f", "input": bad},
+            ]},
+        ]
+        out = fn(messages, request_id=rid, mode="chat", provider="p", tier="sonnet")
+        expected = [{"role": "assistant",
+                     "content": ("[Tool call failed: arguments for 'f' (call toolu_bad) "
+                                 "could not be serialized as JSON]")}]
+        if out != expected:
+            fail("non-dict input {!r} should degrade to placeholder, got {!r}".format(bad, out))
+            return
+        if any(isinstance(m, dict) and m.get("tool_calls") for m in out):
+            fail("non-dict input {!r} must not produce a tool_calls entry, got {!r}".format(bad, out))
+            return
+    evs = [e for e in _trace_events_for_request(rid) if e.get("event") == "tool_args_parse_failure"]
+    if len(evs) < 4:
+        fail("expected tool_args_parse_failure events for each non-dict input, got {}: {!r}".format(len(evs), evs))
+        return
+    for ev in evs:
+        if ev.get("tool_name") != "f" or ev.get("tool_id") != "toolu_bad" or not isinstance(ev.get("error"), str):
+            fail("tool_args_parse_failure missing tool_name/tool_id/error, got {!r}".format(ev))
+            return
+    pass_("non-dict tool_use input degraded to placeholder with tool_args_parse_failure")
+
+
+def test_anthropic_to_chat_nan_placeholder_with_valid_tool_use():
+    """NaN tool_use + valid tool_use coexist -> placeholder as separate assistant message before tool_calls."""
+    print("\n--- Test: Anthropic To Chat Nan Placeholder With Valid Tool Use ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    rid = "T-" + uuid.uuid4().hex[:8]
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_nan", "name": "f", "input": {"value": float("nan")}},
+            {"type": "tool_use", "id": "toolu_ok", "name": "g", "input": {"a": 1}},
+        ]},
+    ]
+    out = fn(messages, request_id=rid, mode="chat", provider="p", tier="sonnet")
+    expected = [
+        {"role": "assistant",
+         "content": ("[Tool call failed: arguments for 'f' (call toolu_nan) "
+                     "could not be serialized as JSON]")},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "toolu_ok", "type": "function",
+             "function": {"name": "g", "arguments": '{"a": 1}'}}]},
+    ]
+    if out != expected:
+        fail("NaN placeholder must be preserved before tool_calls, got {!r}".format(out))
+        return
+    evs = [e for e in _trace_events_for_request(rid) if e.get("event") == "tool_args_parse_failure"]
+    if not evs:
+        fail("expected tool_args_parse_failure trace event, none found")
+        return
+    if evs[0].get("tool_name") != "f" or evs[0].get("tool_id") != "toolu_nan":
+        fail("tool_args_parse_failure missing tool_name/tool_id, got {!r}".format(evs[0]))
+        return
+    pass_("NaN placeholder preserved as separate message before tool_calls")
+
+
+def test_anthropic_to_chat_tool_result_list_content():
+    """tool_result.content as a list of text blocks is joined with newlines."""
+    print("\n--- Test: Anthropic To Chat Tool Result List Content ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                {"type": "text", "text": "line1"},
+                {"type": "text", "text": "line2"},
+            ]},
+        ]},
+    ]
+    out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
+    expected = [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "toolu_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "toolu_1", "content": "line1\nline2"},
+    ]
+    if out != expected:
+        fail("tool_result list content not joined, got {!r}".format(out))
+    else:
+        pass_("tool_result list content joined with newlines")
+
+
+def test_anthropic_to_chat_no_input_mutation():
+    """_anthropic_to_chat does not mutate the input dict or its nested structures."""
+    print("\n--- Test: Anthropic To Chat No Input Mutation ---")
+    fn = _require_server_func("_anthropic_to_chat")
+    if fn is None:
+        return
+    import copy
+    inp = {
+        "model": "sonnet",
+        "messages": [
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "a"},
+                {"type": "tool_use", "id": "t1", "name": "f", "input": {"x": 1}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "r"},
+            ]},
+        ],
+        "tools": [{"name": "f", "input_schema": {}, "cache_control": {"type": "ephemeral"}}],
+        "tool_choice": {"type": "auto"},
+        "thinking": {"type": "enabled", "budget_tokens": 100},
+    }
+    messages_identity = inp["messages"]
+    original = copy.deepcopy(inp)
+    fn(dict(inp))
+    if inp != original:
+        fail("input dict was mutated")
+        return
+    if inp["messages"] is not messages_identity:
+        fail("input messages list identity changed")
+        return
+    pass_("input dict and nested structures not mutated")
 
 
 # --- Step 5: _chat_to_anthropic ---
@@ -8913,6 +9683,36 @@ ALL_TESTS = [
     ("anthropic-to-chat-system-list", test_anthropic_to_chat_system_list),
     ("anthropic-to-chat-dropped-fields", test_anthropic_to_chat_dropped_fields),
     ("anthropic-to-chat-stop-sequences", test_anthropic_to_chat_stop_sequences),
+
+    # Chat-mode request transform tests (plan 2026-08-29-fix-chat-mode-request-transform)
+    ("anthropic-to-chat-messages-transform", test_anthropic_to_chat_messages_transform),
+    ("anthropic-to-chat-messages-thinking-stripped", test_anthropic_to_chat_messages_thinking_stripped),
+    ("anthropic-to-chat-messages-tool-use-to-tool-calls", test_anthropic_to_chat_messages_tool_use_to_tool_calls),
+    ("anthropic-to-chat-messages-tool-result-to-role-tool", test_anthropic_to_chat_messages_tool_result_to_role_tool),
+    ("anthropic-to-chat-messages-mixed-text-and-tool-use", test_anthropic_to_chat_messages_mixed_text_and_tool_use),
+    ("anthropic-to-chat-messages-mixed-text-and-tool-result", test_anthropic_to_chat_messages_mixed_text_and_tool_result),
+    ("anthropic-to-chat-messages-interleaved-thinking-tool-use", test_anthropic_to_chat_messages_interleaved_thinking_tool_use),
+    ("anthropic-to-chat-messages-string-content-passthrough", test_anthropic_to_chat_messages_string_content_passthrough),
+    ("anthropic-to-chat-messages-cache-control-stripped", test_anthropic_to_chat_messages_cache_control_stripped),
+    ("anthropic-to-chat-messages-non-list-guarded", test_anthropic_to_chat_messages_non_list_guarded),
+    ("anthropic-to-chat-messages-non-dict-entries-skipped", test_anthropic_to_chat_messages_non_dict_entries_skipped),
+    ("anthropic-to-chat-messages-null-user-content", test_anthropic_to_chat_messages_null_user_content),
+    ("anthropic-to-chat-tools-transform", test_anthropic_to_chat_tools_transform),
+    ("anthropic-to-chat-tools-cache-control-stripped", test_anthropic_to_chat_tools_cache_control_stripped),
+    ("anthropic-to-chat-tools-non-list-guarded", test_anthropic_to_chat_tools_non_list_guarded),
+    ("anthropic-to-chat-tools-malformed-entries-skipped", test_anthropic_to_chat_tools_malformed_entries_skipped),
+    ("anthropic-to-chat-tool-choice-mapping", test_anthropic_to_chat_tool_choice_mapping),
+    ("anthropic-to-chat-tool-choice-none-omitted", test_anthropic_to_chat_tool_choice_none_omitted),
+    ("anthropic-to-chat-tool-choice-malformed-omitted", test_anthropic_to_chat_tool_choice_malformed_omitted),
+    ("anthropic-to-chat-tool-choice-only-with-tools", test_anthropic_to_chat_tool_choice_only_with_tools),
+    ("anthropic-to-chat-integration", test_anthropic_to_chat_integration),
+    ("anthropic-to-chat-content-block-dropped-trace", test_anthropic_to_chat_content_block_dropped_trace),
+    ("anthropic-to-chat-cache-control-stripped-trace", test_anthropic_to_chat_cache_control_stripped_trace),
+    ("anthropic-to-chat-nan-infinity-arguments-rejected", test_anthropic_to_chat_nan_infinity_arguments_rejected),
+    ("anthropic-to-chat-tool-use-non-dict-input", test_anthropic_to_chat_tool_use_non_dict_input),
+    ("anthropic-to-chat-nan-placeholder-with-valid-tool-use", test_anthropic_to_chat_nan_placeholder_with_valid_tool_use),
+    ("anthropic-to-chat-tool-result-list-content", test_anthropic_to_chat_tool_result_list_content),
+    ("anthropic-to-chat-no-input-mutation", test_anthropic_to_chat_no_input_mutation),
     ("chat-to-anthropic-basic", test_chat_to_anthropic_basic),
     ("chat-to-anthropic-empty-choices", test_chat_to_anthropic_empty_choices),
     ("chat-to-anthropic-tool-calls", test_chat_to_anthropic_tool_calls),

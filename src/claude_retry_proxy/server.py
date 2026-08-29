@@ -747,7 +747,9 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
             body_json = json.loads(body)
             body_json["model"] = actual_model
             if mode == "chat":
-                rewritten_body = json.dumps(_anthropic_to_chat(body_json)).encode("utf-8")
+                rewritten_body = json.dumps(_anthropic_to_chat(
+                    body_json, request_id=request_id, mode=mode,
+                    provider=provider_name, tier=tier)).encode("utf-8")
             elif mode == "response":
                 rewritten_body = json.dumps(_anthropic_to_response(body_json)).encode("utf-8")
             else:
@@ -1222,13 +1224,22 @@ def _transform_and_guard(raw_body, tier, transform_fn, request_id, mode, provide
         return raw_body
 
 
-def _anthropic_to_chat(body_json):
-    """Transform an Anthropic Messages request into OpenAI Chat Completions."""
+def _anthropic_to_chat(body_json, request_id=None, mode=None, provider=None,
+                       tier=None):
+    """Transform an Anthropic Messages request into OpenAI Chat Completions.
+
+    Builds `out` without mutating `body_json`. messages / tools / tool_choice
+    are transformed via the _transform_anthropic_*_to_chat helpers; thinking /
+    metadata / top_k are Anthropic-specific request config and are dropped.
+    """
     out = {}
     if "model" in body_json:
         out["model"] = body_json["model"]
+    cache_locations = []
     if "messages" in body_json:
-        out["messages"] = body_json["messages"]
+        out["messages"] = _transform_anthropic_messages_to_chat(
+            body_json.get("messages", []), request_id=request_id, mode=mode,
+            provider=provider, tier=tier, cache_stripped_out=cache_locations)
 
     system = body_json.get("system")
     system_text = None
@@ -1245,12 +1256,291 @@ def _anthropic_to_chat(body_json):
         messages.insert(0, {"role": "system", "content": system_text})
         out["messages"] = messages
 
+    if "tools" in body_json and isinstance(body_json.get("tools"), list):
+        transformed_tools = _transform_anthropic_tools_to_chat(
+            body_json["tools"], request_id=request_id, mode=mode,
+            provider=provider, tier=tier, cache_stripped_out=cache_locations)
+        out["tools"] = transformed_tools
+        if transformed_tools and "tool_choice" in body_json:
+            tc = _transform_anthropic_tool_choice_to_chat(
+                body_json.get("tool_choice"))
+            if tc is not None:
+                out["tool_choice"] = tc
+
+    if cache_locations:
+        log_trace({
+            "timestamp": _request_transform_timestamp(),
+            "event": "cache_control_stripped",
+            "request_id": request_id,
+            "locations": cache_locations,
+            "mode": mode,
+            "provider": provider,
+            "tier": tier,
+        })
+
     for field in ("max_tokens", "temperature", "stream", "top_p"):
         if field in body_json:
             out[field] = body_json[field]
     if "stop_sequences" in body_json:
         out["stop"] = body_json["stop_sequences"]
     return out
+
+
+def _request_transform_timestamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
+                                          provider=None, tier=None,
+                                          cache_stripped_out=None):
+    """Convert an Anthropic messages array into OpenAI Chat messages.
+
+    Always returns a new list (never mutates the input). thinking /
+    redacted_thinking / image / unknown blocks are stripped; tool_use and
+    tool_result are converted to OpenAI tool_calls / role:tool messages;
+    cache_control is stripped from kept blocks. cache_control_stripped is
+    reported to the caller via the optional cache_stripped_out list rather
+    than logged here, so _anthropic_to_chat can coalesce one event per request.
+    """
+    if not isinstance(messages, list):
+        return []
+    dropped = {"thinking": 0, "redacted_thinking": 0, "image": 0,
+               "tool_result": 0, "unknown": 0}
+    cache_stripped = False
+    tool_use_ids = set()
+    out = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        if isinstance(content, str):
+            out.append({"role": role, "content": content})
+            continue
+        if role == "user" and (content is None or content == []):
+            out.append({"role": "user", "content": ""})
+            continue
+        if not isinstance(content, list):
+            continue
+        if role == "assistant":
+            text_parts = []
+            tool_calls = []
+            for block in content:
+                if not isinstance(block, dict):
+                    dropped["unknown"] += 1
+                    continue
+                if "cache_control" in block:
+                    cache_stripped = True
+                btype = block.get("type")
+                if btype == "thinking":
+                    dropped["thinking"] += 1
+                    continue
+                if btype == "redacted_thinking":
+                    dropped["redacted_thinking"] += 1
+                    continue
+                if btype == "tool_use":
+                    tool_name = block.get("name")
+                    tool_id = block.get("id")
+                    input_val = block.get("input")
+                    if not isinstance(input_val, dict):
+                        text_parts.append(
+                            "[Tool call failed: arguments for '{}' (call {}) "
+                            "could not be serialized as JSON]".format(
+                                tool_name or "<unknown>", tool_id or "<unknown>"))
+                        log_trace({
+                            "timestamp": _request_transform_timestamp(),
+                            "event": "tool_args_parse_failure",
+                            "request_id": request_id,
+                            "mode": mode,
+                            "provider": provider,
+                            "tier": tier,
+                            "tool_name": tool_name,
+                            "tool_id": tool_id,
+                            "error": "tool_use.input must be a JSON object",
+                        })
+                        continue
+                    try:
+                        arguments = json.dumps(input_val, allow_nan=False)
+                    except (ValueError, TypeError) as exc:
+                        text_parts.append(
+                            "[Tool call failed: arguments for '{}' (call {}) "
+                            "could not be serialized as JSON]".format(
+                                tool_name or "<unknown>", tool_id or "<unknown>"))
+                        log_trace({
+                            "timestamp": _request_transform_timestamp(),
+                            "event": "tool_args_parse_failure",
+                            "request_id": request_id,
+                            "mode": mode,
+                            "provider": provider,
+                            "tier": tier,
+                            "tool_name": tool_name,
+                            "tool_id": tool_id,
+                            "error": str(exc),
+                        })
+                        continue
+                    if not isinstance(tool_id, str) or not tool_id:
+                        dropped["unknown"] += 1
+                        continue
+                    tool_use_ids.add(tool_id)
+                    if not isinstance(tool_name, str):
+                        tool_name = ""
+                    tool_calls.append({
+                        "id": tool_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": arguments,
+                        },
+                    })
+                    continue
+                if btype == "text":
+                    text_parts.append(block.get("text"))
+                    continue
+                dropped["unknown"] += 1
+            if tool_calls and text_parts:
+                out.append({"role": "assistant",
+                            "content": "\n".join(
+                                t for t in text_parts if isinstance(t, str))})
+            if tool_calls:
+                out.append({"role": "assistant", "content": None,
+                            "tool_calls": tool_calls})
+            elif text_parts:
+                out.append({"role": "assistant",
+                            "content": "\n".join(
+                                t for t in text_parts if isinstance(t, str))})
+            else:
+                out.append({"role": "assistant", "content": ""})
+        elif role == "user":
+            tool_messages = []
+            text_parts = []
+            for block in content:
+                if not isinstance(block, dict):
+                    dropped["unknown"] += 1
+                    continue
+                if "cache_control" in block:
+                    cache_stripped = True
+                btype = block.get("type")
+                if btype == "tool_result":
+                    t = _transform_tool_result_to_chat_tool(block, tool_use_ids)
+                    if t is None:
+                        dropped["tool_result"] += 1
+                        continue
+                    tool_messages.append(t)
+                    continue
+                if btype == "text":
+                    text_parts.append(block.get("text"))
+                    continue
+                if btype == "image":
+                    dropped["image"] += 1
+                    continue
+                dropped["unknown"] += 1
+            out.extend(tool_messages)
+            if text_parts:
+                text = "\n".join(t for t in text_parts if isinstance(t, str))
+                out.append({"role": role, "content": text})
+        else:
+            out.append({"role": role, "content": content})
+    if cache_stripped and cache_stripped_out is not None:
+        cache_stripped_out.append("messages")
+    if sum(dropped.values()) > 0:
+        log_trace({
+            "timestamp": _request_transform_timestamp(),
+            "event": "content_block_dropped",
+            "request_id": request_id,
+            "dropped_counts": dropped,
+            "location": "message",
+            "mode": mode,
+            "provider": provider,
+            "tier": tier,
+        })
+    return out
+
+
+def _transform_tool_result_to_chat_tool(block, known_ids):
+    """Convert one Anthropic tool_result block into an OpenAI role:tool message.
+
+    Returns None if the block's tool_use_id is missing/not a string, or does
+    not match a tool_use.id from a preceding assistant message (the block is
+    dropped). tool_result.content may be a string or a list of text blocks;
+    text is extracted and joined with newlines.
+    """
+    tid = block.get("tool_use_id")
+    if not isinstance(tid, str) or not tid or tid not in known_ids:
+        return None
+    content = block.get("content")
+    if isinstance(content, list):
+        parts = [c.get("text") for c in content
+                 if isinstance(c, dict) and c.get("type") == "text"
+                 and isinstance(c.get("text"), str)]
+        content = "\n".join(parts)
+    if not isinstance(content, str):
+        content = ""
+    return {"role": "tool", "tool_call_id": tid, "content": content}
+
+
+def _transform_anthropic_tools_to_chat(tools, request_id=None, mode=None,
+                                       provider=None, tier=None,
+                                       cache_stripped_out=None):
+    """Convert Anthropic tool definitions to OpenAI Chat function tools.
+
+    Returns a new list; tools:null and non-list inputs become []. Entries
+    missing name or input_schema are skipped. cache_control_stripped is
+    reported to the caller via the optional cache_stripped_out list rather
+    than logged here, so _anthropic_to_chat can coalesce one event per request.
+    """
+    if not isinstance(tools, list):
+        return []
+    out = []
+    cache_stripped = False
+    dropped = 0
+    for tool in tools:
+        if not isinstance(tool, dict):
+            dropped += 1
+            continue
+        name = tool.get("name")
+        input_schema = tool.get("input_schema")
+        if not isinstance(name, str) or not name or not isinstance(input_schema, dict):
+            dropped += 1
+            continue
+        fn = {"name": name, "parameters": input_schema}
+        if isinstance(tool.get("description"), str):
+            fn["description"] = tool["description"]
+        if "cache_control" in tool:
+            cache_stripped = True
+        out.append({"type": "function", "function": fn})
+    if dropped > 0:
+        log_trace({
+            "timestamp": _request_transform_timestamp(),
+            "event": "content_block_dropped",
+            "request_id": request_id,
+            "dropped_counts": {"unknown": dropped},
+            "location": "tool_definition",
+            "mode": mode,
+            "provider": provider,
+            "tier": tier,
+        })
+    if cache_stripped and cache_stripped_out is not None:
+        cache_stripped_out.append("tools")
+    return out
+
+
+def _transform_anthropic_tool_choice_to_chat(tool_choice):
+    """Convert an Anthropic tool_choice to OpenAI tool_choice (None to omit)."""
+    if not isinstance(tool_choice, dict):
+        return None
+    tc_type = tool_choice.get("type")
+    if tc_type == "none":
+        return "none"
+    if tc_type == "auto":
+        return "auto"
+    if tc_type == "any":
+        return "required"
+    if tc_type == "tool":
+        name = tool_choice.get("name")
+        if isinstance(name, str) and name:
+            return {"type": "function", "function": {"name": name}}
+        return None
+    return None
 
 
 def _map_chat_finish_reason(finish_reason):

@@ -284,12 +284,22 @@ does not block startup on failure).
   format; response mode transforms to OpenAI Responses format (single-turn,
   stream forced false). Error responses (non-2xx) pass through untransformed.
   `count_tokens` returns 400 for chat/response modes (no OpenAI equivalent).
-  Tool-use SSE deltas are not transformed (stop_reason degraded to null when
-  tool_calls are seen). Response mode is usable only by non-streaming clients
-  (forces `stream: false`). Chat-mode SSE is synthesized from OpenAI SSE
-  (frame-assembled on `\n\n`, terminal synthesized on EOF).
-- **Malformed tool arguments in chat mode.** When `_chat_to_anthropic` encounters tool-call arguments that cannot be parsed as a JSON dict (including `json.JSONDecodeError`, non-dict parse results, empty dicts, non-dict `function` values, and non-dict tool-call entries), it now emits a user-visible text block `[Tool call failed: arguments for '<name>' (call <id>) could not be parsed as JSON]` instead of a `tool_use` block with `input: {}`. A `tool_args_parse_failure` trace event is also logged with the now-threaded `request_id`/`mode`/`provider`/`tier` fields. When all tool calls in a response are malformed, `stop_reason` is forced to `None` to prevent the client from hanging on `stop_reason: "tool_use"` with zero tool_use blocks (behavior change landed 2026-08-28).
-- **Test suite is safe alongside a live proxy.** The test suite now sets `os.environ["PROXY_STATE_FILE"]` to a session temp path at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read `PROXY_STATE_FILE` from the env, so test proxies use an isolated state file and can never touch the live proxy's `~/.claude/proxy/proxy-state.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite (123 tests) passes with the live proxy up (landed 2026-08-28).
+  **Chat-mode request transform:** messages are converted via
+  `_transform_anthropic_messages_to_chat()` (thinking/redacted_thinking/image
+  blocks stripped, tool_use→tool_calls with dict-validated input and NaN/non-dict→placeholder,
+  tool_result→role:tool paired by tool_use_id, cache_control stripped per-block);
+  tools are converted via `_transform_anthropic_tools_to_chat()` (input_schema→parameters);
+  tool_choice is mapped via `_transform_anthropic_tool_choice_to_chat()`.
+  Request-level `thinking`, `metadata`, and `top_k` are dropped.
+  **Chat-mode SSE streaming:** tool-use SSE deltas are not transformed
+  (stop_reason degraded to null when tool_calls are seen). The non-streaming
+  path correctly transforms tool_use/tool_result in both request and response.
+  Image content blocks and streaming tool call deltas are deferred (see
+  `tmp/reports/defer-issue-*.json`). Response mode is usable only by
+  non-streaming clients (forces `stream: false`). Chat-mode SSE is synthesized
+  from OpenAI SSE (frame-assembled on `\n\n`, terminal synthesized on EOF).
+- **Malformed tool arguments in chat mode.** When `_chat_to_anthropic` encounters tool-call arguments that cannot be parsed as a JSON dict (including `json.JSONDecodeError`, non-dict parse results, empty dicts, non-dict `function` values, and non-dict tool-call entries), it emits a user-visible text block `[Tool call failed: arguments for '<name>' (call <id>) could not be parsed as JSON]` instead of a `tool_use` block with `input: {}`. A `tool_args_parse_failure` trace event is also logged. When all tool calls in a response are malformed, `stop_reason` is forced to `None` to prevent the client from hanging on `stop_reason: "tool_use"` with zero tool_use blocks. **Request-transform path:** `_transform_anthropic_messages_to_chat` applies the same degradation pattern for NaN/Infinity/non-dict `tool_use.input` values (rejected by `json.dumps(input, allow_nan=False)`), emitting the placeholder `[Tool call failed: arguments for '<name>' (call <id>) could not be serialized as JSON]` and a `tool_args_parse_failure` trace event. When a failed tool_use coexists with valid tool_use(s) in the same assistant message, the placeholder is emitted as a separate assistant message before the tool_calls message (content: null). (Behavior changes landed 2026-08-28 and 2026-08-29.)
+- **Test suite is safe alongside a live proxy.** The test suite now sets `os.environ["PROXY_STATE_FILE"]` to a session temp path at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read `PROXY_STATE_FILE` from the env, so test proxies use an isolated state file and can never touch the live proxy's `~/.claude/proxy/proxy-state.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite (151 tests) passes with the live proxy up (landed 2026-08-28, updated 2026-08-29).
 
 ## Documentation
 
@@ -300,6 +310,9 @@ does not block startup on failure).
   rates, TTFT, latency) for a configurable time window, with outlier filtering.
 - [plans/](plans/) — completed implementation plans (one per feature, with
   design rationale, issue log, and test results).
+- [plans/2026-08-29-fix-chat-mode-request-transform.md](plans/2026-08-29-fix-chat-mode-request-transform.md) — chat-mode
+  request transform: Anthropic Messages → OpenAI Chat Completions conversion
+  with content block transforms, tool mapping, and trace events.
 - [plans/2026-08-27-support-three-endpoint-modes.md](plans/2026-08-27-support-three-endpoint-modes.md) — three-endpoint-mode
   dispatch (anthropic/chat/response) with full request/response transformation
   and SSE streaming.
@@ -311,7 +324,18 @@ does not block startup on failure).
 
 No other supplementary docs.
 
+## Unresolved Deferred Issues
+
+```json
+[
+  {"issue_id": "streaming-tool-call-deltas", "title": "Chat mode SSE: tool call deltas are not transformed to Anthropic streaming events", "deferred": "2026-08-29", "target_repo": null},
+  {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "deferred": "2026-08-29", "target_repo": null}
+]
+```
+
 ## Future Work — TODO
 
-All deferred issues from the original `claude-config` extraction have been resolved.
-Future hardening work can focus on additional features or performance optimizations.
+The original `claude-config` extraction deferred issues are all resolved.
+Two chat-mode deferred issues remain (see `## Unresolved Deferred Issues` above):
+streaming tool call deltas and image content block mapping. Future hardening
+work can also focus on additional features or performance optimizations.
