@@ -237,9 +237,11 @@ stripped first to avoid doubling (e.g., `https://api.openai.com/v1` →
 user message as `input`, discards conversation history). Chat-mode
 non-streaming requests correctly transform tool_use/tool_result in both
 directions (thinking blocks converted to reasoning_content, tool_use→tool_calls, tool_result→role:tool).
-Tool-use SSE deltas are not transformed in chat-mode streaming (stop_reason is
-degraded to null when tool calls are detected). Image content blocks are not
-mapped between Anthropic and OpenAI formats. Error responses (non-2xx) pass
+Chat-mode streaming correctly converts tool-call SSE deltas to Anthropic
+`tool_use` content blocks (per-index state, parallel/interleaved support,
+dict-only JSON validation, conservative degradation on malformed/truncated
+streams). Image content blocks are not mapped between Anthropic and OpenAI
+formats. Error responses (non-2xx) pass
 through untransformed in the upstream format.
 
 ### Admin page (`http://localhost:8080/admin/`)

@@ -8873,6 +8873,135 @@ def _sse_stream_chunks(chunks):
     return "".join("data: {}\n\n".format(json.dumps(c)) for c in chunks).encode()
 
 
+def _cc(delta, finish=None):
+    """One minimal OpenAI chat-completion chunk."""
+    return {"id": "c1", "object": "chat.completion.chunk", "created": 1,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+
+
+def _sse_stop_reason(frames):
+    """Return the stop_reason from the first message_delta frame, or None."""
+    deltas = _sse_frames_with_type(frames, "message_delta")
+    if not deltas:
+        return None
+    return (deltas[0].get("delta") or {}).get("stop_reason")
+
+
+def _sse_content_block_starts(frames):
+    """Return [(index, type)] for every content_block_start, in stream order."""
+    out = []
+    for name, data in frames:
+        if _sse_frame_type((name, data)) == "content_block_start" and isinstance(data, dict):
+            out.append((data.get("index"), (data.get("content_block") or {}).get("type")))
+    return out
+
+
+def _sse_tool_use_blocks(frames):
+    """Reconstruct Anthropic tool_use blocks from parsed SSE frames.
+
+    Joins input_json_delta partial_json fragments per content_block_start
+    (tool_use) and JSON-decodes the concatenation. Returns dicts
+    {index, id, name, input, closed} in content_block_start order.
+    """
+    blocks = []
+    for name, data in frames:
+        ftype = _sse_frame_type((name, data))
+        if not isinstance(data, dict):
+            continue
+        if ftype == "content_block_start":
+            cb = data.get("content_block") or {}
+            if cb.get("type") == "tool_use":
+                blocks.append({"index": data.get("index"), "id": cb.get("id"),
+                               "name": cb.get("name"), "fragments": [],
+                               "closed": False})
+        elif ftype == "content_block_delta":
+            dd = data.get("delta") or {}
+            if dd.get("type") == "input_json_delta":
+                frag = dd.get("partial_json")
+                idx = data.get("index")
+                for b in blocks:
+                    if b["index"] == idx and not b["closed"] and isinstance(frag, str):
+                        b["fragments"].append(frag)
+        elif ftype == "content_block_stop":
+            for b in blocks:
+                if b["index"] == data.get("index"):
+                    b["closed"] = True
+    out = []
+    for b in blocks:
+        joined = "".join(b["fragments"])
+        try:
+            parsed = json.loads(joined) if joined else {}
+        except Exception:
+            parsed = joined
+        out.append({"index": b["index"], "id": b["id"], "name": b["name"],
+                    "input": parsed, "closed": b["closed"]})
+    return out
+
+
+def _start_chat_sse_proxy(chunks, add_done=True):
+    """Start a chat-mode proxy whose mock upstream streams the given OpenAI chunks.
+
+    Returns (proxy_port, trace_file, cleanup) or (None, None, None) on failure.
+    """
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    sse_body = _sse_stream_chunks(chunks)
+    if add_done:
+        sse_body += b"data: [DONE]\n\n"
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return None, None, None
+    return proxy_port, trace_file, cleanup
+
+
+def _chat_sse_fetch_frames(proxy_port, body=None):
+    """POST a chat-mode streaming request and return parsed frames (None on non-200)."""
+    if body is None:
+        body = {"model": "sonnet", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+    status, content_type, raw = _send_proxy_request_stream(proxy_port, body=body)
+    if status != 200:
+        fail("expected 200, got {}".format(status))
+        return None
+    return _parse_sse_frames(raw)
+
+
+def _degraded_trace_events(trace_file):
+    """Return every chat_sse_tool_degradation trace event in the trace file."""
+    out = []
+    if not trace_file or not os.path.exists(trace_file):
+        return out
+    with open(trace_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("event") == "chat_sse_tool_degradation":
+                out.append(ev)
+    return out
+
+
+def _assert_degradation_metadata_only(ev):
+    """Assert a chat_sse_tool_degradation event carries only fixed metadata fields."""
+    fixed = {"timestamp", "event", "request_id", "malformed_tool_count",
+             "overflow_tool_count", "dropped_fragment_count",
+             "unparseable_arg_count", "scalar_after_tools_dropped",
+             "frame_dropped"}
+    keys = set(ev)
+    if keys != fixed:
+        fail("degradation event key set must be the fixed metadata fields, got {!r}".format(keys))
+        return False
+    return True
+
+
 def test_chat_sse_basic_streaming():
     """Simulated OpenAI SSE chunks produce valid Anthropic SSE events."""
     print("\n--- Test: Chat SSE Basic Streaming ---")
@@ -9241,81 +9370,987 @@ def test_chat_sse_event_line_present():
         cleanup()
 
 
-def test_chat_sse_tool_calls_stop_reason_null():
-    """tool_calls finish_reason maps to null stop_reason when tool deltas were seen.
+def test_chat_sse_single_tool_call_fragmented_arguments():
+    """A single tool call split across frames emits one tool_use block with ordered deltas."""
+    print("\n--- Test: Chat SSE Single Tool Call Fragmented Arguments ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                             "function": {"name": "get_weather"}}]}),
+        _cc({"tool_calls": [{"index": 0, "function": {"arguments": "{\"city\":"}}]}),
+        _cc({"tool_calls": [{"index": 0, "function": {"arguments": "\"NYC\"}"}}]}),
+        _cc({}, finish="tool_calls"),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1:
+            fail("expected exactly one tool_use block, got {!r}".format(blocks))
+            return
+        b = blocks[0]
+        if b["index"] != 0 or b["id"] != "call_1" or b["name"] != "get_weather" \
+                or b["input"] != {"city": "NYC"} or not b["closed"]:
+            fail("tool_use block mismatch: {!r}".format(b))
+            return
+        if _sse_content_block_starts(frames) != [(0, "tool_use")]:
+            fail("expected one tool_use start at index 0, got {!r}".format(_sse_content_block_starts(frames)))
+            return
+        deltas = _sse_frames_with_type(frames, "content_block_delta")
+        frags = [(d.get("index"), d.get("delta", {}).get("type"), d.get("delta", {}).get("partial_json"))
+                 for d in deltas]
+        if frags != [(0, "input_json_delta", '{"city":'), (0, "input_json_delta", '"NYC"}')]:
+            fail("expected ordered input_json_delta fragments at index 0, got {!r}".format(frags))
+            return
+        if _sse_types(frames) != ["message_start", "content_block_start", "content_block_delta",
+                                  "content_block_delta", "content_block_stop",
+                                  "message_delta", "message_stop"]:
+            fail("unexpected event sequence: {}".format(_sse_types(frames)))
+            return
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("expected stop_reason tool_use, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        pass_("single fragmented tool call -> one tool_use block, ordered deltas, stop tool_use")
+    finally:
+        cleanup()
 
-    The SSE path does not transform delta.tool_calls into tool_use content
-    blocks, so claiming stop_reason='tool_use' would make Claude Code hang
-    waiting for tool_use blocks that never arrive. When tool_calls deltas were
-    seen but not transformed, the terminal stop_reason degrades to null.
+
+def test_chat_sse_parallel_tool_calls_interleaved():
+    """Two interleaved tool indexes keep per-call association and close ascending."""
+    print("\n--- Test: Chat SSE Parallel Tool Calls Interleaved ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_a", "function": {"name": "tool_a",
+                                                                      "arguments": "{\"x\":"}}]}),
+        _cc({"tool_calls": [{"index": 1, "id": "call_b", "function": {"name": "tool_b",
+                                                                      "arguments": "{\"y\":"}}]}),
+        _cc({"tool_calls": [{"index": 0, "function": {"arguments": "1}"}}]}),
+        _cc({"tool_calls": [{"index": 1, "function": {"arguments": "2}"}}]}),
+        _cc({}, finish="tool_calls"),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 2:
+            fail("expected 2 tool_use blocks, got {!r}".format(blocks))
+            return
+        by_idx = {b["index"]: b for b in blocks}
+        if set(by_idx) != {0, 1}:
+            fail("tool block indices should be {{0, 1}}, got {!r}".format(list(by_idx)))
+            return
+        a, b = by_idx[0], by_idx[1]
+        if a["id"] != "call_a" or a["name"] != "tool_a" or a["input"] != {"x": 1} or not a["closed"]:
+            fail("index 0 tool block wrong: {!r}".format(a))
+            return
+        if b["id"] != "call_b" or b["name"] != "tool_b" or b["input"] != {"y": 2} or not b["closed"]:
+            fail("index 1 tool block wrong: {!r}".format(b))
+            return
+        if _sse_content_block_starts(frames) != [(0, "tool_use"), (1, "tool_use")]:
+            fail("contiguous tool starts [0, 1] required, got {!r}".format(_sse_content_block_starts(frames)))
+            return
+        stop_idx = [data.get("index") for name, data in frames
+                    if _sse_frame_type((name, data)) == "content_block_stop" and isinstance(data, dict)]
+        if stop_idx != [0, 1]:
+            fail("content_block_stop must close ascending [0, 1], got {!r}".format(stop_idx))
+            return
+        if _sse_types(frames).count("content_block_start") != 2 or _sse_types(frames).count("content_block_stop") != 2:
+            fail("expected exactly 2 starts and 2 stops, got {}".format(_sse_types(frames)))
+            return
+        deltas = _sse_frames_with_type(frames, "content_block_delta")
+        frag_seq = [(d.get("index"), d.get("delta", {}).get("partial_json")) for d in deltas]
+        if frag_seq != [(0, '{"x":'), (1, '{"y":'), (0, "1}"), (1, "2}")]:
+            fail("interleaved fragments mis-associated: {!r}".format(frag_seq))
+            return
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("expected stop_reason tool_use, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        pass_("interleaved parallel tool calls keep association, contiguous indices, ascending close")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_reasoning_text_then_tool_call():
+    """Scalar blocks close before a tool block starts; indices stay contiguous."""
+    print("\n--- Test: Chat SSE Reasoning Text Then Tool Call ---")
+    chunks = [
+        _cc({"role": "assistant", "reasoning_content": "Let me think"}),
+        _cc({"content": "text answer"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_1",
+                             "function": {"name": "Bash", "arguments": "{\"command\":\"ls\"}"}}]}),
+        _cc({}, finish="tool_calls"),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        starts = _sse_content_block_starts(frames)
+        if starts != [(0, "thinking"), (1, "text"), (2, "tool_use")]:
+            fail("scalar-then-tool indices/types wrong: {!r}".format(starts))
+            return
+        seq = []
+        for name, data in frames:
+            t = _sse_frame_type((name, data))
+            if t in ("content_block_start", "content_block_stop") and isinstance(data, dict):
+                seq.append((t, data.get("index")))
+        expected_seq = [("content_block_start", 0), ("content_block_stop", 0),
+                        ("content_block_start", 1), ("content_block_stop", 1),
+                        ("content_block_start", 2), ("content_block_stop", 2)]
+        if seq != expected_seq:
+            fail("block lifecycle order wrong: {!r}".format(seq))
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1 or blocks[0]["id"] != "call_1" or blocks[0]["name"] != "Bash" \
+                or blocks[0]["input"] != {"command": "ls"} or not blocks[0]["closed"]:
+            fail("tool block mismatch: {!r}".format(blocks))
+            return
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("expected stop_reason tool_use, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        pass_("reasoning/text blocks close before tool start; indices unique and contiguous")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_tool_call_metadata_buffering():
+    """Arguments arriving before id/name are buffered and emitted in order after the start."""
+    print("\n--- Test: Chat SSE Tool Call Metadata Buffering ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "function": {"arguments": "{\"city\":"}}]}),
+        _cc({"tool_calls": [{"index": 0, "function": {"arguments": "\"NYC\"}"}}]}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "get_weather"}}]}),
+        _cc({}, finish="tool_calls"),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1 or blocks[0]["id"] != "call_1" or blocks[0]["name"] != "get_weather" \
+                or blocks[0]["input"] != {"city": "NYC"} or not blocks[0]["closed"]:
+            fail("buffered tool block mismatch: {!r}".format(blocks))
+            return
+        types = _sse_types(frames)
+        start_pos = types.index("content_block_start")
+        delta_positions = [i for i, t in enumerate(types) if t == "content_block_delta"]
+        if not delta_positions or any(p < start_pos for p in delta_positions):
+            fail("buffered fragments must emit after content_block_start: {}".format(types))
+            return
+        deltas = _sse_frames_with_type(frames, "content_block_delta")
+        frags = [d.get("delta", {}).get("partial_json") for d in deltas]
+        if frags != ['{"city":', '"NYC"}']:
+            fail("fragments must be emitted in original order, got {!r}".format(frags))
+            return
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("expected stop_reason tool_use, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        pass_("arguments before metadata buffered and emitted in order after the start")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_malformed_tool_call_degrades():
+    """Malformed tool-call deltas never emit a tool_use block; one metadata-only trace event.
+
+    Covers missing/non-string index, non-string id, and null function object.
+    The coalesced event must carry request_id and integer counts only — no tool
+    id/name/fragment text/request body.
     """
-    print("\n--- Test: Chat SSE Tool Calls Stop Reason Null ---")
+    print("\n--- Test: Chat SSE Malformed Tool Call Degrades ---")
+
+    def run_case(chunks, markers):
+        proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+        if proxy_port is None:
+            return False
+        try:
+            frames = _chat_sse_fetch_frames(proxy_port)
+            if frames is None:
+                return False
+            if _sse_content_block_starts(frames):
+                fail("malformed tool deltas must not emit a content_block_start: {!r}".format(
+                    _sse_content_block_starts(frames)))
+                return False
+            if "message_stop" not in _sse_types(frames):
+                fail("malformed stream must still terminate cleanly with message_stop")
+                return False
+            if _sse_stop_reason(frames) is not None:
+                fail("no-valid-tool stream must degrade to null stop_reason, got {!r}".format(
+                    _sse_stop_reason(frames)))
+                return False
+            events = _degraded_trace_events(trace_file)
+            if len(events) != 1:
+                fail("expected exactly one chat_sse_tool_degradation trace event, got {}".format(len(events)))
+                return False
+            ev = events[0]
+            if not ev.get("request_id"):
+                fail("degradation event missing request_id: {!r}".format(ev))
+                return False
+            blob = json.dumps(ev)
+            for marker in markers:
+                if marker in blob:
+                    fail("degradation event leaked tool content marker {!r}: {}".format(marker, blob))
+                    return False
+            return True
+        finally:
+            cleanup()
+
+    ok = True
+    if not run_case([
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": "x", "id": "call_mal_a", "function": {"name": "fx", "arguments": "{frag"}}]}),
+        _cc({}, finish="tool_calls"),
+    ], ["call_mal_a", "fx", "{frag"]):
+        ok = False
+    if not run_case([
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": 123, "function": {"name": "nb", "arguments": "{}"}}]}),
+        _cc({}, finish="tool_calls"),
+    ], ["nb"]):
+        ok = False
+    if not run_case([
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_nullfn", "function": None}]}),
+        _cc({}, finish="tool_calls"),
+    ], ["call_nullfn"]):
+        ok = False
+    if ok:
+        pass_("malformed tool deltas degrade to null stop_reason with one metadata-only trace event")
+
+
+def test_chat_sse_mixed_valid_and_malformed_tool_calls():
+    """A valid parallel call survives alongside a malformed entry without contamination."""
+    print("\n--- Test: Chat SSE Mixed Valid And Malformed Tool Calls ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_ok", "function": {"name": "ok", "arguments": "{\"a\":1}"}}]}),
+        _cc({"tool_calls": [{"index": 1, "function": None}]}),
+        _cc({}, finish="tool_calls"),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1:
+            fail("valid call should survive alongside malformed, got {!r}".format(blocks))
+            return
+        b = blocks[0]
+        if b["index"] != 0 or b["id"] != "call_ok" or b["name"] != "ok" or b["input"] != {"a": 1} or not b["closed"]:
+            fail("valid block mismatch: {!r}".format(b))
+            return
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("surviving valid block should map finish tool_calls to tool_use, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        events = _degraded_trace_events(trace_file)
+        if len(events) != 1:
+            fail("malformed entry must be diagnosed once, got {}".format(len(events)))
+            return
+        pass_("valid parallel call survives; malformed entry diagnosed without contamination")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_tool_call_eof_without_finish():
+    """EOF without finish_reason: valid blocks close and get null; no deltas get end_turn."""
+    print("\n--- Test: Chat SSE Tool Call EOF Without Finish ---")
+    chunks_a = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_eof", "function": {"name": "eof_tool", "arguments": "{\"z\":9}"}}]}),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks_a)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1 or not blocks[0]["closed"]:
+            fail("EOF after valid tool deltas must close the emitted block, got {!r}".format(blocks))
+            return
+        if blocks[0]["input"] != {"z": 9}:
+            fail("EOF tool block input wrong: {!r}".format(blocks[0]))
+            return
+        if _sse_stop_reason(frames) is not None:
+            fail("EOF with emitted tool block must degrade to null stop_reason, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        if "message_stop" not in _sse_types(frames):
+            fail("EOF must synthesize message_stop")
+            return
+    finally:
+        cleanup()
+    chunks_b = [
+        _cc({"role": "assistant", "content": "hi"}),
+    ]
+    proxy_port2, trace_file2, cleanup2 = _start_chat_sse_proxy(chunks_b)
+    if proxy_port2 is None:
+        return
+    try:
+        frames2 = _chat_sse_fetch_frames(proxy_port2)
+        if frames2 is None:
+            return
+        if _sse_stop_reason(frames2) != "end_turn":
+            fail("EOF with no tool deltas should map to end_turn, got {!r}".format(_sse_stop_reason(frames2)))
+            return
+        if "message_stop" not in _sse_types(frames2):
+            fail("EOF must synthesize message_stop (no-tools case)")
+            return
+    finally:
+        cleanup2()
+    chunks_c = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_incomplete"}]}),
+    ]
+    proxy_port3, trace_file3, cleanup3 = _start_chat_sse_proxy(chunks_c)
+    if proxy_port3 is None:
+        return
+    try:
+        frames3 = _chat_sse_fetch_frames(proxy_port3)
+        if frames3 is None:
+            return
+        if _sse_content_block_starts(frames3):
+            fail("incomplete metadata must not emit a tool_use at EOF, got {!r}".format(_sse_content_block_starts(frames3)))
+            return
+        if _sse_stop_reason(frames3) is not None:
+            fail("incomplete tool metadata at EOF must degrade to null, got {!r}".format(_sse_stop_reason(frames3)))
+            return
+        events = _degraded_trace_events(trace_file3)
+        if len(events) != 1:
+            fail("incomplete metadata at EOF must fire the coalesced trace event, got {}".format(len(events)))
+            return
+    finally:
+        cleanup3()
+    pass_("EOF: emitted tool block -> null; no tool deltas -> end_turn; incomplete metadata -> null + trace")
+
+
+def test_chat_sse_non_tool_calls_finish_with_tool_blocks():
+    """A length/stop finish while tool blocks are open closes them and maps normally."""
+    print("\n--- Test: Chat SSE Non Tool Calls Finish With Tool Blocks ---")
+    base = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "len_tool", "arguments": "{\"a\":1}"}}]}),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(base + [_cc({}, finish="length")])
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1 or not blocks[0]["closed"]:
+            fail("length finish with open tool blocks must close them, got {!r}".format(blocks))
+            return
+        if _sse_stop_reason(frames) != "max_tokens":
+            fail("length finish should map to max_tokens (never tool_use), got {!r}".format(_sse_stop_reason(frames)))
+            return
+        events = _degraded_trace_events(trace_file)
+        if len(events) != 1:
+            fail("non-tool_calls finish with open tool blocks must log the coalesced event, got {}".format(len(events)))
+            return
+    finally:
+        cleanup()
+    proxy_port2, trace_file2, cleanup2 = _start_chat_sse_proxy(base + [_cc({}, finish="stop")])
+    if proxy_port2 is None:
+        return
+    try:
+        frames2 = _chat_sse_fetch_frames(proxy_port2)
+        if frames2 is None:
+            return
+        blocks2 = _sse_tool_use_blocks(frames2)
+        if len(blocks2) != 1 or not blocks2[0]["closed"]:
+            fail("stop finish with open tool blocks must close them, got {!r}".format(blocks2))
+            return
+        if _sse_stop_reason(frames2) != "end_turn":
+            fail("stop finish should map to end_turn (never tool_use), got {!r}".format(_sse_stop_reason(frames2)))
+            return
+    finally:
+        cleanup2()
+    pass_("non-tool_calls finish with open tool blocks: close blocks, map finish normally, log event")
+
+
+def test_chat_sse_scalar_delta_after_tool_blocks():
+    """Scalar deltas after the first tool block are dropped with a counted diagnostic."""
+    print("\n--- Test: Chat SSE Scalar Delta After Tool Blocks ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "t", "arguments": "{\"a\":1}"}}]}),
+        _cc({"content": "late text"}),
+        _cc({"reasoning_content": "late think"}),
+        _cc({}, finish="tool_calls"),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        if _sse_content_block_starts(frames) != [(0, "tool_use")]:
+            fail("no scalar content_block_start may follow a tool block, got {!r}".format(_sse_content_block_starts(frames)))
+            return
+        deltas = _sse_frames_with_type(frames, "content_block_delta")
+        text_bits = [d.get("delta", {}).get("text") for d in deltas if isinstance(d.get("delta", {}).get("text"), str)]
+        think_bits = [d.get("delta", {}).get("thinking") for d in deltas if isinstance(d.get("delta", {}).get("thinking"), str)]
+        if text_bits or think_bits:
+            fail("scalar deltas after tool blocks must be dropped, text={!r} thinking={!r}".format(text_bits, think_bits))
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1 or blocks[0]["input"] != {"a": 1}:
+            fail("tool block contaminated by late scalar deltas: {!r}".format(blocks))
+            return
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("valid tool block should still yield tool_use, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        events = _degraded_trace_events(trace_file)
+        if len(events) != 1 or events[0].get("scalar_after_tools_dropped") != 2:
+            fail("dropped scalar deltas must be counted (2) once, got {!r}".format(events))
+            return
+        pass_("scalar deltas after tool blocks dropped with counted diagnostic; tool block intact")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_final_fragment_in_finish_frame():
+    """The last argument fragment sharing the finish frame is emitted before close."""
+    print("\n--- Test: Chat SSE Final Fragment In Finish Frame ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "t", "arguments": "{\"a\":"}}]}),
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
+         "choices": [{"index": 0,
+                      "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "1}"}}]},
+                      "finish_reason": "tool_calls"}]},
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1 or blocks[0]["input"] != {"a": 1}:
+            fail("final fragment in the finish frame must be included, got {!r}".format(blocks))
+            return
+        types = _sse_types(frames)
+        delta_pos = types.index("content_block_delta")
+        stop_pos = types.index("content_block_stop")
+        if not (delta_pos < stop_pos):
+            fail("final fragment delta must be emitted before tool close: {}".format(types))
+            return
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("expected stop_reason tool_use, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        pass_("final fragment in finish frame emitted before close and claimed tool_use")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_no_deltas_tool_calls_finish():
+    """finish_reason tool_calls with zero tool-call deltas degrades to null (never tool_use)."""
+    print("\n--- Test: Chat SSE No Deltas Tool Calls Finish ---")
+    chunks = [
+        _cc({"role": "assistant", "content": "ok"}),
+        _cc({}, finish="tool_calls"),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        if _sse_stop_reason(frames) is not None:
+            fail("tool_calls finish with zero tool deltas must degrade to null stop_reason, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        if _sse_content_block_starts(frames) != [(0, "text")]:
+            fail("expected only the text block, got {!r}".format(_sse_content_block_starts(frames)))
+            return
+        if "message_stop" not in _sse_types(frames):
+            fail("message_stop must be emitted")
+            return
+        pass_("tool_calls finish with zero deltas -> null stop_reason")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_unparseable_arguments_at_close():
+    """Valid metadata + tool_calls finish but unparseable args degrade the stop reason."""
+    print("\n--- Test: Chat SSE Unparseable Arguments At Close ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "bad", "arguments": "{oops"}}]}),
+        _cc({}, finish="tool_calls"),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1 or not blocks[0]["closed"]:
+            fail("unparseable-args tool block should still be emitted and closed, got {!r}".format(blocks))
+            return
+        if _sse_stop_reason(frames) is not None:
+            fail("unparseable accumulated arguments must degrade stop_reason to null, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        events = _degraded_trace_events(trace_file)
+        if len(events) != 1 or events[0].get("unparseable_arg_count") != 1:
+            fail("expected one event with unparseable_arg_count 1, got {!r}".format(events))
+            return
+        pass_("unparseable accumulated arguments degrade stop_reason to null")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_conflicting_metadata():
+    """A later valid-but-different id/name on an existing index is treated as malformed."""
+    print("\n--- Test: Chat SSE Conflicting Metadata ---")
+    chunks_a = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_orig"}]}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_other", "function": {"name": "n1", "arguments": "{}"}}]}),
+        _cc({}, finish="tool_calls"),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks_a)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        if _sse_content_block_starts(frames):
+            fail("conflicting id must prevent tool_use emission, got {!r}".format(_sse_content_block_starts(frames)))
+            return
+        if _sse_stop_reason(frames) is not None:
+            fail("conflicting id must degrade stop_reason to null, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        if len(_degraded_trace_events(trace_file)) != 1:
+            fail("conflicting id must log one degradation event")
+            return
+    finally:
+        cleanup()
+    chunks_b = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "function": {"name": "n1"}}]}),
+        _cc({"tool_calls": [{"index": 0, "function": {"name": "n2"}}]}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_c"}]}),
+        _cc({}, finish="tool_calls"),
+    ]
+    proxy_port2, trace_file2, cleanup2 = _start_chat_sse_proxy(chunks_b)
+    if proxy_port2 is None:
+        return
+    try:
+        frames2 = _chat_sse_fetch_frames(proxy_port2)
+        if frames2 is None:
+            return
+        if _sse_content_block_starts(frames2):
+            fail("conflicting name must prevent tool_use emission, got {!r}".format(_sse_content_block_starts(frames2)))
+            return
+        if _sse_stop_reason(frames2) is not None:
+            fail("conflicting name must degrade stop_reason to null, got {!r}".format(_sse_stop_reason(frames2)))
+            return
+        if len(_degraded_trace_events(trace_file2)) != 1:
+            fail("conflicting name must log one degradation event")
+            return
+    finally:
+        cleanup2()
+    pass_("conflicting id/name on an existing index degrades the entry (coalesced trace, no tool_use)")
+
+
+def test_chat_sse_fragments_missing_index():
+    """Non-empty fragments without an index are dropped, counted, and block tool_use."""
+    print("\n--- Test: Chat SSE Fragments Missing Index ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "frag_tool", "arguments": "{\"a\":1}"}}]}),
+        _cc({"tool_calls": [{"function": {"arguments": "{\"b\":2}"}}]}),
+        _cc({}, finish="tool_calls"),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1 or blocks[0]["input"] != {"a": 1}:
+            fail("index-less fragment must not contaminate the started block, got {!r}".format(blocks))
+            return
+        if _sse_stop_reason(frames) is not None:
+            fail("dropped fragments must prevent tool_use claim, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        events = _degraded_trace_events(trace_file)
+        if len(events) != 1 or events[0].get("dropped_fragment_count") != 1:
+            fail("expected one event with dropped_fragment_count 1, got {!r}".format(events))
+            return
+        pass_("index-less fragments dropped, counted, and tool_use not claimed")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_malformed_delta_shapes():
+    """Malformed delta shapes are skipped without crashing; the stream still terminates."""
+    print("\n--- Test: Chat SSE Malformed Delta Shapes ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [123]}),
+        _cc({"tool_calls": "abc"}),
+        _cc({"tool_calls": [None]}),
+        _cc("oops"),
+        _cc({}, finish="stop"),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        if _sse_content_block_starts(frames):
+            fail("malformed delta shapes must not emit content blocks, got {!r}".format(_sse_content_block_starts(frames)))
+            return
+        if "message_stop" not in _sse_types(frames):
+            fail("malformed delta frames must not crash mid-stream; message_stop required")
+            return
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("stop finish maps to end_turn, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        events = _degraded_trace_events(trace_file)
+        if len(events) != 1:
+            fail("expected exactly one coalesced degradation event, got {}".format(len(events)))
+            return
+        if events[0].get("malformed_tool_count", 0) < 3:
+            fail("malformed_tool_count should count the bad shapes, got {!r}".format(events[0]))
+            return
+        pass_("malformed delta shapes skipped; stream terminates cleanly with one trace event")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_pending_buffer_cap_exceeded():
+    """Pending argument fragments exceeding the per-tool cap never emit a tool_use."""
+    print("\n--- Test: Chat SSE Pending Buffer Cap Exceeded ---")
+    frag = 'x' * 8000
+    chunks = [_cc({"role": "assistant"})]
+    for _ in range(12):
+        chunks.append(_cc({"tool_calls": [{"index": 0, "function": {"arguments": frag}}]}))
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        if _sse_content_block_starts(frames):
+            fail("pending buffer over the per-tool cap must never emit a tool_use, got {!r}".format(_sse_content_block_starts(frames)))
+            return
+        if _sse_stop_reason(frames) is not None:
+            fail("overflowed pending buffer must not claim tool_use, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        events = _degraded_trace_events(trace_file)
+        if len(events) != 1:
+            fail("expected exactly one coalesced degradation event on EOF, got {}".format(len(events)))
+            return
+        if events[0].get("malformed_tool_count", 0) < 1:
+            fail("overflowed pending buffer should be counted, got {!r}".format(events[0]))
+            return
+        pass_("per-tool pending buffer cap bounds memory and degrades without claiming tool_use")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_too_many_parallel_tools():
+    """More than 32 tracked tool indexes overflow into the coalesced diagnostic."""
+    print("\n--- Test: Chat SSE Too Many Parallel Tools ---")
+    chunks = [_cc({"role": "assistant"})]
+    for i in range(33):
+        chunks.append(_cc({"tool_calls": [{"index": i, "id": "call_{}".format(i),
+                                           "function": {"name": "t{}".format(i),
+                                                        "arguments": "{}"}}]}))
+    chunks.append(_cc({}, finish="tool_calls"))
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        starts = _sse_content_block_starts(frames)
+        if len(starts) != 32:
+            fail("expected 32 tracked tool starts (33rd overflows), got {}".format(len(starts)))
+            return
+        if [s[0] for s in starts] != list(range(32)):
+            fail("tool starts must use contiguous indices 0..31, got {!r}".format([s[0] for s in starts]))
+            return
+        if _sse_stop_reason(frames) is not None:
+            fail("tool-index overflow must degrade stop_reason to null, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        events = _degraded_trace_events(trace_file)
+        if len(events) != 1 or events[0].get("overflow_tool_count") != 1:
+            fail("expected overflow_tool_count 1 in one event, got {!r}".format(events))
+            return
+        pass_("33 parallel tool indexes: 32 started contiguously, overflow diagnosed, stop null")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_eof_empty_tool_calls_sentinel():
+    """An empty tool_calls: [] sentinel frame must not mark tool deltas seen at EOF.
+
+    R1 review remediation: tool_calls_seen is set only when delta.tool_calls is
+    truthy — an empty list is falsy — so a stream that ends after only this
+    sentinel terminates with stop_reason "end_turn" (never null), emits no
+    tool_use block, and fires no degradation event.
+    """
+    print("\n--- Test: Chat SSE EOF Empty Tool Calls Sentinel ---")
+    chunks = [
+        _cc({"role": "assistant", "tool_calls": []}),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        if _sse_content_block_starts(frames):
+            fail("empty tool_calls sentinel must not emit a tool block, got {!r}".format(_sse_content_block_starts(frames)))
+            return
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("EOF after empty tool_calls sentinel must stop with end_turn, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        if "message_stop" not in _sse_types(frames):
+            fail("EOF must synthesize message_stop")
+            return
+        if _degraded_trace_events(trace_file):
+            fail("empty tool_calls sentinel at EOF must not fire a degradation event, got {!r}".format(_degraded_trace_events(trace_file)))
+            return
+        pass_("EOF + empty tool_calls sentinel -> end_turn, no tool_use, no degradation event")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_mixed_parseable_unparseable_finish():
+    """One unparseable parallel tool degrades the whole stream to a null stop reason.
+
+    R2 review remediation: the finish claim condition includes
+    unparseable_arg_count == 0, so a stream with a valid tool and a second tool
+    whose accumulated arguments fail json.loads never claims tool_use, even
+    though both blocks start and close.
+    """
+    print("\n--- Test: Chat SSE Mixed Parseable Unparseable Finish ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_good", "function": {"name": "good_tool", "arguments": "{\"a\":1}"}}]}),
+        _cc({"tool_calls": [{"index": 1, "id": "call_bad", "function": {"name": "bad_tool", "arguments": "{\"b\":"}}]}),
+        _cc({}, finish="tool_calls"),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 2:
+            fail("both parallel tools should emit blocks, got {!r}".format(blocks))
+            return
+        if [b["index"] for b in blocks] != [0, 1] or not all(b["closed"] for b in blocks):
+            fail("parallel tools must close ascending 0..1, got {!r}".format(blocks))
+            return
+        if _sse_types(frames).count("content_block_start") != 2 or _sse_types(frames).count("content_block_stop") != 2:
+            fail("expected exactly 2 starts and 2 stops, got {}".format(_sse_types(frames)))
+            return
+        if _sse_stop_reason(frames) is not None:
+            fail("mixed parseable+unparseable finish must degrade to null, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        events = _degraded_trace_events(trace_file)
+        if len(events) != 1:
+            fail("expected exactly one degradation event, got {}".format(len(events)))
+            return
+        if events[0].get("unparseable_arg_count") != 1:
+            fail("expected unparseable_arg_count 1, got {!r}".format(events[0]))
+            return
+        if not _assert_degradation_metadata_only(events[0]):
+            return
+        blob = json.dumps(events[0])
+        for marker in ["call_good", "call_bad", "good_tool", "bad_tool"]:
+            if marker in blob:
+                fail("degradation event leaked tool marker {!r}: {}".format(marker, blob))
+                return
+        pass_("mixed parseable+unparseable parallel finish -> null, unparseable_arg_count 1, metadata-only event")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_non_dict_arguments_at_close():
+    """Arguments that parse but not as a dict (e.g. \"123\") are counted unparseable.
+
+    R3 review remediation: close-time json.loads must produce a dict to count a
+    tool as valid; a number/string/bool/null parse result increments
+    unparseable_arg_count, so this stream degrades to a null stop reason.
+    """
+    print("\n--- Test: Chat SSE Non Dict Arguments At Close ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_nd", "function": {"name": "nd_tool", "arguments": "123"}}]}),
+        _cc({}, finish="tool_calls"),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1 or not blocks[0]["closed"]:
+            fail("non-dict args tool should still emit a closed block, got {!r}".format(blocks))
+            return
+        if blocks[0]["input"] != 123:
+            fail("block input should reconstruct the non-dict parse 123, got {!r}".format(blocks[0]["input"]))
+            return
+        if _sse_stop_reason(frames) is not None:
+            fail("non-dict arguments at close must not claim tool_use, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        events = _degraded_trace_events(trace_file)
+        if len(events) != 1 or events[0].get("unparseable_arg_count") != 1:
+            fail("expected unparseable_arg_count 1 in one event, got {!r}".format(events))
+            return
+        if not _assert_degradation_metadata_only(events[0]):
+            return
+        blob = json.dumps(events[0])
+        for marker in ["call_nd", "nd_tool", "partial_json"]:
+            if marker in blob:
+                fail("degradation event leaked tool marker {!r}: {}".format(marker, blob))
+                return
+        pass_("non-dict arguments at close -> null stop_reason, unparseable_arg_count 1, metadata-only event")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_frame_dropped_guard():
+    """A mid-stream oversized no-delimiter frame blocks the tool_use claim.
+
+    R5 review remediation: when an oversized (>64 KB) no-delimiter frame is
+    dropped after a tool block was emitted, frame_dropped blocks the finish
+    claim via `not (frame_dropped and emitted_tool_use)`, so the stream
+    degrades to null and the trace event reports frame_dropped: 1.
+    """
+    print("\n--- Test: Chat SSE Frame Dropped Guard ---")
     upstream_port = find_free_port()
     tiers = _mode_tiers()
     vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
     chunks = [
-        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
-         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
-        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
-         "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
-                      "function": {"name": "get_weather", "arguments": "{\"city\":\"NYC\"}"}}]}, "finish_reason": None}]},
-        {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
-         "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_fd", "function": {"name": "fd_tool", "arguments": "{\"a\":1}"}}]}),
     ]
-    sse_body = _sse_stream_chunks(chunks) + b"data: [DONE]\n\n"
+    finish = _cc({}, finish="tool_calls")
+    sse_body = (_sse_stream_chunks(chunks) + b"z" * 90000 + b"\n\n"
+                + _sse_stream_chunks([finish]) + b"data: [DONE]\n\n")
     responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
-    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, responders=responders)
     if proc is None:
         fail("Failed to set up test")
         return
     try:
-        status, content_type, raw = _send_proxy_request_stream(
-            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
-        if status != 200:
-            fail("expected 200, got {}".format(status))
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
             return
-        frames = _parse_sse_frames(raw)
-        deltas = _sse_frames_with_type(frames, "message_delta")
-        if not deltas:
-            fail("no message_delta in stream")
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1 or not blocks[0]["closed"]:
+            fail("tool block emitted before the drop should close, got {!r}".format(blocks))
             return
-        stop_reason = deltas[0].get("delta", {}).get("stop_reason")
-        if stop_reason is not None:
-            fail("tool_calls finish_reason with tool_calls deltas seen should map to null stop_reason, got {!r}".format(stop_reason))
+        if blocks[0]["input"] != {"a": 1}:
+            fail("tool input wrong after frame drop: {!r}".format(blocks[0]))
             return
-        # Control: tool_calls finish_reason WITHOUT tool_calls deltas seen maps to tool_use.
-        upstream2_port = find_free_port()
-        vendors2 = {"p": {"url": "http://127.0.0.1:{}".format(upstream2_port), "key": "K", "mode": "chat"}}
-        chunks2 = [
-            {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
-             "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": None}]},
-            {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-4o",
-             "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
-        ]
-        sse2 = _sse_stream_chunks(chunks2) + b"data: [DONE]\n\n"
-        responders2 = {"p": lambda info: (200, "text/event-stream", sse2)}
-        temp_dir2, proxy_port2, proc2, mock2, trace2, cleanup2 = _start_mode_proxy(tiers, vendors2, responders=responders2)
-        if proc2 is None:
-            fail("Failed to set up control test")
+        if _sse_stop_reason(frames) is not None:
+            fail("frame drop with emitted tool use must degrade to null, got {!r}".format(_sse_stop_reason(frames)))
             return
-        try:
-            status2, content_type2, raw2 = _send_proxy_request_stream(
-                proxy_port2, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
-            if status2 != 200:
-                fail("control expected 200, got {}".format(status2))
+        events = _degraded_trace_events(trace_file)
+        if len(events) != 1:
+            fail("expected exactly one degradation event, got {}".format(len(events)))
+            return
+        if events[0].get("frame_dropped") != 1:
+            fail("expected frame_dropped 1 in the trace event, got {!r}".format(events[0]))
+            return
+        if not _assert_degradation_metadata_only(events[0]):
+            return
+        blob = json.dumps(events[0])
+        for marker in ["call_fd", "fd_tool"]:
+            if marker in blob:
+                fail("degradation event leaked tool marker {!r}: {}".format(marker, blob))
                 return
-            frames2 = _parse_sse_frames(raw2)
-            deltas2 = _sse_frames_with_type(frames2, "message_delta")
-            if not deltas2:
-                fail("control: no message_delta in stream")
-                return
-            sr2 = deltas2[0].get("delta", {}).get("stop_reason")
-            if sr2 != "tool_use":
-                fail("control: tool_calls finish_reason WITHOUT tool deltas seen should map to tool_use, got {!r}".format(sr2))
-                return
-        finally:
-            cleanup2()
-        pass_("tool_calls deltas seen -> null stop_reason; control (no deltas) -> tool_use")
+        pass_("oversized no-delimiter frame mid-tool-stream -> null stop_reason, frame_dropped 1")
+    finally:
+        cleanup()
+
+
+def test_chat_mode_streamed_tool_command_e2e():
+    """State-wide: a streamed Bash tool call becomes a runnable Anthropic tool_use turn."""
+    print("\n--- Test: Chat Mode Streamed Tool Command E2E ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_123", "function": {"name": "Bash",
+                                                                        "arguments": "{\"command\":\"ls -la\"}"}}]}),
+        _cc({}, finish="tool_calls"),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        body = {
+            "model": "sonnet",
+            "messages": [{"role": "user", "content": "list files"}],
+            "tools": [{"name": "Bash", "description": "Run a bash command",
+                       "input_schema": {"type": "object",
+                                        "properties": {"command": {"type": "string"}}}}],
+            "stream": True,
+        }
+        frames = _chat_sse_fetch_frames(proxy_port, body=body)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1:
+            fail("e2e streamed tool call should yield one tool_use block, got {!r}".format(blocks))
+            return
+        b = blocks[0]
+        if b["id"] != "call_123" or b["name"] != "Bash" or b["input"] != {"command": "ls -la"} \
+                or b["index"] != 0 or not b["closed"]:
+            fail("e2e tool_use block mismatch: {!r}".format(b))
+            return
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("e2e stream should terminate with stop_reason tool_use, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        if "message_stop" not in _sse_types(frames):
+            fail("e2e stream missing message_stop")
+            return
+        pass_("streamed tool command e2e: runnable tool_use block + stop_reason tool_use")
     finally:
         cleanup()
 
@@ -10129,7 +11164,28 @@ ALL_TESTS = [
     ("chat-sse-first-event-has-content", test_chat_sse_first_event_has_content),
     ("chat-sse-injection-prevented", test_chat_sse_injection_prevented),
     ("chat-sse-event-line-present", test_chat_sse_event_line_present),
-    ("chat-sse-tool-calls-stop-reason-null", test_chat_sse_tool_calls_stop_reason_null),
+    ("chat-sse-single-tool-call-fragmented-arguments", test_chat_sse_single_tool_call_fragmented_arguments),
+    ("chat-sse-parallel-tool-calls-interleaved", test_chat_sse_parallel_tool_calls_interleaved),
+    ("chat-sse-reasoning-text-then-tool-call", test_chat_sse_reasoning_text_then_tool_call),
+    ("chat-sse-tool-call-metadata-buffering", test_chat_sse_tool_call_metadata_buffering),
+    ("chat-sse-malformed-tool-call-degrades", test_chat_sse_malformed_tool_call_degrades),
+    ("chat-sse-mixed-valid-and-malformed-tool-calls", test_chat_sse_mixed_valid_and_malformed_tool_calls),
+    ("chat-sse-tool-call-eof-without-finish", test_chat_sse_tool_call_eof_without_finish),
+    ("chat-sse-non-tool-calls-finish-with-tool-blocks", test_chat_sse_non_tool_calls_finish_with_tool_blocks),
+    ("chat-sse-scalar-delta-after-tool-blocks", test_chat_sse_scalar_delta_after_tool_blocks),
+    ("chat-sse-final-fragment-in-finish-frame", test_chat_sse_final_fragment_in_finish_frame),
+    ("chat-sse-no-deltas-tool-calls-finish", test_chat_sse_no_deltas_tool_calls_finish),
+    ("chat-sse-unparseable-arguments-at-close", test_chat_sse_unparseable_arguments_at_close),
+    ("chat-sse-conflicting-metadata", test_chat_sse_conflicting_metadata),
+    ("chat-sse-fragments-missing-index", test_chat_sse_fragments_missing_index),
+    ("chat-sse-malformed-delta-shapes", test_chat_sse_malformed_delta_shapes),
+    ("chat-sse-pending-buffer-cap-exceeded", test_chat_sse_pending_buffer_cap_exceeded),
+    ("chat-sse-too-many-parallel-tools", test_chat_sse_too_many_parallel_tools),
+    ("chat-sse-eof-empty-tool-calls-sentinel", test_chat_sse_eof_empty_tool_calls_sentinel),
+    ("chat-sse-mixed-parseable-unparseable-finish", test_chat_sse_mixed_parseable_unparseable_finish),
+    ("chat-sse-non-dict-arguments-at-close", test_chat_sse_non_dict_arguments_at_close),
+    ("chat-sse-frame-dropped-guard", test_chat_sse_frame_dropped_guard),
+    ("chat-mode-streamed-tool-command-e2e", test_chat_mode_streamed_tool_command_e2e),
     ("chat-sse-reasoning-delta-to-thinking-delta", test_chat_sse_reasoning_delta_to_thinking_delta),
     ("chat-sse-reasoning-delta-no-content", test_chat_sse_reasoning_delta_no_content),
     ("chat-sse-reasoning-then-text-transition", test_chat_sse_reasoning_then_text_transition),

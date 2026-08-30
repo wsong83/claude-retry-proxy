@@ -304,16 +304,20 @@ does not block startup on failure).
   **Chat-mode SSE streaming:** `reasoning`/`reasoning_content` deltas are
   transformed to `thinking_delta` events with proper block-index management
   (thinking block at index 0, text block at index 1; deferred
-  `content_block_start` until first delta type is known). Tool-use SSE deltas
-  are not transformed (stop_reason degraded to null when tool_calls are seen).
-  The non-streaming path correctly transforms tool_use/tool_result in both
-  request and response. Image content blocks and streaming tool call deltas
-  are deferred (see `tmp/reports/defer-issue-*.json`). Response mode is
+  `content_block_start` until first delta type is known). Tool-use SSE deltas are now converted to Anthropic `tool_use` content
+  blocks (per-index state, parallel/interleaved support, dict-only
+  `json.loads` validation at close, and conservative degradation on
+  malformed/truncated streams). A bounded metadata-only
+  `chat_sse_tool_degradation` trace event (no tool names, IDs, or
+  arguments) fires once per affected stream when any tool delta cannot
+  form a valid `tool_use` block. The non-streaming path correctly
+  transforms tool_use/tool_result in both request and response. Image
+  content blocks are deferred (see `tmp/reports/defer-issue-*.json`). Response mode is
   usable only by non-streaming clients (forces `stream: false`). Chat-mode
   SSE is synthesized from OpenAI SSE (frame-assembled on `\n\n`, terminal
   synthesized on EOF).
 - **Malformed tool arguments in chat mode.** When `_chat_to_anthropic` encounters tool-call arguments that cannot be parsed as a JSON dict (including `json.JSONDecodeError`, non-dict parse results, empty dicts, non-dict `function` values, and non-dict tool-call entries), it emits a user-visible text block `[Tool call failed: arguments for '<name>' (call <id>) could not be parsed as JSON]` instead of a `tool_use` block with `input: {}`. A `tool_args_parse_failure` trace event is also logged. When all tool calls in a response are malformed, `stop_reason` is forced to `None` to prevent the client from hanging on `stop_reason: "tool_use"` with zero tool_use blocks. **Request-transform path:** `_transform_anthropic_messages_to_chat` applies the same degradation pattern for NaN/Infinity/non-dict `tool_use.input` values (rejected by `json.dumps(input, allow_nan=False)`), emitting the placeholder `[Tool call failed: arguments for '<name>' (call <id>) could not be serialized as JSON]` and a `tool_args_parse_failure` trace event. When a failed tool_use coexists with valid tool_use(s) in the same assistant message, the placeholder is emitted as a separate assistant message before the tool_calls message (content: null). (Behavior changes landed 2026-08-28 and 2026-08-29.)
-- **Test suite is safe alongside a live proxy.** The test suite now sets `os.environ["PROXY_STATE_FILE"]` to a session temp path at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read `PROXY_STATE_FILE` from the env, so test proxies use an isolated state file and can never touch the live proxy's `~/.claude/proxy/proxy-state.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite (159 tests) passes with the live proxy up (landed 2026-08-28, updated 2026-08-30).
+- **Test suite is safe alongside a live proxy.** The test suite now sets `os.environ["PROXY_STATE_FILE"]` to a session temp path at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read `PROXY_STATE_FILE` from the env, so test proxies use an isolated state file and can never touch the live proxy's `~/.claude/proxy/proxy-state.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite (180 tests) passes with the live proxy up (landed 2026-08-28, updated 2026-08-30).
 
 ## Documentation
 
@@ -331,6 +335,10 @@ does not block startup on failure).
   thinking/reasoning round-trip: thinking blocks → reasoning_content on
   request, reasoning_content → thinking blocks on response, SSE reasoning
   delta handling, redacted_thinking passthrough with trace events.
+- [plans/2026-08-30-fix-chat-sse-tool-calls.md](plans/2026-08-30-fix-chat-sse-tool-calls.md) — chat-mode
+  streaming tool-call delta conversion: `delta.tool_calls` → Anthropic
+  `tool_use` SSE with per-index state, dict-only validation, and
+  metadata-only degradation diagnostics.
 - [plans/2026-08-27-support-three-endpoint-modes.md](plans/2026-08-27-support-three-endpoint-modes.md) — three-endpoint-mode
   dispatch (anthropic/chat/response) with full request/response transformation
   and SSE streaming.
@@ -346,7 +354,6 @@ No other supplementary docs.
 
 ```json
 [
-  {"issue_id": "streaming-tool-call-deltas", "title": "Chat mode SSE: tool call deltas are not transformed to Anthropic streaming events", "deferred": "2026-08-29", "target_repo": null},
   {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "deferred": "2026-08-29", "target_repo": null}
 ]
 ```
@@ -356,7 +363,9 @@ No other supplementary docs.
 The original `claude-config` extraction deferred issues are all resolved.
 The chat-mode thinking/reasoning round-trip is now implemented
 (thinking blocks → reasoning_content, reasoning_content → thinking blocks,
-SSE reasoning delta handling — landed 2026-08-30). Two chat-mode deferred
-issues remain (see `## Unresolved Deferred Issues` above): streaming tool
-call deltas and image content block mapping. Future hardening work can also
-focus on additional features or performance optimizations.
+SSE reasoning delta handling — landed 2026-08-30). The chat-mode SSE
+streaming tool-call delta conversion is now implemented (landed
+2026-08-30). One chat-mode deferred issue remains (see
+`## Unresolved Deferred Issues` above): image content block mapping.
+Future hardening work can also focus on additional features or
+performance optimizations.

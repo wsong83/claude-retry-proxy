@@ -1086,6 +1086,11 @@ def sanitize_error(msg):
 
 SSE_EVENT_DELIMITER = b"\n\n"
 
+# Chat-mode SSE tool-call conversion bounds (mirror the per-frame event buffer).
+MAX_CHAT_TOOL_PENDING_BYTES = 64 * 1024
+MAX_CHAT_TRACKED_TOOL_INDEXES = 32
+MAX_CHAT_OPEN_TOOL_BLOCKS = 32
+
 
 def _rewrite_sse_first_event(event_bytes, tier, request_id):
     """Rewrite model in first SSE event if it's a message_start event.
@@ -2035,6 +2040,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         emitted exactly once — on the finish_reason chunk, or synthesized at
         EOF/truncation so the Anthropic client never hangs. [DONE] and
         non-data frames are skipped.
+
+        OpenAI delta.tool_calls are converted into Anthropic tool_use content
+        blocks: per-upstream-index state buffers argument fragments until valid
+        id+name metadata exists, and all Anthropic block indices come from the
+        shared monotonic allocator (incremented only on content_block_start,
+        never on close, so indices stay contiguous). A normal "tool_calls"
+        finish closes open tool blocks in ascending index order and claims
+        stop_reason "tool_use" only when a parseable tool block was emitted; all
+        malformed/dropped variants degrade to a null stop reason that are
+        reported via one bounded metadata-only trace event per stream.
         """
         MAX_EVENT_BUFFER = 64 * 1024
         buf = bytearray()
@@ -2043,12 +2058,22 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         message_started = False
         first_frame = True
         tool_calls_seen = False
+        emitted_tool_use = False
         bytes_streamed = 0
         first_byte_ms = None
         block_index = 0
         current_block_type = None
-        first_content_block = True
+        current_block_index = None
         open_blocks = []
+        tool_states = {}
+        tools_started = 0
+        malformed_tool_count = 0
+        overflow_tool_count = 0
+        dropped_fragment_count = 0
+        unparseable_arg_count = 0
+        scalar_after_tools_dropped = 0
+        frame_dropped = False
+        degradation_logged = False
 
         def write(payload):
             nonlocal bytes_streamed, first_byte_ms
@@ -2079,45 +2104,228 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             })
             message_started = True
 
+        def alloc_index():
+            nonlocal block_index
+            idx = block_index
+            block_index += 1
+            return idx
+
+        def close_scalar_block():
+            nonlocal current_block_type, current_block_index
+            if current_block_type is not None:
+                write({"type": "content_block_stop", "index": open_blocks[-1]})
+                open_blocks.pop()
+                current_block_type = None
+                current_block_index = None
+
         def open_text_block():
-            nonlocal block_index, current_block_type, first_content_block
+            nonlocal current_block_type, current_block_index
             if current_block_type == "text":
                 return
-            if current_block_type is not None:
-                write({"type": "content_block_stop", "index": block_index})
-                open_blocks.pop()
-                block_index += 1
+            close_scalar_block()
+            idx = alloc_index()
             write({
                 "type": "content_block_start",
-                "index": block_index,
+                "index": idx,
                 "content_block": {"type": "text", "text": ""},
             })
-            open_blocks.append(block_index)
+            open_blocks.append(idx)
             current_block_type = "text"
-            first_content_block = False
+            current_block_index = idx
 
         def open_thinking_block():
-            nonlocal block_index, current_block_type, first_content_block
+            nonlocal current_block_type, current_block_index
             if current_block_type == "thinking":
                 return
-            if current_block_type is not None:
-                write({"type": "content_block_stop", "index": block_index})
-                open_blocks.pop()
-                block_index += 1
+            close_scalar_block()
+            idx = alloc_index()
             write({
                 "type": "content_block_start",
-                "index": block_index,
+                "index": idx,
                 "content_block": {"type": "thinking", "thinking": "",
                                   "signature": ""},
             })
-            open_blocks.append(block_index)
+            open_blocks.append(idx)
             current_block_type = "thinking"
-            first_content_block = False
+            current_block_index = idx
 
-        def terminal(stop_reason):
+        def new_tool_state():
+            return {
+                "id": None,
+                "name": None,
+                "index": None,
+                "started": False,
+                "closed": False,
+                "dropped": False,
+                "pending": [],
+                "pending_bytes": 0,
+                "arg_parts": [],
+            }
+
+        def start_tool_block(state):
+            nonlocal tools_started, emitted_tool_use
+            if tools_started >= MAX_CHAT_OPEN_TOOL_BLOCKS:
+                return False
+            close_scalar_block()
+            idx = alloc_index()
+            write({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": "tool_use",
+                                  "id": state["id"],
+                                  "name": state["name"],
+                                  "input": {}},
+            })
+            state["index"] = idx
+            state["started"] = True
+            tools_started += 1
+            emitted_tool_use = True
+            for frag in state["pending"]:
+                write({"type": "content_block_delta", "index": idx,
+                       "delta": {"type": "input_json_delta",
+                                 "partial_json": frag}})
+                state["arg_parts"].append(frag)
+            state["pending"] = []
+            state["pending_bytes"] = 0
+            return True
+
+        def close_open_tool_blocks(validate):
+            nonlocal unparseable_arg_count
+            candidates = [st for st in tool_states.values()
+                          if st["started"] and not st["closed"]]
+            valid = 0
+            for st in sorted(candidates, key=lambda s: s["index"]):
+                write({"type": "content_block_stop", "index": st["index"]})
+                st["closed"] = True
+                if validate and not st["dropped"]:
+                    try:
+                        parsed = json.loads("".join(st["arg_parts"]))
+                    except ValueError:
+                        unparseable_arg_count += 1
+                        continue
+                    if not isinstance(parsed, dict):
+                        unparseable_arg_count += 1
+                        continue
+                    valid += 1
+            return valid
+
+        def log_tool_degradation_summary():
+            nonlocal degradation_logged
+            if degradation_logged:
+                return
+            degradation_logged = True
+            log_trace({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "event": "chat_sse_tool_degradation",
+                "request_id": request_id,
+                "malformed_tool_count": malformed_tool_count,
+                "overflow_tool_count": overflow_tool_count,
+                "dropped_fragment_count": dropped_fragment_count,
+                "unparseable_arg_count": unparseable_arg_count,
+                "scalar_after_tools_dropped": scalar_after_tools_dropped,
+                "frame_dropped": 1 if frame_dropped else 0,
+            })
+
+        def process_tool_calls(tool_calls):
+            nonlocal malformed_tool_count, overflow_tool_count, dropped_fragment_count
+            if not isinstance(tool_calls, list):
+                malformed_tool_count += 1
+                return
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    malformed_tool_count += 1
+                    continue
+                index = tc.get("index")
+                if not isinstance(index, int) or isinstance(index, bool):
+                    # Missing index: a non-empty argument fragment cannot be
+                    # associated with any tool — counted as a dropped fragment so
+                    # the stream never claims tool_use; other entries are malformed.
+                    fn0 = tc.get("function")
+                    args0 = fn0.get("arguments") if isinstance(fn0, dict) else None
+                    if isinstance(args0, str) and args0:
+                        dropped_fragment_count += 1
+                    else:
+                        malformed_tool_count += 1
+                    continue
+                fn = tc.get("function")
+                if fn is not None and not isinstance(fn, dict):
+                    malformed_tool_count += 1
+                    continue
+                fn = fn if isinstance(fn, dict) else {}
+                state = tool_states.get(index)
+                if state is None:
+                    if len(tool_states) >= MAX_CHAT_TRACKED_TOOL_INDEXES:
+                        overflow_tool_count += 1
+                        continue
+                    state = new_tool_state()
+                    tool_states[index] = state
+                if state["dropped"]:
+                    continue
+                id_ = tc.get("id")
+                name_ = fn.get("name")
+                if isinstance(id_, str) and id_:
+                    if state["id"] is not None and state["id"] != id_:
+                        malformed_tool_count += 1
+                        state["dropped"] = True
+                        state["pending"] = []
+                        state["pending_bytes"] = 0
+                        continue
+                    state["id"] = id_
+                if isinstance(name_, str) and name_:
+                    if state["name"] is not None and state["name"] != name_:
+                        malformed_tool_count += 1
+                        state["dropped"] = True
+                        state["pending"] = []
+                        state["pending_bytes"] = 0
+                        continue
+                    state["name"] = name_
+                args = fn.get("arguments")
+                if args is not None and not isinstance(args, str):
+                    malformed_tool_count += 1
+                    state["dropped"] = True
+                    state["pending"] = []
+                    state["pending_bytes"] = 0
+                    continue
+                if not state["started"] and state["id"] and state["name"] \
+                        and not state["dropped"]:
+                    if not start_tool_block(state):
+                        overflow_tool_count += 1
+                        state["dropped"] = True
+                        state["pending"] = []
+                        state["pending_bytes"] = 0
+                        continue
+                if isinstance(args, str) and args:
+                    if state["started"]:
+                        state["arg_parts"].append(args)
+                        write({
+                            "type": "content_block_delta",
+                            "index": state["index"],
+                            "delta": {"type": "input_json_delta",
+                                      "partial_json": args},
+                        })
+                    else:
+                        if state["pending_bytes"] + len(args.encode("utf-8")) \
+                                > MAX_CHAT_TOOL_PENDING_BYTES:
+                            malformed_tool_count += 1
+                            state["dropped"] = True
+                            state["pending"] = []
+                            state["pending_bytes"] = 0
+                            continue
+                        state["pending"].append(args)
+                        state["pending_bytes"] += len(args.encode("utf-8"))
+
+        def terminal(stop_reason, force_log=False):
+            nonlocal malformed_tool_count
             while open_blocks:
                 idx = open_blocks.pop()
                 write({"type": "content_block_stop", "index": idx})
+            close_open_tool_blocks(validate=False)
+            # Any tracked tool whose metadata never produced a start is
+            # incomplete — count it so the coalesced diagnostic fires.
+            for st in tool_states.values():
+                if not st["started"] and not st["dropped"]:
+                    malformed_tool_count += 1
+                    st["dropped"] = True
             delta_usage = {"input_tokens": 0, "output_tokens": 0}
             if usage.get("prompt_tokens") is not None:
                 delta_usage["input_tokens"] = usage.get("prompt_tokens")
@@ -2129,9 +2337,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "usage": delta_usage,
             })
             write({"type": "message_stop"})
+            if force_log or malformed_tool_count or overflow_tool_count \
+                    or dropped_fragment_count or unparseable_arg_count \
+                    or scalar_after_tools_dropped or frame_dropped:
+                log_tool_degradation_summary()
 
         def handle_frame(frame):
-            nonlocal chat_id, usage, first_frame, tool_calls_seen
+            nonlocal chat_id, usage, first_frame, tool_calls_seen, scalar_after_tools_dropped, malformed_tool_count
             text = frame.decode("utf-8", errors="replace")
             data_lines = [ln[5:].strip() for ln in text.splitlines()
                           if ln.startswith("data:")]
@@ -2166,28 +2378,42 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     chat_id = cid
                 start_message()
             if isinstance(delta, dict):
-                if delta.get("tool_calls") is not None:
+                if delta.get("tool_calls"):
                     tool_calls_seen = True
                 reasoning = delta.get("reasoning_content")
                 if not (isinstance(reasoning, str) and reasoning):
                     reasoning = delta.get("reasoning")
                 if isinstance(reasoning, str) and reasoning:
-                    if current_block_type != "thinking":
-                        open_thinking_block()
-                    write({
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {"type": "thinking_delta", "thinking": reasoning},
-                    })
+                    if emitted_tool_use:
+                        scalar_after_tools_dropped += 1
+                    else:
+                        if current_block_type != "thinking":
+                            open_thinking_block()
+                        write({
+                            "type": "content_block_delta",
+                            "index": current_block_index,
+                            "delta": {"type": "thinking_delta", "thinking": reasoning},
+                        })
                 content = delta.get("content")
                 if isinstance(content, str) and content:
-                    if current_block_type != "text":
-                        open_text_block()
-                    write({
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {"type": "text_delta", "text": content},
-                    })
+                    if emitted_tool_use:
+                        scalar_after_tools_dropped += 1
+                    else:
+                        if current_block_type != "text":
+                            open_text_block()
+                        write({
+                            "type": "content_block_delta",
+                            "index": current_block_index,
+                            "delta": {"type": "text_delta", "text": content},
+                        })
+                tool_calls = delta.get("tool_calls")
+                if tool_calls is not None:
+                    process_tool_calls(tool_calls)
+            elif delta:
+                # Non-dict delta shape (e.g. a string or list): cannot be a
+                # valid tool-call frame — the frame is skipped and counted in
+                # the degradation diagnostics rather than raising mid-stream.
+                malformed_tool_count += 1
             finish_reason = choice.get("finish_reason")
             if finish_reason is not None:
                 return ("finish", finish_reason)
@@ -2225,10 +2451,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     if result == "done":
                         continue
                     if isinstance(result, tuple) and result[0] == "finish":
-                        sr = _map_chat_finish_reason(result[1])
-                        if tool_calls_seen and sr == "tool_use":
-                            sr = None  # tool deltas untransformed — don't claim tool_use
-                        terminal(sr)
+                        finish_reason = result[1]
+                        if finish_reason == "tool_calls":
+                            valid = close_open_tool_blocks(validate=True)
+                            if (valid > 0 and dropped_fragment_count == 0
+                                    and overflow_tool_count == 0
+                                    and unparseable_arg_count == 0
+                                    and not (frame_dropped and emitted_tool_use)):
+                                sr = "tool_use"
+                            else:
+                                sr = None
+                            terminal(sr)
+                        elif emitted_tool_use:
+                            close_open_tool_blocks(validate=False)
+                            terminal(_map_chat_finish_reason(finish_reason),
+                                     force_log=True)
+                        else:
+                            terminal(_map_chat_finish_reason(finish_reason))
                         return first_byte_ms
                 # Memory guards for frames without a delimiter
                 if len(buf) > MAX_EVENT_BUFFER:
@@ -2256,6 +2495,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             "request_id": request_id,
                             "bytes": len(buf),
                         })
+                        frame_dropped = True
                         buf.clear()
                 if bytes_streamed > PROXY_MAX_RESPONSE_SIZE:
                     self._log_response_cap_exceeded(request_id, bytes_streamed)
