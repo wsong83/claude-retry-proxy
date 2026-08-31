@@ -1,5 +1,9 @@
 [
   {
+    "plan_id": "2026-08-31-fix-response-mode-assistant-text-content-type",
+    "summary": "Fixed the response-mode request transformer so that assistant-role historical text messages emit output_text instead of input_text in the Responses API conversion, matching the OpenAI Responses schema requirement that assistant content uses output_text or refusal. The _msg_item nested helper was made role-aware and the coalescing loop was updated to derive the content type from the item's own role using it.get('role') rather than a stale outer variable, with or [] guards against content: None. Three existing tests encoding the bug were updated, 11 new permanent tests were added covering assistant output_text, mid-history stale-role discrimination, system-role defensive path, and a schema-validating E2E mock upstream. The mega-audit caught a stale-variable trap in the original pseudocode and a wrong item-count in the verification script, both fixed before implementation. The full suite passed 209/209. CLAUDE.md was updated with the content-type architecture note. One reviewer Suggestion to extract a shared role-to-content-type helper was dismissed as non-blocking."
+  },
+  {
     "plan_id": "2026-08-31-fix-response-mode-tool-roundtrip",
     "summary": "Buffered Responses API tool-call round trips replace the single-turn text-only response-mode conversion. Full conversation history with tools tool_use and tool_result maps to ordered Responses function_call and function_call_output items. Upstream function_call output items are converted to Anthropic tool_use blocks with strict argument validation and correct stop reason tool_use when a valid call is emitted. The proxy still forces stream false for response mode. Implementation in server.py _anthropic_to_response and _response_to_anthropic with 198 tests passing including a live apinebula-codex E2E."
   },

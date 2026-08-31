@@ -1743,8 +1743,9 @@ def _anthropic_to_response(body_json, request_id=None, mode=None, provider=None,
     consumed_call_ids = set()
 
     def _msg_item(role, text):
+        ct = "output_text" if role == "assistant" else "input_text"
         return {"type": "message", "role": role,
-                "content": [{"type": "input_text", "text": text}]}
+                "content": [{"type": ct, "text": text}]}
 
     items = []
     messages = body_json.get("messages")
@@ -1922,13 +1923,16 @@ def _anthropic_to_response(body_json, request_id=None, mode=None, provider=None,
         if (coalesced and it.get("type") == "message"
                 and coalesced[-1].get("type") == "message"
                 and coalesced[-1].get("role") == it.get("role")):
-            prev_texts = [c.get("text") for c in coalesced[-1].get("content", [])
-                          if isinstance(c, dict) and c.get("type") == "input_text"
+            # Derive from the coalesced pair's shared role — the outer `role`
+            # variable from the messages loop is stale here.
+            ct = "output_text" if it.get("role") == "assistant" else "input_text"
+            prev_texts = [c.get("text") for c in (coalesced[-1].get("content") or [])
+                          if isinstance(c, dict) and c.get("type") == ct
                           and isinstance(c.get("text"), str)]
-            new_texts = [c.get("text") for c in it.get("content", [])
-                         if isinstance(c, dict) and c.get("type") == "input_text"
+            new_texts = [c.get("text") for c in (it.get("content") or [])
+                         if isinstance(c, dict) and c.get("type") == ct
                          and isinstance(c.get("text"), str)]
-            coalesced[-1]["content"] = [{"type": "input_text", "text": "\n".join(
+            coalesced[-1]["content"] = [{"type": ct, "text": "\n".join(
                 prev_texts + new_texts)}]
             continue
         coalesced.append(it)

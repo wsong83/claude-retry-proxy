@@ -8718,7 +8718,7 @@ def test_anthropic_to_response_multiple_user_messages():
         {"type": "message", "role": "user",
          "content": [{"type": "input_text", "text": "first"}]},
         {"type": "message", "role": "assistant",
-         "content": [{"type": "input_text", "text": "resp"}]},
+         "content": [{"type": "output_text", "text": "resp"}]},
         {"type": "message", "role": "user",
          "content": [{"type": "input_text", "text": "secX\nsecY"}]},
     ]
@@ -8901,7 +8901,7 @@ def test_anthropic_to_response_invalid_tool_use_degrade():
     for it in items:
         if isinstance(it, dict) and it.get("type") == "message":
             for c in it.get("content", []):
-                if isinstance(c, dict) and c.get("type") == "input_text":
+                if isinstance(c, dict) and c.get("type") in ("input_text", "output_text"):
                     texts.append(c.get("text"))
     joined = "\n".join(t for t in texts if isinstance(t, str))
     ph1 = "[Tool call failed: arguments for 'f' (call t1) could not be serialized as JSON]"
@@ -8989,6 +8989,299 @@ def test_anthropic_to_response_role_coalescing():
         fail("expected coalesced single user message, got {!r}".format(out.get("input")))
     else:
         pass_("thinking-only turn dropped; adjacent user messages coalesced")
+
+
+def test_anthropic_to_response_assistant_output_text():
+    """Assistant text block becomes output_text in the Responses input."""
+    print("\n--- Test: Anthropic To Response Assistant Output Text ---")
+    fn = _require_server_func("_anthropic_to_response")
+    if fn is None:
+        return
+    inp = {"model": "sonnet",
+           "messages": [{"role": "assistant",
+                         "content": [{"type": "text", "text": "hello"}]}]}
+    out = fn(inp)
+    expected = [{"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "hello"}]}]
+    if out.get("input") != expected:
+        fail("expected assistant output_text item, got {!r}".format(out.get("input")))
+    else:
+        pass_("assistant text block -> output_text")
+
+
+def test_anthropic_to_response_assistant_string_output_text():
+    """Assistant string content becomes output_text."""
+    print("\n--- Test: Anthropic To Response Assistant String Output Text ---")
+    fn = _require_server_func("_anthropic_to_response")
+    if fn is None:
+        return
+    out = fn({"model": "sonnet",
+              "messages": [{"role": "assistant", "content": "hello"}]})
+    items = out.get("input")
+    if not isinstance(items, list) or len(items) != 1:
+        fail("expected 1 input item, got {!r}".format(items))
+        return
+    content = items[0].get("content", [])
+    if (items[0].get("role") == "assistant" and len(content) == 1
+            and content[0].get("type") == "output_text"
+            and content[0].get("text") == "hello"):
+        pass_("assistant string content -> output_text")
+    else:
+        fail("expected assistant string content as output_text, got {!r}".format(items[0]))
+
+
+def test_anthropic_to_response_user_input_text_unchanged():
+    """User text stays input_text."""
+    print("\n--- Test: Anthropic To Response User Input Text Unchanged ---")
+    fn = _require_server_func("_anthropic_to_response")
+    if fn is None:
+        return
+    out = fn({"model": "sonnet",
+              "messages": [{"role": "user", "content": "hi"}]})
+    items = out.get("input")
+    if not isinstance(items, list) or len(items) != 1:
+        fail("expected 1 input item, got {!r}".format(items))
+        return
+    content = items[0].get("content", [])
+    if (items[0].get("role") == "user" and len(content) == 1
+            and content[0].get("type") == "input_text"
+            and content[0].get("text") == "hi"):
+        pass_("user text stays input_text")
+    else:
+        fail("expected user text as input_text, got {!r}".format(items[0]))
+
+
+def test_anthropic_to_response_assistant_coalescing():
+    """Adjacent assistant messages coalesce into a single output_text item."""
+    print("\n--- Test: Anthropic To Response Assistant Coalescing ---")
+    fn = _require_server_func("_anthropic_to_response")
+    if fn is None:
+        return
+    inp = {"model": "sonnet",
+           "messages": [
+               {"role": "assistant", "content": "part one"},
+               {"role": "assistant", "content": [
+                   {"type": "thinking", "thinking": "hmm", "signature": "s"}]},
+               {"role": "assistant", "content": "part two"},
+           ]}
+    out = fn(inp)
+    items = out.get("input")
+    if not isinstance(items, list) or len(items) != 1:
+        fail("expected 1 coalesced assistant item, got {!r}".format(items))
+        return
+    content = items[0].get("content", [])
+    if (items[0].get("role") == "assistant" and len(content) == 1
+            and content[0].get("type") == "output_text"
+            and content[0].get("text") == "part one\npart two"):
+        pass_("adjacent assistant messages coalesced with output_text")
+    else:
+        fail("expected coalesced assistant item with output_text, got {!r}".format(items[0]))
+
+
+def test_anthropic_to_response_assistant_coalescing_mid_history():
+    """Coalesced assistant item keeps output_text even with a trailing user message.
+
+    Discriminating case for the stale-role trap: the outer messages loop leaves
+    `role` bound to the last message ("user"), so a buggy implementation reading
+    the bare `role` variable would emit input_text here.
+    """
+    print("\n--- Test: Anthropic To Response Assistant Coalescing Mid History ---")
+    fn = _require_server_func("_anthropic_to_response")
+    if fn is None:
+        return
+    # Assistant pair mid-history, followed by a trailing user message.
+    inp = {"model": "sonnet",
+           "messages": [
+               {"role": "assistant", "content": "part one"},
+               {"role": "assistant", "content": [
+                   {"type": "thinking", "thinking": "hmm", "signature": "s"}]},
+               {"role": "assistant", "content": "part two"},
+               {"role": "user", "content": "trailing"},
+           ]}
+    out = fn(inp)
+    items = out.get("input")
+    if not isinstance(items, list) or len(items) != 2:
+        fail("expected 2 items (coalesced assistant + trailing user), got {!r}".format(items))
+        return
+    first = items[0]
+    first_content = first.get("content", [])
+    if (first.get("role") == "assistant" and len(first_content) == 1
+            and first_content[0].get("type") == "output_text"
+            and first_content[0].get("text") == "part one\npart two"):
+        pass_("mid-history assistant pair coalesced with output_text")
+    else:
+        fail("expected mid-history assistant coalescing with output_text, got {!r}".format(first))
+        return
+    # Symmetric: user pair mid-history, followed by a trailing assistant message.
+    inp2 = {"model": "sonnet",
+            "messages": [
+                {"role": "user", "content": "a"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "hmm", "signature": "s"}]},
+                {"role": "user", "content": "b"},
+                {"role": "assistant", "content": "trailing"},
+            ]}
+    out2 = fn(inp2)
+    items2 = out2.get("input")
+    if not isinstance(items2, list) or len(items2) != 2:
+        fail("expected 2 items (coalesced user + trailing assistant), got {!r}".format(items2))
+        return
+    first2 = items2[0]
+    first2_content = first2.get("content", [])
+    if (first2.get("role") == "user" and len(first2_content) == 1
+            and first2_content[0].get("type") == "input_text"
+            and first2_content[0].get("text") == "a\nb"):
+        pass_("mid-history user pair coalesced with input_text")
+    else:
+        fail("expected mid-history user coalescing with input_text, got {!r}".format(first2))
+
+
+def test_anthropic_to_response_user_coalescing_unchanged():
+    """Adjacent user messages still coalesce with input_text."""
+    print("\n--- Test: Anthropic To Response User Coalescing Unchanged ---")
+    fn = _require_server_func("_anthropic_to_response")
+    if fn is None:
+        return
+    inp = {"model": "sonnet",
+           "messages": [
+               {"role": "user", "content": "a"},
+               {"role": "assistant", "content": [
+                   {"type": "thinking", "thinking": "hmm", "signature": "s"}]},
+               {"role": "user", "content": "b"},
+           ]}
+    out = fn(inp)
+    items = out.get("input")
+    if not isinstance(items, list) or len(items) != 1:
+        fail("expected 1 coalesced user item, got {!r}".format(items))
+        return
+    content = items[0].get("content", [])
+    if (items[0].get("role") == "user" and len(content) == 1
+            and content[0].get("type") == "input_text"
+            and content[0].get("text") == "a\nb"):
+        pass_("adjacent user messages coalesced with input_text")
+    else:
+        fail("expected coalesced user item with input_text, got {!r}".format(items[0]))
+
+
+def test_anthropic_to_response_mixed_roles_no_coalescing():
+    """Adjacent user and assistant messages do not coalesce."""
+    print("\n--- Test: Anthropic To Response Mixed Roles No Coalescing ---")
+    fn = _require_server_func("_anthropic_to_response")
+    if fn is None:
+        return
+    inp = {"model": "sonnet",
+           "messages": [
+               {"role": "user", "content": "q"},
+               {"role": "assistant", "content": "a"},
+           ]}
+    out = fn(inp)
+    items = out.get("input")
+    if not isinstance(items, list) or len(items) != 2:
+        fail("expected 2 items (no cross-role coalescing), got {!r}".format(items))
+        return
+    user_item, asst_item = items[0], items[1]
+    ok = (user_item.get("role") == "user"
+          and user_item.get("content", [{}])[0].get("type") == "input_text"
+          and asst_item.get("role") == "assistant"
+          and asst_item.get("content", [{}])[0].get("type") == "output_text")
+    if ok:
+        pass_("adjacent user+assistant items kept separate with correct types")
+    else:
+        fail("unexpected items, got {!r}".format(items))
+
+
+def test_anthropic_to_response_system_role_input_text():
+    """System role (non-user, non-assistant) stays input_text."""
+    print("\n--- Test: Anthropic To Response System Role Input Text ---")
+    fn = _require_server_func("_anthropic_to_response")
+    if fn is None:
+        return
+    out = fn({"model": "sonnet",
+              "messages": [{"role": "system", "content": "ctx"}]})
+    items = out.get("input")
+    if not isinstance(items, list) or len(items) != 1:
+        fail("expected 1 input item, got {!r}".format(items))
+        return
+    content = items[0].get("content", [])
+    if (items[0].get("role") == "system" and len(content) == 1
+            and content[0].get("type") == "input_text"
+            and content[0].get("text") == "ctx"):
+        pass_("system role stays input_text")
+    else:
+        fail("expected system role as input_text, got {!r}".format(items[0]))
+
+
+def test_anthropic_to_response_mixed_history_content_types():
+    """Mixed history preserves order with role-appropriate content types."""
+    print("\n--- Test: Anthropic To Response Mixed History Content Types ---")
+    fn = _require_server_func("_anthropic_to_response")
+    if fn is None:
+        return
+    inp = {"model": "sonnet",
+           "messages": [
+               {"role": "user", "content": "run it"},
+               {"role": "assistant", "content": [
+                   {"type": "text", "text": "Let me check"},
+                   {"type": "tool_use", "id": "t1", "name": "f", "input": {"a": 1}},
+               ]},
+               {"role": "user", "content": [
+                   {"type": "tool_result", "tool_use_id": "t1", "content": "42"},
+                   {"type": "text", "text": "thanks"},
+               ]},
+           ]}
+    out = fn(inp)
+    items = out.get("input")
+    if not isinstance(items, list) or len(items) != 5:
+        fail("expected 5 items, got {!r}".format(items))
+        return
+    expected_kinds = ["message", "message", "function_call", "message",
+                      "function_call_output"]
+    kinds = [it.get("type") for it in items if isinstance(it, dict)]
+    if kinds != expected_kinds:
+        fail("expected item kinds {!r}, got {!r}".format(expected_kinds, kinds))
+        return
+    checks = [
+        (items[0], "user", "input_text", "run it"),
+        (items[1], "assistant", "output_text", "Let me check"),
+        (items[3], "user", "input_text", "thanks"),
+    ]
+    ok = True
+    for item, role, ct, text in checks:
+        content = item.get("content", [])
+        if not (item.get("role") == role and len(content) == 1
+                and content[0].get("type") == ct
+                and content[0].get("text") == text):
+            fail("expected {} item with {} {!r}, got {!r}".format(role, ct, text, item))
+            ok = False
+    if items[2].get("call_id") != "t1":
+        fail("expected function_call for t1, got {!r}".format(items[2]))
+        ok = False
+    if items[4].get("call_id") != "t1" or items[4].get("output") != "42":
+        fail("expected function_call_output for t1, got {!r}".format(items[4]))
+        ok = False
+    if ok:
+        pass_("mixed history preserves order with role-appropriate content types")
+
+
+def test_anthropic_to_response_assistant_empty_string_content():
+    """Empty-string assistant content is emitted as an output_text item."""
+    print("\n--- Test: Anthropic To Response Assistant Empty String Content ---")
+    fn = _require_server_func("_anthropic_to_response")
+    if fn is None:
+        return
+    out = fn({"model": "sonnet",
+              "messages": [{"role": "assistant", "content": ""}]})
+    items = out.get("input")
+    if not isinstance(items, list) or len(items) != 1:
+        fail("expected 1 input item, got {!r}".format(items))
+        return
+    content = items[0].get("content", [])
+    if (items[0].get("role") == "assistant" and len(content) == 1
+            and content[0].get("type") == "output_text"
+            and content[0].get("text") == ""):
+        pass_("empty-string assistant content -> output_text with empty text")
+    else:
+        fail("expected empty assistant string as output_text, got {!r}".format(items[0]))
 
 
 def test_anthropic_to_response_flat_tools():
@@ -11166,7 +11459,7 @@ def test_response_mode_e2e_json():
             {"type": "message", "role": "user",
              "content": [{"type": "input_text", "text": "one"}]},
             {"type": "message", "role": "assistant",
-             "content": [{"type": "input_text", "text": "two"}]},
+             "content": [{"type": "output_text", "text": "two"}]},
             {"type": "message", "role": "user",
              "content": [{"type": "input_text", "text": "three"}]},
         ]
@@ -11181,6 +11474,99 @@ def test_response_mode_e2e_json():
                 and "messages" not in ubody
                 and ubody.get("input") == expected_input):
             pass_("response mode e2e transform round-trips")
+    finally:
+        cleanup()
+
+
+def test_response_mode_assistant_output_text_e2e():
+    """E2E: schema-validating mock upstream enforces role-appropriate content types.
+
+    The mock rejects any Responses input item whose content type does not match
+    its role (assistant must use output_text, non-assistant input_text) with a
+    400; the proxy's transformed request must pass validation.
+    """
+    print("\n--- Test: Response Mode Assistant Output Text E2E ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K",
+                     "mode": "response"}}
+    state = {"parse_ok": False, "validated_items": 0, "violations": []}
+    resp_ok = json.dumps({
+        "id": "resp_1", "object": "response", "created_at": 1, "model": "gpt-4o",
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok",
+                                 "annotations": []}]}],
+        "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+    }).encode()
+
+    def responder(info):
+        try:
+            ubody = json.loads(info["body"])
+        except Exception:
+            state["parse_ok"] = False
+            err = json.dumps({"error": {"message": "schema validation failed: "
+                                                  "body not JSON"}}).encode()
+            return 400, "application/json", err
+        state["parse_ok"] = True
+        for item in ubody.get("input", []):
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            role = item.get("role")
+            expected_ct = "output_text" if role == "assistant" else "input_text"
+            state["validated_items"] += 1
+            for block in item.get("content", []):
+                if isinstance(block, dict) and block.get("type") != expected_ct:
+                    state["violations"].append(
+                        "role {!r} has block type {!r}, expected {!r}".format(
+                            role, block.get("type"), expected_ct))
+        if state["violations"]:
+            err = json.dumps({"error": {"message": "schema validation failed: "
+                                                   + "; ".join(state["violations"])}}).encode()
+            return 400, "application/json", err
+        return 200, "application/json", resp_ok
+
+    responders = {"p": responder}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        body = json.dumps({"model": "sonnet",
+                           "messages": [{"role": "user", "content": "q1"},
+                                        {"role": "assistant", "content": "a1"},
+                                        {"role": "user", "content": "q2"}],
+                           "stream": False})
+        status, resp_body = _send_proxy_request(proxy_port, body=body)
+        if status != 200:
+            fail("expected 200, got {} body={!r}".format(status, resp_body[:200]))
+            return
+        reqs = mock_servers["p"]["requests"]
+        if len(reqs) != 1:
+            fail("expected exactly 1 upstream request, got {}".format(len(reqs)))
+            return
+        if not state["parse_ok"] or state["validated_items"] != 3 or state["violations"]:
+            fail("mock validation did not pass cleanly: parse_ok={!r} "
+                 "validated={!r} violations={!r}".format(
+                     state["parse_ok"], state["validated_items"], state["violations"]))
+            return
+        try:
+            data = json.loads(resp_body)
+        except Exception:
+            fail("proxy response is not valid JSON: {!r}".format(resp_body[:200]))
+            return
+        if data.get("type") != "message":
+            fail("expected Anthropic message response, got type {!r}".format(data.get("type")))
+        if data.get("role") != "assistant":
+            fail("expected role assistant, got {!r}".format(data.get("role")))
+        if data.get("stop_reason") != "end_turn":
+            fail("expected stop_reason end_turn, got {!r}".format(data.get("stop_reason")))
+        if data.get("content") != [{"type": "text", "text": "ok"}]:
+            fail("expected content [text ok], got {!r}".format(data.get("content")))
+        else:
+            pass_("schema-validating upstream accepted role-appropriate "
+                   "content types; round-trip ok")
     finally:
         cleanup()
 
@@ -11844,6 +12230,16 @@ ALL_TESTS = [
     ("anthropic-to-response-empty-dict-arguments", test_anthropic_to_response_empty_dict_arguments),
     ("anthropic-to-response-mixed-text-and-tool-use", test_anthropic_to_response_mixed_text_and_tool_use),
     ("anthropic-to-response-role-coalescing", test_anthropic_to_response_role_coalescing),
+    ("anthropic-to-response-assistant-output-text", test_anthropic_to_response_assistant_output_text),
+    ("anthropic-to-response-assistant-string-output-text", test_anthropic_to_response_assistant_string_output_text),
+    ("anthropic-to-response-user-input-text-unchanged", test_anthropic_to_response_user_input_text_unchanged),
+    ("anthropic-to-response-assistant-coalescing", test_anthropic_to_response_assistant_coalescing),
+    ("anthropic-to-response-assistant-coalescing-mid-history", test_anthropic_to_response_assistant_coalescing_mid_history),
+    ("anthropic-to-response-user-coalescing-unchanged", test_anthropic_to_response_user_coalescing_unchanged),
+    ("anthropic-to-response-mixed-roles-no-coalescing", test_anthropic_to_response_mixed_roles_no_coalescing),
+    ("anthropic-to-response-system-role-input-text", test_anthropic_to_response_system_role_input_text),
+    ("anthropic-to-response-mixed-history-content-types", test_anthropic_to_response_mixed_history_content_types),
+    ("anthropic-to-response-assistant-empty-string-content", test_anthropic_to_response_assistant_empty_string_content),
     ("anthropic-to-response-flat-tools", test_anthropic_to_response_flat_tools),
     ("anthropic-to-response-tool-choice-mapping", test_anthropic_to_response_tool_choice_mapping),
     ("anthropic-to-response-no-input-mutation", test_anthropic_to_response_no_input_mutation),
@@ -11889,6 +12285,7 @@ ALL_TESTS = [
     ("chat-sse-reasoning-then-text-transition", test_chat_sse_reasoning_then_text_transition),
     ("chat-mode-e2e-json", test_chat_mode_e2e_json),
     ("response-mode-e2e-json", test_response_mode_e2e_json),
+    ("response-mode-assistant-output-text-e2e", test_response_mode_assistant_output_text_e2e),
     ("response-mode-tool-loop-e2e", test_response_mode_tool_loop_e2e),
     ("anthropic-mode-unchanged", test_anthropic_mode_unchanged),
     ("chat-mode-non-2xx-passthrough", test_chat_mode_non_2xx_passthrough),
