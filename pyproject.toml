@@ -43,4 +43,4 @@ Homepage = "https://github.com/anthropics/claude-code"
 where = ["src"]
 
 [tool.setuptools.package-data]
-claude_retry_proxy = ["admin.html", "config-template.json"]
+claude_retry_proxy = ["admin.html"]

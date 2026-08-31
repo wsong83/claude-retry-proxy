@@ -49,8 +49,10 @@ Requires `setuptools >= 64` (for PEP 660 src-layout editable installs). Python
 #    ANTHROPIC_API_KEY = <any value — the proxy injects the real key>
 
 # 2. Prepare ~/.claude/keys-index.json with your provider URLs and API keys.
+#    Copy the template: src/templates/keys-index.json → ~/.claude/keys-index.json
 #    Can be plain JSON (convenient for testing/automation) or encrypted
 #    with `vim -n -x` (blowfish2, VimCrypt~03!, recommended for production).
+#    See "Keys file" section below for format details.
 
 # 3. Start the proxy (prompts for passphrase if keys are encrypted;
 #    starts immediately if keys are plain JSON)
@@ -141,6 +143,10 @@ for non-interactive use.
 
 ### Config file (`~/.claude/proxy/config.json`)
 
+A template is provided at [`src/templates/config.json`](src/templates/config.json). On first
+`claude-retry-proxy start`, if `~/.claude/proxy/config.json` doesn't exist,
+the template is copied there automatically.
+
 Maps each tier to a provider and model name. Editable via the admin page or
 directly on disk (use `claude-retry-proxy reload` after manual edits).
 
@@ -178,6 +184,9 @@ shipped config template sets it to `true`.
 
 ### Keys file format (`~/.claude/keys-index.json`)
 
+A template is provided at [`src/templates/keys-index.json`](src/templates/keys-index.json). Copy it to
+`~/.claude/keys-index.json` and fill in your provider details.
+
 The keys file can be either:
 
 - **Encrypted** (recommended for production): Encrypt with `vim -n -x
@@ -201,7 +210,7 @@ at the start of the file. The JSON structure is the same in both cases:
       "key": "sk-ant-api03-your-key-here"
     },
     "provider-b": {
-      "url": "https://api.openai.com/v1",
+      "url": "https://api.openai.com",
       "key": "sk-your-openai-key",
       "mode": "chat"
     }

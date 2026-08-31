@@ -20,7 +20,8 @@ PROXY_DIR = os.path.join(HOME, ".claude", "proxy")
 PROXY_STATE_FILE = os.environ.get("PROXY_STATE_FILE", os.path.join(PROXY_DIR, "proxy-state.json"))
 CONFIG_FILE = os.path.join(PROXY_DIR, "config.json")
 KEYS_FILE = os.path.join(HOME, ".claude", "keys-index.json")
-CONFIG_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "config-template.json")
+_src_root = os.path.dirname(os.path.dirname(__file__))
+CONFIG_TEMPLATE_PATH = os.path.join(_src_root, "templates", "config.json")
 
 # Trace file defaults — MUST mirror server.py main()'s resolution so the CLI
 # prunes the same file the server writes to.

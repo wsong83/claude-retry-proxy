@@ -26,7 +26,8 @@ src/claude_retry_proxy/
   cli.py                the claude-retry-proxy CLI: start / stop / status / reload (passphrase prompt, config validation, no URL swap)
   vimcrypt.py           vim blowfish2 (VimCrypt~03!) decryption (derived from claude-config bin/vimcrypt.py)
   admin.html            admin page for hot-switching tier mappings (served at /admin/)
-  config-template.json  template for ~/.claude/proxy/config.json (copied on first start)
+src/templates/
+  config.json  template for ~/.claude/proxy/config.json (copied on first start)
 tests/
   test_claude_proxy.py  behavioral tests (tier routing, model rewriting, admin API, config validation, key decryption, retry, streaming, disconnect, trace)
 scripts/
@@ -354,7 +355,8 @@ No other supplementary docs.
 
 ```json
 [
-  {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "deferred": "2026-08-29", "target_repo": null}
+  {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "deferred": "2026-08-29", "target_repo": null},
+  {"issue_id": "opencode-zen-claude-rejects-extra-inputs", "title": "Anthropic mode: non-standard fields like context_management rejected by third-party providers", "deferred": "2026-08-28", "target_repo": null}
 ]
 ```
 

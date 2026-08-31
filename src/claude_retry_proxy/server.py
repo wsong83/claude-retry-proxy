@@ -69,7 +69,8 @@ PROXY_TRACE_FILE = _env_str("PROXY_TRACE_FILE", _default_trace)
 
 # Config paths
 DEFAULT_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".claude", "proxy", "config.json")
-CONFIG_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "config-template.json")
+_src_root = os.path.dirname(os.path.dirname(__file__))
+CONFIG_TEMPLATE_PATH = os.path.join(_src_root, "templates", "config.json")
 _default_keys = os.path.join(os.path.expanduser("~"), ".claude", "keys-index.json")
 PROXY_KEYS_PATH = _env_str("PROXY_KEYS_PATH", _default_keys)
 
@@ -303,7 +304,7 @@ def write_config(path, config):
 
 
 def install_template(dest_path):
-    """Copy config-template.json from package data to dest_path."""
+    """Copy config.json template from src/templates/ to dest_path."""
     import shutil
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     shutil.copy2(CONFIG_TEMPLATE_PATH, dest_path)
