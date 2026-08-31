@@ -87,7 +87,7 @@ paths resolve against cwd), `--all` (log full request/response bodies),
        `count_tokens` returns 400 for chat/response modes.
      - **Request body:** model-only rewrite for anthropic; full
        Anthropic→Chat-Completions transform for chat; Anthropic→Responses
-       transform for response (stream forced false, single-turn).
+       transform for response (buffered: full text/tool history, stream forced false).
      - **Response body (2xx only):** model-only rewrite for anthropic;
        Chat-Completions→Anthropic transform for chat; Responses→Anthropic
        transform for response. Error responses (non-2xx) pass through untransformed.
@@ -282,9 +282,24 @@ does not block startup on failure).
   stderr warning for each vendor without an explicit mode. Invalid modes
   return 500 at request time. Chat mode transforms the request to OpenAI
   Chat Completions format and the response back to Anthropic Messages
-  format; response mode transforms to OpenAI Responses format (single-turn,
-  stream forced false). Error responses (non-2xx) pass through untransformed.
-  `count_tokens` returns 400 for chat/response modes (no OpenAI equivalent).
+  format; response mode transforms to OpenAI Responses format (buffered:
+  full text/tool history, stream forced false). Error responses (non-2xx)
+  pass through untransformed. `count_tokens` returns 400 for chat/response
+  modes (no OpenAI equivalent).
+  **Response-mode request transform:** the full conversation history is
+  converted to ordered Responses input items: text becomes `message` items,
+  `tool_use` becomes `function_call` with validated arguments, `tool_result`
+  becomes `function_call_output` only when its `tool_use_id` matches a
+  preceding emitted call. Anthropic tool definitions are converted to flat
+  Responses function-tool shape (`type`, `name`, `description`, `parameters`);
+  `tool_choice` is mapped against validated emitted tool names.
+  **Response-mode response transform:** every output item is inspected in
+  order; `function_call` items map to `tool_use` blocks with strict argument
+  validation (dict-accepted, `{}` valid for zero-arg tools, malformed
+  arguments degrade to visible placeholder + metadata-only trace event).
+  `stop_reason` is `"tool_use"` when at least one valid function call was
+  emitted; `null` when calls were seen but all degraded; otherwise
+  `"end_turn"` (completed) or `null` (other status).
   **Chat-mode request transform:** messages are converted via
   `_transform_anthropic_messages_to_chat()` (thinking blocks converted to
   `reasoning_content` on the assistant message, redacted_thinking with non-empty
@@ -313,12 +328,15 @@ does not block startup on failure).
   arguments) fires once per affected stream when any tool delta cannot
   form a valid `tool_use` block. The non-streaming path correctly
   transforms tool_use/tool_result in both request and response. Image
-  content blocks are deferred (see `tmp/reports/defer-issue-*.json`). Response mode is
-  usable only by non-streaming clients (forces `stream: false`). Chat-mode
+  content blocks are deferred (see `tmp/reports/defer-issue-*.json`). Response mode
+  is buffered-only (forces `stream: false`) and converts the full conversation
+  history including text, tools, tool_use, and tool_result items to the
+  Responses API format; upstream `function_call` output items are mapped back
+  to Anthropic `tool_use` blocks. Chat-mode
   SSE is synthesized from OpenAI SSE (frame-assembled on `\n\n`, terminal
   synthesized on EOF).
 - **Malformed tool arguments in chat mode.** When `_chat_to_anthropic` encounters tool-call arguments that cannot be parsed as a JSON dict (including `json.JSONDecodeError`, non-dict parse results, empty dicts, non-dict `function` values, and non-dict tool-call entries), it emits a user-visible text block `[Tool call failed: arguments for '<name>' (call <id>) could not be parsed as JSON]` instead of a `tool_use` block with `input: {}`. A `tool_args_parse_failure` trace event is also logged. When all tool calls in a response are malformed, `stop_reason` is forced to `None` to prevent the client from hanging on `stop_reason: "tool_use"` with zero tool_use blocks. **Request-transform path:** `_transform_anthropic_messages_to_chat` applies the same degradation pattern for NaN/Infinity/non-dict `tool_use.input` values (rejected by `json.dumps(input, allow_nan=False)`), emitting the placeholder `[Tool call failed: arguments for '<name>' (call <id>) could not be serialized as JSON]` and a `tool_args_parse_failure` trace event. When a failed tool_use coexists with valid tool_use(s) in the same assistant message, the placeholder is emitted as a separate assistant message before the tool_calls message (content: null). (Behavior changes landed 2026-08-28 and 2026-08-29.)
-- **Test suite is safe alongside a live proxy.** The test suite now sets `os.environ["PROXY_STATE_FILE"]` to a session temp path at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read `PROXY_STATE_FILE` from the env, so test proxies use an isolated state file and can never touch the live proxy's `~/.claude/proxy/proxy-state.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite (180 tests) passes with the live proxy up (landed 2026-08-28, updated 2026-08-30).
+- **Test suite is safe alongside a live proxy.** The test suite now sets `os.environ["PROXY_STATE_FILE"]` to a session temp path at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read `PROXY_STATE_FILE` from the env, so test proxies use an isolated state file and can never touch the live proxy's `~/.claude/proxy/proxy-state.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite (198 tests) passes with the live proxy up (landed 2026-08-28, updated 2026-08-31).
 
 ## Documentation
 
@@ -340,6 +358,10 @@ does not block startup on failure).
   streaming tool-call delta conversion: `delta.tool_calls` → Anthropic
   `tool_use` SSE with per-index state, dict-only validation, and
   metadata-only degradation diagnostics.
+- [plans/2026-08-31-fix-response-mode-tool-roundtrip.md](plans/2026-08-31-fix-response-mode-tool-roundtrip.md) — response-mode
+  buffered tool-call round trips: full text/tool history → Responses items,
+  `function_call` → `tool_use`, flat function tools, strict validation, and
+  correct stop reasons.
 - [plans/2026-08-27-support-three-endpoint-modes.md](plans/2026-08-27-support-three-endpoint-modes.md) — three-endpoint-mode
   dispatch (anthropic/chat/response) with full request/response transformation
   and SSE streaming.

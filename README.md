@@ -228,7 +228,7 @@ Three modes are supported:
 |------|-------------|-------------|-------------|
 | `anthropic` | `{url}/v1/messages` | `x-api-key` | Anthropic Messages API (default). Request/response body is model-name-rewritten only. SSE streaming forwarded+rewritten verbatim. |
 | `chat` | `{url}/v1/chat/completions` | `Authorization: Bearer` | OpenAI Chat Completions API. Request body transformed from Anthropic Messages to Chat Completions format; response body transformed back to Anthropic Messages. SSE streaming is synthesized from OpenAI SSE. `count_tokens` returns 400. |
-| `response` | `{url}/v1/responses` | `Authorization: Bearer` | OpenAI Responses API. Request body transformed from Anthropic Messages to Responses format (single-turn, stream forced false); response body transformed back to Anthropic Messages. `count_tokens` returns 400. |
+| `response` | `{url}/v1/responses` | `Authorization: Bearer` | OpenAI Responses API. Request body transformed from Anthropic Messages to Responses format (buffered: full text/tool history, stream forced false); response body transformed back to Anthropic Messages. `count_tokens` returns 400. |
 
 When `mode` is absent, `null`, or empty, it defaults to `"anthropic"`.
 Invalid modes return a 500 error at request time. Startup validates the
@@ -242,8 +242,9 @@ stripped first to avoid doubling (e.g., `https://api.openai.com/v1` →
 `https://api.openai.com/v1/chat/completions`, not
 `/v1/v1/chat/completions`).
 
-**Limitations:** Response mode is single-turn only (extracts only the last
-user message as `input`, discards conversation history). Chat-mode
+**Limitations:** Response mode is buffered-only (stream forced false) and
+converts the full conversation history including text, tools, tool_use, and
+tool_result items to the Responses API format. Chat-mode
 non-streaming requests correctly transform tool_use/tool_result in both
 directions (thinking blocks converted to reasoning_content, tool_use→tool_calls, tool_result→role:tool).
 Chat-mode streaming correctly converts tool-call SSE deltas to Anthropic
