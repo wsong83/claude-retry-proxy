@@ -226,7 +226,7 @@ Three modes are supported:
 
 | Mode | API Endpoint | Auth Header | Description |
 |------|-------------|-------------|-------------|
-| `anthropic` | `{url}/v1/messages` | `x-api-key` | Anthropic Messages API (default). Request/response body is model-name-rewritten only. SSE streaming forwarded+rewritten verbatim. |
+| `anthropic` | `{url}/v1/messages` | `x-api-key` | Anthropic Messages API (default). Request/response body is model-name-rewritten; the `context_management` field is conditionally stripped for learned-unsupported providers. SSE streaming forwarded+rewritten verbatim. |
 | `chat` | `{url}/v1/chat/completions` | `Authorization: Bearer` | OpenAI Chat Completions API. Request body transformed from Anthropic Messages to Chat Completions format; response body transformed back to Anthropic Messages. SSE streaming is synthesized from OpenAI SSE. `count_tokens` returns 400. |
 | `response` | `{url}/v1/responses` | `Authorization: Bearer` | OpenAI Responses API. Request body transformed from Anthropic Messages to Responses format (buffered: full text/tool history, stream forced false); response body transformed back to Anthropic Messages. `count_tokens` returns 400. |
 

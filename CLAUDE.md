@@ -29,7 +29,20 @@ src/claude_retry_proxy/
 src/templates/
   config.json  template for ~/.claude/proxy/config.json (copied on first start)
 tests/
-  test_claude_proxy.py  behavioral tests (tier routing, model rewriting, admin API, config validation, key decryption, retry, streaming, disconnect, trace)
+  test_claude_proxy.py  test suite aggregator (entry point: `python tests/test_claude_proxy.py`)
+  _harness.py           shared test harness (env isolation, helper functions, proxy lifecycle)
+  test_compat.py        compatibility learning tests (persistence, detector, state machine, concurrency)
+  test_admin.py         admin API tests
+  test_chat_sse.py      chat-mode SSE streaming tests
+  test_chat_transform.py  chat-mode request/response transform tests
+  test_cli.py           CLI lifecycle tests (start/stop/status)
+  test_config_keys.py   config validation and key decryption tests
+  test_mode_dispatch.py mode dispatch and auth header tests
+  test_response_transform.py  response-mode transform tests
+  test_retry_streaming.py  retry, streaming, and buffered-response-cap tests
+  test_tier_routing.py  tier routing and model resolution tests
+  test_trace.py         trace logging and analysis tests
+  test_unit.py          unit-level tests (jitter, delay, helpers)
 scripts/
   analyze_proxy_trace.py  trace log analysis tool (model stats, latency, success rates)
 pyproject.toml   setuptools src-layout, console scripts, cryptography dependency
@@ -99,7 +112,10 @@ paths resolve against cwd), `--all` (log full request/response bodies),
      before: `PROXY_INITIAL_DELAY * 2**attempt`, capped at `PROXY_MAX_DELAY`,
      ±25% jitter, thread-local RNG). **429 retries use `PROXY_MAX_DELAY`**
      directly; 503 and connection errors use the exponential. Request body is
-     built once before the retry loop — never re-transformed on retry.
+     built once before the retry loop — never re-transformed on retry. A
+     compatibility-retry stripped variant is derived from the already-transformed
+     outbound body after a recognized 400 rejection (single-attempt, same
+     config/vendors snapshot, `suppress_compat=True`).
   6. **Response model rewriting**: the tier name is resolved from the request
      body at entry and threaded through the call chain. For anthropic-mode SSE
      (`text/event-stream`): buffer first event (64 KB cap), rewrite `model` in
@@ -167,10 +183,12 @@ paths resolve against cwd), `--all` (log full request/response bodies),
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | Trace log path |
 | `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | Keys file path (encrypted or plain JSON) |
 | `PROXY_STATE_FILE` | `~/.claude/proxy/proxy-state.json` | State file path override (added 2026-08-28). The server heartbeat writes PID/port/start_time to this file; `claude-retry-proxy stop`/`status`/`reload` read it. Override for test isolation. |
+| `PROXY_FEATURE_COMPAT_FILE` | `~/.claude/proxy/feature-compatibility.json` | Compatibility state file path (added 2026-09-02). Stores learned per-provider field incompatibility. Override for test isolation. |
 
 Runtime artifacts (all under `~/.claude/`, paths overridable via env vars — see table above):
 `proxy/config.json`, `proxy/proxy-state.json`,
-`proxy/proxy-stderr.log`, `logs/proxy-trace.jsonl`. The trace log is pruned of
+`proxy/proxy-stderr.log`, `logs/proxy-trace.jsonl`,
+`proxy/feature-compatibility.json`. The trace log is pruned of
 entries older than 5 days on each `claude-retry-proxy start` (best-effort;
 does not block startup on failure).
 
@@ -225,18 +243,25 @@ does not block startup on failure).
   connection-error exhaustion, a synthesized `upstream_unreachable` JSON body
   is returned. Preserved bodies flow into the `--all` trace log — on Windows
   the trace file is world-readable (see `--all` gotcha above).
-- **`response-streaming-no-size-cap` is partially addressed.** The give-up
-  drain is capped, and the SSE first-event buffer is capped at 64 KB, but
-  the **streaming success path** (the `read1` loop in
-  `_stream_upstream_response` for events after the first) is still uncapped.
-  The Open issue tracked in `## Future Work` remains open for the streaming
-  path.
+- **Response size caps** are applied at `PROXY_MAX_RESPONSE_SIZE` on all four
+  streaming loops (silently writing the response, client-disconnect aware,
+  and the two audit paths) and on all three buffered read loops in
+  `_forward_core` (2xx application/json, 2xx other-content-type for
+  chat/response, and non-2xx). Each truncation emits a
+  `response_size_cap_exceeded` trace event. The give-up drain remains capped
+  at `PROXY_MAX_BODY_SIZE` via `_read_capped`.
 - **Streaming disconnect catch is scoped to `_DISCONNECT_ERRORS`.** A
   non-standard client-write `OSError` outside that tuple (e.g.
   WSAENOBUFS/WSAENOTSOCK/ENOTCONN) can propagate into `forward_request`'s
   retry `except` after headers were sent, re-issuing the upstream POST. All
   realistic disconnect classes are caught; accepted residual (reviewer
-  Warning, non-blocking).
+  Warning, non-blocking). **Compatibility probe impact:** if this residual
+  fires during a streamed probe response (probe owner holds
+  `_compat_retry_lock`), the retry loop re-issues the unstripped probe POST,
+  and a duplicate outcome can spuriously double the threshold or reset
+  probation. Probability is negligible (exotic WSAENOBUFS-class, Windows
+  only); consequence is bounded (one spurious doubling, next probe cycle
+  revalidates). Accepted residual — documented for awareness.
 - **`/admin/shutdown` can block during retry sleep.** Graceful shutdown waits
   for in-flight requests to finish, and a request mid-retry-backoff holds its
   worker thread for up to `PROXY_MAX_RETRIES * jittered_max_delay`, so shutdown
@@ -338,7 +363,7 @@ does not block startup on failure).
   SSE is synthesized from OpenAI SSE (frame-assembled on `\n\n`, terminal
   synthesized on EOF).
 - **Malformed tool arguments in chat mode.** When `_chat_to_anthropic` encounters tool-call arguments that cannot be parsed as a JSON dict (including `json.JSONDecodeError`, non-dict parse results, empty dicts, non-dict `function` values, and non-dict tool-call entries), it emits a user-visible text block `[Tool call failed: arguments for '<name>' (call <id>) could not be parsed as JSON]` instead of a `tool_use` block with `input: {}`. A `tool_args_parse_failure` trace event is also logged. When all tool calls in a response are malformed, `stop_reason` is forced to `None` to prevent the client from hanging on `stop_reason: "tool_use"` with zero tool_use blocks. **Request-transform path:** `_transform_anthropic_messages_to_chat` applies the same degradation pattern for NaN/Infinity/non-dict `tool_use.input` values (rejected by `json.dumps(input, allow_nan=False)`), emitting the placeholder `[Tool call failed: arguments for '<name>' (call <id>) could not be serialized as JSON]` and a `tool_args_parse_failure` trace event. When a failed tool_use coexists with valid tool_use(s) in the same assistant message, the placeholder is emitted as a separate assistant message before the tool_calls message (content: null). (Behavior changes landed 2026-08-28 and 2026-08-29.)
-- **Test suite is safe alongside a live proxy.** The test suite now sets `os.environ["PROXY_STATE_FILE"]` to a session temp path at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read `PROXY_STATE_FILE` from the env, so test proxies use an isolated state file and can never touch the live proxy's `~/.claude/proxy/proxy-state.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite (209 tests) passes with the live proxy up (landed 2026-08-28, updated 2026-08-31).
+- **Test suite is safe alongside a live proxy.** The test suite sets `os.environ["PROXY_STATE_FILE"]` and `os.environ["PROXY_FEATURE_COMPAT_FILE"]` to session temp paths at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read these env vars at import time, so test proxies use isolated state files and can never touch the live proxy's `~/.claude/proxy/proxy-state.json` or `~/.claude/proxy/feature-compatibility.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite (253 tests across 12 modules: `tests/_harness.py` + `tests/test_compat.py` + 10 cluster modules + `tests/test_claude_proxy.py` aggregator) passes with the live proxy up (landed 2026-08-28, updated 2026-09-02).
 
 ## Documentation
 
@@ -364,6 +389,10 @@ does not block startup on failure).
   buffered tool-call round trips: full text/tool history → Responses items,
   `function_call` → `tool_use`, flat function tools, strict validation, and
   correct stop reasons.
+- [plans/2026-09-01-learn-context-management-compatibility.md](plans/2026-09-01-learn-context-management-compatibility.md) — per-upstream
+  `context_management` compatibility learner: automatic detection, stripping,
+  request-count revalidation, and two-success delisting for Anthropic-mode
+  third-party providers.
 - [plans/2026-08-27-support-three-endpoint-modes.md](plans/2026-08-27-support-three-endpoint-modes.md) — three-endpoint-mode
   dispatch (anthropic/chat/response) with full request/response transformation
   and SSE streaming.
@@ -379,8 +408,7 @@ No other supplementary docs.
 
 ```json
 [
-  {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "deferred": "2026-08-29", "target_repo": null},
-  {"issue_id": "opencode-zen-claude-rejects-extra-inputs", "title": "Anthropic mode: non-standard fields like context_management rejected by third-party providers", "deferred": "2026-08-28", "target_repo": null}
+  {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "deferred": "2026-08-29", "target_repo": null}
 ]
 ```
 

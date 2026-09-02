@@ -151,7 +151,7 @@ ALLOWED_METHODS = {"POST", "OPTIONS"}
 
 # Headers forwarded to upstream
 FORWARD_HEADERS = {"authorization", "x-api-key", "content-type",
-                   "anthropic-version", "accept"}
+                   "anthropic-version", "accept", "anthropic-beta"}
 
 # Provider endpoint modes
 MODE_VALUES = ("anthropic", "chat", "response")
@@ -598,6 +598,454 @@ def _read_capped(resp, max_bytes):
 
 
 # ---------------------------------------------------------------------------
+# Feature compatibility learning (Anthropic mode, single feature)
+# ---------------------------------------------------------------------------
+
+# Maintainer-tunable policy constants (no user-facing configuration surface).
+COMPAT_INITIAL_THRESHOLD = 32      # strips before first revalidation probe
+COMPAT_PROBATION_THRESHOLD = 8     # strips between probation probes
+COMPAT_BACKOFF_MULTIPLIER = 2      # threshold multiplier on repeated rejection
+COMPAT_MAX_THRESHOLD = 4096        # maximum strip threshold
+COMPAT_DELISTING_SUCCESSES = 2     # successful probes to delist
+COMPAT_MAX_RETRIES_PER_REQUEST = 1 # maximum compatibility retries per client request
+COMPAT_FAILED_CONFIRMATION_SUPPRESSION = 3  # failed confirmations before suppression
+
+# The single learnable feature. Field names from upstream error bodies are
+# compared against this constant and never copied into state keys, strip
+# logic, or trace events.
+COMPAT_FEATURE = "context_management"
+COMPAT_FEATURE_MODE = "anthropic"
+COMPAT_SCHEMA_VERSION = 1
+
+PROXY_FEATURE_COMPAT_FILE = _env_str(
+    "PROXY_FEATURE_COMPAT_FILE",
+    os.path.join(os.path.expanduser("~"), ".claude", "proxy",
+                 "feature-compatibility.json"))
+
+COMPAT_STATE_UNSUPPORTED = "unsupported"
+COMPAT_STATE_PROBATION = "probation"
+
+# In-memory learned state: {key_string: entry_dict}
+_compat_state = {}
+# Per-key in-memory failed-confirmation counters: {key_string: int}
+_compat_failed_confirmations = {}
+# Per-key counters of matching requests seen while suppression is active:
+# re-enters discovery after COMPAT_INITIAL_THRESHOLD matching requests.
+_compat_suppressed_seen = {}
+# Rate limiter for compatibility_persist_failed trace events: {key_string: ts}
+_compat_persist_warned = {}
+
+# Fast lock: protects _compat_state / _compat_failed_confirmations and
+# serializes persistence I/O (built under the lock).
+_compat_state_lock = threading.Lock()
+# Slow-path lock: at most one in-flight compatibility retry/probe globally.
+# Acquired with blocking=False; held for the duration of the upstream HTTP
+# call; released in finally on every outcome.
+_compat_retry_lock = threading.Lock()
+
+
+def _compat_validate_constants():
+    """Validate tuning-constant relationships at startup; warn and clamp."""
+    global COMPAT_INITIAL_THRESHOLD, COMPAT_BACKOFF_MULTIPLIER, \
+        COMPAT_DELISTING_SUCCESSES
+    if COMPAT_BACKOFF_MULTIPLIER < 2:
+        print("[proxy] WARNING: COMPAT_BACKOFF_MULTIPLIER must be >= 2 — "
+              "clamped to 2", file=sys.stderr)
+        COMPAT_BACKOFF_MULTIPLIER = 2
+    if COMPAT_DELISTING_SUCCESSES < 2:
+        print("[proxy] WARNING: COMPAT_DELISTING_SUCCESSES must be >= 2 — "
+              "clamped to 2", file=sys.stderr)
+        COMPAT_DELISTING_SUCCESSES = 2
+    if COMPAT_INITIAL_THRESHOLD > COMPAT_MAX_THRESHOLD:
+        print("[proxy] WARNING: COMPAT_INITIAL_THRESHOLD exceeds "
+              "COMPAT_MAX_THRESHOLD — clamped", file=sys.stderr)
+        COMPAT_INITIAL_THRESHOLD = COMPAT_MAX_THRESHOLD
+
+
+def _compat_key(provider, mode, actual_model):
+    """Build the in-memory state key for a learned entry."""
+    return (provider, mode, actual_model, COMPAT_FEATURE)
+
+
+def _compat_file_key(key):
+    """Serialize a state key tuple for the persisted dict (unambiguous separator)."""
+    return "\x1f".join(key)
+
+
+def _compat_parse_file_key(key_str):
+    return tuple(key_str.split("\x1f"))
+
+
+def _compat_normalize_threshold(threshold):
+    """Snap an arbitrary threshold onto the doubling ladder [initial, max].
+
+    Returns the largest ladder element (initial * multiplier^k) that does not
+    exceed min(threshold, max), floored at COMPAT_INITIAL_THRESHOLD.
+    """
+    t = COMPAT_INITIAL_THRESHOLD
+    while t * COMPAT_BACKOFF_MULTIPLIER <= min(threshold, COMPAT_MAX_THRESHOLD):
+        t *= COMPAT_BACKOFF_MULTIPLIER
+    return t
+
+
+def _compat_validate_entry(entry):
+    """Validate one loaded state entry. Returns normalized entry or None."""
+    if not isinstance(entry, dict):
+        return None
+    provider = entry.get("provider")
+    mode = entry.get("mode")
+    actual_model = entry.get("actual_model")
+    feature = entry.get("feature")
+    state = entry.get("state")
+    threshold = entry.get("threshold")
+    if not isinstance(provider, str) or not provider:
+        return None
+    if not isinstance(mode, str) or not mode:
+        return None
+    if not isinstance(actual_model, str) or not actual_model:
+        return None
+    if not isinstance(feature, str) or not feature:
+        return None
+    if feature != COMPAT_FEATURE:
+        return None
+    if state not in (COMPAT_STATE_UNSUPPORTED, COMPAT_STATE_PROBATION):
+        return None
+    if not isinstance(threshold, int) or isinstance(threshold, bool):
+        return None
+    strip_counter = entry.get("strip_counter", 0)
+    probation_successes = entry.get("probation_successes", 0)
+    failed_confirmations = entry.get("failed_confirmations", 0)
+    for v in (strip_counter, probation_successes, failed_confirmations):
+        if not isinstance(v, int) or isinstance(v, bool):
+            return None
+    return {
+        "schema_version": COMPAT_SCHEMA_VERSION,
+        "provider": provider,
+        "mode": mode,
+        "actual_model": actual_model,
+        "feature": feature,
+        "state": state,
+        "threshold": _compat_normalize_threshold(threshold),
+        # Counters are in-memory-only: restart resets them to zero
+        # (fail-safe direction — over-stripping, never under-stripping).
+        "strip_counter": 0,
+        "probation_successes": 0,
+        "failed_confirmations": 0,
+    }
+
+
+def _load_compat_state():
+    """Load learned compatibility state from PROXY_FEATURE_COMPAT_FILE.
+
+    Missing file → empty state (no warning). Malformed/unreadable file →
+    warn to stderr and fail open with empty state. Known schema version with
+    invalid individual entries → drop bad entries, keep valid ones, warn per
+    entry. Unknown feature keys → ignored (forward-compat).
+    """
+    global _compat_state
+    loaded = {}
+    try:
+        with open(PROXY_FEATURE_COMPAT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+        print("[proxy] WARNING: compatibility state file unreadable "
+              "({}) — failing open with empty state".format(
+                  sanitize_error(str(e))), file=sys.stderr)
+        return
+    if not isinstance(data, dict):
+        print("[proxy] WARNING: compatibility state file is not a JSON "
+              "object — failing open with empty state", file=sys.stderr)
+        return
+    version = data.get("schema_version")
+    if version != COMPAT_SCHEMA_VERSION:
+        print("[proxy] WARNING: compatibility state file has unknown "
+              "schema_version {!r} (expected {}) — failing open with "
+              "empty state".format(version, COMPAT_SCHEMA_VERSION),
+              file=sys.stderr)
+        return
+    entries = data.get("entries")
+    if not isinstance(entries, dict):
+        print("[proxy] WARNING: compatibility state file has invalid "
+              "'entries' — failing open with empty state", file=sys.stderr)
+        return
+    for key_str, entry in entries.items():
+        if not isinstance(key_str, str):
+            continue
+        parsed = _compat_validate_entry(entry)
+        if parsed is None:
+            feature_name = entry.get("feature") if isinstance(entry, dict) else None
+            if feature_name != COMPAT_FEATURE:
+                # Unknown feature keys: ignore silently (forward-compat).
+                continue
+            print("[proxy] WARNING: dropping invalid compatibility state "
+                  "entry (key redacted)", file=sys.stderr)
+            continue
+        loaded[_compat_parse_file_key(key_str)] = parsed
+    _compat_state = loaded
+
+
+def _persist_compat_state_locked():
+    """Atomically persist the learned state. Caller must hold _compat_state_lock.
+
+    Keeps successful in-memory updates on failure and emits a rate-limited
+    metadata-only compatibility_persist_failed trace event (once per 60s per key).
+    """
+    payload = {
+        "schema_version": COMPAT_SCHEMA_VERSION,
+        "entries": {_compat_file_key(k): v for k, v in _compat_state.items()},
+    }
+    d = os.path.dirname(PROXY_FEATURE_COMPAT_FILE)
+    tmp = "{}.{}.tmp".format(PROXY_FEATURE_COMPAT_FILE,
+                             "{}-{}".format(os.getpid(),
+                                            uuid.uuid4().hex[:8]))
+    try:
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp, PROXY_FEATURE_COMPAT_FILE)
+        if os.name == "posix":
+            try:
+                os.chmod(PROXY_FEATURE_COMPAT_FILE, 0o600)
+            except OSError:
+                pass
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _compat_persist_failure_trace(key):
+    """Rate-limited metadata-only trace for persistence failure (60s per key)."""
+    key_str = _compat_file_key(key)
+    now = time.time()
+    last = _compat_persist_warned.get(key_str, 0)
+    if now - last < 60:
+        return
+    _compat_persist_warned[key_str] = now
+    log_trace({
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": "compatibility_persist_failed",
+        "provider": key[0],
+        "mode": key[1],
+        "actual_model": key[2],
+        "feature": key[3],
+    })
+
+
+def _compat_update(key, mutate):
+    """Apply mutate(entry_dict) under the state lock and persist on transition.
+
+    mutate receives the current entry dict (or None) and returns
+    (new_entry_or_None, persist_flag). new_entry None means delist. Returns
+    the resulting entry (or None).
+    """
+    with _compat_state_lock:
+        entry = _compat_state.get(key)
+        new_entry, persist = mutate(entry)
+        if new_entry is None:
+            _compat_state.pop(key, None)
+        else:
+            _compat_state[key] = new_entry
+        if persist:
+            if not _persist_compat_state_locked():
+                _compat_persist_failure_trace(key)
+        return new_entry
+
+
+def _compat_get(key):
+    with _compat_state_lock:
+        return _compat_state.get(key)
+
+
+def _compat_record_failed_confirmation(key):
+    """Increment the in-memory failed-confirmation counter. Returns the count."""
+    with _compat_state_lock:
+        n = _compat_failed_confirmations.get(key, 0) + 1
+        _compat_failed_confirmations[key] = n
+        return n
+
+
+def _compat_reset_failed_confirmations(key):
+    with _compat_state_lock:
+        _compat_failed_confirmations.pop(key, None)
+
+
+def _compat_suppressed(key):
+    with _compat_state_lock:
+        return _compat_failed_confirmations.get(key, 0) \
+            >= COMPAT_FAILED_CONFIRMATION_SUPPRESSION
+
+
+def _compat_note_suppressed_request(key):
+    """Count a matching request seen while suppression is active.
+
+    After COMPAT_INITIAL_THRESHOLD matching requests, re-enter discovery by
+    clearing the failed-confirmation counter for the key.
+    """
+    with _compat_state_lock:
+        n = _compat_suppressed_seen.get(key, 0) + 1
+        if n >= COMPAT_INITIAL_THRESHOLD:
+            _compat_suppressed_seen.pop(key, None)
+            _compat_failed_confirmations.pop(key, None)
+        else:
+            _compat_suppressed_seen[key] = n
+
+
+def _compat_learn(key, request_id, tier):
+    """Record unsupported state for key after a successful stripped retry."""
+    def mutate(entry):
+        if entry is not None:
+            return entry, False  # already learned
+        return ({
+            "schema_version": COMPAT_SCHEMA_VERSION,
+            "provider": key[0],
+            "mode": key[1],
+            "actual_model": key[2],
+            "feature": key[3],
+            "state": COMPAT_STATE_UNSUPPORTED,
+            "threshold": COMPAT_INITIAL_THRESHOLD,
+            "strip_counter": 0,
+            "probation_successes": 0,
+            "failed_confirmations": 0,
+        }, True)
+
+    _compat_update(key, mutate)
+    _compat_reset_failed_confirmations(key)
+    log_trace({
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": "compatibility_learned",
+        "request_id": request_id,
+        "provider": key[0],
+        "mode": key[1],
+        "actual_model": key[2],
+        "feature": key[3],
+        "tier": tier,
+        "state": COMPAT_STATE_UNSUPPORTED,
+        "threshold": COMPAT_INITIAL_THRESHOLD,
+    })
+
+
+def _compat_record_strip(key):
+    """Increment the strip counter. Returns True when the threshold is reached.
+
+    Effective threshold: COMPAT_PROBATION_THRESHOLD (8) in probation state,
+    otherwise the entry's (possibly doubled) threshold.
+    """
+    with _compat_state_lock:
+        entry = _compat_state.get(key)
+        if entry is None:
+            return False
+        entry["strip_counter"] += 1
+        if entry["state"] == COMPAT_STATE_PROBATION:
+            return entry["strip_counter"] >= COMPAT_PROBATION_THRESHOLD
+        return entry["strip_counter"] >= entry["threshold"]
+
+
+def _compat_reset_strip_counter(key):
+    with _compat_state_lock:
+        entry = _compat_state.get(key)
+        if entry is not None:
+            entry["strip_counter"] = 0
+
+
+def _compat_probe_success(key, request_id, tier):
+    """Record one probe success; delist at delisting_successes, else probation."""
+    existed = True
+
+    def mutate(entry):
+        nonlocal existed
+        if entry is None:
+            existed = False
+            return None, False
+        entry["probation_successes"] += 1
+        entry["strip_counter"] = 0
+        if entry["probation_successes"] >= COMPAT_DELISTING_SUCCESSES:
+            return None, True
+        entry["state"] = COMPAT_STATE_PROBATION
+        return entry, True
+
+    result = _compat_update(key, mutate)
+    if not existed:
+        return  # entry vanished concurrently — no state change to report
+    if result is not None:
+        log_trace({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "compatibility_probe_succeeded",
+            "request_id": request_id,
+            "provider": key[0],
+            "mode": key[1],
+            "actual_model": key[2],
+            "feature": key[3],
+            "tier": tier,
+            "probation_successes": result["probation_successes"],
+        })
+    else:
+        log_trace({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "compatibility_delisted",
+            "request_id": request_id,
+            "provider": key[0],
+            "mode": key[1],
+            "actual_model": key[2],
+            "feature": key[3],
+            "tier": tier,
+        })
+
+
+def _compat_probe_rejected(key, request_id, tier):
+    """Repeated rejection: reset probation, double the threshold (capped), persist."""
+    def mutate(entry):
+        if entry is None:
+            return None, False
+        entry["probation_successes"] = 0
+        entry["state"] = COMPAT_STATE_UNSUPPORTED
+        entry["strip_counter"] = 0
+        entry["threshold"] = min(entry["threshold"] * COMPAT_BACKOFF_MULTIPLIER,
+                                 COMPAT_MAX_THRESHOLD)
+        return entry, True
+
+    result = _compat_update(key, mutate)
+    if result is not None:
+        log_trace({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "compatibility_probe_rejected",
+            "request_id": request_id,
+            "provider": key[0],
+            "mode": key[1],
+            "actual_model": key[2],
+            "feature": key[3],
+            "tier": tier,
+            "threshold": result["threshold"],
+        })
+
+
+def _compat_probe_inconclusive(key, request_id, tier):
+    """Inconclusive probe: leave state/successes unchanged, reschedule at current."""
+    with _compat_state_lock:
+        entry = _compat_state.get(key)
+        threshold = entry["threshold"] if entry else COMPAT_INITIAL_THRESHOLD
+        if entry is not None:
+            entry["strip_counter"] = 0
+    log_trace({
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": "compatibility_probe_inconclusive",
+        "request_id": request_id,
+        "provider": key[0],
+        "mode": key[1],
+        "actual_model": key[2],
+        "feature": key[3],
+        "tier": tier,
+        "threshold": threshold,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Heartbeat thread
 # ---------------------------------------------------------------------------
 
@@ -659,9 +1107,127 @@ def forward_request(method, path, headers, body, handler=None, request_id=None):
             _inflight_count -= 1
 
 
+# Anchored message-form detector for the observed unsupported-feature 400.
+# The feature token must appear at message start or be preceded by ': ' or
+# '] ' — dotted nested-path matches (e.g. tools.0.context_management) never
+# match. Built from the policy constant; upstream text is only ever matched
+# against it, never copied.
+_COMPAT_MESSAGE_RE = re.compile(
+    r"(?:^|(?<=: )|(?<=\] ))" + re.escape(COMPAT_FEATURE) +
+    r": Extra inputs are not permitted$")
+
+
+def _compat_message_match(data):
+    """True if any error message matches the anchored message-form 400 shape."""
+    stack = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            msg = node.get("message")
+            if isinstance(msg, str) and _COMPAT_MESSAGE_RE.search(msg):
+                return True
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return False
+
+
+def _compat_structured_match(data):
+    """True if structured `extra_forbidden` validation data locates the
+    feature constant at top level (loc ends with it and is not a nested path)."""
+    stack = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if any(node.get(k) == "extra_forbidden" for k in ("type", "code")):
+                loc = node.get("loc", node.get("location"))
+                if isinstance(loc, list) and loc:
+                    if (loc[-1] == COMPAT_FEATURE and len(loc) <= 2
+                            and (len(loc) == 1 or loc[0] in ("body", "request"))):
+                        return True
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return False
+
+
+def _compat_rejection_match(status, resp_body):
+    """Recognize the two enumerated unsupported-feature 400 shapes.
+
+    Content-type agnostic: the drained body is parsed as JSON regardless of
+    the upstream Content-Type header. Bodies exceeding PROXY_MAX_BODY_SIZE
+    or failing to parse are inconclusive (False — never learn).
+    """
+    if status != 400 or not resp_body:
+        return False
+    if len(resp_body) > PROXY_MAX_BODY_SIZE:
+        return False
+    try:
+        data = json.loads(resp_body)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    return _compat_message_match(data) or _compat_structured_match(data)
+
+
+def _compat_merge_retries(original_result, retry_result):
+    """Sum the original forwarding loop's retries with the retry's own."""
+    merged = list(retry_result)
+    merged[5] = (retry_result[5] or 0) + (original_result[5] or 0)
+    return tuple(merged)
+
+
+def _compat_stripped_body(body):
+    """Derive the stripped client body (original minus the feature). None if
+    the original body does not parse as a JSON object."""
+    try:
+        stripped = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(stripped, dict):
+        return None
+    stripped.pop(COMPAT_FEATURE, None)
+    return json.dumps(stripped).encode("utf-8")
+
+
+def _compat_probe_outcome(result, key, request_id, tier, method, path,
+                          headers, body, handler, config, vendors):
+    """Process an unstripped probe response under the state machine.
+
+    2xx records a probation success (evidence recorded at status receipt;
+    mid-stream failures do not roll back). The same exact 400 doubles the
+    threshold and returns the stripped retry result. Anything else is
+    inconclusive. The caller owns _compat_retry_lock.
+    """
+    status = result[0]
+    if 200 <= status < 300:
+        _compat_probe_success(key, request_id, tier)
+        return result
+    if status == 400 and _compat_rejection_match(status, result[2]):
+        _compat_probe_rejected(key, request_id, tier)
+        stripped_body = _compat_stripped_body(body)
+        if stripped_body is None:
+            return result
+        for _attempt in range(COMPAT_MAX_RETRIES_PER_REQUEST):
+            retry_result = _forward_request_impl(
+                method, path, headers, stripped_body, handler, request_id,
+                config, vendors, suppress_compat=True)
+            return _compat_merge_retries(result, retry_result)
+        return result
+    _compat_probe_inconclusive(key, request_id, tier)
+    return result
+
+
 def _forward_request_impl(method, path, headers, body, handler, request_id,
-                          config, vendors):
-    """Internal implementation of forward_request with snapshot config."""
+                          config, vendors, suppress_compat=False):
+    """Internal implementation of forward_request with snapshot config.
+
+    suppress_compat=True bypasses the feature-compatibility subsystem
+    entirely — compatibility retries call this function with the flag set,
+    so recursion is structurally impossible and the retry is a single
+    upstream attempt (never re-enters the 429/503 retry loop).
+    """
     if method not in ALLOWED_METHODS:
         return 400, {}, b'{"error":"Method not allowed"}', 0, 0, 0, "unknown", None, None
 
@@ -738,15 +1304,66 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
         })
         return 400, {}, err_msg.encode("utf-8"), 0, 0, 0, tier, provider_name, actual_model
 
-    # Build request body once before the retry loop (never re-transformed per
-    # attempt). Anthropic mode does a model-only rewrite; chat/response modes
-    # run the full body transform. On any failure fall back to the original
-    # body and log a transform_failure trace event.
-    rewritten_body = body
+    # Parse the request body once. Unparseable bodies skip compatibility
+    # logic entirely (the transform below falls back to the original body).
+    body_json = None
     if body:
         try:
             body_json = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            body_json = None
+
+    # Build request body once before the retry loop (never re-transformed per
+    # attempt). Anthropic mode does a model-only rewrite (plus learned
+    # conditional stripping of the compatibility feature); chat/response modes
+    # run the full body transform. On any failure fall back to the original
+    # body and log a transform_failure trace event.
+    rewritten_body = body
+    compat_decision = None  # None | ("strip", key) | ("probe", key)
+    compat_outbound_present = False
+    if body:
+        try:
             body_json["model"] = actual_model
+            # Compatibility gate: Anthropic mode only, single learnable
+            # feature present at top level in the parsed body, never on
+            # compatibility retries, count_tokens excluded.
+            if (mode == "anthropic" and not _is_count_tokens
+                    and not suppress_compat and isinstance(body_json, dict)
+                    and COMPAT_FEATURE in body_json):
+                _ck = _compat_key(provider_name, mode, actual_model)
+                if _compat_get(_ck) is not None:
+                    reached = _compat_record_strip(_ck)
+                    if reached and _compat_retry_lock.acquire(blocking=False):
+                        # Probe owner: send the unstripped body. Counter
+                        # resets to 0 at probe start; strips concurrent with
+                        # an in-progress probe count toward the next threshold.
+                        _compat_reset_strip_counter(_ck)
+                        log_trace({
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "event": "compatibility_probe_started",
+                            "request_id": request_id,
+                            "provider": provider_name,
+                            "mode": mode,
+                            "tier": tier,
+                            "actual_model": actual_model,
+                            "feature": COMPAT_FEATURE,
+                        })
+                        compat_decision = ("probe", _ck)
+                    else:
+                        body_json.pop(COMPAT_FEATURE, None)
+                        log_trace({
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "event": "compatibility_field_stripped",
+                            "request_id": request_id,
+                            "provider": provider_name,
+                            "mode": mode,
+                            "tier": tier,
+                            "actual_model": actual_model,
+                            "feature": COMPAT_FEATURE,
+                        })
+                        compat_decision = ("strip", _ck)
+            if isinstance(body_json, dict):
+                compat_outbound_present = COMPAT_FEATURE in body_json
             if mode == "chat":
                 rewritten_body = json.dumps(_anthropic_to_chat(
                     body_json, request_id=request_id, mode=mode,
@@ -795,15 +1412,121 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
         endpoint = "/v1/chat/completions" if mode == "chat" else "/v1/responses"
         upstream_path = path_prefix + endpoint
 
+    # Accepted residual (review finding 6): an exotic non-_DISCONNECT
+    # client-write OSError during a streamed 2xx probe can re-issue the probe
+    # POST after headers were sent; bounded to one spurious threshold doubling,
+    # self-heals on the next probe cycle. Documented in CLAUDE.md Gotchas.
+    compat_owned = compat_decision is not None and compat_decision[0] == "probe"
+    if compat_owned:
+        try:
+            result = _forward_core(
+                method, path, handler, request_id, config, rewritten_body,
+                fwd_headers, upstream_path, host, port, use_ssl, tier,
+                provider_name, actual_model, mode, _is_count_tokens)
+            return _compat_probe_outcome(
+                result, compat_decision[1], request_id, tier, method, path,
+                headers, body, handler, config, vendors)
+        finally:
+            _compat_retry_lock.release()
+
+    result = _forward_core(
+        method, path, handler, request_id, config, rewritten_body,
+        fwd_headers, upstream_path, host, port, use_ssl, tier,
+        provider_name, actual_model, mode, _is_count_tokens,
+        max_attempts=1 if suppress_compat else None)
+
+    # Stripped request: upstream already saw the stripped body — return as-is.
+    if compat_decision is not None:
+        return result
+
+    # Discovery: the request carried the feature with no learned entry at
+    # send time. On a recognized exact 400, confirm with one stripped retry
+    # (single upstream attempt, same snapshot, suppress_compat=True).
+    if suppress_compat or mode != "anthropic" or _is_count_tokens \
+            or not compat_outbound_present:
+        return result
+    if result[0] != 400:
+        return result
+    if not _compat_rejection_match(result[0], result[2]):
+        return result
+    key = _compat_key(provider_name, mode, actual_model)
+    log_trace({
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": "compatibility_rejection_detected",
+        "request_id": request_id,
+        "provider": provider_name,
+        "mode": mode,
+        "tier": tier,
+        "actual_model": actual_model,
+        "feature": COMPAT_FEATURE,
+    })
+    if _compat_suppressed(key):
+        _compat_note_suppressed_request(key)
+        log_trace({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "compatibility_failed_confirmation_suppressed",
+            "request_id": request_id,
+            "provider": provider_name,
+            "mode": mode,
+            "tier": tier,
+            "actual_model": actual_model,
+            "feature": COMPAT_FEATURE,
+        })
+        return result
+    if not _compat_retry_lock.acquire(blocking=False):
+        return result
+    try:
+        retry_result = None
+        stripped_body = _compat_stripped_body(body)
+        if stripped_body is not None:
+            for _attempt in range(COMPAT_MAX_RETRIES_PER_REQUEST):
+                retry_result = _forward_request_impl(
+                    method, path, headers, stripped_body, handler,
+                    request_id, config, vendors, suppress_compat=True)
+                break
+        if retry_result is None:
+            return result
+        retry_result = _compat_merge_retries(result, retry_result)
+        if 200 <= retry_result[0] < 300:
+            _compat_learn(key, request_id, tier)
+            return retry_result
+        _compat_record_failed_confirmation(key)
+        if _compat_suppressed(key):
+            log_trace({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "event": "compatibility_failed_confirmation_suppressed",
+                "request_id": request_id,
+                "provider": provider_name,
+                "mode": mode,
+                "tier": tier,
+                "actual_model": actual_model,
+                "feature": COMPAT_FEATURE,
+            })
+        return result
+    finally:
+        _compat_retry_lock.release()
+
+
+def _forward_core(method, path, handler, request_id, config,
+                  rewritten_body, fwd_headers, upstream_path,
+                  host, port, use_ssl, tier, provider_name, actual_model,
+                  mode, is_count_tokens, max_attempts=None):
+    """Forwarding pass: 429/503/connection retry loop and response handling.
+
+    max_attempts=None derives the attempt count from config (PROXY_MAX_RETRIES,
+    count_tokens exclusion); an explicit value overrides both — compatibility
+    retries pass 1 so a compat retry is a single upstream attempt.
+    """
     total_start = time.time()
     last_status = None
     retries = 0
 
     # Skip retry for count_tokens when disabled (avoids wasting bandwidth
     # on providers that don't support this Anthropic-specific endpoint)
-    disable_retry = config.get("disable_retry_claude_count_token", False)
-    max_attempts = 1 if (disable_retry and _is_count_tokens) \
-                   else PROXY_MAX_RETRIES + 1
+    if max_attempts is None:
+        disable_retry = config.get("disable_retry_claude_count_token", False)
+        max_attempts = 1 if (disable_retry and is_count_tokens) \
+                       else PROXY_MAX_RETRIES + 1
 
     for attempt in range(max_attempts):
         try:
@@ -878,6 +1601,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                     chunks = []
                     first_byte = True
                     first_byte_elapsed = None
+                    total_bytes = 0
 
                     while True:
                         chunk = resp.read(8192)
@@ -887,6 +1611,18 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                             first_byte_elapsed = (time.time() - first_byte_start) * 1000
                             first_byte = False
                         chunks.append(chunk)
+                        total_bytes += len(chunk)
+                        if total_bytes > PROXY_MAX_RESPONSE_SIZE:
+                            log_trace({
+                                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                "event": "response_size_cap_exceeded",
+                                "request_id": request_id,
+                                "bytes_read": total_bytes,
+                                "limit": PROXY_MAX_RESPONSE_SIZE,
+                            })
+                            print("[proxy] Response size limit exceeded ({} bytes), rid={}".format(
+                                total_bytes, request_id), file=sys.stderr)
+                            break
 
                     total_elapsed = time.time() - total_start
                     resp_body = b"".join(chunks)
@@ -914,6 +1650,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                         chunks = []
                         first_byte = True
                         first_byte_elapsed = None
+                        total_bytes = 0
                         while True:
                             chunk = resp.read(8192)
                             if not chunk:
@@ -922,6 +1659,18 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                                 first_byte_elapsed = (time.time() - first_byte_start) * 1000
                                 first_byte = False
                             chunks.append(chunk)
+                            total_bytes += len(chunk)
+                            if total_bytes > PROXY_MAX_RESPONSE_SIZE:
+                                log_trace({
+                                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                    "event": "response_size_cap_exceeded",
+                                    "request_id": request_id,
+                                    "bytes_read": total_bytes,
+                                    "limit": PROXY_MAX_RESPONSE_SIZE,
+                                })
+                                print("[proxy] Response size limit exceeded ({} bytes), rid={}".format(
+                                    total_bytes, request_id), file=sys.stderr)
+                                break
                         total_elapsed = time.time() - total_start
                         resp_body = b"".join(chunks)
                         conn.close()
@@ -945,6 +1694,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
             chunks = []
             first_byte = True
             first_byte_elapsed = None
+            total_bytes = 0
 
             while True:
                 chunk = resp.read(8192)
@@ -954,6 +1704,18 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                     first_byte_elapsed = (time.time() - first_byte_start) * 1000
                     first_byte = False
                 chunks.append(chunk)
+                total_bytes += len(chunk)
+                if total_bytes > PROXY_MAX_RESPONSE_SIZE:
+                    log_trace({
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "event": "response_size_cap_exceeded",
+                        "request_id": request_id,
+                        "bytes_read": total_bytes,
+                        "limit": PROXY_MAX_RESPONSE_SIZE,
+                    })
+                    print("[proxy] Response size limit exceeded ({} bytes), rid={}".format(
+                        total_bytes, request_id), file=sys.stderr)
+                    break
 
             total_elapsed = time.time() - total_start
 
@@ -3421,6 +4183,10 @@ def main():
         for err in errors:
             print("[proxy]   - {}".format(err), file=sys.stderr)
         sys.exit(1)
+
+    # Compatibility subsystem: validate tuning constants and load learned state
+    _compat_validate_constants()
+    _load_compat_state()
 
     # Check if another proxy is already running on this port
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
