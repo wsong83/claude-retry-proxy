@@ -151,7 +151,25 @@ ALLOWED_METHODS = {"POST", "OPTIONS"}
 
 # Headers forwarded to upstream
 FORWARD_HEADERS = {"authorization", "x-api-key", "content-type",
-                   "anthropic-version", "accept", "anthropic-beta"}
+                   "anthropic-version", "accept", "anthropic-beta",
+                   "user-agent"}
+
+# Header names an extra_request_headers rule may not set: proxy-managed
+# (auth injection, Host, body semantics, forwarded allowlist) plus
+# hop-by-hop/protocol framing headers. Match case-insensitively.
+RESERVED_EXTRA_HEADER_NAMES = {
+    "authorization", "x-api-key", "host", "content-length",
+    "content-type", "accept", "anthropic-version", "anthropic-beta",
+    "user-agent", "connection", "transfer-encoding", "expect", "te",
+    "accept-encoding", "cookie",
+}
+
+# 'header' names and 'from' entries must be token-shaped RFC 9110 field names
+EXTRA_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
+
+# 'from' entries may not name the client auth headers — copying the client's
+# key into an arbitrary outbound header (or the trace) is not permissible.
+EXTRA_FROM_FORBIDDEN = {"authorization", "x-api-key"}
 
 # Provider endpoint modes
 MODE_VALUES = ("anthropic", "chat", "response")
@@ -204,6 +222,108 @@ def load_config(path):
     if not isinstance(data["models"], dict):
         raise ValueError("'models' must be an object")
     return data
+
+
+def _validate_extra_header_spec(provider, spec, errors, seen_headers):
+    """Append validation errors for one extra_request_headers rule spec.
+
+    Appends to errors only — never raises. Type-guards every string field
+    before any regex/truthiness check so non-string values yield validation
+    errors, not exceptions. `seen_headers` tracks lowercased 'header' names
+    already accepted for this provider (case-insensitive uniqueness).
+    """
+    header = spec.get("header")
+    if not isinstance(header, str):
+        errors.append(
+            "extra_request_headers['{}'] rule 'header' must be a string, "
+            "got {}".format(provider, type(header).__name__))
+        return
+    if not header:
+        errors.append(
+            "extra_request_headers['{}'] rule 'header' cannot be "
+            "empty".format(provider))
+        return
+    if not EXTRA_HEADER_NAME_RE.match(header):
+        errors.append(
+            "extra_request_headers['{}'] rule 'header' '{}' does not match "
+            "^[A-Za-z0-9][A-Za-z0-9-]*$".format(provider, header))
+        return
+    header_lower = header.lower()
+    if header_lower in RESERVED_EXTRA_HEADER_NAMES:
+        errors.append(
+            "extra_request_headers['{}'] rule 'header' '{}' is reserved "
+            "and cannot be set".format(provider, header))
+        return
+    if header_lower in seen_headers:
+        errors.append(
+            "extra_request_headers['{}'] duplicate rule 'header' '{}' "
+            "(case-insensitive)".format(provider, header))
+        return
+    seen_headers.add(header_lower)
+
+    from_list = spec.get("from")
+    has_from = False
+    if from_list is not None:
+        if not isinstance(from_list, list):
+            errors.append(
+                "extra_request_headers['{}'] rule 'from' must be a list of "
+                "header names, got {}".format(
+                    provider, type(from_list).__name__))
+        else:
+            for entry in from_list:
+                if not isinstance(entry, str):
+                    errors.append(
+                        "extra_request_headers['{}'] rule 'from' entry must "
+                        "be a string, got {}".format(
+                            provider, type(entry).__name__))
+                    continue
+                if not entry.strip():
+                    errors.append(
+                        "extra_request_headers['{}'] rule 'from' entry "
+                        "cannot be empty".format(provider))
+                    continue
+                if not EXTRA_HEADER_NAME_RE.match(entry):
+                    errors.append(
+                        "extra_request_headers['{}'] rule 'from' entry '{}' "
+                        "does not match ^[A-Za-z0-9][A-Za-z0-9-]*$".format(
+                            provider, entry))
+                    continue
+                if entry.lower() in EXTRA_FROM_FORBIDDEN:
+                    errors.append(
+                        "extra_request_headers['{}'] rule 'from' entry '{}' "
+                        "is reserved (client auth headers cannot be "
+                        "copied)".format(provider, entry))
+                    continue
+                has_from = True
+
+    fallback = spec.get("fallback")
+    if fallback is not None:
+        if not isinstance(fallback, str):
+            errors.append(
+                "extra_request_headers['{}'] rule 'fallback' must be a "
+                "string, got {}".format(
+                    provider, type(fallback).__name__))
+        elif not fallback.strip():
+            errors.append(
+                "extra_request_headers['{}'] rule 'fallback' cannot be "
+                "empty".format(provider))
+        else:
+            try:
+                fallback.encode("latin-1")
+            except UnicodeEncodeError:
+                errors.append(
+                    "extra_request_headers['{}'] rule 'fallback' must be "
+                    "latin-1 encodable".format(provider))
+            else:
+                if any(ord(_c) < 32 or ord(_c) == 127 for _c in fallback):
+                    errors.append(
+                        "extra_request_headers['{}'] rule 'fallback' "
+                        "contains control characters".format(provider))
+
+    if not has_from and fallback is None:
+        errors.append(
+            "extra_request_headers['{}'] rule needs a non-empty 'from' list "
+            "or a 'fallback'".format(provider))
 
 
 def validate_config(config, providers):
@@ -282,6 +402,41 @@ def validate_config(config, providers):
             errors.append(
                 "disable_retry_claude_count_token must be a boolean "
                 "(true/false), got {}".format(type(flag).__name__))
+
+    # Validate optional extra_request_headers (provider-keyed map of header
+    # rules). Absent key is valid (defaults to {} on resolution). Every check
+    # appends to errors — never raises — and type-guards string fields before
+    # any regex/truthiness test so non-string values yield a validation error,
+    # not an exception.
+    if "extra_request_headers" in config:
+        extra = config.get("extra_request_headers")
+        if not isinstance(extra, dict):
+            errors.append(
+                "extra_request_headers must be an object, got {}".format(
+                    type(extra).__name__))
+        else:
+            for provider, spec_list in extra.items():
+                if provider not in models:
+                    errors.append(
+                        "extra_request_headers references unknown provider "
+                        "'{}'".format(provider))
+                    continue
+                if not isinstance(spec_list, list):
+                    errors.append(
+                        "extra_request_headers['{}'] must be a list of rule "
+                        "objects, got {}".format(
+                            provider, type(spec_list).__name__))
+                    continue
+                seen_headers = set()
+                for spec in spec_list:
+                    if not isinstance(spec, dict):
+                        errors.append(
+                            "extra_request_headers['{}'] rule must be an "
+                            "object, got {}".format(
+                                provider, type(spec).__name__))
+                        continue
+                    _validate_extra_header_spec(provider, spec, errors,
+                                                seen_headers)
 
     return errors
 
@@ -1219,6 +1374,73 @@ def _compat_probe_outcome(result, key, request_id, tier, method, path,
     return result
 
 
+def _resolve_extra_request_headers(headers, provider_name, config, request_id):
+    """Resolve outbound extra request headers for a provider from config rules.
+
+    Pure helper — no globals. Total: unexpected shapes (missing top-level key,
+    unknown/None provider, malformed rules, non-string fields, request_id None
+    with the token fallback) degrade to a skipped rule / {}; never raises.
+    Config validation is the strict gate; this is defense-in-depth, not a
+    second gate.
+
+    Inbound `from` names are matched case-insensitively over a plain dict
+    (both call sites pass plain dicts, so we compare k.lower() ourselves);
+    the first non-empty stripped value wins and the emitted value is the
+    stripped value. `fallback` is a literal string or the exact case-sensitive
+    token "request_id", which resolves to the `request_id` argument (None
+    yields nothing for that rule). Rules whose resolved value contains CR/LF
+    are skipped.
+    """
+    if not provider_name or not isinstance(config, dict):
+        return {}
+    extra = config.get("extra_request_headers")
+    if not isinstance(extra, dict):
+        return {}
+    rules = extra.get(provider_name)
+    if not isinstance(rules, list):
+        return {}
+    inbound = {}
+    for k, v in headers.items():
+        if isinstance(k, str):
+            lk = k.lower()
+            if lk not in inbound:
+                inbound[lk] = v
+    resolved = {}
+    for spec in rules:
+        if not isinstance(spec, dict):
+            continue
+        header = spec.get("header")
+        if not isinstance(header, str) or not header:
+            continue
+        value = None
+        from_list = spec.get("from")
+        if isinstance(from_list, list):
+            for name in from_list:
+                if not isinstance(name, str):
+                    continue
+                candidate = inbound.get(name.lower())
+                if candidate is None:
+                    continue
+                stripped = candidate.strip() if isinstance(candidate, str) else None
+                if stripped:
+                    value = stripped
+                    break
+        if value is None:
+            fallback = spec.get("fallback")
+            if isinstance(fallback, str):
+                if fallback == "request_id":
+                    if request_id is not None:
+                        value = request_id
+                elif fallback.strip():
+                    value = fallback.strip()
+        if value is None:
+            continue
+        if "\r" in value or "\n" in value:
+            continue
+        resolved[header] = value
+    return resolved
+
+
 def _forward_request_impl(method, path, headers, body, handler, request_id,
                           config, vendors, suppress_compat=False):
     """Internal implementation of forward_request with snapshot config.
@@ -1400,6 +1622,14 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
         fwd_headers["x-api-key"] = api_key
     else:
         fwd_headers["Authorization"] = "Bearer {}".format(api_key)
+
+    # Apply config-driven extra request headers. Runs here, after the
+    # per-mode key injection and outside the retry loop, so injected auth
+    # wins by construction (validate_config rejects reserved names) and the
+    # resolved value is stable across 429/503 retries.
+    for _header_name, _header_value in _resolve_extra_request_headers(
+            headers, provider_name, config, request_id).items():
+        fwd_headers[_header_name] = _header_value
 
     # Dispatch upstream path per mode. chat/response modes strip a trailing
     # /v1 from the configured base URL so an OpenAI-style base does not
@@ -3894,7 +4124,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         "models": _current_config.get("models", {})
                     }
                     # Preserve known top-level config keys across hot-switches
-                    for _key in ("disable_retry_claude_count_token",):
+                    for _key in ("disable_retry_claude_count_token",
+                                 "extra_request_headers",):
                         if _key in _current_config:
                             new_config[_key] = _current_config[_key]
                     if response_status is None:
@@ -4057,6 +4288,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 resp_body.decode("utf-8", errors="replace") if resp_body else
                 "HTTP {}".format(status))
         }
+
+        # Re-resolve extra request headers for the trace (never threaded
+        # through forward_request's return tuple — signature discipline).
+        # This uses _current_config at event time, so a mid-request admin
+        # swap could log the post-swap mapping; the wire header used the
+        # entry snapshot. Trace-only cosmetic divergence, accepted.
+        resolved_extra = _resolve_extra_request_headers(
+            {k: v for k, v in self.headers.items()},
+            provider, _current_config, request_id)
+        if resolved_extra:
+            trace_entry["extra_request_headers"] = resolved_extra
 
         if PROXY_LOG_ALL:
             # Include full request/response bodies

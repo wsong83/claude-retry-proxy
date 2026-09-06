@@ -107,6 +107,19 @@ paths resolve against cwd), `--all` (log full request/response bodies),
      - **SSE streaming:** anthropic mode forwards+rewrites upstream SSE; chat mode
        synthesizes Anthropic SSE from OpenAI SSE (frame-assembled, terminal
        synthesized on EOF); response mode forces `stream: false` and returns JSON.
+     - **Extra request headers (config-driven):** an optional top-level
+       `extra_request_headers` map in config.json keys providers to
+       `{header, from, fallback}` specs; each spec attaches one outbound
+       header to all requests for that provider in any mode. Resolution:
+       first non-empty inbound header among `from` (case-insensitive,
+       stripped) wins, else `fallback` — a literal (stripped on emit) or the
+       token `"request_id"` (per-request uuid4). The resolver is total (bad
+       shapes degrade to no rule, never raises); validation is strict at
+       startup/reload (type guards, token-charset names, reserved-name
+       rejection — proxy-managed + hop-by-hop sets —, latin-1/control-free
+       fallback values, case-insensitive duplicate rejection). Applied
+       after provider-key injection, outside the retry loop. `user-agent`
+       joins the forwarded allowlist.
   5. Forward to resolved upstream, retry on **429** and **503** /
      connection error with jittered exponential backoff (same logic as
      before: `PROXY_INITIAL_DELAY * 2**attempt`, capped at `PROXY_MAX_DELAY`,
@@ -128,6 +141,9 @@ paths resolve against cwd), `--all` (log full request/response bodies),
      (resp_body == b"")` — streaming paths return `b""`, buffering paths
      return actual body. Only buffered responses call `_send_response`.
   8. Log a JSONL trace entry with `tier`, `provider`, and `mode` fields.
+     Request events for providers with `extra_request_headers` rules also
+     carry an `extra_request_headers` field with the resolved map
+     (re-resolved in `do_POST`; omitted when empty).
   - `/admin/shutdown` (localhost-only) triggers graceful shutdown.
   - **Admin page** (`GET /admin/`): serves `admin.html` from package data.
   - **Admin API** (localhost-only, CSRF-protected via Origin validation):
@@ -204,7 +220,10 @@ does not block startup on failure).
   `os.chmod(0o600)` on **POSIX only** (guarded by `os.name == 'posix'`) — on
   Windows `chmod` is a near-no-op (read-only bit only; no group/other model).
   Windows users must restrict the trace/state directory ACL manually
-  (`icacls`).
+  (`icacls`). The `extra_request_headers` trace field is NOT gated by
+  `--all`: resolved values (e.g. the client's per-conversation session id)
+  are logged on every request for providers with rules — the Windows
+  caveat above applies to them too.
 - **Config validation is strict.** The proxy refuses to start if config.json
   is missing (copies template and tells user to populate it), has empty
   provider/model fields, or references unknown providers. Validation flows
@@ -289,6 +308,8 @@ does not block startup on failure).
   Without this flag, the proxy retries up to `PROXY_MAX_RETRIES` times
   (default 10), wasting bandwidth and provider quota. The shipped template
   defaults to `true`. Admin Apply preserves the flag; Reload reads it from disk.
+  The admin-switch preservation tuple also preserves `extra_request_headers` —
+  hot tier switches never drop header rules.
 - **Keys file can be plain JSON (no encryption).** The server and CLI
   auto-detect the format: if the file starts with `VimCrypt~03!` it is
   decrypted with the passphrase; otherwise it is parsed as plain JSON
@@ -363,7 +384,7 @@ does not block startup on failure).
   SSE is synthesized from OpenAI SSE (frame-assembled on `\n\n`, terminal
   synthesized on EOF).
 - **Malformed tool arguments in chat mode.** When `_chat_to_anthropic` encounters tool-call arguments that cannot be parsed as a JSON dict (including `json.JSONDecodeError`, non-dict parse results, empty dicts, non-dict `function` values, and non-dict tool-call entries), it emits a user-visible text block `[Tool call failed: arguments for '<name>' (call <id>) could not be parsed as JSON]` instead of a `tool_use` block with `input: {}`. A `tool_args_parse_failure` trace event is also logged. When all tool calls in a response are malformed, `stop_reason` is forced to `None` to prevent the client from hanging on `stop_reason: "tool_use"` with zero tool_use blocks. **Request-transform path:** `_transform_anthropic_messages_to_chat` applies the same degradation pattern for NaN/Infinity/non-dict `tool_use.input` values (rejected by `json.dumps(input, allow_nan=False)`), emitting the placeholder `[Tool call failed: arguments for '<name>' (call <id>) could not be serialized as JSON]` and a `tool_args_parse_failure` trace event. When a failed tool_use coexists with valid tool_use(s) in the same assistant message, the placeholder is emitted as a separate assistant message before the tool_calls message (content: null). (Behavior changes landed 2026-08-28 and 2026-08-29.)
-- **Test suite is safe alongside a live proxy.** The test suite sets `os.environ["PROXY_STATE_FILE"]` and `os.environ["PROXY_FEATURE_COMPAT_FILE"]` to session temp paths at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read these env vars at import time, so test proxies use isolated state files and can never touch the live proxy's `~/.claude/proxy/proxy-state.json` or `~/.claude/proxy/feature-compatibility.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite (253 tests across 12 modules: `tests/_harness.py` + `tests/test_compat.py` + 10 cluster modules + `tests/test_claude_proxy.py` aggregator) passes with the live proxy up (landed 2026-08-28, updated 2026-09-02).
+- **Test suite is safe alongside a live proxy.** The test suite sets `os.environ["PROXY_STATE_FILE"]` and `os.environ["PROXY_FEATURE_COMPAT_FILE"]` to session temp paths at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read these env vars at import time, so test proxies use isolated state files and can never touch the live proxy's `~/.claude/proxy/proxy-state.json` or `~/.claude/proxy/feature-compatibility.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite (259 tests across 12 modules: `tests/_harness.py` + `tests/test_compat.py` + 10 cluster modules + `tests/test_claude_proxy.py` aggregator) passes with the live proxy up (landed 2026-08-28, updated 2026-09-07).
 
 ## Documentation
 
@@ -393,6 +414,10 @@ does not block startup on failure).
   `context_management` compatibility learner: automatic detection, stripping,
   request-count revalidation, and two-success delisting for Anthropic-mode
   third-party providers.
+- [plans/2026-09-06-opencode-session-header.md](plans/2026-09-06-opencode-session-header.md) — config-driven
+  per-provider extra request headers (`x-opencode-session` translation from
+  the native `X-Claude-Code-Session-Id`) with strict validation, total
+  resolver, retry-stable values, trace logging, and `user-agent` forwarding.
 - [plans/2026-08-27-support-three-endpoint-modes.md](plans/2026-08-27-support-three-endpoint-modes.md) — three-endpoint-mode
   dispatch (anthropic/chat/response) with full request/response transformation
   and SSE streaming.
@@ -408,7 +433,8 @@ No other supplementary docs.
 
 ```json
 [
-  {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "deferred": "2026-08-29", "target_repo": null}
+  {"issue_id": "break-up-large-source-and-test-files", "title": "Break up large source and test files into smaller modules", "target_repo": null, "report": "./tmp/reports/defer-issue-break-up-large-source-and-test-files.json", "deferred": "2026-09-01", "date_source": "creation"},
+  {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "target_repo": null, "report": "./tmp/reports/defer-issue-image-content-blocks-chat-mode.json", "deferred": "2026-08-29", "date_source": "creation"}
 ]
 ```
 
@@ -419,7 +445,7 @@ The chat-mode thinking/reasoning round-trip is now implemented
 (thinking blocks → reasoning_content, reasoning_content → thinking blocks,
 SSE reasoning delta handling — landed 2026-08-30). The chat-mode SSE
 streaming tool-call delta conversion is now implemented (landed
-2026-08-30). One chat-mode deferred issue remains (see
-`## Unresolved Deferred Issues` above): image content block mapping.
-Future hardening work can also focus on additional features or
-performance optimizations.
+2026-08-30). Two deferred issues remain (see `## Unresolved Deferred
+Issues` above): chat-mode image content block mapping and the large
+source/test file split. Future hardening work can also focus on
+additional features or performance optimizations.

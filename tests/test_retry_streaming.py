@@ -21,7 +21,9 @@ from _harness import (
     _create_test_keys,
     _create_test_keys_plain,
     _derive_models_from_tiers,
+    _mode_tiers,
     _send_proxy_request,
+    _start_mode_proxy,
     _start_proxy_server_directly,
     errors,
     fail,
@@ -2562,6 +2564,92 @@ def test_buffered_response_size_cap():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+# --- extra_request_headers retry stability ---
+# (plan 2026-09-06-opencode-session-header)
+
+def test_retry_stability_extra_header():
+    """A 429-retried request to a ruled provider carries the SAME
+    x-opencode-session value on every attempt.
+
+    The resolver is applied once in _forward_request_impl's header build
+    (before the retry loop), so the outbound header must not drift across
+    attempts. Also correlates the value with the request's trace request_id
+    (the fallback token source).
+    """
+    print("\n--- Test: extra_request_headers retry stability ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers("opencode-go")
+    vendors = {
+        "opencode-go": {"url": "http://127.0.0.1:{}".format(upstream_port),
+                        "key": "K-OG", "mode": "chat"},
+    }
+    extra = {
+        "opencode-go": [
+            {"header": "x-opencode-session", "fallback": "request_id"},
+        ],
+    }
+    attempts = [0]
+
+    def responder(info):
+        attempts[0] += 1
+        if attempts[0] <= 3:
+            return 429, "application/json", b'{"error":"Too Many Requests"}'
+        return 200, "application/json", b'{"id":"ok","type":"message","content":[{"text":"response"}]}'
+
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, responders={"opencode-go": responder}, extra_headers=extra,
+        extra_env={"PROXY_MAX_RETRIES": "5", "PROXY_INITIAL_DELAY": "1",
+                   "PROXY_MAX_DELAY": "1"})
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200 after 429 retries, got {}".format(status))
+            return
+
+        reqs = mock_servers["opencode-go"]["requests"]
+        if len(reqs) < 4:
+            fail("expected >=4 upstream attempts (3x429 + 200), got {}".format(len(reqs)))
+            return
+        values = []
+        for r in reqs:
+            vals = (r.get("headers") or {}).get("x-opencode-session", [])
+            values.append(vals[0] if vals else "<missing>")
+        distinct = set(values)
+        if len(distinct) == 1:
+            pass_("same x-opencode-session value on all {} attempts: {}".format(
+                len(reqs), values[0]))
+        else:
+            fail("x-opencode-session drifted across retries: {}".format(values))
+
+        # Correlate with the trace: the fallback token resolves to the
+        # per-request uuid4 recorded as the request event's request_id.
+        expected = None
+        if trace_file and os.path.exists(trace_file):
+            with open(trace_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+                    if (ev.get("event") == "request"
+                            and ev.get("provider") == "opencode-go"
+                            and ev.get("http_status") == 200):
+                        expected = ev.get("request_id")
+        if expected and values and values[0] == expected:
+            pass_("resolved value equals the request trace event's request_id")
+        elif expected:
+            fail("expected x-opencode-session={!r} (trace request_id), got {!r}".format(
+                expected, values[0] if values else None))
+    finally:
+        cleanup()
+
+
 ALL_TESTS = [
     ("concurrent-requests", test_concurrent_requests),
     ("retry-logic", test_retry_logic),
@@ -2582,6 +2670,7 @@ ALL_TESTS = [
     ("disable-retry-count-tokens-path-anchoring", test_disable_retry_count_tokens_path_anchoring),
     ("disable-retry-count-tokens-invalid-type", test_disable_retry_count_tokens_invalid_type),
     ("buffered-response-size-cap", test_buffered_response_size_cap),
+    ("retry-stability-extra-header", test_retry_stability_extra_header),
 ]
 
 

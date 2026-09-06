@@ -21,6 +21,7 @@ from _harness import (
     _create_test_config_with_flag,
     _create_test_keys,
     _send_proxy_request,
+    _start_mode_proxy,
     fail,
     find_free_port,
     info,
@@ -768,6 +769,117 @@ def test_retry_trace_event_enriched():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+# --- extra_request_headers in trace events ---
+# (plan 2026-09-06-opencode-session-header)
+
+def _read_request_events(trace_file):
+    """Read all 'request' trace events from the trace file."""
+    events = []
+    if not trace_file or not os.path.exists(trace_file):
+        return events
+    with open(trace_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("event") == "request":
+                events.append(ev)
+    return events
+
+
+def test_extra_request_headers_in_trace():
+    """Request trace events include extra_request_headers (resolved map) for a
+    ruled provider, omit it for an unruled provider, and omit it on the
+    unknown-model 400 error path (provider None)."""
+    print("\n--- Test: extra_request_headers in trace events ---")
+    upstream1 = find_free_port()
+    upstream2 = find_free_port()
+    tiers = {
+        "haiku": {"provider": "opencode-go", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "opencode-go", "model": "sonnet"},
+        "opus": {"provider": "other", "model": "opaque-model-other"},
+    }
+    vendors = {
+        "opencode-go": {"url": "http://127.0.0.1:{}".format(upstream1), "key": "K-OG"},
+        "other": {"url": "http://127.0.0.1:{}".format(upstream2), "key": "K-OTHER"},
+    }
+    extra = {
+        "opencode-go": [
+            {"header": "x-opencode-session",
+             "from": ["x-claude-code-session-id"],
+             "fallback": "request_id"},
+        ],
+    }
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, extra_headers=extra)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        # (1) ruled provider 200 with inbound session header
+        status, _ = _send_proxy_request(
+            proxy_port, headers={"X-Claude-Code-Session-Id": "trace-sess"})
+        if status != 200:
+            fail("ruled provider request expected 200, got {}".format(status))
+            return
+        events = _read_request_events(trace_file)
+        ev = [e for e in events
+              if e.get("provider") == "opencode-go" and e.get("http_status") == 200]
+        if not ev:
+            fail("no request trace event for the ruled-provider request")
+            return
+        ev = ev[-1]
+        if ev.get("extra_request_headers") == {"x-opencode-session": "trace-sess"}:
+            pass_("ruled provider request event carries extra_request_headers={!r}".format(
+                ev.get("extra_request_headers")))
+        else:
+            fail("expected extra_request_headers={{'x-opencode-session': 'trace-sess'}}, got {!r}".format(
+                ev.get("extra_request_headers")))
+
+        # (2) unruled provider request omits the key
+        status, _ = _send_proxy_request(
+            proxy_port,
+            body=json.dumps({"model": "opaque-model-other",
+                             "messages": [{"role": "user", "content": "hi"}]}))
+        if status != 200:
+            fail("unruled provider request expected 200, got {}".format(status))
+            return
+        events = _read_request_events(trace_file)
+        ev = [e for e in events
+              if e.get("provider") == "other" and e.get("http_status") == 200][-1]
+        if "extra_request_headers" not in ev:
+            pass_("unruled provider request event omits extra_request_headers")
+        else:
+            fail("expected unruled provider trace to omit extra_request_headers, got {!r}".format(
+                ev.get("extra_request_headers")))
+
+        # (3) unknown-model 400 (provider None) omits the key
+        status, _ = _send_proxy_request(
+            proxy_port,
+            body=json.dumps({"model": "zz-not-a-model",
+                             "messages": [{"role": "user", "content": "hi"}]}))
+        if status != 400:
+            fail("unknown model expected 400, got {}".format(status))
+            return
+        events = _read_request_events(trace_file)
+        ev = [e for e in events if e.get("http_status") == 400]
+        if not ev:
+            fail("no request trace event for the unknown-model 400 path")
+            return
+        ev = ev[-1]
+        if ev.get("provider") is None and "extra_request_headers" not in ev:
+            pass_("unknown-model 400 event (provider None) omits extra_request_headers")
+        else:
+            fail("expected 400 event without extra_request_headers, got provider={!r}, keys={!r}".format(
+                ev.get("provider"), sorted(ev.keys())))
+    finally:
+        cleanup()
+
+
 ALL_TESTS = [
     ("start-prunes-old-trace-entries", test_start_prunes_old_trace_entries),
     ("prune-trace-file-edge-cases", test_prune_trace_file_edge_cases),
@@ -775,6 +887,7 @@ ALL_TESTS = [
     ("trace-logs-oversized-body", test_trace_logs_oversized_body),
     ("relative-log-path", test_relative_log_path),
     ("retry-trace-event-enriched", test_retry_trace_event_enriched),
+    ("extra-request-headers-in-trace", test_extra_request_headers_in_trace),
 ]
 
 

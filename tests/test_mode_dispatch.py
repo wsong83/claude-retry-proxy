@@ -6,8 +6,10 @@ Part of the claude-retry-proxy suite; runnable standalone.
 """
 
 import json
+import os
 
 from _harness import (
+    _mode_default_responder,
     _mode_tiers,
     _require_server_func,
     _send_proxy_request,
@@ -1136,6 +1138,207 @@ def test_retry_does_not_double_transform():
         cleanup()
 
 
+# --- extra_request_headers attach matrix + user-agent forwarding ---
+# (plan 2026-09-06-opencode-session-header)
+
+def _last_request_event(trace_file, provider):
+    """Return the newest 'request' trace event dict for provider, or None."""
+    ev = None
+    if not trace_file or not os.path.exists(trace_file):
+        return None
+    with open(trace_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except Exception:
+                continue
+            if parsed.get("event") == "request" and parsed.get("provider") == provider:
+                ev = parsed
+    return ev
+
+
+def _last_request_event_request_id(trace_file, provider):
+    """Return the request_id of the newest 'request' trace event for provider."""
+    ev = _last_request_event(trace_file, provider)
+    return ev.get("request_id") if ev else None
+
+
+def test_extra_request_headers_attach_matrix():
+    """Resolved extra header emission for a ruled vs unruled provider.
+
+    (a) mixed-case inbound X-Claude-Code-Session-Id -> x-opencode-session
+    (b) inbound x-opencode-session wins over the alias header
+    (c) padded inbound value -> stripped emitted value
+    (d) neither inbound -> value equals the request's request_id (trace-correlated)
+    (e) provider without an x-opencode-session rule -> x-opencode-session absent upstream
+    (f) padded literal fallback -> stripped value upstream AND in the trace
+    """
+    print("\n--- Test: extra_request_headers attach matrix ---")
+    upstream1 = find_free_port()
+    upstream2 = find_free_port()
+    tiers = {
+        "haiku": {"provider": "opencode-go", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "opencode-go", "model": "sonnet"},
+        "opus": {"provider": "other", "model": "opaque-model-other"},
+    }
+    vendors = {
+        "opencode-go": {"url": "http://127.0.0.1:{}".format(upstream1), "key": "K-OG"},
+        "other": {"url": "http://127.0.0.1:{}".format(upstream2), "key": "K-OTHER"},
+    }
+    extra = {
+        "opencode-go": [
+            {"header": "x-opencode-session",
+             "from": ["x-opencode-session", "x-claude-code-session-id"],
+             "fallback": "request_id"},
+        ],
+        "other": [
+            {"header": "x-strip-fallback", "fallback": "  v  "},
+        ],
+    }
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, extra_headers=extra)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        og_reqs = mock_servers["opencode-go"]["requests"]
+        other_reqs = mock_servers["other"]["requests"]
+
+        def send(model, headers=None, check_other=False):
+            status, _ = _send_proxy_request(
+                proxy_port,
+                body=json.dumps({"model": model, "messages": [{"role": "user", "content": "hi"}]}),
+                headers=headers)
+            if status != 200:
+                fail("expected 200, got {}".format(status))
+                return None
+            if check_other:
+                return other_reqs[-1]["headers"]
+            return og_reqs[-1]["headers"]
+
+        # (a) mixed-case inbound alias name -> x-opencode-session emitted
+        h = send("sonnet", {"X-Claude-Code-Session-Id": "session-a1"})
+        if h is None:
+            return
+        if h.get("x-opencode-session") == ["session-a1"]:
+            pass_("(a) mixed-case X-Claude-Code-Session-Id -> x-opencode-session: session-a1")
+        else:
+            fail("(a) expected x-opencode-session=session-a1, got {!r}".format(h.get("x-opencode-session")))
+
+        # (b) native x-opencode-session inbound wins over the alias
+        h = send("sonnet", {"x-opencode-session": "native-v", "X-Claude-Code-Session-Id": "alias-v"})
+        if h is None:
+            return
+        if h.get("x-opencode-session") == ["native-v"]:
+            pass_("(b) inbound x-opencode-session wins over alias")
+        else:
+            fail("(b) expected x-opencode-session=native-v, got {!r}".format(h.get("x-opencode-session")))
+
+        # (c) padded inbound value -> stripped emitted value
+        h = send("sonnet", {"X-Claude-Code-Session-Id": "  padded  "})
+        if h is None:
+            return
+        if h.get("x-opencode-session") == ["padded"]:
+            pass_("(c) padded inbound value emitted stripped: 'padded'")
+        else:
+            fail("(c) expected x-opencode-session='padded', got {!r}".format(h.get("x-opencode-session")))
+
+        # (d) neither inbound -> value equals the request's request_id
+        h = send("sonnet")
+        if h is None:
+            return
+        expected = _last_request_event_request_id(trace_file, "opencode-go")
+        if h.get("x-opencode-session") == [expected]:
+            pass_("(d) absent inbound -> resolved to request_id {}".format(expected))
+        else:
+            fail("(d) expected x-opencode-session={!r} (trace request_id), got {!r}".format(
+                expected, h.get("x-opencode-session")))
+
+        # (e) provider without an x-opencode-session rule -> header absent upstream
+        h = send("opaque-model-other", check_other=True)
+        if h is None:
+            return
+        if "x-opencode-session" not in h:
+            pass_("(e) provider without an x-opencode-session rule emits no x-opencode-session upstream")
+        else:
+            fail("(e) expected no x-opencode-session for non-opencode provider, got {!r}".format(
+                h.get("x-opencode-session")))
+
+        # (f) padded literal fallback -> stripped value upstream AND in the trace
+        #     (Phase-6 review round-2: fallback literals are emitted stripped,
+        #      matching from-derived values)
+        h = send("opaque-model-other", check_other=True)
+        if h is None:
+            return
+        if h.get("x-strip-fallback") == ["v"]:
+            pass_("(f) padded fallback literal emitted stripped upstream: 'v'")
+        else:
+            fail("(f) expected x-strip-fallback='v', got {!r}".format(h.get("x-strip-fallback")))
+        ev = _last_request_event(trace_file, "other")
+        if ev is not None and ev.get("extra_request_headers") == {"x-strip-fallback": "v"}:
+            pass_("(f) trace records the stripped fallback value: {{'x-strip-fallback': 'v'}}")
+        else:
+            fail("(f) expected trace extra_request_headers={{'x-strip-fallback': 'v'}}, got {!r}".format(
+                ev.get("extra_request_headers") if ev else None))
+    finally:
+        cleanup()
+
+
+def test_user_agent_forwarded_all_modes():
+    """Inbound User-Agent forwarded upstream for anthropic/chat/response modes,
+    exactly one User-Agent line reaching upstream."""
+    print("\n--- Test: User-Agent forwarded across all modes ---")
+    chat_ok = json.dumps({
+        "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "gpt-4o",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello"},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+    }).encode()
+    resp_ok = json.dumps({
+        "id": "resp_1", "object": "response", "created_at": 1, "model": "gpt-4o",
+        "status": "completed",
+        "output": [{"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hello", "annotations": []}]}],
+        "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+    }).encode()
+
+    for mode, responder in (
+        ("anthropic", _mode_default_responder),
+        ("chat", lambda info: (200, "application/json", chat_ok)),
+        ("response", lambda info: (200, "application/json", resp_ok)),
+    ):
+        upstream_port = find_free_port()
+        vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K",
+                         "mode": mode} if mode != "anthropic" else
+                   {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K"}}
+        temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+            _mode_tiers(), vendors, responders={"p": responder})
+        if proc is None:
+            fail("Failed to set up {} mode proxy".format(mode))
+            continue
+        try:
+            status, _ = _send_proxy_request(
+                proxy_port, headers={"User-Agent": "claude-cli/2.1.220 (external, cli)"})
+            if status != 200:
+                fail("{} mode: expected 200, got {}".format(mode, status))
+                continue
+            reqs = mock_servers["p"]["requests"]
+            if not reqs:
+                fail("{} mode: upstream received no requests".format(mode))
+                continue
+            ua_lines = (reqs[0].get("headers") or {}).get("user-agent")
+            if ua_lines == ["claude-cli/2.1.220 (external, cli)"]:
+                pass_("{} mode: User-Agent forwarded exactly once with value".format(mode))
+            else:
+                fail("{} mode: expected exactly one 'claude-cli/2.1.220 (external, cli)' "
+                     "user-agent line, got {!r}".format(mode, ua_lines))
+        finally:
+            cleanup()
+
+
 ALL_TESTS = [
     ("mode-defaults-to-anthropic", test_mode_defaults_to_anthropic),
     ("mode-null-defaults-to-anthropic", test_mode_null_defaults_to_anthropic),
@@ -1163,6 +1366,8 @@ ALL_TESTS = [
     ("transform-failure-passthrough", test_transform_failure_passthrough),
     ("tool-args-parse-failure-trace-has-request-id", test_tool_args_parse_failure_trace_has_request_id),
     ("retry-does-not-double-transform", test_retry_does_not_double_transform),
+    ("extra-request-headers-attach-matrix", test_extra_request_headers_attach_matrix),
+    ("user-agent-forwarded-all-modes", test_user_agent_forwarded_all_modes),
 ]
 
 

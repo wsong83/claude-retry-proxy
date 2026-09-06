@@ -182,6 +182,50 @@ shipped config template sets it to `true`.
 "disable_retry_claude_count_token": true
 ```
 
+### `extra_request_headers` (optional, object)
+
+An optional top-level map keyed by provider name. Each provider maps to a
+list of header specs; every spec attaches one outbound header to all
+upstream requests for that provider, in any mode.
+
+```json
+"extra_request_headers": {
+  "opencode-go": [
+    {
+      "header": "x-opencode-session",
+      "from": ["x-opencode-session", "x-claude-code-session-id"],
+      "fallback": "request_id"
+    }
+  ]
+}
+```
+
+Each spec has:
+
+- `header` — the outbound header name. Alphanumeric plus hyphens; names
+  that collide with proxy-managed or protocol headers (`authorization`,
+  `x-api-key`, `host`, `content-length`, `content-type`, `accept`,
+  `anthropic-version`, `anthropic-beta`, `user-agent`, `connection`,
+  `transfer-encoding`, …) are rejected at startup/reload.
+- `from` — list of inbound header names, checked case-insensitively left
+  to right; the first non-empty (stripped) value wins. Entries cannot be
+  `authorization` or `x-api-key` (client auth credentials are never copied).
+- `fallback` — used when no `from` header is present: a literal string
+  (emitted stripped) or the token `"request_id"` resolving to a fresh UUID
+  per request (note: per-request, not per-conversation — Claude Code ≥ 2.1.86
+  sends the stable `X-Claude-Code-Session-Id` header, which the example above
+  translates so the conversation ID is preserved).
+
+At least one of `from` (non-empty) / `fallback` is required. Duplicate header
+names within a provider are rejected. The top-level key itself is optional —
+configs without it behave exactly as before. Resolved values are computed once
+per request, so they are stable across retries, and are recorded in the trace
+log (see Trace log below).
+
+The proxy also forwards your client's `User-Agent` (e.g.
+`claude-cli/2.1.220 (external, cli)`) to upstream providers in every mode, so
+providers can identify the client instead of logging "Unknown client".
+
 ### Keys file format (`~/.claude/keys-index.json`)
 
 A template is provided at [`src/templates/keys-index.json`](src/templates/keys-index.json). Copy it to
@@ -294,7 +338,9 @@ Default location: `~/.claude/logs/proxy-trace.jsonl` (one JSON object per line).
 
 Each request logs: timestamp, method, path, model, tier, provider, status,
 http_status, retry count, total latency, first-byte latency, and a sanitized
-error. Lifecycle markers (`proxy_start`, `proxy_stop`) and per-retry events
+error. Requests to providers with `extra_request_headers` rules additionally
+log an `extra_request_headers` field with the resolved header map. Lifecycle
+markers (`proxy_start`, `proxy_stop`) and per-retry events
 are also logged. When a client disconnects mid-response, a `client_disconnect`
 event is logged instead of printing a traceback.
 
@@ -315,6 +361,9 @@ max retries + failure) are filtered automatically.
 
 With `--all`, the trace file contains **raw prompts** (plus error-path
 response bodies) in plaintext; streamed 2xx success bodies are not captured.
+Resolved `extra_request_headers` values are logged on every request for
+providers with rules regardless of `--all` — a resolved session id is a
+stable per-conversation identifier, so treat the trace file accordingly.
 The proxy applies `0600` permissions to the trace and state files on
 **POSIX** systems. On **Windows**, `chmod` is effectively a no-op (it only
 toggles the read-only attribute; there is no Unix group/other model), so you
@@ -330,6 +379,10 @@ icacls "$env:USERPROFILE\.claude\logs" /inheritance:r /grant:r "$env:USERNAME:(O
   upstream providers. Hot-switchable via admin page.
 - **Model name rewriting** — request: tier → actual model. Response: actual
   model → tier. Claude Code only sees tier names.
+- **Config-driven extra request headers** — per-provider
+  `extra_request_headers` rules attach stable outbound headers (e.g.
+  `x-opencode-session`) in all modes; the client `User-Agent` is forwarded
+  upstream.
 - **Automatic retries** — `429`, `503`, and connection errors retried with
   jittered exponential backoff (default 10 attempts). `429`s back off at the
   maximal delay; jitter de-synchronizes concurrent sessions.

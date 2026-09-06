@@ -657,6 +657,271 @@ def test_api_key_from_keys_index():
         cleanup()
 
 
+# ===========================================================================
+# extra_request_headers validation matrix (plan 2026-09-06-opencode-session-header)
+# ===========================================================================
+
+def _base_valid_config():
+    """Configuration that validates cleanly (no extra_request_headers key).
+
+    Providers set for validate_config is {"p"}. The unknown-provider check for
+    extra_request_headers keys is membership in config['models'], matching the
+    plan ('unknown provider key (not in config.models)').
+    """
+    return {
+        "tiers": {
+            "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+            "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+            "opus": {"provider": "p", "model": "claude-opus-5"},
+        },
+        "models": {"p": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]},
+    }
+
+
+_RESERVED_EXTRA_HEADER_NAMES = [
+    "authorization", "x-api-key", "host", "content-length", "content-type",
+    "accept", "anthropic-version", "anthropic-beta", "user-agent",
+    "connection", "transfer-encoding", "expect", "te", "accept-encoding",
+    "cookie",
+]
+
+
+def _expect_extra_errors(cfg, wanted_substrings, label, srv, n_exact=None):
+    """Run validate_config over cfg and assert wanted substrings appear.
+
+    wanted_substrings: list of substrings, each must appear in some error.
+    n_exact: optional exact error-list length (when the variant is fully
+    specified and the base config is clean). Pass None to skip the check
+    (variants that legitimately emit multiple errors).
+    """
+    errors = srv.validate_config(cfg, {"p"})
+    if n_exact is not None and len(errors) != n_exact:
+        fail(f"{label}: expected exactly {n_exact} error(s), got {len(errors)}: {errors}")
+        return
+    for sub in wanted_substrings:
+        if not any(sub in e for e in errors):
+            fail(f"{label}: no error contains {sub!r}; got {errors}")
+            return
+    pass_(f"{label}: errors matched ({errors!r})")
+
+
+def test_extra_request_headers_validation_matrix():
+    """Validation matrix for extra_request_headers: every malformed variant
+    yields its specific validation error (never a raise), and the two valid
+    sides (with rules / without the key) pass empty-error.
+
+    Error substrings are pinned from the coder's implementation (see coder
+    report out_of_scope field). In-process validate_config keeps ~40
+    sub-checks fast; one spawn-refusal integration test covers the startup
+    path.
+    """
+    print("\n--- Test: extra_request_headers validation matrix ---")
+    import claude_retry_proxy.server as srv
+
+    base = _base_valid_config()
+    if srv.validate_config(base, {"p"}):
+        fail("base config should validate clean without extra_request_headers")
+        return
+    pass_("config without extra_request_headers key validates clean (optional key)")
+
+    def variant(extra):
+        cfg = dict(base)
+        cfg["extra_request_headers"] = extra
+        return cfg
+
+    RESERVED = _RESERVED_EXTRA_HEADER_NAMES
+
+    # Top-level shape (string, null, list)
+    _expect_extra_errors(variant("x"), ["extra_request_headers must be an object, got str"], "top-level string", srv, n_exact=1)
+    _expect_extra_errors(variant(None), ["extra_request_headers must be an object, got NoneType"], "top-level null", srv, n_exact=1)
+    _expect_extra_errors(variant(["x"]), ["extra_request_headers must be an object, got list"], "top-level list", srv, n_exact=1)
+
+    # Unknown provider key (not in config.models)
+    _expect_extra_errors(variant({"ghost": [{"header": "x-a", "fallback": "v"}]}),
+                         ["extra_request_headers references unknown provider 'ghost'"],
+                         "unknown provider key", srv, n_exact=1)
+
+    # Provider value not a list
+    _expect_extra_errors(variant({"p": "notalist"}),
+                         ["extra_request_headers['p'] must be a list of rule objects, got str"],
+                         "provider value string", srv, n_exact=1)
+    _expect_extra_errors(variant({"p": None}),
+                         ["extra_request_headers['p'] must be a list of rule objects, got NoneType"],
+                         "provider value null", srv, n_exact=1)
+
+    # Spec not a dict (and null)
+    _expect_extra_errors(variant({"p": ["notadict"]}),
+                         ["extra_request_headers['p'] rule must be an object, got str"],
+                         "spec string", srv, n_exact=1)
+    _expect_extra_errors(variant({"p": [None]}),
+                         ["extra_request_headers['p'] rule must be an object, got NoneType"],
+                         "spec null", srv, n_exact=1)
+
+    # Missing header
+    _expect_extra_errors(variant({"p": [{"fallback": "v"}]}),
+                         ["extra_request_headers['p'] rule 'header' must be a string, got NoneType"],
+                         "missing header", srv)
+
+    # Non-string header (int)
+    _expect_extra_errors(variant({"p": [{"header": 42, "fallback": "v"}]}),
+                         ["extra_request_headers['p'] rule 'header' must be a string, got int"],
+                         "non-string header int", srv, n_exact=1)
+
+    # Header empty
+    _expect_extra_errors(variant({"p": [{"header": "", "fallback": "v"}]}),
+                         ["extra_request_headers['p'] rule 'header' cannot be empty"],
+                         "empty header", srv, n_exact=1)
+
+    # Header regex failure
+    _expect_extra_errors(variant({"p": [{"header": "bad name", "fallback": "v"}]}),
+                         ["extra_request_headers['p'] rule 'header' 'bad name' does not match ^[A-Za-z0-9][A-Za-z0-9-]*$"],
+                         "header regex", srv, n_exact=1)
+
+    # Reserved header names — one row per name, case-insensitive
+    for h in RESERVED:
+        _expect_extra_errors(variant({"p": [{"header": h.upper(), "fallback": "v"}]}),
+                             ["extra_request_headers['p'] rule 'header' '{}' is reserved and cannot be set".format(h.upper())],
+                             "reserved header {}".format(h), srv, n_exact=1)
+
+    # Duplicate header names — exact and case-variant
+    dup_cfg = {"p": [
+        {"header": "x-opencode-session", "from": ["x-s"], "fallback": "request_id"},
+        {"header": "x-opencode-session", "fallback": "v2"},
+    ]}
+    _expect_extra_errors(variant(dup_cfg),
+                         ["duplicate rule 'header' 'x-opencode-session' (case-insensitive)"],
+                         "duplicate header exact", srv)
+    dup_cfg2 = {"p": [
+        {"header": "x-opencode-session", "from": ["x-s"], "fallback": "request_id"},
+        {"header": "X-OpenCode-Session", "fallback": "v2"},
+    ]}
+    _expect_extra_errors(variant(dup_cfg2),
+                         ["duplicate rule 'header' 'X-OpenCode-Session' (case-insensitive)"],
+                         "duplicate header case-variant", srv)
+
+    # from not a list
+    _expect_extra_errors(variant({"p": [{"header": "x-a", "from": "notalist", "fallback": "v"}]}),
+                         ["extra_request_headers['p'] rule 'from' must be a list of header names, got str"],
+                         "from not a list", srv, n_exact=1)
+
+    # from entry non-string (int)
+    _expect_extra_errors(variant({"p": [{"header": "x-a", "from": [42], "fallback": "v"}]}),
+                         ["extra_request_headers['p'] rule 'from' entry must be a string, got int"],
+                         "from entry int", srv)
+
+    # from entry stripped-empty
+    _expect_extra_errors(variant({"p": [{"header": "x-a", "from": ["", "  "], "fallback": "v"}]}),
+                         ["extra_request_headers['p'] rule 'from' entry cannot be empty"],
+                         "from entry whitespace", srv)
+
+    # from entry regex failure
+    _expect_extra_errors(variant({"p": [{"header": "x-a", "from": ["bad name"], "fallback": "v"}]}),
+                         ["extra_request_headers['p'] rule 'from' entry 'bad name' does not match ^[A-Za-z0-9][A-Za-z0-9-]*$"],
+                         "from entry regex", srv, n_exact=1)
+
+    # from entry reserved auth name — case-insensitive
+    _expect_extra_errors(variant({"p": [{"header": "x-a", "from": ["Authorization"], "fallback": "v"}]}),
+                         ["extra_request_headers['p'] rule 'from' entry 'Authorization' is reserved (client auth headers cannot be copied)"],
+                         "from entry authorization", srv, n_exact=1)
+    _expect_extra_errors(variant({"p": [{"header": "x-a", "from": ["x-api-key"], "fallback": "v"}]}),
+                         ["extra_request_headers['p'] rule 'from' entry 'x-api-key' is reserved (client auth headers cannot be copied)"],
+                         "from entry x-api-key", srv, n_exact=1)
+
+    # fallback non-string (int and dict)
+    _expect_extra_errors(variant({"p": [{"header": "x-a", "from": ["x-b"], "fallback": 42}]}),
+                         ["extra_request_headers['p'] rule 'fallback' must be a string, got int"],
+                         "fallback int", srv, n_exact=1)
+    _expect_extra_errors(variant({"p": [{"header": "x-a", "from": ["x-b"], "fallback": {}}]}),
+                         ["extra_request_headers['p'] rule 'fallback' must be a string, got dict"],
+                         "fallback dict", srv, n_exact=1)
+
+    # fallback empty and stripped-empty
+    _expect_extra_errors(variant({"p": [{"header": "x-a", "from": ["x-b"], "fallback": ""}]}),
+                         ["extra_request_headers['p'] rule 'fallback' cannot be empty"],
+                         "fallback empty", srv, n_exact=1)
+    _expect_extra_errors(variant({"p": [{"header": "x-a", "from": ["x-b"], "fallback": "   "}]}),
+                         ["extra_request_headers['p'] rule 'fallback' cannot be empty"],
+                         "fallback stripped-empty", srv, n_exact=1)
+
+    # fallback CR/LF and control char
+    _expect_extra_errors(variant({"p": [{"header": "x-a", "from": ["x-b"], "fallback": "a\nb"}]}),
+                         ["extra_request_headers['p'] rule 'fallback' contains control characters"],
+                         "fallback CR/LF", srv, n_exact=1)
+    _expect_extra_errors(variant({"p": [{"header": "x-a", "from": ["x-b"], "fallback": "a\x00b"}]}),
+                         ["extra_request_headers['p'] rule 'fallback' contains control characters"],
+                         "fallback control char", srv, n_exact=1)
+
+    # fallback not latin-1 encodable (U+6728 is outside latin-1)
+    _expect_extra_errors(variant({"p": [{"header": "x-a", "from": ["x-b"], "fallback": "a木b"}]}),
+                         ["extra_request_headers['p'] rule 'fallback' must be latin-1 encodable"],
+                         "fallback non-latin1", srv, n_exact=1)
+
+    # neither from (non-empty, non-[]) nor fallback present — including from: []
+    _expect_extra_errors(variant({"p": [{"header": "x-a"}]}),
+                         ["extra_request_headers['p'] rule needs a non-empty 'from' list or a 'fallback'"],
+                         "neither from nor fallback", srv, n_exact=1)
+    _expect_extra_errors(variant({"p": [{"header": "x-a", "from": []}]}),
+                         ["extra_request_headers['p'] rule needs a non-empty 'from' list or a 'fallback'"],
+                         "from empty list no fallback", srv, n_exact=1)
+
+    # Valid side: provider with a well-formed rule list validates clean
+    valid_rules = {"p": [
+        {"header": "x-opencode-session",
+         "from": ["x-opencode-session", "x-claude-code-session-id"],
+         "fallback": "request_id"},
+    ]}
+    errs = srv.validate_config(variant(valid_rules), {"p"})
+    if errs:
+        fail("config with well-formed extra_request_headers should validate clean, got {}".format(errs))
+    else:
+        pass_("config with well-formed extra_request_headers validates clean")
+
+
+def test_extra_request_headers_startup_refusal():
+    """Server refuses to start with a malformed extra_request_headers and
+    starts with a well-formed one (startup integration)."""
+    print("\n--- Test: extra_request_headers startup integration ---")
+
+    def try_start(extra):
+        temp_dir = tempfile.mkdtemp(prefix="proxy_erh_start_")
+        try:
+            cfg = _base_valid_config()
+            cfg["extra_request_headers"] = extra
+            config_path = os.path.join(temp_dir, "config.json")
+            with open(config_path, "w") as f:
+                json.dump(cfg, f)
+            keys_path = _create_test_keys_plain(temp_dir, {"p": {"url": "http://127.0.0.1:9999", "key": "k"}})
+            proc, probe_ok = _start_proxy_server_directly(
+                find_free_port(), config_path=config_path, keys_path=keys_path)
+            err = ""
+            if probe_ok:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            else:
+                try:
+                    _, err = proc.communicate(timeout=5)
+                except Exception:
+                    pass
+            return probe_ok, err or ""
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    started, err = try_start("not-a-map")
+    if not started and "extra_request_headers must be an object" in err:
+        pass_("Server refused to start with malformed extra_request_headers (top-level string)")
+    else:
+        fail(f"Expected malformed extra_request_headers to refuse startup, got started={started}, stderr={err[:300]!r}")
+
+    started, err = try_start({"p": [{"header": "x-opencode-session", "from": ["x-s"], "fallback": "request_id"}]})
+    if started:
+        pass_("Server started with a well-formed extra_request_headers config")
+    else:
+        fail(f"Server refused to start with valid extra_request_headers: {err[:300]!r}")
+
+
 ALL_TESTS = [
     ("config-validation-missing-tier", test_config_validation_missing_tier),
     ("config-validation-unknown-provider", test_config_validation_unknown_provider),
@@ -668,6 +933,8 @@ ALL_TESTS = [
     ("key-decryption-wrong-passphrase", test_key_decryption_wrong_passphrase),
     ("key-decryption-missing-file", test_key_decryption_missing_file),
     ("api-key-from-keys-index", test_api_key_from_keys_index),
+    ("extra-request-headers-validation-matrix", test_extra_request_headers_validation_matrix),
+    ("extra-request-headers-startup-integration", test_extra_request_headers_startup_refusal),
 ]
 
 

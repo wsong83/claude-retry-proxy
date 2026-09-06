@@ -751,8 +751,10 @@ def test_admin_models_provider_keyed():
 
 
 def test_admin_switch_preserves_disable_retry_flag():
-    """Admin Apply preserves disable_retry_claude_count_token in returned + on-disk config."""
-    print("\n--- Test: Admin Switch Preserves Disable Retry Flag ---")
+    """Admin Apply preserves disable_retry_claude_count_token and
+    extra_request_headers (one switch flow, both top-level keys) in the
+    returned and on-disk config."""
+    print("\n--- Test: Admin Switch Preserves Top-Level Keys (flag + extra headers) ---")
 
     upstream_port = find_free_port()
     proxy_port = find_free_port()
@@ -763,10 +765,12 @@ def test_admin_switch_preserves_disable_retry_flag():
         "opus": {"provider": "p", "model": "claude-opus-5"},
     }
     vendors = {"p": {"url": f"http://127.0.0.1:{upstream_port}", "key": "k"}}
+    seeded_extra = {"p": [{"header": "x-opencode-session", "fallback": "request_id"}]}
 
     temp_dir = tempfile.mkdtemp(prefix="proxy_drct_admin_test_")
     try:
-        config_path = _create_test_config_with_flag(temp_dir, tiers, True)
+        config_path = _create_test_config_with_flag(
+            temp_dir, tiers, True, extra_request_headers=seeded_extra)
         keys_path = _create_test_keys(temp_dir, vendors)
 
         proc, probe_ok = _start_proxy_server_directly(
@@ -817,6 +821,19 @@ def test_admin_switch_preserves_disable_retry_flag():
                 pass_("On-disk config preserves disable_retry_claude_count_token=true")
             else:
                 fail(f"On-disk config missing/preserved flag: {disk_config.get('disable_retry_claude_count_token')}")
+
+            # extra_request_headers survives the switch in both the returned
+            # (in-memory) and on-disk config.
+            if config.get("extra_request_headers") == seeded_extra:
+                pass_("Returned config preserves extra_request_headers")
+            else:
+                fail(f"Returned config missing/preserved extra_request_headers: "
+                     f"{config.get('extra_request_headers')}")
+            if disk_config.get("extra_request_headers") == seeded_extra:
+                pass_("On-disk config preserves extra_request_headers")
+            else:
+                fail(f"On-disk config missing/preserved extra_request_headers: "
+                     f"{disk_config.get('extra_request_headers')}")
 
         finally:
             proc.terminate()

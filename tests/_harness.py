@@ -225,6 +225,19 @@ def find_free_port():
     return port
 
 
+def _record_request_headers(headers):
+    """Capture a mock-upstream request's full outbound header set.
+
+    Returns {lowercased_name: [value, ...]} preserving duplicate header
+    lines (http.client may merge/split headers), so tests can assert both
+    values and line counts (e.g. exactly one User-Agent line).
+    """
+    out = {}
+    for k, v in headers.items():
+        out.setdefault(str(k).lower(), []).append(str(v))
+    return out
+
+
 
 
 # ===========================================================================
@@ -266,7 +279,7 @@ def _models_for_vendors(tiers, vendors):
 
 
 
-def _create_test_config(temp_dir, tiers, models=None):
+def _create_test_config(temp_dir, tiers, models=None, extra_request_headers=None):
     """Create a temp config.json with tier mappings.
 
     Args:
@@ -275,6 +288,9 @@ def _create_test_config(temp_dir, tiers, models=None):
         models: Optional dict mapping provider names to model lists. When None,
             a provider-keyed catalog is derived from the tier mappings so the
             config passes models-per-provider startup validation.
+        extra_request_headers: Optional provider-keyed extra_request_headers
+            map to write into the config. When None the key is omitted
+            entirely (matches existing behavior — the key is optional).
 
     Returns:
         Path to created config.json
@@ -285,6 +301,8 @@ def _create_test_config(temp_dir, tiers, models=None):
         "tiers": tiers,
         "models": models
     }
+    if extra_request_headers is not None:
+        config["extra_request_headers"] = extra_request_headers
     path = os.path.join(temp_dir, "config.json")
     with open(path, "w") as f:
         json.dump(config, f)
@@ -441,17 +459,23 @@ def _start_proxy_server_directly(port, config_path=None, keys_path=None,
 
 
 
-def _send_proxy_request(port, path="/v1/messages", body=None):
-    """Send an HTTP request to the proxy and return (status, response_body)."""
+def _send_proxy_request(port, path="/v1/messages", body=None, headers=None):
+    """Send an HTTP request to the proxy and return (status, response_body).
+
+    headers: optional dict of extra inbound request headers (merged over the
+    default Content-Type; passed verbatim to http.client).
+    """
     import http.client as _hc
     if body is None:
         body = json.dumps({"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
     conn = _hc.HTTPConnection("127.0.0.1", port, timeout=10)
-    headers = {
+    req_headers = {
         "Content-Type": "application/json",
     }
+    if headers:
+        req_headers.update(headers)
     try:
-        conn.request("POST", path, body=body, headers=headers)
+        conn.request("POST", path, body=body, headers=req_headers)
         resp = conn.getresponse()
         status = resp.status
         resp_body = resp.read()
@@ -536,7 +560,8 @@ def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-pas
                     content_len = int(self.headers.get("Content-Length", 0))
                     body = self.rfile.read(content_len) if content_len > 0 else b"{}"
                     api_key = self.headers.get("x-api-key", "")
-                    req_list.append({"body": body, "api_key": api_key})
+                    req_list.append({"body": body, "api_key": api_key,
+                                     "headers": _record_request_headers(self.headers)})
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
@@ -606,7 +631,8 @@ def _start_mock_upstream(port, req_list):
             content_len = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_len) if content_len > 0 else b"{}"
             api_key = self.headers.get("x-api-key", "")
-            req_list.append({"body": body, "api_key": api_key})
+            req_list.append({"body": body, "api_key": api_key,
+                             "headers": _record_request_headers(self.headers)})
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -691,14 +717,19 @@ def _start_admin_proxy(tiers, vendors, models=None):
 # Part B (Steps 9-15): disable_retry_claude_count_token
 # ===========================================================================
 
-def _create_test_config_with_flag(temp_dir, tiers, flag_value=None):
-    """Create a config.json with an optional disable_retry_claude_count_token.
+def _create_test_config_with_flag(temp_dir, tiers, flag_value=None,
+                                  extra_request_headers=None):
+    """Create a config.json with an optional disable_retry_claude_count_token
+    and/or extra_request_headers map.
 
     flag_value: True/False to set, or None to omit the key entirely.
+    extra_request_headers: provider-keyed map to set, or None to omit.
     """
     config = {"tiers": tiers, "models": _derive_models_from_tiers(tiers)}
     if flag_value is not None:
         config["disable_retry_claude_count_token"] = flag_value
+    if extra_request_headers is not None:
+        config["extra_request_headers"] = extra_request_headers
     path = os.path.join(temp_dir, "config.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(config, f)
@@ -811,6 +842,7 @@ def _start_mode_mock_upstream(port, req_list, responder):
                 "api_key": self.headers.get("x-api-key", ""),
                 "authorization": self.headers.get("authorization", ""),
                 "anthropic_beta": self.headers.get("anthropic-beta", ""),
+                "headers": _record_request_headers(self.headers),
             }
             req_list.append(info)
             status, content_type, resp_body = responder(info)
@@ -852,18 +884,22 @@ def _mode_default_responder(info):
 
 
 
-def _start_mode_proxy(tiers, vendors, responders=None, extra_env=None):
+def _start_mode_proxy(tiers, vendors, responders=None, extra_env=None,
+                      extra_headers=None):
     """Start proxy + mode-aware mock upstreams (plain keys).
 
     vendors maps vendor -> {url, key, mode?}. responders maps vendor ->
     responder(info). extra_env passes additional env vars to the proxy
-    subprocess (e.g. reduced PROXY_MAX_DELAY for fast retry tests). Returns
+    subprocess (e.g. reduced PROXY_MAX_DELAY for fast retry tests).
+    extra_headers: optional provider-keyed extra_request_headers map written
+    into the config. Returns
     (temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup).
     """
     temp_dir = tempfile.mkdtemp(prefix="proxy_mode_")
     proxy_port = find_free_port()
     config_path = _create_test_config(
-        temp_dir, tiers, models=_models_for_vendors(tiers, vendors))
+        temp_dir, tiers, models=_models_for_vendors(tiers, vendors),
+        extra_request_headers=extra_headers)
     keys_path = _create_test_keys_plain(temp_dir, vendors)
 
     responders = responders or {}
