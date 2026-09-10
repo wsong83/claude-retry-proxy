@@ -27,7 +27,9 @@ src/claude_retry_proxy/
   vimcrypt.py           vim blowfish2 (VimCrypt~03!) decryption (derived from claude-config bin/vimcrypt.py)
   admin.html            admin page for hot-switching tier mappings (served at /admin/)
 src/templates/
-  config.json  template for ~/.claude/proxy/config.json (copied on first start)
+  config.json     template for ~/.claude/proxy/config.json (copied on first start)
+  keys-index.json template for ~/.claude/keys-index.json (single-key `key` string
+                  or multi-key `keys` name→payload object)
 tests/
   test_claude_proxy.py  test suite aggregator (entry point: `python tests/test_claude_proxy.py`)
   _harness.py           shared test harness (env isolation, helper functions, proxy lifecycle)
@@ -90,9 +92,15 @@ paths resolve against cwd), `--all` (log full request/response bodies),
   1. Extract model name from request body → `resolve_tier` (direct name,
      reverse lookup, pattern match, or 400 error for unknown)
   2. Config lookup: tier → (provider, model name)
-  3. Keys lookup: provider → (url, api_key, mode) from decrypted vendors table.
-     `mode` defaults to `"anthropic"` when absent; valid values are `"anthropic"`,
-     `"chat"`, `"response"`.
+  3. Keys lookup: provider → (url, key or keys, mode) from decrypted vendors
+     table. `key` is a plain string (single key, its name is `"default"`);
+     `keys` is a name→payload object (multi-key; exactly one of the two fields
+     may be present). The tier's configured `key` field selects the payload —
+     absent/`""` means the first key in file order — and a tier selector that
+     names no key of its provider fails startup/reload/switch validation; an
+     unresolvable vendor key at request time yields 500 `invalid_provider_key`.
+     `mode` defaults to `"anthropic"` when absent; valid values are
+     `"anthropic"`, `"chat"`, `"response"`.
   4. **Mode dispatch** — auth header, path, and body transforms depend on mode:
      - **Auth:** `x-api-key` for anthropic; `Authorization: Bearer` for chat/response.
      - **Path:** original path for anthropic; `/v1/chat/completions` for chat;
@@ -140,21 +148,27 @@ paths resolve against cwd), `--all` (log full request/response bodies),
   7. **`do_POST` streamed flag**: `streamed = (200 <= status < 300) and
      (resp_body == b"")` — streaming paths return `b""`, buffering paths
      return actual body. Only buffered responses call `_send_response`.
-  8. Log a JSONL trace entry with `tier`, `provider`, and `mode` fields.
+  8. Log a JSONL trace entry with `tier`, `provider`, `mode`, and `key`
+     (resolved key name; omitted when resolution is impossible) fields.
      Request events for providers with `extra_request_headers` rules also
      carry an `extra_request_headers` field with the resolved map
      (re-resolved in `do_POST`; omitted when empty).
   - `/admin/shutdown` (localhost-only) triggers graceful shutdown.
   - **Admin page** (`GET /admin/`): serves `admin.html` from package data.
   - **Admin API** (localhost-only, CSRF-protected via Origin validation):
-    - `GET /admin/api/config` — return current tiers + models
+    - `GET /admin/api/config` — return current tiers (incl. per-tier `key`) + models
     - `GET /admin/api/providers` — return list of available provider names
-    - `GET /admin/api/providers-detail` — return mode per provider (read-only, no keys)
+    - `GET /admin/api/providers-detail` — return mode + key NAMES per
+      provider (read-only; never payloads — names are `"default"` for
+      string-form vendors or the `keys` object keys in insertion order)
     - `POST /admin/api/switch` — update tier mappings (preserves models
-      catalog), validate all 3 tiers present, validate provider names,
-      drain-and-swap pattern (block new queries, drain in-flight, swap,
+      catalog), validate all 3 tiers present, validate provider names and
+      each tier's optional `key` selector (absent → provider's first key,
+      which is defaulted into the persisted config; unknown/invalid name →
+      400), drain-and-swap pattern (block new queries, drain in-flight, swap,
       unblock)
-    - `POST /admin/api/reload` — re-read config.json from disk, validate,
+    - `POST /admin/api/reload` — re-read config.json from disk, validate
+      (incl. per-tier key names against the in-memory vendors snapshot),
       drain-and-swap pattern
   - **Drain-and-swap pattern:** config changes use `_config_swapping` flag
     + `_inflight_count` counter + `_swap_done` Event. New requests wait if
@@ -322,6 +336,31 @@ does not block startup on failure).
   production is to encrypt with `vim -n -x` (blowfish2, `VimCrypt~03!`, the
   default). The `--passphrase-file` CLI option is only used when keys are
   encrypted; with plain keys it is ignored.
+- **Multi-key provider keys.** Each vendor in keys-index.json carries exactly
+  one of two fields: `key` — a plain string (single key, its name is
+  `"default"`) — or `keys` — a name→payload object (multi-key, e.g.
+  `"keys": {"SW": "sk-...", "CZ": "sk-..."}`; insertion order = key order,
+  and the first key is the default). Payloads are plaintext within the
+  file-level encryption; the proxy never decrypts per-key blobs. Key shape is
+  load-validated for ALL vendors, including inactive ones (malformed `keys`
+  objects, both/neither fields present, non-string `key` values refuse
+  startup with a per-vendor ValueError); a string-form `"key": ""` loads
+  with a stderr warning and requests through it fail with 500
+  `invalid_provider_key`. Payloads must be non-empty strings free of CR/LF
+  and control chars (emitted verbatim into auth headers). Each tier in
+  config.json may carry a `key` selector naming one of its provider's keys:
+  absent/`""`/null = first key; non-string values and unknown names are
+  validation errors at startup, admin switch, and reload alike
+  (server-authoritative: the CLI performs no key-name validation of its own —
+  a bad config fails at server startup and the CLI surfaces that error via
+  its "Proxy exited during startup" stderr-tail path; admin switch writes
+  the defaulted first-key name into the persisted config). The admin page
+  gained a Key column after Model — options come
+  from the provider's key names only (never payloads), and single-key
+  providers show a fixed grey disabled `default` select. The trace `key`
+  field carries the resolved key name for any tier present in config —
+  standard or extra tiers routed via reverse lookup (not gated by `--all`) —
+  and is omitted when resolution is impossible.
 - **Provider mode dispatch.** Each vendor entry in `keys-index.json` may
   carry a `mode` field (`"anthropic"`, `"chat"`, or `"response"`). Defaults
   to `"anthropic"` when absent. Startup validates the mode enum and emits a
@@ -384,7 +423,7 @@ does not block startup on failure).
   SSE is synthesized from OpenAI SSE (frame-assembled on `\n\n`, terminal
   synthesized on EOF).
 - **Malformed tool arguments in chat mode.** When `_chat_to_anthropic` encounters tool-call arguments that cannot be parsed as a JSON dict (including `json.JSONDecodeError`, non-dict parse results, empty dicts, non-dict `function` values, and non-dict tool-call entries), it emits a user-visible text block `[Tool call failed: arguments for '<name>' (call <id>) could not be parsed as JSON]` instead of a `tool_use` block with `input: {}`. A `tool_args_parse_failure` trace event is also logged. When all tool calls in a response are malformed, `stop_reason` is forced to `None` to prevent the client from hanging on `stop_reason: "tool_use"` with zero tool_use blocks. **Request-transform path:** `_transform_anthropic_messages_to_chat` applies the same degradation pattern for NaN/Infinity/non-dict `tool_use.input` values (rejected by `json.dumps(input, allow_nan=False)`), emitting the placeholder `[Tool call failed: arguments for '<name>' (call <id>) could not be serialized as JSON]` and a `tool_args_parse_failure` trace event. When a failed tool_use coexists with valid tool_use(s) in the same assistant message, the placeholder is emitted as a separate assistant message before the tool_calls message (content: null). (Behavior changes landed 2026-08-28 and 2026-08-29.)
-- **Test suite is safe alongside a live proxy.** The test suite sets `os.environ["PROXY_STATE_FILE"]` and `os.environ["PROXY_FEATURE_COMPAT_FILE"]` to session temp paths at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read these env vars at import time, so test proxies use isolated state files and can never touch the live proxy's `~/.claude/proxy/proxy-state.json` or `~/.claude/proxy/feature-compatibility.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite (259 tests across 12 modules: `tests/_harness.py` + `tests/test_compat.py` + 10 cluster modules + `tests/test_claude_proxy.py` aggregator) passes with the live proxy up (landed 2026-08-28, updated 2026-09-07).
+- **Test suite is safe alongside a live proxy.** The test suite sets `os.environ["PROXY_STATE_FILE"]` and `os.environ["PROXY_FEATURE_COMPAT_FILE"]` to session temp paths at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read these env vars at import time, so test proxies use isolated state files and can never touch the live proxy's `~/.claude/proxy/proxy-state.json` or `~/.claude/proxy/feature-compatibility.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite (275 tests across 12 modules: `tests/_harness.py` + `tests/test_compat.py` + 10 cluster modules + `tests/test_claude_proxy.py` aggregator) passes with the live proxy up (landed 2026-08-28, updated 2026-09-10).
 
 ## Documentation
 
@@ -418,6 +457,11 @@ does not block startup on failure).
   per-provider extra request headers (`x-opencode-session` translation from
   the native `X-Claude-Code-Session-Id`) with strict validation, total
   resolver, retry-stable values, trace logging, and `user-agent` forwarding.
+- [plans/2026-09-10-multi-key-provider-selection.md](plans/2026-09-10-multi-key-provider-selection.md) — multi-key
+  provider credentials (`keys` name→payload object vs legacy `key` string),
+  per-tier `key` selector with server-authoritative validation, admin
+  Provider/Model/Key columns (disabled grey `default` for single-key
+  providers), and name-only trace resolution generic over any config tier.
 - [plans/2026-08-27-support-three-endpoint-modes.md](plans/2026-08-27-support-three-endpoint-modes.md) — three-endpoint-mode
   dispatch (anthropic/chat/response) with full request/response transformation
   and SSE streaming.
@@ -434,7 +478,8 @@ No other supplementary docs.
 ```json
 [
   {"issue_id": "break-up-large-source-and-test-files", "title": "Break up large source and test files into smaller modules", "target_repo": null, "report": "./tmp/reports/defer-issue-break-up-large-source-and-test-files.json", "deferred": "2026-09-01", "date_source": "creation"},
-  {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "target_repo": null, "report": "./tmp/reports/defer-issue-image-content-blocks-chat-mode.json", "deferred": "2026-08-29", "date_source": "creation"}
+  {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "target_repo": null, "report": "./tmp/reports/defer-issue-image-content-blocks-chat-mode.json", "deferred": "2026-08-29", "date_source": "creation"},
+  {"issue_id": "unguarded-write-state-log-trace-oserror", "title": "Unguarded write_state/log_trace OSError paths in proxy heartbeat and trace sinks", "target_repo": null, "report": "./tmp/reports/defer-issue-unguarded-write-state-log-trace-oserror.json", "deferred": "2026-09-07", "date_source": "creation"}
 ]
 ```
 

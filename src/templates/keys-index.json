@@ -13,6 +13,14 @@
       "url": "https://api.openai.com",
       "key": "sk-your-openai-key-here",
       "mode": "response"
+    },
+    "example-multikey-provider": {
+      "url": "https://opencode.ai/zen/go",
+      "mode": "chat",
+      "keys": {
+        "SW": "sk-first-example-key",
+        "CZ": "sk-second-example-key"
+      }
     }
   }
 }

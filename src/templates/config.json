@@ -2,15 +2,18 @@
   "tiers": {
     "haiku": {
       "provider": "",
-      "model": ""
+      "model": "",
+      "key": ""
     },
     "sonnet": {
       "provider": "",
-      "model": ""
+      "model": "",
+      "key": ""
     },
     "opus": {
       "provider": "",
-      "model": ""
+      "model": "",
+      "key": ""
     }
   },
   "models": {

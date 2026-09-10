@@ -305,6 +305,16 @@ def _write_state(state):
         raise
 
 
+def _format_tier_line(tier_name, tier, indent="  "):
+    """One tier display line, with the [key=NAME] suffix when one is set."""
+    label = "{}{} -> {} ({})".format(
+        indent, tier_name, tier.get("model"), tier.get("provider"))
+    key = tier.get("key")
+    if key:
+        label += " [key={}]".format(key)
+    return label
+
+
 def _load_config_for_validation(path=None):
     """Load and validate config.json. Returns (config, error_msg)."""
     if path is None:
@@ -649,7 +659,7 @@ def cmd_start(args):
     for tier_name in sorted(tiers.keys()):
         tier = tiers[tier_name]
         if isinstance(tier, dict):
-            print("  {} -> {} ({})".format(tier_name, tier.get("model"), tier.get("provider")))
+            print(_format_tier_line(tier_name, tier))
     _trace("cmd_start: success, returning 0")
     return 0
 
@@ -759,8 +769,7 @@ def cmd_status(args):
                 for tier_name in sorted(tiers.keys()):
                     tier = tiers[tier_name]
                     if isinstance(tier, dict):
-                        print("    {} -> {} ({})".format(
-                            tier_name, tier.get("model"), tier.get("provider")))
+                        print(_format_tier_line(tier_name, tier, "    "))
         return 0
     else:
         _trace("cmd_status: pid={} dead (stale state) -> returning 1".format(pid))
@@ -803,8 +812,7 @@ def cmd_reload(args):
                     for tier_name in sorted(tiers.keys()):
                         tier = tiers[tier_name]
                         if isinstance(tier, dict):
-                            print("  {} -> {} ({})".format(
-                                tier_name, tier.get("model"), tier.get("provider")))
+                            print(_format_tier_line(tier_name, tier))
                 return 0
             else:
                 print("ERROR: {}".format(data.get("error", "unknown error")))

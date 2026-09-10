@@ -979,6 +979,353 @@ def test_admin_providers_detail_invalid_mode_normalized():
         cleanup()
 
 
+# ===========================================================================
+# Multi-key provider selection (plan 2026-09-10-multi-key-provider-selection)
+# ===========================================================================
+
+def test_admin_providers_detail_returns_key_names():
+    """providers-detail returns key NAMES per provider (insertion order for
+    object form, ['default'] for string form) and never payloads or url."""
+    print("\n--- Test: Admin Providers Detail Key Names ---")
+    p1 = find_free_port()
+    tiers = _mode_tiers("mkp")
+    vendors = {
+        "mkp": {"url": "http://127.0.0.1:{}".format(p1), "keys": {"SW": "p1", "CZ": "p2"}},
+        "strp": {"url": "http://127.0.0.1:{}".format(find_free_port()), "key": "K-STR"},
+    }
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body, _ = _admin_get(proxy_port, "/admin/api/providers-detail")
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        try:
+            data = json.loads(body)
+        except Exception:
+            fail("providers-detail not JSON: {!r}".format(body[:200]))
+            return
+        providers = data.get("providers", {})
+        if providers.get("mkp", {}).get("keys") == ["SW", "CZ"]:
+            pass_("object-form vendor key names == [SW, CZ] in insertion order")
+        else:
+            fail("expected mkp keys [SW, CZ], got {!r}".format(providers.get("mkp")))
+        if providers.get("strp", {}).get("keys") == ["default"]:
+            pass_("string-form vendor key names == [default]")
+        else:
+            fail("expected strp keys [default], got {!r}".format(providers.get("strp")))
+        text = body.decode("utf-8", errors="replace")
+        leaked = None
+        for needle in ("p1", "p2", "K-STR", '"url"', "http://"):
+            if needle in text:
+                leaked = needle
+                break
+        if leaked is None:
+            pass_("providers-detail leaks no payload or url material")
+        else:
+            fail("providers-detail leaked {!r}".format(leaked))
+    finally:
+        cleanup()
+
+
+def test_admin_switch_with_key_name():
+    """An admin switch carrying a per-tier key selector persists it and routes
+    subsequent traffic under the selected key's payload."""
+    print("\n--- Test: Admin Switch With Key Name ---")
+    port = find_free_port()
+    tiers = _mode_tiers("mkp")
+    vendors = {"mkp": {"url": "http://127.0.0.1:{}".format(port), "keys": {"SW": "p1", "CZ": "p2"}}}
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, _ = _send_proxy_request(proxy_port, body=json.dumps({
+            "model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hi"}]}))
+        if status != 200:
+            fail("baseline request expected 200, got {}".format(status))
+            return
+        got = mock_servers["mkp"]["requests"][-1]["api_key"]
+        if got == "p1":
+            pass_("baseline sonnet request used first key payload p1")
+        else:
+            fail("baseline auth expected p1, got {!r}".format(got))
+
+        switch_body = {"tiers": {
+            "haiku": {"provider": "mkp", "model": "claude-haiku-4-5", "key": "SW"},
+            "sonnet": {"provider": "mkp", "model": "claude-sonnet-5", "key": "CZ"},
+            "opus": {"provider": "mkp", "model": "claude-opus-5", "key": "SW"},
+        }}
+        status, data = _admin_post(proxy_port, "/admin/api/switch", switch_body)
+        if status != 200:
+            fail("switch expected 200, got {}: {}".format(status, data))
+            return
+        pass_("switch with key selector returned 200")
+
+        status, body, _ = _admin_get(proxy_port, "/admin/api/config")
+        if status != 200:
+            fail("GET config expected 200, got {}".format(status))
+            return
+        config = json.loads(body)
+        if config.get("tiers", {}).get("sonnet", {}).get("key") == "CZ":
+            pass_("switch persisted tier key CZ")
+        else:
+            fail("expected sonnet key CZ in config, got {!r}".format(config.get("tiers", {}).get("sonnet")))
+
+        pre = len(mock_servers["mkp"]["requests"])
+        status, _ = _send_proxy_request(proxy_port, body=json.dumps({
+            "model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hi"}]}))
+        if status != 200:
+            fail("post-switch request expected 200, got {}".format(status))
+            return
+        reqs = mock_servers["mkp"]["requests"][pre:]
+        if reqs and reqs[-1]["api_key"] == "p2":
+            pass_("post-switch sonnet request used CZ payload p2")
+        else:
+            fail("expected post-switch auth p2, got {!r}".format(reqs[-1]["api_key"] if reqs else "none"))
+    finally:
+        cleanup()
+
+
+def test_admin_switch_unknown_key_rejected():
+    """An unknown key name in a switch payload is rejected with a 400 naming
+    tier and provider; config is unchanged and the proxy stays live."""
+    print("\n--- Test: Admin Switch Unknown Key Rejected ---")
+    port = find_free_port()
+    tiers = _mode_tiers("mkp")
+    vendors = {"mkp": {"url": "http://127.0.0.1:{}".format(port), "keys": {"SW": "p1", "CZ": "p2"}}}
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        switch_body = {"tiers": {
+            "haiku": {"provider": "mkp", "model": "claude-haiku-4-5", "key": "SW"},
+            "sonnet": {"provider": "mkp", "model": "claude-sonnet-5", "key": "NOPE"},
+            "opus": {"provider": "mkp", "model": "claude-opus-5", "key": "SW"},
+        }}
+        status, data = _admin_post(proxy_port, "/admin/api/switch", switch_body)
+        if status == 400 and "NOPE" in data and "sonnet" in data and "mkp" in data:
+            pass_("unknown key rejected with 400 naming tier+provider+key")
+        else:
+            fail("expected 400 citing sonnet/NOPE/mkp, got {} {!r}".format(status, data[:300]))
+
+        status, body, _ = _admin_get(proxy_port, "/admin/api/config")
+        config = json.loads(body)
+        if "key" not in config.get("tiers", {}).get("sonnet", {}):
+            pass_("rejected switch left config unchanged")
+        else:
+            fail("config changed despite rejected switch: {!r}".format(config.get("tiers", {}).get("sonnet")))
+
+        status, _ = _send_proxy_request(proxy_port, body=json.dumps({
+            "model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hi"}]}))
+        if status == 200:
+            pass_("proxy still serves requests after rejected switch (no wedge)")
+        else:
+            fail("proxy unhealthy after rejected switch: {}".format(status))
+    finally:
+        cleanup()
+
+
+def test_admin_switch_invalid_key_type_rejected():
+    """Non-string key values (false/0/[]) in a switch payload are rejected
+    with 400 'invalid key name'; config on disk is unchanged."""
+    print("\n--- Test: Admin Switch Invalid Key Type Rejected ---")
+    port = find_free_port()
+    tiers = _mode_tiers("mkp")
+    vendors = {"mkp": {"url": "http://127.0.0.1:{}".format(port), "keys": {"SW": "p1", "CZ": "p2"}}}
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        for bad in (False, 0, []):
+            switch_body = {"tiers": {
+                "haiku": {"provider": "mkp", "model": "claude-haiku-4-5", "key": "SW"},
+                "sonnet": {"provider": "mkp", "model": "claude-sonnet-5", "key": bad},
+                "opus": {"provider": "mkp", "model": "claude-opus-5", "key": "SW"},
+            }}
+            status, data = _admin_post(proxy_port, "/admin/api/switch", switch_body)
+            if status == 400:
+                pass_("non-string key {!r} rejected (400)".format(bad))
+            else:
+                fail("expected 400 for key {!r}, got {} {!r}".format(bad, status, data[:200]))
+
+        status, body, _ = _admin_get(proxy_port, "/admin/api/config")
+        config = json.loads(body)
+        if "key" not in config.get("tiers", {}).get("sonnet", {}):
+            pass_("rejected invalid-key switches left config unchanged")
+        else:
+            fail("config changed despite rejected switches: {!r}".format(config.get("tiers", {}).get("sonnet")))
+    finally:
+        cleanup()
+
+
+def test_admin_switch_missing_key_defaults():
+    """A switch body without key selectors succeeds and the persisted config
+    gains the provider's first key name (canonical config on disk)."""
+    print("\n--- Test: Admin Switch Missing Key Defaults ---")
+    port = find_free_port()
+    tiers = _mode_tiers("mkp")
+    vendors = {"mkp": {"url": "http://127.0.0.1:{}".format(port), "keys": {"SW": "p1", "CZ": "p2"}}}
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        switch_body = {"tiers": {
+            "haiku": {"provider": "mkp", "model": "claude-haiku-4-5"},
+            "sonnet": {"provider": "mkp", "model": "claude-sonnet-5"},
+            "opus": {"provider": "mkp", "model": "claude-opus-5"},
+        }}
+        status, data = _admin_post(proxy_port, "/admin/api/switch", switch_body)
+        if status != 200:
+            fail("switch without key expected 200, got {}: {}".format(status, data))
+            return
+        status, body, _ = _admin_get(proxy_port, "/admin/api/config")
+        config = json.loads(body)
+        tiers_cfg = config.get("tiers", {})
+        if all(tiers_cfg.get(t, {}).get("key") == "SW" for t in ("haiku", "sonnet", "opus")):
+            pass_("missing key defaults persisted as first key name 'SW'")
+        else:
+            fail("expected all tiers key=SW after switch, got {!r}".format(tiers_cfg))
+        with open(os.path.join(temp_dir, "config.json")) as f:
+            disk = json.load(f)
+        if all(disk.get("tiers", {}).get(t, {}).get("key") == "SW" for t in ("haiku", "sonnet", "opus")):
+            pass_("on-disk config.json carries the defaulted key names")
+        else:
+            fail("on-disk config missing defaulted keys: {!r}".format(disk.get("tiers")))
+    finally:
+        cleanup()
+
+
+def test_admin_reload_validates_key_names():
+    """Reload re-validates per-tier key names against the in-memory vendors:
+    an unknown key on disk refuses the reload (400); a fixed name reloads."""
+    print("\n--- Test: Admin Reload Validates Key Names ---")
+    port = find_free_port()
+    tiers = {
+        "haiku": {"provider": "mkp", "model": "claude-haiku-4-5", "key": "SW"},
+        "sonnet": {"provider": "mkp", "model": "claude-sonnet-5", "key": "CZ"},
+        "opus": {"provider": "mkp", "model": "claude-opus-5", "key": "SW"},
+    }
+    vendors = {"mkp": {"url": "http://127.0.0.1:{}".format(port), "keys": {"SW": "p1", "CZ": "p2"}}}
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_admin_reload_key_")
+    proxy_port = find_free_port()
+    config_path = _create_test_config(temp_dir, tiers, models=_derive_models_from_tiers(tiers))
+    keys_path = _create_test_keys_plain(temp_dir, vendors)
+
+    req_list = []
+    mock_servers = {"mkp": {"server": _start_mock_upstream(port, req_list), "requests": req_list}}
+    trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
+    os.close(trace_fd)
+    proc, probe_ok = _start_proxy_server_directly(
+        proxy_port, config_path=config_path, keys_path=keys_path,
+        passphrase=None, trace_file=trace_file)
+    if not probe_ok:
+        mock_servers["mkp"]["server"].shutdown()
+        proc.kill()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        fail("Failed to set up test")
+        return
+
+    def cleanup():
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        mock_servers["mkp"]["server"].shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def write_tiers(tiers_cfg):
+        with open(config_path, "w") as f:
+            json.dump({"tiers": tiers_cfg, "models": _derive_models_from_tiers(tiers_cfg)}, f)
+
+    try:
+        bad_tiers = {
+            "haiku": {"provider": "mkp", "model": "claude-haiku-4-5", "key": "SW"},
+            "sonnet": {"provider": "mkp", "model": "claude-sonnet-5", "key": "NOPE"},
+            "opus": {"provider": "mkp", "model": "claude-opus-5", "key": "SW"},
+        }
+        write_tiers(bad_tiers)
+        status, data = _admin_post(proxy_port, "/admin/api/reload", {})
+        if status == 400 and "NOPE" in data:
+            pass_("reload rejects an unknown key name (400)")
+        else:
+            fail("expected reload 400 for unknown key, got {} {!r}".format(status, data[:300]))
+
+        fixed_tiers = {
+            "haiku": {"provider": "mkp", "model": "claude-haiku-4-5", "key": "SW"},
+            "sonnet": {"provider": "mkp", "model": "claude-sonnet-5", "key": "CZ"},
+            "opus": {"provider": "mkp", "model": "claude-opus-5", "key": "SW"},
+        }
+        write_tiers(fixed_tiers)
+        status, data = _admin_post(proxy_port, "/admin/api/reload", {})
+        if status == 200:
+            pass_("reload succeeds after the key name is fixed")
+        else:
+            fail("expected reload 200 after fix, got {} {!r}".format(status, data[:300]))
+    finally:
+        cleanup()
+
+
+def test_admin_html_key_column():
+    """admin.html gains a per-tier key <select>, a disabled-select style, a
+    static column header row (Provider/Model/Key) above #tiers-container, and
+    a populateKeys wired in renderTiers AND the provider onchange."""
+    print("\n--- Test: Admin HTML Key Column ---")
+    port = find_free_port()
+    tiers = _mode_tiers("p")
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(port), "keys": {"SW": "p1", "CZ": "p2"}}}
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body, _ = _admin_get(proxy_port, "/admin/")
+        if status != 200:
+            fail("expected 200 for /admin/, got {}".format(status))
+            return
+        html = body.decode("utf-8", errors="replace")
+
+        if '<select id="${tier}-key"' in html:
+            pass_("admin.html has a per-tier key <select>")
+        else:
+            fail("admin.html missing '<select id=\"${tier}-key\"'")
+
+        if "select:disabled" in html:
+            pass_("admin.html has the disabled-select CSS rule")
+        else:
+            fail("admin.html missing 'select:disabled' CSS rule")
+
+        if "providerKeys" in html:
+            pass_("admin.html consumes the providers-detail keys list (providerKeys)")
+        else:
+            fail("admin.html missing providerKeys")
+
+        n_invoke = html.count("populateKeys(")
+        if n_invoke >= 2:
+            pass_("populateKeys() invoked in {} places (renderTiers + onchange)".format(n_invoke))
+        else:
+            fail("populateKeys() invoked {} times; expected >= 2 (renderTiers + provider onchange)".format(n_invoke))
+
+        idx_provider = html.find(">Provider<")
+        idx_container = html.find("tiers-container")
+        if idx_provider != -1 and idx_container != -1 and idx_provider < idx_container \
+                and ">Model<" in html and ">Key<" in html:
+            pass_("static column header row (Provider/Model/Key) sits above #tiers-container")
+        else:
+            fail("static header row missing/out of place: >Provider< at {}, tiers-container at {}, "
+                 ">Model< present {}, >Key< at {}".format(
+                     idx_provider, idx_container, ">Model<" in html, html.find(">Key<")))
+    finally:
+        cleanup()
+
+
 ALL_TESTS = [
     ("admin-page-served", test_admin_page_served),
     ("admin-api-config", test_admin_api_config),
@@ -997,6 +1344,13 @@ ALL_TESTS = [
     ("admin-providers-detail-forbidden", test_admin_providers_detail_forbidden),
     ("admin-providers-detail-invalid-mode-normalized", test_admin_providers_detail_invalid_mode_normalized),
     ("admin-switch-preserves-disable-retry-flag", test_admin_switch_preserves_disable_retry_flag),
+    ("admin-providers-detail-returns-key-names", test_admin_providers_detail_returns_key_names),
+    ("admin-switch-with-key-name", test_admin_switch_with_key_name),
+    ("admin-switch-unknown-key-rejected", test_admin_switch_unknown_key_rejected),
+    ("admin-switch-invalid-key-type-rejected", test_admin_switch_invalid_key_type_rejected),
+    ("admin-switch-missing-key-defaults", test_admin_switch_missing_key_defaults),
+    ("admin-reload-validates-key-names", test_admin_reload_validates_key_names),
+    ("admin-html-key-column", test_admin_html_key_column),
 ]
 
 

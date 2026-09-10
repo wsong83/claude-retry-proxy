@@ -880,6 +880,79 @@ def test_extra_request_headers_in_trace():
         cleanup()
 
 
+def test_trace_includes_key_name_not_payload():
+    """Request trace events carry the resolved key *name* for a multi-key tier
+    (never the payload); the unknown-model 400 path still delivers the 400
+    response with a trace entry that omits the key field; and an EXTRA
+    (non-standard) tier routed via reverse model lookup also carries its key
+    in the trace (generic re-resolution, no tier whitelist)."""
+    print("\n--- Test: Trace Includes Key Name Not Payload ---")
+    upstream = find_free_port()
+    tiers = {
+        "haiku": {"provider": "p", "model": "claude-haiku-4-5", "key": "CZ"},
+        "sonnet": {"provider": "p", "model": "claude-sonnet-5", "key": "SW"},
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+        "extra": {"provider": "p", "model": "extra-model", "key": "CZ"},
+    }
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream),
+                     "keys": {"SW": "p1", "CZ": "p2"}}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        # (1) multi-key tier request carries the resolved key name; no payload
+        status, _ = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("ruled request expected 200, got {}".format(status))
+            return
+        events = _read_request_events(trace_file)
+        ev = [e for e in events if e.get("provider") == "p" and e.get("http_status") == 200][-1]
+        if ev.get("key") == "SW":
+            pass_("request trace carries resolved key name SW")
+        else:
+            fail("expected trace key 'SW', got {!r}".format(ev.get("key")))
+        with open(trace_file) as f:
+            raw = f.read()
+        if "p1" not in raw and "p2" not in raw:
+            pass_("trace JSONL contains no key payload strings")
+        else:
+            fail("trace JSONL leaked a key payload (p1/p2 present)")
+
+        # (2) unknown-model 400: response delivered AND trace entry without key
+        status, _ = _send_proxy_request(proxy_port, body=json.dumps({
+            "model": "zz-not-a-model", "messages": [{"role": "user", "content": "hi"}]}))
+        if status != 400:
+            fail("unknown model expected 400, got {}".format(status))
+            return
+        pass_("unknown-model request still delivered a 400 response")
+        events = _read_request_events(trace_file)
+        ev = [e for e in events if e.get("http_status") == 400][-1]
+        if "key" not in ev and ev.get("provider") is None:
+            pass_("400 trace entry omits the key field (provider None, no crash)")
+        else:
+            fail("expected 400 event without key, got provider={!r} keys={!r}".format(
+                ev.get("provider"), sorted(ev.keys())))
+
+        # (3) extra (non-standard) tier routed via reverse model lookup carries
+        #     its key in the trace too (generic re-resolution, no whitelist)
+        status, _ = _send_proxy_request(proxy_port, body=json.dumps({
+            "model": "extra-model", "messages": [{"role": "user", "content": "hi"}]}))
+        if status != 200:
+            fail("extra-tier request expected 200, got {}".format(status))
+            return
+        events = _read_request_events(trace_file)
+        ev = [e for e in events
+              if e.get("tier") == "extra" and e.get("http_status") == 200][-1]
+        if ev.get("key") == "CZ":
+            pass_("extra-tier request trace carries key CZ (generic resolution)")
+        else:
+            fail("expected extra-tier trace key 'CZ', got tier={!r} key={!r}".format(
+                ev.get("tier"), ev.get("key")))
+    finally:
+        cleanup()
+
+
 ALL_TESTS = [
     ("start-prunes-old-trace-entries", test_start_prunes_old_trace_entries),
     ("prune-trace-file-edge-cases", test_prune_trace_file_edge_cases),
@@ -888,6 +961,7 @@ ALL_TESTS = [
     ("relative-log-path", test_relative_log_path),
     ("retry-trace-event-enriched", test_retry_trace_event_enriched),
     ("extra-request-headers-in-trace", test_extra_request_headers_in_trace),
+    ("trace-includes-key-name-not-payload", test_trace_includes_key_name_not_payload),
 ]
 
 

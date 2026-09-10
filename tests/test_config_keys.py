@@ -18,6 +18,7 @@ from _harness import (
     _create_test_keys,
     _create_test_keys_plain,
     _restore_proxy_state,
+    _send_proxy_request,
     _setup_tier_routing_test,
     _start_proxy_server_directly,
     cleanup_lock_files,
@@ -922,6 +923,336 @@ def test_extra_request_headers_startup_refusal():
         fail(f"Server refused to start with valid extra_request_headers: {err[:300]!r}")
 
 
+# ===========================================================================
+# Multi-key provider selection (plan 2026-09-10-multi-key-provider-selection)
+# ===========================================================================
+
+def test_multikey_keys_load_and_route():
+    """Object-form keys vendor loads through the encrypted path (decrypt_keys);
+    a tier key selector reaches the upstream with the selected payload; a tier
+    without a selector defaults to the first insertion-order entry."""
+    print("\n--- Test: Multi-key keys load and route ---")
+    port = find_free_port()
+    tiers = {
+        "haiku": {"provider": "mkp", "model": "claude-haiku-4-5", "key": "CZ"},
+        "sonnet": {"provider": "mkp", "model": "claude-sonnet-5", "key": "SW"},
+        "opus": {"provider": "mkp", "model": "claude-opus-5"},
+    }
+    vendors = {
+        "mkp": {"url": "http://127.0.0.1:{}".format(port),
+                "keys": {"SW": "p1", "CZ": "p2"}},
+    }
+    temp_dir, proxy_port, proc, mock_servers, cleanup = _setup_tier_routing_test(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, _ = _send_proxy_request(proxy_port, body=json.dumps({
+            "model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "hi"}]}))
+        if status != 200:
+            fail("haiku request expected 200, got {}".format(status))
+            return
+        got = mock_servers["mkp"]["requests"][-1]["api_key"]
+        if got == "p2":
+            pass_("tier haiku key=CZ routes with payload p2")
+        else:
+            fail("haiku (key=CZ) expected wire auth p2, got {!r}".format(got))
+
+        status, _ = _send_proxy_request(proxy_port, body=json.dumps({
+            "model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hi"}]}))
+        if status != 200:
+            fail("sonnet request expected 200, got {}".format(status))
+            return
+        got = mock_servers["mkp"]["requests"][-1]["api_key"]
+        if got == "p1":
+            pass_("tier sonnet key=SW routes with payload p1")
+        else:
+            fail("sonnet (key=SW) expected wire auth p1, got {!r}".format(got))
+
+        status, _ = _send_proxy_request(proxy_port, body=json.dumps({
+            "model": "claude-opus-5", "messages": [{"role": "user", "content": "hi"}]}))
+        if status != 200:
+            fail("opus request expected 200, got {}".format(status))
+            return
+        got = mock_servers["mkp"]["requests"][-1]["api_key"]
+        if got == "p1":
+            pass_("tier opus (no key) defaults to first entry SW -> p1")
+        else:
+            fail("opus (no key) expected default wire auth p1, got {!r}".format(got))
+    finally:
+        cleanup()
+
+
+def test_tier_key_absent_defaults_first():
+    """A tier with no key field (legacy config) uses the provider's first key."""
+    print("\n--- Test: Tier key absent defaults to first ---")
+    port = find_free_port()
+    tiers = {
+        "haiku": {"provider": "mkp", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "mkp", "model": "claude-sonnet-5"},
+        "opus": {"provider": "mkp", "model": "claude-opus-5"},
+    }
+    vendors = {"mkp": {"url": "http://127.0.0.1:{}".format(port),
+                       "keys": {"A": "pay-a", "B": "pay-b"}}}
+    temp_dir, proxy_port, proc, mock_servers, cleanup = _setup_tier_routing_test(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, _ = _send_proxy_request(proxy_port, body=json.dumps({
+            "model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hi"}]}))
+        if status != 200:
+            fail("request expected 200, got {}".format(status))
+            return
+        got = mock_servers["mkp"]["requests"][-1]["api_key"]
+        if got == "pay-a":
+            pass_("tier without key uses the first key payload")
+        else:
+            fail("expected first-key payload pay-a, got {!r}".format(got))
+    finally:
+        cleanup()
+
+
+def test_tier_key_empty_string_defaults_first():
+    """A tier with an empty-string key selector defaults to the first key."""
+    print("\n--- Test: Tier key '' defaults to first ---")
+    port = find_free_port()
+    tiers = {
+        "haiku": {"provider": "mkp", "model": "claude-haiku-4-5", "key": ""},
+        "sonnet": {"provider": "mkp", "model": "claude-sonnet-5", "key": ""},
+        "opus": {"provider": "mkp", "model": "claude-opus-5", "key": ""},
+    }
+    vendors = {"mkp": {"url": "http://127.0.0.1:{}".format(port),
+                       "keys": {"A": "pay-a", "B": "pay-b"}}}
+    temp_dir, proxy_port, proc, mock_servers, cleanup = _setup_tier_routing_test(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, _ = _send_proxy_request(proxy_port, body=json.dumps({
+            "model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "hi"}]}))
+        if status != 200:
+            fail("request expected 200, got {}".format(status))
+            return
+        got = mock_servers["mkp"]["requests"][-1]["api_key"]
+        if got == "pay-a":
+            pass_("tier with empty-string key uses the first key payload")
+        else:
+            fail("expected first-key payload pay-a, got {!r}".format(got))
+    finally:
+        cleanup()
+
+
+def test_validate_config_key_name_checks():
+    """validate_config's provider_keys mode validates per-tier key selectors
+    for ALL config tiers; the two-arg (legacy) call skips key checks."""
+    print("\n--- Test: validate_config key-name checks ---")
+    import claude_retry_proxy.server as srv
+
+    names = {"mkp": ["default", "SW", "CZ"]}
+    base = {
+        "tiers": {
+            "haiku": {"provider": "mkp", "model": "claude-haiku-4-5"},
+            "sonnet": {"provider": "mkp", "model": "claude-sonnet-5"},
+            "opus": {"provider": "mkp", "model": "claude-opus-5"},
+        },
+        "models": {"mkp": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]},
+    }
+
+    def with_key(tier, value, extra_tier=None):
+        cfg = json.loads(json.dumps(base))
+        cfg["tiers"][tier]["key"] = value
+        if extra_tier is not None:
+            cfg["tiers"][extra_tier] = {"provider": "mkp", "model": "m-extra"}
+        return cfg
+
+    errs = srv.validate_config(base, {"mkp"}, names)
+    if errs == []:
+        pass_("clean multi-key config validates")
+    else:
+        fail("clean config should validate, got {!r}".format(errs))
+
+    errs = srv.validate_config(with_key("opus", "SW"), {"mkp"}, names)
+    if errs == []:
+        pass_("known selector SW passes")
+    else:
+        fail("expected no errors for key=SW, got {!r}".format(errs))
+
+    errs = srv.validate_config(with_key("opus", "NOPE"), {"mkp"}, names)
+    if any("opus" in e and "NOPE" in e and "mkp" in e and "available" in e for e in errs):
+        pass_("unknown key errors name tier, provider, and the available list")
+    else:
+        fail("unknown-key error missing context: {!r}".format(errs))
+
+    for bad in (123, False, []):
+        errs = srv.validate_config(with_key("opus", bad), {"mkp"}, names)
+        if any("must be a string" in e for e in errs):
+            pass_("non-string selector {!r} rejected as 'must be a string'".format(bad))
+        else:
+            fail("expected 'must be a string' for {!r}, got {!r}".format(bad, errs))
+
+    for val in ("", None):
+        errs = srv.validate_config(with_key("opus", val), {"mkp"}, names)
+        if errs == []:
+            pass_("selector {!r} treated as unset (no error)".format(val))
+        else:
+            fail("expected no error for {!r}, got {!r}".format(val, errs))
+
+    cfg = json.loads(json.dumps(base))
+    cfg["tiers"]["sonnet"] = ["not", "a", "dict"]
+    errs = srv.validate_config(cfg, {"mkp"}, names)
+    if any("must be an object" in e for e in errs):
+        pass_("non-dict tier keeps the 'must be an object' error (no raise)")
+    else:
+        fail("non-dict tier should produce 'must be an object', got {!r}".format(errs))
+
+    cfg = with_key("opus", None, extra_tier="extra")
+    cfg["tiers"]["extra"]["key"] = "NOPE"
+    errs = srv.validate_config(cfg, {"mkp"}, names)
+    if any("extra" in e and "unknown key" in e for e in errs):
+        pass_("extra (non-required) tier with unknown key is validated")
+    else:
+        fail("extra-tier unknown key should error, got {!r}".format(errs))
+
+    errs = srv.validate_config(with_key("opus", "NOPE"), {"mkp"})
+    if errs == []:
+        pass_("two-arg validate_config skips key checks (legacy compatible)")
+    else:
+        fail("two-arg call should skip key checks, got {!r}".format(errs))
+
+
+def test_keys_file_invalid_multikey_shapes_rejected():
+    """Every malformed multi-key vendor shape refuses server startup with a
+    per-vendor ValueError — never a silent load-and-route."""
+    print("\n--- Test: invalid multi-key shapes rejected at startup ---")
+
+    def try_start(vendors):
+        temp_dir = tempfile.mkdtemp(prefix="proxy_mkey_start_")
+        try:
+            tiers = {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            }
+            config_path = _create_test_config(temp_dir, tiers, models={
+                "p": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]})
+            keys_path = _create_test_keys_plain(temp_dir, vendors)
+            proc, probe_ok = _start_proxy_server_directly(
+                find_free_port(), config_path=config_path, keys_path=keys_path)
+            err = ""
+            if probe_ok:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            else:
+                try:
+                    _, err = proc.communicate(timeout=5)
+                except Exception:
+                    pass
+            return probe_ok, err or ""
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    url = "http://127.0.0.1:1"
+    cases = [
+        ("vendor with both key and keys",
+         {"p": {"url": url, "key": "k", "keys": {"A": "p"}}},
+         "both 'key' and 'keys'"),
+        ("vendor with neither key nor keys",
+         {"p": {"url": url, "mode": "chat"}},
+         "missing 'key' or 'keys'"),
+        ("keys not a dict (string)",
+         {"p": {"url": url, "keys": "SW"}},
+         "must be a non-empty object"),
+        ("keys not a dict (int)",
+         {"p": {"url": url, "keys": 123}},
+         "must be a non-empty object"),
+        ("keys empty object",
+         {"p": {"url": url, "keys": {}}},
+         "must be a non-empty object"),
+        ("empty key name",
+         {"p": {"url": url, "keys": {"": "p"}}},
+         "empty key name"),
+        ("key name fails charset",
+         {"p": {"url": url, "keys": {"bad name": "p"}}},
+         "invalid characters"),
+        ("non-string payload",
+         {"p": {"url": url, "keys": {"SW": 42}}},
+         "payload"),
+        ("empty payload",
+         {"p": {"url": url, "keys": {"SW": ""}}},
+         "payload"),
+        ("payload with CR/LF",
+         {"p": {"url": url, "keys": {"SW": "a\nb"}}},
+         "control"),
+        ("payload with C0 control char",
+         {"p": {"url": url, "keys": {"SW": "a\x00b"}}},
+         "control"),
+        ("non-string key value",
+         {"p": {"url": url, "key": 123}},
+         "must be a string"),
+    ]
+    for label, vendors, sub in cases:
+        started, err = try_start(vendors)
+        if not started and sub.lower() in err.lower():
+            pass_("{}: startup refused ({!r})".format(label, sub))
+        else:
+            fail("{}: expected startup refusal citing {!r}, got started={} stderr={!r}".format(
+                label, sub, started, err[:400]))
+
+
+def test_string_form_empty_key_warns_not_rejects():
+    """A string-form empty key still loads (startup warning on stderr) and a
+    request through that provider fails with invalid_provider_key — no empty
+    auth header is forwarded upstream."""
+    print("\n--- Test: string-form empty key warns, does not reject ---")
+    upstream = find_free_port()
+    temp_dir = tempfile.mkdtemp(prefix="proxy_empty_key_")
+    try:
+        tiers = {
+            "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+            "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+            "opus": {"provider": "p", "model": "claude-opus-5"},
+        }
+        config_path = _create_test_config(temp_dir, tiers, models={
+            "p": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]})
+        keys_path = _create_test_keys_plain(temp_dir, {
+            "p": {"url": "http://127.0.0.1:{}".format(upstream), "key": ""}
+        })
+        port = find_free_port()
+        proc, probe_ok = _start_proxy_server_directly(
+            port, config_path=config_path, keys_path=keys_path)
+        if not probe_ok:
+            fail("server refused to start with empty-string key (expected warn)")
+            return
+        try:
+            status, body = _send_proxy_request(port)
+            text = body.decode("utf-8", errors="replace")
+            if status == 500 and "invalid_provider_key" in text:
+                pass_("request through empty-key provider returns 500 invalid_provider_key")
+            else:
+                fail("expected 500 invalid_provider_key, got {} {!r}".format(status, text[:200]))
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            # stderr is line-buffered; the startup warning is already flushed
+            try:
+                _, err = proc.communicate(timeout=5)
+            except Exception:
+                err = ""
+            if "WARNING" in err and ("empty" in err or "key" in err):
+                pass_("startup stderr warns about the empty key")
+            else:
+                fail("expected empty-key WARNING on stderr, got {!r}".format(err[:400]))
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 ALL_TESTS = [
     ("config-validation-missing-tier", test_config_validation_missing_tier),
     ("config-validation-unknown-provider", test_config_validation_unknown_provider),
@@ -935,6 +1266,12 @@ ALL_TESTS = [
     ("api-key-from-keys-index", test_api_key_from_keys_index),
     ("extra-request-headers-validation-matrix", test_extra_request_headers_validation_matrix),
     ("extra-request-headers-startup-integration", test_extra_request_headers_startup_refusal),
+    ("multikey-keys-load-and-route", test_multikey_keys_load_and_route),
+    ("tier-key-absent-defaults-first", test_tier_key_absent_defaults_first),
+    ("tier-key-empty-string-defaults-first", test_tier_key_empty_string_defaults_first),
+    ("validate-config-key-name-checks", test_validate_config_key_name_checks),
+    ("keys-file-invalid-multikey-shapes-rejected", test_keys_file_invalid_multikey_shapes_rejected),
+    ("string-form-empty-key-warns-not-rejects", test_string_form_empty_key_warns_not_rejects),
 ]
 
 

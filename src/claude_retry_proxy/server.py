@@ -326,12 +326,18 @@ def _validate_extra_header_spec(provider, spec, errors, seen_headers):
             "or a 'fallback'".format(provider))
 
 
-def validate_config(config, providers):
+def validate_config(config, providers, provider_keys=None):
     """Validate config against available providers.
 
     Args:
         config: dict with 'tiers' and 'models' keys
         providers: set of available provider names (from keys-index.json)
+        provider_keys: optional map of provider -> key names (built with
+            vendor_key_names). When provided, each tier's optional "key"
+            selector is validated against that list: absent/None/"" select
+            the first key, non-string values are errors, and unknown names
+            are errors. Legacy two-arg callers (provider_keys=None) skip key
+            checks entirely.
 
     Returns:
         list of error strings. Empty list means valid.
@@ -394,6 +400,37 @@ def validate_config(config, providers):
                 "provider '{}' (used by tier '{}') has no entry in "
                 "config.models — add at least one model name for this "
                 "provider".format(provider, tier_name))
+
+    # Validate per-tier key selectors against the providers' key lists
+    # (provider_keys is additive — legacy two-arg callers skip key checks).
+    # Iterates ALL config tiers, not just the three required ones, because
+    # resolve_tier's reverse lookup can route to extra tiers. Non-dict tiers
+    # are skipped here — a required non-dict tier already got the existing
+    # "must be an object" error from the loop above, and this loop must not
+    # raise (never-raise property preserved).
+    if provider_keys is not None:
+        for tier_name, tier in tiers.items():
+            if not isinstance(tier, dict):
+                continue
+            provider = tier.get("provider", "")
+            selected = tier.get("key")
+            if selected is None or selected == "":
+                continue
+            if not isinstance(selected, str):
+                errors.append(
+                    "tier '{}' key must be a string, got {}".format(
+                        tier_name, type(selected).__name__))
+                continue
+            if not provider or provider not in providers:
+                continue
+            names = provider_keys.get(provider)
+            if not names:
+                continue
+            if selected not in names:
+                errors.append(
+                    "tier '{}' references unknown key '{}' for provider "
+                    "'{}' (available: {})".format(
+                        tier_name, selected, provider, ", ".join(names)))
 
     # Validate disable_retry_claude_count_token is a boolean if present
     if "disable_retry_claude_count_token" in config:
@@ -465,6 +502,113 @@ def install_template(dest_path):
     shutil.copy2(CONFIG_TEMPLATE_PATH, dest_path)
 
 
+def vendor_key_entries(vendor):
+    """Normalize a vendor's key material to [(name, payload), ...].
+
+    Total (never raises) and pure. A non-dict vendor, a vendor with no usable
+    key entries, or a malformed shape degrades to [("default", "")]. The
+    multi-key "keys" object (insertion order, survivor rule: non-empty-string
+    name and non-empty-string payload) takes precedence over the legacy
+    "key" string; when a present "keys" object yields zero surviving entries
+    the result degrades rather than falling through to "key".
+    """
+    if not isinstance(vendor, dict):
+        return [("default", "")]
+    keys_field = vendor.get("keys")
+    if isinstance(keys_field, dict):
+        entries = [
+            (n, p) for n, p in keys_field.items()
+            if isinstance(n, str) and n
+            and isinstance(p, str) and p
+        ]
+        if entries:
+            return entries
+        return [("default", "")]
+    key_field = vendor.get("key")
+    if isinstance(key_field, str):
+        return [("default", key_field)]
+    return [("default", "")]
+
+
+def vendor_key_names(vendor):
+    """Key names for a vendor in insertion order (via vendor_key_entries)."""
+    return [name for name, _ in vendor_key_entries(vendor)]
+
+
+def resolve_api_key(vendor, tier_config):
+    """Resolve the (payload, name) for a request against a tier config.
+
+    Exact-name match on a non-empty string tier_config["key"]; any other
+    selection (absent/None/""/non-string, or a non-dict tier_config) falls
+    back to the first entry. Total and pure.
+    """
+    entries = vendor_key_entries(vendor)
+    if isinstance(tier_config, dict):
+        selected = tier_config.get("key")
+        if isinstance(selected, str) and selected:
+            for name, payload in entries:
+                if name == selected:
+                    return (payload, name)
+    return (entries[0][1], entries[0][0])
+
+
+def _validate_vendor_keys_shape(vendors):
+    """Validate the per-vendor key/keys shape of a keys table (load-time gate).
+
+    Raises ValueError on the first violation. Every vendor must carry exactly
+    one of the two forms: "key" (legacy single-key string; an empty string is
+    accepted with a stderr warning) or "keys" (a non-empty object mapping a
+    non-empty charset-safe name to a non-empty string payload free of CR/LF
+    and C0 control characters — payloads are emitted verbatim into outbound
+    auth headers). Used by both decryption paths so they enforce one shared
+    rule, never a divergent one.
+    """
+    for name, vendor in vendors.items():
+        if not isinstance(vendor, dict):
+            raise ValueError("vendor '{}' must be an object".format(name))
+        if "url" not in vendor:
+            raise ValueError("vendor '{}' missing 'url'".format(name))
+        has_key = "key" in vendor
+        has_keys = "keys" in vendor
+        if has_key and has_keys:
+            raise ValueError(
+                "vendor '{}' has both 'key' and 'keys' — use one form".format(name))
+        if not has_key and not has_keys:
+            raise ValueError(
+                "vendor '{}' missing 'key' or 'keys'".format(name))
+        if has_keys:
+            keys_field = vendor["keys"]
+            if not isinstance(keys_field, dict) or not keys_field:
+                raise ValueError(
+                    "vendor '{}' 'keys' must be a non-empty object".format(name))
+            for kname, payload in keys_field.items():
+                if not isinstance(kname, str) or not kname:
+                    raise ValueError(
+                        "vendor '{}' has an empty key name".format(name))
+                if not _validate_admin_name(kname):
+                    raise ValueError(
+                        "vendor '{}' key name '{}' has invalid characters".format(
+                            name, kname))
+                if not isinstance(payload, str) or not payload:
+                    raise ValueError(
+                        "vendor '{}' key '{}' must have a non-empty string "
+                        "payload".format(name, kname))
+                if any(ord(_c) < 32 or ord(_c) == 127 for _c in payload):
+                    raise ValueError(
+                        "vendor '{}' key '{}' payload contains control "
+                        "characters".format(name, kname))
+        else:
+            key_value = vendor["key"]
+            if not isinstance(key_value, str):
+                raise ValueError(
+                    "vendor '{}' 'key' must be a string, got {}".format(
+                        name, type(key_value).__name__))
+            if key_value == "":
+                print("[proxy] WARNING: provider '{}' has an empty 'key' — "
+                      "requests through it will fail with "
+                      "invalid_provider_key".format(name), file=sys.stderr)
+
+
 def decrypt_keys(path, passphrase):
     """Decrypt keys-index.json and return vendors table.
 
@@ -497,14 +641,7 @@ def decrypt_keys(path, passphrase):
     vendors = keys_data["vendors"]
     if not isinstance(vendors, dict):
         raise ValueError("'vendors' must be an object")
-    # Validate each vendor has url and key
-    for name, vendor in vendors.items():
-        if not isinstance(vendor, dict):
-            raise ValueError("vendor '{}' must be an object".format(name))
-        if "url" not in vendor:
-            raise ValueError("vendor '{}' missing 'url'".format(name))
-        if "key" not in vendor:
-            raise ValueError("vendor '{}' missing 'key'".format(name))
+    _validate_vendor_keys_shape(vendors)
     return vendors
 
 
@@ -547,13 +684,8 @@ def load_keys_file(path, passphrase=None):
     vendors = keys_data["vendors"]
     if not isinstance(vendors, dict):
         raise ValueError("'vendors' must be an object")
+    _validate_vendor_keys_shape(vendors)
     for name, vendor in vendors.items():
-        if not isinstance(vendor, dict):
-            raise ValueError("vendor '{}' must be an object".format(name))
-        if "url" not in vendor:
-            raise ValueError("vendor '{}' missing 'url'".format(name))
-        if "key" not in vendor:
-            raise ValueError("vendor '{}' missing 'key'".format(name))
         mode = vendor.get("mode")
         if mode is None or mode == "":
             print("[proxy] WARNING: provider '{}' has no 'mode' field — "
@@ -1479,7 +1611,20 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     actual_model = tier_config["model"]
     vendor = vendors[provider_name]
     upstream_url = vendor["url"]
-    api_key = vendor["key"]
+    api_key, key_name = resolve_api_key(vendor, tier_config)
+
+    if not api_key:
+        # Degenerate resolution (defense-in-depth behind the load gate — e.g.
+        # a string-form "key": "" vendor): fail clearly rather than emitting
+        # an empty/x-api-key: None header upstream.
+        err_msg = json.dumps({
+            "error": {
+                "type": "invalid_provider_key",
+                "message": "Provider '{}' has no usable API key configured".format(
+                    provider_name)
+            }
+        })
+        return 500, {}, err_msg.encode("utf-8"), 0, 0, 0, tier, provider_name, actual_model
 
     # Read endpoint mode (None/''/missing normalize to "anthropic")
     mode = vendor.get("mode") or "anthropic"
@@ -1501,6 +1646,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
             "tier": tier,
             "provider": provider_name,
             "mode": mode,
+            "key": key_name,
         })
 
     # Parse upstream URL
@@ -3973,7 +4119,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 mode = vendor.get("mode")
                 if mode not in MODE_VALUES:
                     mode = "anthropic"
-                providers_detail[name] = {"mode": mode}
+                providers_detail[name] = {
+                    "mode": mode,
+                    "keys": vendor_key_names(vendor),
+                }
             self._send_response(200, json.dumps({
                 "providers": providers_detail
             }).encode("utf-8"))
@@ -4079,6 +4228,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         "error": "invalid model name: {}".format(model)
                     }).encode("utf-8"))
                     return
+                key = tier_config.get("key")
+                if key is not None and key != "" and (
+                        not isinstance(key, str) or not _validate_admin_name(key)):
+                    self._send_response(400, json.dumps({
+                        "error": "invalid key name: {}".format(key)
+                    }).encode("utf-8"))
+                    return
 
             # Validate providers exist
             provider_names = set(_vendors.keys())
@@ -4087,6 +4243,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if provider not in provider_names:
                     self._send_response(400, json.dumps({
                         "error": "unknown provider: {}".format(provider)
+                    }).encode("utf-8"))
+                    return
+                names = vendor_key_names(_vendors[provider])
+                key = tier_config.get("key")
+                if key is None or key == "":
+                    tier_config["key"] = names[0]
+                elif key not in names:
+                    self._send_response(400, json.dumps({
+                        "error": "tier '{}': unknown key '{}' for provider "
+                        "'{}' (available: {})".format(
+                            tier_name, key, provider, ", ".join(names))
                     }).encode("utf-8"))
                     return
 
@@ -4177,7 +4344,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
             # Validate against providers
             provider_names = set(_vendors.keys())
-            errors = validate_config(new_config, provider_names)
+            provider_keys = {name: vendor_key_names(v) for name, v in _vendors.items()}
+            errors = validate_config(new_config, provider_names, provider_keys)
             if errors:
                 self._send_response(400, json.dumps({
                     "error": "config validation failed: {}".format("; ".join(errors))
@@ -4279,6 +4447,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "model": actual_model or model,
             "tier": tier,
             "provider": provider,
+            "key": None,  # resolved below; omitted when resolution fails
             "status": "success" if success else "failure",
             "http_status": status,
             "retries": retries,
@@ -4299,6 +4468,33 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             provider, _current_config, request_id)
         if resolved_extra:
             trace_entry["extra_request_headers"] = resolved_extra
+
+        # Re-resolve the provider key name for the trace (never threaded
+        # through forward_request's return tuple — signature discipline; the
+        # wire auth used the entry snapshot). Resolution is generic over ANY
+        # tier present in config, so an extra tier reached via reverse model
+        # lookup gets its key traced too. Unlike _resolve_extra_request_headers
+        # above (total on its inputs), this dereferences _current_config["tiers"]
+        # and _vendors, which can KeyError on the unknown-tier / None-provider
+        # early-return paths (method/path/model 400s and the 413) and after a
+        # mid-request admin swap; the guard keeps do_POST from crashing before
+        # the error response and the trace entry are written, and the key field
+        # is omitted when resolution is impossible. The provider-ownership
+        # check (entry-snapshot provider still owns the tier) prevents a
+        # post-swap tier from mixing the old provider's vendor with the new
+        # tier's key selector; an unowned tier simply omits the field.
+        try:
+            if provider:
+                _tier_cfg = (_current_config.get("tiers") or {}).get(tier)
+                if (isinstance(_tier_cfg, dict)
+                        and _tier_cfg.get("provider") == provider
+                        and isinstance(_vendors.get(provider), dict)):
+                    trace_entry["key"] = resolve_api_key(
+                        _vendors[provider], _tier_cfg)[1]
+        except Exception:
+            pass
+        if trace_entry.get("key") is None:
+            trace_entry.pop("key", None)
 
         if PROXY_LOG_ALL:
             # Include full request/response bodies
@@ -4419,7 +4615,8 @@ def main():
         sys.exit(1)
 
     provider_names = set(_vendors.keys())
-    errors = validate_config(_current_config, provider_names)
+    provider_keys = {name: vendor_key_names(v) for name, v in _vendors.items()}
+    errors = validate_config(_current_config, provider_names, provider_keys)
     if errors:
         print("[proxy] ERROR: Config validation failed:", file=sys.stderr)
         for err in errors:

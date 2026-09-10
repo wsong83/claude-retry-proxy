@@ -94,7 +94,8 @@ For each request from Claude Code:
 1. The model name is resolved to a tier (haiku/sonnet/opus)
 2. The config maps the tier to a specific provider and model name
 3. The request body's `model` field is rewritten to the actual model name
-4. The provider's API key is injected (replacing the client's dummy key)
+4. The provider's API key is injected (replacing the client's dummy key) —
+   the tier's selected key, when the provider holds several named keys
 5. The request is forwarded to the provider's URL with retry handling
 6. The response model name is rewritten back to the tier name
 
@@ -147,8 +148,9 @@ A template is provided at [`src/templates/config.json`](src/templates/config.jso
 `claude-retry-proxy start`, if `~/.claude/proxy/config.json` doesn't exist,
 the template is copied there automatically.
 
-Maps each tier to a provider and model name. Editable via the admin page or
-directly on disk (use `claude-retry-proxy reload` after manual edits).
+Maps each tier to a provider, model name, and an optional key selector.
+Editable via the admin page or directly on disk (use
+`claude-retry-proxy reload` after manual edits).
 
 ```json
 {
@@ -169,6 +171,22 @@ directly on disk (use `claude-retry-proxy reload` after manual edits).
 The `models` section populates the admin page dropdowns. Each key is a provider
 name (matching the provider names in the tiers section); the value is a list of
 model names shown in the admin page dropdown when that provider is selected.
+
+### Per-tier key selection (optional)
+
+Each tier object may carry an optional `"key"` field naming one of that
+provider's API keys (see the Keys file section below for multi-key
+providers). When absent, empty, or null, the provider's **first key** is
+used. A `"key"` that names no key of that provider — or a non-string value —
+is a validation error at startup, `reload`, and admin Apply. Use it to route
+two tiers to the same provider under different keys:
+
+```json
+"tiers": {
+  "haiku":  { "provider": "opencode-go", "model": "go", "key": "SW" },
+  "sonnet": { "provider": "opencode-go", "model": "go", "key": "CZ" }
+}
+```
 
 ### `disable_retry_claude_count_token` (optional, boolean)
 
@@ -262,6 +280,35 @@ at the start of the file. The JSON structure is the same in both cases:
 }
 ```
 
+Each vendor carries exactly one API key field:
+
+- **`"key"` (string)** — a single key. Its name is `"default"` (shown in the
+  admin page).
+- **`"keys"` (object)** — multiple named keys, name → key string:
+
+  ```json
+  "opencode-go": {
+    "url": "https://opencode.ai/zen/go",
+    "mode": "chat",
+    "keys": {
+      "SW": "sk-your-first-key",
+      "CZ": "sk-your-second-key"
+    }
+  }
+  ```
+
+  Key names are the object's keys (non-empty, letters/digits/`_`/`.`/`/`/`-`).
+  The object order defines the key order — the **first entry is the default**
+  when a tier does not pick one. Each tier picks a key via its optional `key`
+  selector in `config.json` (see Configuration above).
+
+Every payload must be a non-empty string without CR/LF or control characters
+(it is sent verbatim in the auth header). Malformed `keys` objects, vendors
+carrying both `key` and `keys` or neither, and non-string `key` values are
+rejected at startup with a per-vendor error — including providers no tier
+currently uses. A string-form `"key": ""` loads with a stderr warning, and
+requests through it fail with a clear 500 (`invalid_provider_key`).
+
 ### Provider Modes
 
 Each vendor entry in `keys-index.json` may carry an optional `mode` field
@@ -304,6 +351,11 @@ A browser-based admin panel for hot-switching tier mappings. Changes are
 written to `config.json` and take effect immediately. The admin page is
 localhost-only with CSRF protection (Origin header validation).
 
+Each tier row has **Provider**, **Model**, and **Key** columns. The Key
+dropdown lists that provider's key names (never the key material); for a
+single-key provider it shows `default` and appears fixed, disabled, and
+greyed out.
+
 ### Server environment variables
 
 | Variable | Default | Range | Description |
@@ -336,13 +388,15 @@ concurrent sessions de-synchronize instead of retrying in lockstep.
 
 Default location: `~/.claude/logs/proxy-trace.jsonl` (one JSON object per line).
 
-Each request logs: timestamp, method, path, model, tier, provider, status,
-http_status, retry count, total latency, first-byte latency, and a sanitized
-error. Requests to providers with `extra_request_headers` rules additionally
-log an `extra_request_headers` field with the resolved header map. Lifecycle
-markers (`proxy_start`, `proxy_stop`) and per-retry events
-are also logged. When a client disconnects mid-response, a `client_disconnect`
-event is logged instead of printing a traceback.
+Each request logs: timestamp, method, path, model, tier, provider, the
+resolved key name (`key`), status, http_status, retry count, total latency,
+first-byte latency, and a sanitized error. Only the key **name** is logged —
+never the key material — and the field is omitted when resolution is
+impossible. Requests to providers with `extra_request_headers` rules
+additionally log an `extra_request_headers` field with the resolved header
+map. Lifecycle markers (`proxy_start`, `proxy_stop`) and per-retry events
+are also logged. When a client disconnects mid-response, a
+`client_disconnect` event is logged instead of printing a traceback.
 
 Entries older than 5 days are pruned on each `claude-retry-proxy start`.
 
@@ -364,7 +418,9 @@ response bodies) in plaintext; streamed 2xx success bodies are not captured.
 Resolved `extra_request_headers` values are logged on every request for
 providers with rules regardless of `--all` — a resolved session id is a
 stable per-conversation identifier, so treat the trace file accordingly.
-The proxy applies `0600` permissions to the trace and state files on
+The resolved key **name** (`key` field) is likewise logged on every request
+regardless of `--all`; the key material itself never enters the trace. The
+proxy applies `0600` permissions to the trace and state files on
 **POSIX** systems. On **Windows**, `chmod` is effectively a no-op (it only
 toggles the read-only attribute; there is no Unix group/other model), so you
 must restrict the trace directory's ACL yourself, e.g.:
@@ -395,6 +451,10 @@ icacls "$env:USERPROFILE\.claude\logs" /inheritance:r /grant:r "$env:USERNAME:(O
   trace log and prints a one-line summary.
 - **Admin page** — browser-based tier switching at `http://localhost:8080/admin/`.
   CSRF-protected, localhost-only.
+- **Per-tier API key selection** — a provider may hold multiple named keys
+  (`keys` object in keys-index.json); each tier picks one via its `key`
+  selector (admin Key column, hot-switchable), defaulting to the provider's
+  first key.
 - **Encrypted key storage** — provider credentials stored in vim blowfish2
   encrypted `keys-index.json`, decrypted at startup via passphrase.
 - **Concurrent sessions** — `ThreadingHTTPServer` handles multiple in-flight

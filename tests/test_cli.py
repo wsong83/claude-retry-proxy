@@ -738,11 +738,166 @@ def test_cli_status_shows_tiers():
         _restore_proxy_state(state_backup)
 
 
+# ===========================================================================
+# Multi-key provider selection (plan 2026-09-10-multi-key-provider-selection)
+# ===========================================================================
+
+def test_start_unknown_tier_key_fails_via_server_gate():
+    """claude-retry-proxy start with an unknown or non-string tier key exits
+    non-zero POST-spawn — the server's validate_config is the single
+    authoritative gate — and the surfaced error names the key."""
+    print("\n--- Test: Start Unknown Tier Key Fails Via Server Gate ---")
+    state_backup = _backup_proxy_state()
+    cleanup_lock_files()
+
+    try:
+        try:
+            os.remove(PROXY_STATE_FILE)
+        except OSError:
+            pass
+
+        p_port = find_free_port()
+        temp_dir = tempfile.mkdtemp(prefix="proxy_cli_key_")
+        try:
+            vendors = {"p": {"url": "http://127.0.0.1:{}".format(p_port),
+                             "keys": {"SW": "p1", "CZ": "p2"}}}
+
+            def try_start(tiers):
+                config_path = _create_test_config(temp_dir, tiers, models={
+                    "p": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]})
+                keys_path = _create_test_keys_plain(temp_dir, vendors)
+                proc = subprocess.Popen(
+                    CLAUDE_PROXY + ["start", "--config-path", config_path,
+                                    "--keys-path", keys_path],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    stdin=subprocess.PIPE, text=True
+                )
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+                try:
+                    stdout, stderr = proc.communicate(timeout=60)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                    return -1, "", "timeout"
+                return proc.returncode, stdout, stderr
+
+            # Unknown key name on the sonnet tier -> the server gate rejects
+            # post-spawn and the CLI surfaces the server's error
+            rc, stdout, stderr = try_start({
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5", "key": "NOPE"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            })
+            combined = stdout + stderr
+            if (rc == 1 and "Proxy exited during startup" in combined
+                    and "unknown key" in combined and "NOPE" in combined and "sonnet" in combined):
+                pass_("start with unknown tier key fails post-spawn via the server gate (error names key/tier)")
+            else:
+                fail("expected post-spawn server-gate rejection naming sonnet/NOPE, got rc={} "
+                     "stdout={!r} stderr={!r}".format(rc, stdout[:400], stderr[:400]))
+
+            # Non-string truthy key (false) -> 'must be a string' from the server gate
+            rc, stdout, stderr = try_start({
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5", "key": False},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            })
+            combined = stdout + stderr
+            if rc == 1 and "must be a string" in combined:
+                pass_("start with non-string selector 'false' fails post-spawn (must be a string)")
+            else:
+                fail("expected 'must be a string' via the server gate, got rc={} stdout={!r}".format(
+                    rc, stdout[:400]))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    finally:
+        cleanup_lock_files()
+        subprocess.run(CLAUDE_PROXY + ["stop"], capture_output=True, text=True, timeout=10)
+        _restore_proxy_state(state_backup)
+
+
+def test_start_status_reload_tier_lines_show_key():
+    """Tier display lines in start, status, and reload all carry the
+    [key=NAME] suffix when a tier has a key selector set."""
+    print("\n--- Test: Start/Status/Reload Tier Lines Show Key ---")
+    state_backup = _backup_proxy_state()
+    cleanup_lock_files()
+
+    try:
+        try:
+            os.remove(PROXY_STATE_FILE)
+        except OSError:
+            pass
+
+        port = find_free_port()
+        p_port = find_free_port()
+        temp_dir = tempfile.mkdtemp(prefix="proxy_cli_key_col_")
+        try:
+            tiers = {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5", "key": "SW"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5", "key": "CZ"},
+                "opus": {"provider": "p", "model": "claude-opus-5", "key": "SW"},
+            }
+            config_path = _create_test_config(temp_dir, tiers, models={
+                "p": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]})
+            keys_path = _create_test_keys_plain(temp_dir, {
+                "p": {"url": "http://127.0.0.1:{}".format(p_port), "keys": {"SW": "p1", "CZ": "p2"}}
+            })
+            trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
+            os.close(trace_fd)
+
+            mock_server = _start_mock_upstream(p_port, [])
+
+            proc, stdout, stderr, rc = _cli_start_with_plain_keys(
+                port, config_path, keys_path, trace_file)
+            if rc != 0:
+                fail("Start failed (exit {}): {} {}".format(rc, stdout, stderr))
+                return
+            try:
+                if "[key=CZ]" in stdout:
+                    pass_("start tier lines show [key=CZ]")
+                else:
+                    fail("start stdout missing [key=CZ]. stdout: {!r}".format(stdout[:400]))
+
+                out, err, status_rc = proxy_status()
+                if status_rc == 0 and "[key=CZ]" in out:
+                    pass_("status tier lines show [key=CZ]")
+                else:
+                    fail("status missing [key=CZ] (rc={}): {!r}".format(status_rc, out[:400]))
+
+                reload_result = subprocess.run(
+                    CLAUDE_PROXY + ["reload"], capture_output=True, text=True, timeout=30
+                )
+                if reload_result.returncode == 0 and "[key=CZ]" in reload_result.stdout:
+                    pass_("reload tier lines show [key=CZ]")
+                else:
+                    fail("reload missing [key=CZ] (rc={}): {!r}".format(
+                        reload_result.returncode, reload_result.stdout[:400]))
+            finally:
+                stop_result = subprocess.run(
+                    CLAUDE_PROXY + ["stop"], capture_output=True, text=True, timeout=10)
+                if stop_result.returncode != 0:
+                    fail("stop after start failed: {} {}".format(
+                        stop_result.stdout, stop_result.stderr))
+                mock_server.shutdown()
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    finally:
+        cleanup_lock_files()
+        subprocess.run(CLAUDE_PROXY + ["stop"], capture_output=True, text=True, timeout=10)
+        _restore_proxy_state(state_backup)
+
+
 ALL_TESTS = [
     ("cli-reload", test_cli_reload),
     ("cli-start-no-config", test_cli_start_no_config),
     ("cli-start-invalid-config", test_cli_start_invalid_config),
     ("cli-status-shows-tiers", test_cli_status_shows_tiers),
+    ("start-unknown-tier-key-fails-via-server-gate", test_start_unknown_tier_key_fails_via_server_gate),
+    ("start-status-reload-tier-lines-show-key", test_start_status_reload_tier_lines_show_key),
     ("cli-stop-cleans-proxy-state-lock", test_stop_cleans_proxy_state_lock),
     ("cli-stop-cleans-proxy-state", test_stop_cleans_proxy_state),
     ("cli-stop-trace-with-proxy", test_stop_trace_with_proxy),
