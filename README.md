@@ -400,6 +400,25 @@ are also logged. When a client disconnects mid-response, a
 
 Entries older than 5 days are pruned on each `claude-retry-proxy start`.
 
+### If the trace or state file can't be written
+
+Startup **fails fast**: if the trace file or `proxy-state.json` is not writable,
+the proxy exits before becoming ready, and `claude-retry-proxy start` reports
+"Proxy exited during startup" with the underlying error. Fix the path — or point
+`PROXY_TRACE_FILE` / `PROXY_STATE_FILE` somewhere writable — and start again.
+
+Once running, a failing write never stops the proxy and never drops a request.
+The failure is reported on stderr (captured in
+`~/.claude/proxy/proxy-stderr.log`): the first failure reports immediately, and
+further failures while the fault persists report at most once per 60s with a
+count of those suppressed in between. When writes recover, a
+`resumed after N failed write(s)` line closes the episode — so an intermittent
+fault that comes and goes reports each time it returns, not once per minute. **Entries emitted while a sink is failing are lost** —
+there is no buffer — so that count is the record of the gap. Transient causes
+(the file or its directory deleted, a transient lock, a full disk that later
+frees space) recover on their own at the next write with no restart; a
+permanently unwritable path has to be fixed by hand.
+
 ### Analyzing the trace log
 
 ```bash

@@ -732,6 +732,103 @@ STATE_FILE = os.environ.get("PROXY_STATE_FILE",
                                          "proxy-state.json"))
 
 
+# ---------------------------------------------------------------------------
+# Sink failure recording (thread-safe)
+# ---------------------------------------------------------------------------
+
+# The trace and state sinks are written from the request path and the heartbeat
+# thread. Their writes must never raise into the caller: a trace-write OSError
+# inside the retry loop's `except (socket.error, ConnectionError, OSError)`
+# clause would be misread as a connection error and re-issue the upstream POST.
+# Failures are recorded here and reported on stderr at most once per interval.
+
+SINK_WARN_INTERVAL = 60.0
+
+_sink_warn_lock = threading.Lock()
+_sink_warn_state = {}
+
+
+def _warn_sink_failure(sink, exc):
+    """Record a failed sink write and warn on stderr, rate-limited per sink.
+
+    The first failure of an episode always warns; later failures warn at most
+    once per SINK_WARN_INTERVAL and report how many were suppressed. Carries
+    only the sink name and the sanitized cause — never the entry contents,
+    which can hold raw prompts under --all.
+    """
+    now = time.time()
+    with _sink_warn_lock:
+        entry = _sink_warn_state.setdefault(
+            sink, {"failed": False, "last_warn": 0.0, "episode": 0,
+                   "since_warn": 0})
+        entry["episode"] += 1
+        if not entry["failed"]:
+            entry["failed"] = True
+            emit, suppressed = True, 0
+        else:
+            suppressed = entry["since_warn"]
+            emit = now - entry["last_warn"] >= SINK_WARN_INTERVAL
+            if not emit:
+                entry["since_warn"] += 1
+        if emit:
+            entry["last_warn"] = now
+            entry["since_warn"] = 0
+    if not emit:
+        return
+    detail = (" ({} further failures suppressed)".format(suppressed)
+              if suppressed else "")
+    try:
+        print("[proxy] WARNING: {} sink write failed{}: {}".format(
+            sink, detail, sanitize_error(str(exc))), file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _note_sink_recovery(sink):
+    """Close a sink's failure episode, reporting its dropped-write count once."""
+    with _sink_warn_lock:
+        entry = _sink_warn_state.pop(sink, None)
+    if entry is None:
+        return
+    try:
+        print("[proxy] WARNING: {} sink write resumed after {} failed "
+              "write(s)".format(sink, entry["episode"]), file=sys.stderr)
+    except Exception:
+        pass
+
+
+class _BestEffortStderr:
+    """Wraps a stderr stream so diagnostic prints cannot raise into callers.
+
+    server.py holds ~40 runtime stderr prints, several inside the retry loop's
+    try block. A stderr write failure there (full disk — proxy-stderr.log sits
+    on the same volume as the sinks) would be read by the loop's
+    `except (socket.error, ConnectionError, OSError)` clause as a connection
+    error, re-issuing the upstream POST or dropping an already-answered
+    response. Guarding the stream covers every present and future print site.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data):
+        try:
+            return self._stream.write(data)
+        except Exception:
+            # Generic form: a payload with no __len__ must not turn the
+            # swallowed write failure into a TypeError out of this wrapper.
+            return len(data) if hasattr(data, "__len__") else 0
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def read_state():
     try:
         with open(STATE_FILE) as f:
@@ -741,17 +838,29 @@ def read_state():
 
 
 def write_state(state):
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f)
-    os.replace(tmp, STATE_FILE)
-    # Restrict permissions on POSIX (best-effort; Windows chmod is a near-no-op).
-    if os.name == "posix":
-        try:
-            os.chmod(STATE_FILE, 0o600)
-        except OSError:
-            pass
+    """Write the state file. Returns True on success, False on failure.
+
+    Never raises: a failing state sink must not kill the heartbeat thread.
+    """
+    try:
+        d = os.path.dirname(STATE_FILE)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE_FILE)
+        # Restrict permissions on POSIX (best-effort; Windows chmod is a near-no-op).
+        if os.name == "posix":
+            try:
+                os.chmod(STATE_FILE, 0o600)
+            except OSError:
+                pass
+    except Exception as e:
+        _warn_sink_failure("state", e)
+        return False
+    _note_sink_recovery("state")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -792,22 +901,34 @@ def increment_retried():
 
 
 def log_trace(entry):
-    d = os.path.dirname(PROXY_TRACE_FILE)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    with _trace_lock:
-        with open(PROXY_TRACE_FILE, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-    # Restrict permissions on POSIX (best-effort; Windows chmod is a near-no-op).
-    if os.name == "posix":
-        try:
-            os.chmod(PROXY_TRACE_FILE, 0o600)
-        except OSError:
-            pass
+    """Append one trace entry. Returns True on success, False on failure.
+
+    Never raises: callers include the retry loop's error paths, where an
+    escaping OSError would be misclassified as a connection error.
+    """
+    try:
+        d = os.path.dirname(PROXY_TRACE_FILE)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with _trace_lock:
+            with open(PROXY_TRACE_FILE, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        # Restrict permissions on POSIX (best-effort; Windows chmod is a near-no-op).
+        if os.name == "posix":
+            try:
+                os.chmod(PROXY_TRACE_FILE, 0o600)
+            except OSError:
+                pass
+    except Exception as e:
+        _warn_sink_failure("trace", e)
+        return False
+    _note_sink_recovery("trace")
+    return True
 
 
 def write_start_marker():
-    log_trace({
+    """Write the proxy_start trace marker. Returns the sink write result."""
+    return log_trace({
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
         "event": "proxy_start",
         "port": PROXY_PORT,
@@ -4647,11 +4768,27 @@ def main():
         "last_heartbeat": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "last_request_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    write_state(state)
+    if not write_state(state):
+        try:
+            print("[proxy] ERROR: state file {} is not writable — aborting startup".format(
+                STATE_FILE), file=sys.stderr)
+        except Exception:
+            pass
+        sys.exit(1)
     _startup_state = state
 
     # Write start marker to trace
-    write_start_marker()
+    if not write_start_marker():
+        try:
+            print("[proxy] ERROR: trace file {} is not writable — aborting startup".format(
+                PROXY_TRACE_FILE), file=sys.stderr)
+        except Exception:
+            pass
+        sys.exit(1)
+
+    # Runtime diagnostics become best-effort from here on (see _BestEffortStderr).
+    # Installed after both fail-fast checks so their ERROR lines stay loud.
+    sys.stderr = _BestEffortStderr(sys.stderr)
 
     # Start background threads
     threading.Thread(target=heartbeat_loop, daemon=True).start()

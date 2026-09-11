@@ -10,6 +10,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -23,6 +24,7 @@ from _harness import (
     _derive_models_from_tiers,
     _mode_tiers,
     _send_proxy_request,
+    _start_mode_mock_upstream,
     _start_mode_proxy,
     _start_proxy_server_directly,
     errors,
@@ -2650,6 +2652,170 @@ def test_retry_stability_extra_header():
         cleanup()
 
 
+# --- Sink guard: retry-loop misclassification (plan 2026-09-10-guard-trace-state-sinks) ---
+
+def _oversized_json_responder(info):
+    """200 anthropic-shape JSON, deliberately larger than the 1024-byte cap.
+
+    Exceeding PROXY_MAX_RESPONSE_SIZE is what makes the in-loop
+    `response_size_cap_exceeded` log_trace (server.py:2072) fire on an
+    otherwise successful response.
+    """
+    payload = json.dumps({
+        "id": "msg_big",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-5",
+        "content": [{"type": "text", "text": "x" * 2000}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }).encode()
+    return 200, "application/json", payload
+
+
+def test_trace_write_failure_does_not_duplicate_upstream_request():
+    """A trace-write failure inside the retry loop must not be misread as a
+    connection error and re-issue the upstream POST.
+
+    The response-size cap is what puts a log_trace call inside the retry loop's
+    `try`: the body exceeds PROXY_MAX_RESPONSE_SIZE, so the cap event is traced
+    and the truncated body is returned. With the trace path blocked at runtime,
+    that call is exactly what `except (socket.error, ConnectionError, OSError)`
+    would have swallowed pre-fix — backing off and sending the POST upstream a
+    second time, then handing the client status 0 with an upstream_unreachable
+    body. PROXY_MAX_RETRIES=1 bounds a pre-fix regression to ~1s of backoff.
+    """
+    print("\n--- Test: Trace Write Failure Does Not Duplicate Upstream Request ---")
+
+    upstream = find_free_port()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream), "key": "K"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        _mode_tiers(), vendors,
+        responders={"p": _oversized_json_responder},
+        extra_env={"PROXY_MAX_RESPONSE_SIZE": "1024", "PROXY_MAX_RETRIES": "1"})
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        # Block the trace sink at runtime — a blocked path at startup aborts.
+        os.remove(trace_file)
+        os.mkdir(trace_file)
+
+        status, body = _send_proxy_request(proxy_port)
+        if status == 200:
+            pass_("client received 200 despite the in-loop trace-write failure")
+        else:
+            fail("expected 200, got {} ({!r}) — the trace-write failure was "
+                 "misread as a connection error".format(status, body[:200]))
+
+        reqs = mock_servers["p"]["requests"]
+        if len(reqs) == 1:
+            pass_("upstream received exactly 1 request (no duplicate POST)")
+        else:
+            fail("expected exactly 1 upstream request, got {} — the retry loop "
+                 "re-issued the POST after a trace-write failure".format(len(reqs)))
+    finally:
+        cleanup()
+
+
+class _RaisingStderr(object):
+    """A stderr whose write() raises OSError(28) — the full-disk fault."""
+    encoding = "utf-8"
+
+    def write(self, _s):
+        raise OSError(28, "No space left on device")
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+def _responder_503(info):
+    """Upstream that always answers 503, so the retry loop's notices fire."""
+    return 503, "application/json", b'{"error":"Service Unavailable"}'
+
+
+def test_retry_path_print_failure_does_not_misclassify():
+    """A failing print inside the retry loop must not read as a connection error.
+
+    In-process: forward_request is driven directly while sys.stderr is
+    _BestEffortStderr over a raising stream. The mock upstream answers 503, so
+    the loop's retry notice fires — the print that, unguarded, would raise
+    OSError out of the try block and be caught by `except (socket.error,
+    ConnectionError, OSError)`, turning an answered 503 into a synthesized
+    status-0 upstream_unreachable. With the stream wrapper the 503 survives.
+
+    This exercises the wrapper directly; main()'s installation of it is covered
+    by the structural check, and no other test drives forward_request in-process
+    because every other integration test spawns the proxy as a subprocess (whose
+    sys.stderr the test cannot replace).
+    """
+    print("\n--- Test: Retry-Path Print Failure Does Not Misclassify ---")
+
+    import claude_retry_proxy.server as srv
+
+    upstream_port = find_free_port()
+    reqs = []
+    mock_server = _start_mode_mock_upstream(upstream_port, reqs, _responder_503)
+    root = tempfile.mkdtemp(prefix="proxy_retryprint_")
+    saved = (srv.PROXY_TRACE_FILE, srv.STATE_FILE, srv._current_config,
+             srv._vendors, srv.PROXY_MAX_RETRIES, srv.PROXY_INITIAL_DELAY,
+             srv.PROXY_MAX_DELAY, sys.stderr)
+    try:
+        srv.PROXY_TRACE_FILE = os.path.join(root, "trace.jsonl")
+        srv.STATE_FILE = os.path.join(root, "state.json")
+        # One retry (2 attempts), fast backoff.
+        srv.PROXY_MAX_RETRIES = 1
+        srv.PROXY_INITIAL_DELAY = 1
+        srv.PROXY_MAX_DELAY = 1
+        srv._current_config = {
+            "tiers": {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            },
+            "models": {"p": ["claude-haiku-4-5", "claude-sonnet-5",
+                             "claude-opus-5"]},
+        }
+        srv._vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port),
+                              "key": "K"}}
+        srv._compat_validate_constants()
+        srv._load_compat_state()
+
+        sys.stderr = srv._BestEffortStderr(_RaisingStderr())
+        body = json.dumps({
+            "model": "sonnet",
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
+        status = srv.forward_request(
+            "POST", "/v1/messages", {"content-type": "application/json"},
+            body, None, "retryprint-1")[0]
+        sys.stderr = saved[-1]
+
+        if status == 503:
+            pass_("client received the upstream 503 (print failure not misclassified)")
+        else:
+            fail("expected 503, got {} — a diagnostic print failure was read as "
+                 "a connection error".format(status))
+
+        if len(reqs) == 2:
+            pass_("upstream received exactly 2 requests (1 retry, no duplicates)")
+        else:
+            fail("expected exactly 2 upstream requests, got {}".format(len(reqs)))
+    finally:
+        (srv.PROXY_TRACE_FILE, srv.STATE_FILE, srv._current_config,
+         srv._vendors, srv.PROXY_MAX_RETRIES, srv.PROXY_INITIAL_DELAY,
+         srv.PROXY_MAX_DELAY, sys.stderr) = saved
+        try:
+            mock_server.shutdown()
+        except Exception:
+            pass
+        shutil.rmtree(root, ignore_errors=True)
+
+
 ALL_TESTS = [
     ("concurrent-requests", test_concurrent_requests),
     ("retry-logic", test_retry_logic),
@@ -2671,6 +2837,8 @@ ALL_TESTS = [
     ("disable-retry-count-tokens-invalid-type", test_disable_retry_count_tokens_invalid_type),
     ("buffered-response-size-cap", test_buffered_response_size_cap),
     ("retry-stability-extra-header", test_retry_stability_extra_header),
+    ("trace-write-failure-does-not-duplicate-upstream-request", test_trace_write_failure_does_not_duplicate_upstream_request),
+    ("retry-path-print-failure-does-not-misclassify", test_retry_path_print_failure_does_not_misclassify),
 ]
 
 

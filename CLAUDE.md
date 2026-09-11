@@ -68,6 +68,16 @@ python -m claude_retry_proxy.cli --help       # PATH-independent invocation
 python -m claude_retry_proxy.server --help
 ```
 
+`pip install -e .` must be an **editable** install. The console script, the
+spawned `python -m claude_retry_proxy.server`, and therefore the running proxy
+all resolve `claude_retry_proxy` through the interpreter's path — never through
+the working directory. A non-editable (snapshot) install silently runs a frozen
+copy of `src/`, so edits have no effect in the CLI, in the live proxy, *and* in
+the test suite, which exercises both routes. Verify with
+`python -c "import claude_retry_proxy.server as s; print(s.__file__)"` — it must
+print this repo's `src/claude_retry_proxy/server.py`. With an editable install,
+any `src/` change reaches the live proxy on its next restart.
+
 Start options: `--port` (default 8080), `--log <path>` (trace file; relative
 paths resolve against cwd), `--all` (log full request/response bodies),
 `--config-path <path>` (config.json location), `--keys-path <path>`
@@ -188,6 +198,51 @@ paths resolve against cwd), `--all` (log full request/response bodies),
     `PROXY_MAX_BODY_SIZE` via `_read_capped`) and returns it to the client.
     On connection-error exhaustion, a synthesized `upstream_unreachable`
     JSON body is returned.
+- **Sink I/O failure policy (trace + state).** `log_trace` and `write_state`
+  never raise: each wraps its body in a broad `except Exception` and returns
+  `True`/`False`. This is load-bearing, not defensive padding — a trace-write
+  `OSError` escaping into the retry loop's `except (socket.error, ConnectionError,
+  OSError)` clause would be misread as a connection error and re-issue the
+  upstream POST, and an escaped `OSError` in `heartbeat_loop` would kill the
+  thread permanently. The first failure of an episode is reported on stderr
+  immediately; further failures **in that same episode** are reported at most
+  once per 60s (`SINK_WARN_INTERVAL`) with a count of those suppressed in
+  between. A successful write closes the episode and emits one `resumed` line
+  carrying that episode's total failed writes — so an intermittent fault that
+  alternates success and failure reports on every new episode, not once per 60s
+  overall. **Startup fails fast:** `main()` acts on the two startup
+  returns (`write_state` for the state file, `write_start_marker` for the trace
+  file) and exits non-zero *before* printing `READY` if either path is
+  unwritable, which the CLI surfaces as "Proxy exited during startup" plus the
+  stderr tail. At runtime there is no recovery machinery and none is needed:
+  both sinks redo their work on every call — `log_trace` re-runs `makedirs` and
+  appends via `open(..., "a")`, while `write_state` re-creates the directory,
+  writes a `.tmp` in `"w"` mode and `os.replace`s it into place — so a deleted
+  file or directory, a transient lock, or a freed disk self-heals on the next
+  call.
+  Entries emitted during an outage are **lost, not buffered** — the `resumed`
+  line's count is the record of the gap. The failure report itself is
+  best-effort: the trace file and `proxy-stderr.log` both live under
+  `~/.claude/`, so a full disk can suppress the warning line entirely while the
+  sinks still return `False`/`True` correctly.
+  **Runtime diagnostics are best-effort process-wide.** `main()` replaces
+  `sys.stderr` with a non-raising `_BestEffortStderr` wrapper once, immediately
+  after the two fail-fast checks — so every later `print(..., file=sys.stderr)`
+  in the request path (including the retry loop's own notices, which would
+  otherwise be caught by `except (socket.error, ConnectionError, OSError)` and
+  misread as connection errors) cannot raise. The two fail-fast `ERROR` prints
+  run *before* the wrapper is installed and keep their own `try/except`, so they
+  stay loud on a healthy stderr. One scope limit: the wrapper is installed in
+  `main()` only, so a module imported directly (the test suite's in-process
+  imports, `tmp/verification/*.py`) still has a raw `sys.stderr`. The failure
+  return covers everything `print` can produce: `_BestEffortStderr.write`
+  reports `len(data)` for a sized payload and `0` otherwise, so no payload
+  lacking `__len__` can raise out of a wrapper whose entire purpose is not
+  raising. Keep that guarded form — a bare `len(data)` restores the `TypeError`
+  this note used to document, and an editor reasoning that "print only ever
+  passes a `str`" would be tempted to simplify it back. Residual (final-review
+  Suggestion, unreachable here): a payload whose own `__len__` raises would
+  still propagate; nothing in this codebase writes such an object to stderr.
 - **Passphrase pipe protocol**: When keys are encrypted (`VimCrypt~03!`),
   CLI writes passphrase + `\n` to `proc.stdin`, closes stdin. Server reads
   one line from stdin in `main()` before `serve_forever()`. On decryption
@@ -253,6 +308,20 @@ does not block startup on failure).
   thread updates `last_heartbeat` on this in-memory copy and writes it to disk
   — it never reads from disk. If `proxy-state.json` is deleted externally, the
   next heartbeat recreates it with all fields intact within 30s.
+- **Trace/state I/O failures degrade the proxy; they never stop it — except at
+  startup.** An unwritable trace or state path at startup aborts before `READY`
+  (fail fast); from then on the sinks keep serving and record failures on stderr
+  — the first failure of an episode always reports, and further failures in that
+  episode at most once per 60s, but a successful write closes the episode, so an
+  intermittent fault reports on each new episode rather than once per minute.
+  Entries emitted while a sink is failing are **lost** —
+  there is no buffer — and the `resumed after N failed write(s)` line is the only
+  record of how many. No restart or manual recovery is needed for the transient
+  classes (deleted file or directory, transient lock, freed disk) because both
+  sinks re-open per call; a permanently unwritable path (ACL, path replaced by a
+  directory) fails forever and needs a human. If stderr is unwritable too, even
+  the warning line is lost while the sinks still behave correctly. See the sink
+  I/O failure policy in Architecture.
 - **Admin API CSRF protection.** Admin POST endpoints validate the Origin
   header. Non-browser clients (curl, CLI `reload`) must include an Origin
   header matching `http://localhost:<port>` or `http://127.0.0.1:<port>` or
@@ -423,7 +492,7 @@ does not block startup on failure).
   SSE is synthesized from OpenAI SSE (frame-assembled on `\n\n`, terminal
   synthesized on EOF).
 - **Malformed tool arguments in chat mode.** When `_chat_to_anthropic` encounters tool-call arguments that cannot be parsed as a JSON dict (including `json.JSONDecodeError`, non-dict parse results, empty dicts, non-dict `function` values, and non-dict tool-call entries), it emits a user-visible text block `[Tool call failed: arguments for '<name>' (call <id>) could not be parsed as JSON]` instead of a `tool_use` block with `input: {}`. A `tool_args_parse_failure` trace event is also logged. When all tool calls in a response are malformed, `stop_reason` is forced to `None` to prevent the client from hanging on `stop_reason: "tool_use"` with zero tool_use blocks. **Request-transform path:** `_transform_anthropic_messages_to_chat` applies the same degradation pattern for NaN/Infinity/non-dict `tool_use.input` values (rejected by `json.dumps(input, allow_nan=False)`), emitting the placeholder `[Tool call failed: arguments for '<name>' (call <id>) could not be serialized as JSON]` and a `tool_args_parse_failure` trace event. When a failed tool_use coexists with valid tool_use(s) in the same assistant message, the placeholder is emitted as a separate assistant message before the tool_calls message (content: null). (Behavior changes landed 2026-08-28 and 2026-08-29.)
-- **Test suite is safe alongside a live proxy.** The test suite sets `os.environ["PROXY_STATE_FILE"]` and `os.environ["PROXY_FEATURE_COMPAT_FILE"]` to session temp paths at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read these env vars at import time, so test proxies use isolated state files and can never touch the live proxy's `~/.claude/proxy/proxy-state.json` or `~/.claude/proxy/feature-compatibility.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite (275 tests across 12 modules: `tests/_harness.py` + `tests/test_compat.py` + 10 cluster modules + `tests/test_claude_proxy.py` aggregator) passes with the live proxy up (landed 2026-08-28, updated 2026-09-10).
+- **Test suite is safe alongside a live proxy.** The test suite sets `os.environ["PROXY_STATE_FILE"]` and `os.environ["PROXY_FEATURE_COMPAT_FILE"]` to session temp paths at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read these env vars at import time, so test proxies use isolated state files and can never touch the live proxy's `~/.claude/proxy/proxy-state.json` or `~/.claude/proxy/feature-compatibility.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite passes with the live proxy up (landed 2026-08-28) — 288 tests across 14 files as of 2026-09-11: `tests/_harness.py` + `tests/test_compat.py` + 11 cluster modules + `tests/test_claude_proxy.py` aggregator. That count is a snapshot, not a fixed figure: it has moved 275 → 283 → 284 → 288 in a single day of work, so re-count before quoting it rather than trusting this line.
 
 ## Documentation
 
@@ -462,6 +531,12 @@ does not block startup on failure).
   per-tier `key` selector with server-authoritative validation, admin
   Provider/Model/Key columns (disabled grey `default` for single-key
   providers), and name-only trace resolution generic over any config tier.
+- [plans/2026-09-10-guard-trace-state-sinks.md](plans/2026-09-10-guard-trace-state-sinks.md) — trace/state
+  sink failure policy: non-raising guarded sinks returning `True`/`False`,
+  rate-limited stderr reporting with a recovery line, startup fail-fast on an
+  unwritable sink path, `write_state`'s directory guard, and a best-effort
+  runtime `sys.stderr` wrapper. Resolves the deferred
+  `unguarded-write-state-log-trace-oserror` issue.
 - [plans/2026-08-27-support-three-endpoint-modes.md](plans/2026-08-27-support-three-endpoint-modes.md) — three-endpoint-mode
   dispatch (anthropic/chat/response) with full request/response transformation
   and SSE streaming.
@@ -478,8 +553,7 @@ No other supplementary docs.
 ```json
 [
   {"issue_id": "break-up-large-source-and-test-files", "title": "Break up large source and test files into smaller modules", "target_repo": null, "report": "./tmp/reports/defer-issue-break-up-large-source-and-test-files.json", "deferred": "2026-09-01", "date_source": "creation"},
-  {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "target_repo": null, "report": "./tmp/reports/defer-issue-image-content-blocks-chat-mode.json", "deferred": "2026-08-29", "date_source": "creation"},
-  {"issue_id": "unguarded-write-state-log-trace-oserror", "title": "Unguarded write_state/log_trace OSError paths in proxy heartbeat and trace sinks", "target_repo": null, "report": "./tmp/reports/defer-issue-unguarded-write-state-log-trace-oserror.json", "deferred": "2026-09-07", "date_source": "creation"}
+  {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "target_repo": null, "report": "./tmp/reports/defer-issue-image-content-blocks-chat-mode.json", "deferred": "2026-08-29", "date_source": "creation"}
 ]
 ```
 
