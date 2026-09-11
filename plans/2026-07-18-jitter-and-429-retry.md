@@ -416,7 +416,7 @@ updating it is the planner's doc-sync duty, not a rule violation.
 
 | Issue | Status | Found | Resolved | Resolved By |
 |-------|--------|-------|----------|-------------|
-| [shutdown-during-retry-sleep](#) — `_shutting_down` flag not checked during `time.sleep(delay)` in `forward_request` retry loop; a mid-retry request blocks `/admin/shutdown` for up to `MAX_RETRIES * jittered_max_delay` (~38s default, ~375s env maxes). Pre-existing — affects current 503 and connection-error sleep paths, not introduced by this plan. Out of scope here per Prime Directive 3; tracked for a future hardening plan. | Open | 2026-07-18 | — | — |
+| [shutdown-during-retry-sleep](./tmp/reports/defer-issue-shutdown-during-retry-sleep.json) — `_shutting_down` flag not checked during `time.sleep(delay)` in `forward_request` retry loop; a mid-retry request blocks `/admin/shutdown` for up to `MAX_RETRIES * jittered_max_delay` (~38s default, ~375s env maxes). Pre-existing — affects current 503 and connection-error sleep paths, not introduced by this plan. Out of scope here per Prime Directive 3; tracked for a future hardening plan. | Won't fix | 2026-07-18 | 2026-09-11 | user — explicit decision (2026-09-11). Planner correction on the record: the filed premise is **disproven**. `ThreadingHTTPServer.daemon_threads = True`, so `server_close()` joins nothing — shutdown returns in ~1s regardless of in-flight retries and the process exits with them still running (measured: 1.62s process exit with a 20s sleep in flight). The gap itself is real — `_shutting_down` is never read on the request path, so the sleeps at `server.py:2069` / `:2254` are uninterruptible — but its consequence is the **inverse** of the filing: in-flight requests are killed mid-flight, not awaited. Accepted as intended; `CLAUDE.md` Gotcha corrected. [report](./tmp/reports/defer-issue-shutdown-during-retry-sleep.json) |
 
 ## Final Results
 
@@ -455,11 +455,11 @@ Phase 6 reviewer report [2026-07-18-jitter-and-429-retry-review-2026-07-19.json]
     plan revision (coder core constraint blocked it; correctly reassigned).
   No behavioral change. Issue `step4-test-docstring-blocked-by-constraint`
   closed.
-- **`shutdown-during-retry-sleep`** — pre-existing Open issue (Issue Log), out of scope, unchanged by this plan.
+- **`shutdown-during-retry-sleep`** — pre-existing Open issue (Issue Log), out of scope, unchanged by this plan. **Closed `Won't fix` 2026-09-11** — the filed premise (a blocking drain) was tested against the code and disproven; see the Issue Log row.
 
-### Open issue (carried forward, not blocking this plan)
+### Carried-forward issue (closed 2026-09-11, not blocking this plan)
 
-- `shutdown-during-retry-sleep` — Open, found 2026-07-18, tracked for a future hardening plan.
+- `shutdown-during-retry-sleep` — found 2026-07-18; **closed `Won't fix` 2026-09-11** by explicit user decision. Tested against the code and disproven as filed: shutdown does not drain in-flight requests, it exits and kills them. See the Issue Log row and the [report](./tmp/reports/defer-issue-shutdown-during-retry-sleep.json).
 
 ### Next step
 

@@ -364,18 +364,30 @@ does not block startup on failure).
   probation. Probability is negligible (exotic WSAENOBUFS-class, Windows
   only); consequence is bounded (one spurious doubling, next probe cycle
   revalidates). Accepted residual — documented for awareness.
-- **`/admin/shutdown` can block during retry sleep.** Graceful shutdown waits
-  for in-flight requests to finish, and a request mid-retry-backoff holds its
-  worker thread for up to `PROXY_MAX_RETRIES * jittered_max_delay`, so shutdown
-  can take that long to drain. Tracked as Open issue `shutdown-during-retry-sleep`
-  in the jitter plan's Issue Log for a future hardening pass.
+- **Shutdown does not drain in-flight requests — it kills them.** `server.py`
+  uses a stock `http.server.ThreadingHTTPServer` (`server.py:4797`), which sets
+  `daemon_threads = True`; `socketserver.ThreadingMixIn` only joins *non-daemon*
+  threads in `server_close()`, so worker threads are untracked and killed when
+  the interpreter exits. `stop` / `/admin/shutdown` therefore returns in ~1s
+  regardless of what is in flight (measured: 1.62s process exit with a 20s sleep
+  running in a worker), and a request mid-retry-backoff is **killed mid-flight,
+  not awaited** — the client sees a dropped connection and that request's trace
+  entry never lands (the `proxy_stop` marker still does). `_shutting_down` is
+  read only by `heartbeat_loop` and the shutdown handler itself, never on the
+  request path; the retry sleeps stay uninterruptible (`server.py:2069`,
+  `:2254`). Wiring it up would be a real drain (`daemon_threads = False` +
+  bounded wait), i.e. a behavior change, not a bug fix. Closed `Won't fix` by
+  user decision 2026-09-11 — the issue was filed on a premise the code does not
+  exhibit; see
+  [defer-issue-shutdown-during-retry-sleep.json](./tmp/reports/defer-issue-shutdown-during-retry-sleep.json).
 - **Drain-and-swap timeout during retry sleep.** Admin switch/reload drain
   waits up to 30s for in-flight requests to complete. A request stuck in
   retry backoff (worst case ~3.8 min with defaults) exceeds this timeout —
   the swap is **aborted** (returns 503 to admin client) rather than waiting
   indefinitely. The in-flight request continues with its original config
-  snapshot and completes normally. Same root cause as
-  `shutdown-during-retry-sleep`.
+  snapshot and completes normally. Same underlying condition as the shutdown
+  path above (a request sitting in retry backoff), opposite handling: switch and
+  reload *do* wait, `stop` does not wait at all.
 - **Two-phase readiness protocol.** `claude-retry-proxy start` uses a
   two-phase readiness check: (1) wait for the server to print `READY` to
   stdout (5s timeout), detected via a daemon thread reading `proc.stdout`
