@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Configuration — claude-retry-proxy</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<h1>Configuration<span class="sub">config.json, keys-index.json, and the environment</span></h1>
+
+<p><strong>Last updated:</strong> 2026-09-12</p>
+
+<p>Two files configure the proxy, and the split between them is the important thing to
+understand: <strong><code>config.json</code> is safe to read, share, and commit;
+<code>keys-index.json</code> is not.</strong></p>
+
+<table>
+<tr><th>File</th><th>Holds</th><th>Default location</th></tr>
+<tr>
+  <td><code>config.json</code></td>
+  <td>Which tier goes to which provider and model; which credential to select; the model
+      catalog; retry and header policy</td>
+  <td><code>~/.claude/proxy/config.json</code></td>
+</tr>
+<tr>
+  <td><code>keys-index.json</code></td>
+  <td>Provider base URLs <em>and credentials</em></td>
+  <td><code>~/.claude/keys-index.json</code></td>
+</tr>
+</table>
+
+<div class="warn">
+<strong>Credentials live in <code>keys-index.json</code>, never in <code>config.json</code>.</strong>
+A <code>config.json</code> records <em>which named key</em> to use, not the key itself — so it is
+safe to version-control and to paste into a bug report. Keep that property: if you ever find a
+credential in <code>config.json</code>, something has gone wrong.
+</div>
+
+<h2 id="config-schema">config.json</h2>
+
+<pre><code>{
+  "tiers": {
+    "haiku":  { "provider": "example-provider", "model": "claude-haiku-4-5", "key": "" },
+    "sonnet": { "provider": "example-provider", "model": "claude-sonnet-5",  "key": "" },
+    "opus":   { "provider": "example-provider", "model": "claude-opus-5",   "key": "" }
+  },
+  "models": {
+    "example-provider": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]
+  },
+  "disable_retry_claude_count_token": true,
+  "extra_request_headers": {}
+}</code></pre>
+
+<h3 id="tiers-field">The <code>tiers</code> object</h3>
+
+<p>All three of <code>haiku</code>, <code>sonnet</code>, and <code>opus</code> must be present.
+Each names a <code>provider</code> and the concrete <code>model</code> to send upstream, and
+may name a <code>key</code>.</p>
+
+<table>
+<tr><th>Field</th><th>Required</th><th>Meaning</th></tr>
+<tr><td><code>provider</code></td><td><span class="required">yes</span></td>
+    <td>Must match a provider name in <code>keys-index.json</code></td></tr>
+<tr><td><code>model</code></td><td><span class="required">yes</span></td>
+    <td>The upstream model id sent in place of the client's tier name</td></tr>
+<tr><td><code>key</code></td><td><span class="optional">optional</span></td>
+    <td>Names which credential to use from a multi-key provider. Empty or absent selects the
+        first key. See <a href="#multi-key">Multi-key selection</a>.</td></tr>
+</table>
+
+<p>Extra tiers beyond the required three are permitted, and are reachable through
+<a href="architecture.html#tier-resolution">reverse lookup</a> — a client asking for a model
+name that an extra tier is pointed at resolves to that tier.</p>
+
+<h3 id="models-field">The <code>models</code> object</h3>
+
+<p>Maps each provider to the list of model names it offers. The admin page uses this to populate
+its model dropdown, which is why every tier's provider needs at least one entry here.</p>
+
+<p>Each entry must be a non-empty list of non-empty strings. Note the validation direction: the
+proxy checks that every provider <em>mentioned in <code>config.json</code></em> exists in
+<code>keys-index.json</code>. Providers in <code>keys-index.json</code> that no tier or catalog
+entry references are silently ignored, so you can keep credentials for providers you are not
+currently routing to.</p>
+
+<h3 id="count-tokens-flag"><code>disable_retry_claude_count_token</code></h3>
+
+<p>Boolean, optional, and one of the few settings with a real cost attached.</p>
+
+<p>Setting it to <code>true</code> makes the proxy attempt the <code>count_tokens</code>
+endpoint <strong>once</strong> instead of retrying it up to <code>PROXY_MAX_RETRIES</code>
+times. The reason is that <code>count_tokens</code> is an Anthropic-specific endpoint that most
+third-party providers do not implement, and they answer it with <code>503</code> — which is
+exactly the status the proxy retries. Leaving the flag off therefore means every token count
+burns the full retry budget against a provider that will never succeed.</p>
+
+<p>The shipped template sets it to <code>true</code>. Turn it off only if your providers
+actually implement the endpoint.</p>
+
+<div class="note">
+This flag is preserved across admin hot-switches and re-read from disk on reload. So are the
+models catalog and every rule under <a href="#extra-headers">extra_request_headers</a>: those
+three are carried across a switch by name, so switching a tier cannot silently discard your
+header rules. See <a href="operations.html#admin">operations.html#admin</a>. This flag also
+interacts with the compatibility learner, which excludes <code>count_tokens</code> from its
+probing — see <a href="compatibility.html">compatibility.html</a>.
+</div>
+
+<h3 id="extra-headers"><code>extra_request_headers</code></h3>
+
+<p>Optional. Attaches outbound headers to every request for a given provider, deriving the
+value from the incoming request. This exists for providers that expect a session or trace
+header the Anthropic API does not define.</p>
+
+<pre><code>{
+  "extra_request_headers": {
+    "example-provider": [
+      { "header": "x-opencode-session",
+        "from": ["X-Claude-Code-Session-Id"],
+        "fallback": "request_id" }
+    ]
+  }
+}</code></pre>
+
+<table>
+<tr><th>Field</th><th>Required</th><th>Meaning</th></tr>
+<tr><td><code>header</code></td><td><span class="required">yes</span></td>
+    <td>The outbound header name to set. Must match <code>^[A-Za-z0-9][A-Za-z0-9-]*$</code> and
+        must not be a reserved name.</td></tr>
+<tr><td><code>from</code></td><td><span class="optional">optional</span></td>
+    <td>A list of incoming header names to read, in priority order. The first one present and
+        non-empty wins. Matched case-insensitively; values are stripped.</td></tr>
+<tr><td><code>fallback</code></td><td><span class="optional">optional</span></td>
+    <td>Used when no <code>from</code> header yields a value. Either a literal string
+        (stripped before sending), or the special token <code>"request_id"</code>, which
+        substitutes a fresh UUID for the request.</td></tr>
+</table>
+
+<p>Resolution is <strong>total</strong>: a rule that is malformed, or whose
+<code>from</code> headers are all absent, degrades to using the fallback or to attaching no
+header at all. It never fails a request. Validation at startup and reload is strict, however —
+the resolver tolerates what the validator would have rejected, so a live proxy never sees a
+bad rule.</p>
+
+<p>Two constraints are worth stating plainly because they are security-relevant:</p>
+
+<ul>
+  <li><strong>Reserved names are rejected.</strong> A rule may not set proxy-managed headers
+      (auth, <code>Host</code>, <code>Content-Length</code>, <code>Content-Type</code>, the
+      forwarded allowlist) or hop-by-hop framing headers
+      (<code>Connection</code>, <code>Transfer-Encoding</code>, <code>Expect</code>,
+      <code>TE</code>, <code>Accept-Encoding</code>, <code>Cookie</code>).</li>
+  <li><strong><code>from</code> may not name the client's auth headers.</strong>
+      <code>authorization</code> and <code>x-api-key</code> are forbidden as sources — copying a
+      client credential into an arbitrary outbound header is not permissible.</li>
+</ul>
+
+<p>Header names are unique per provider, compared case-insensitively, so
+<code>x-session</code> and <code>X-Session</code> in the same provider's list is an error
+rather than a silent override. Fallback values must be free of control characters and
+representable in latin-1, since they are written verbatim into an HTTP header.</p>
+
+<div class="note">
+Resolved values are recorded in the trace log on <em>every</em> request for a provider with
+rules — not only under <code>--all</code>. If a rule forwards a per-conversation identifier,
+that identifier lands in the trace file. See <a href="trace-log.html#exposure">trace-log.html</a>.
+</div>
+
+<h2 id="keys-schema">keys-index.json</h2>
+
+<pre><code>{
+  "vendors": {
+    "example-provider": {
+      "url": "https://api.example.invalid",
+      "key": "sk-ant-api03-YOUR-KEY-HERE"
+    },
+    "example-chat-provider": {
+      "url": "https://api.example.invalid",
+      "key": "sk-YOUR-OPENAI-KEY-HERE",
+      "mode": "chat"
+    },
+    "example-multikey-provider": {
+      "url": "https://api.example.invalid",
+      "mode": "chat",
+      "keys": {
+        "ALPHA": "sk-YOUR-FIRST-KEY",
+        "BETA":  "sk-YOUR-SECOND-KEY"
+      }
+    }
+  }
+}</code></pre>
+
+<table>
+<tr><th>Field</th><th>Required</th><th>Meaning</th></tr>
+<tr><td><code>url</code></td><td><span class="required">yes</span></td>
+    <td>The provider's base URL</td></tr>
+<tr><td><code>key</code></td><td><span class="optional">one of</span></td>
+    <td>A single credential as a plain string. Its key name is always <code>"default"</code>.</td></tr>
+<tr><td><code>keys</code></td><td><span class="optional">one of</span></td>
+    <td>A name → credential object. Insertion order is the key order, and the first key is the
+        default.</td></tr>
+<tr><td><code>mode</code></td><td><span class="optional">optional</span></td>
+    <td><code>anthropic</code> (default), <code>chat</code>, or <code>response</code>. See
+        <a href="provider-modes.html">provider-modes.html</a>.</td></tr>
+</table>
+
+<p>A vendor must carry <strong>exactly one</strong> of <code>key</code> and <code>keys</code>.
+Carrying both, or neither, is a startup error naming the offending vendor.</p>
+
+<div class="warn">
+<strong>An empty string <code>"key": ""</code> is accepted at load with a warning</strong>, but
+every request through that provider then fails with <code>500 invalid_provider_key</code>. The
+asymmetry is deliberate: it lets you stage a keys file before populating it, while making the
+consequence unmissable. A <code>keys</code> object with no surviving entries degrades to
+<code>"default"</code> rather than falling through to the <code>key</code> field.
+</div>
+
+<h3 id="multi-key">Multi-key selection</h3>
+
+<p>A provider may hold several credentials. Which one a request uses is decided per
+<em>tier</em>, not per provider — so two tiers pointing at the same provider can bill to
+different keys.</p>
+
+<ol>
+  <li>A tier's <code>key</code> field names the credential to use.</li>
+  <li>If <code>key</code> is absent, <code>null</code>, or the empty string, the
+      <strong>first</strong> key in the provider's <code>keys</code> object is used.</li>
+  <li>A name that matches no key of that provider is a validation error — at startup, at
+      admin switch, and at reload alike. It is never silently ignored.</li>
+</ol>
+
+<p>Selection is by exact name. The admin page shows a Key column sourced from the provider's
+key <em>names</em> only — credential payloads are never sent to the browser. A single-key
+provider shows a fixed, disabled <code>default</code>.</p>
+
+<h3 id="encryption">Encryption and file permissions</h3>
+
+<p>The keys file may be either plain JSON or encrypted. The proxy detects the format from the
+file's first bytes:</p>
+
+<ul>
+  <li>A file beginning <code>VimCrypt~03!</code> is decrypted with the passphrase.</li>
+  <li>Anything else is parsed as plain JSON, and <strong>no passphrase is prompted for</strong>.</li>
+</ul>
+
+<div class="error">
+<strong>Plain JSON leaves your API keys unencrypted on disk.</strong> It is convenient for
+testing and automation, but the file is readable by anything that can read your home directory.
+<p>If you use plain JSON:</p>
+<ul>
+  <li><strong>On Windows</strong>, <code>chmod</code> is a near-no-op — it sets only the
+      read-only bit and has no group/other permission model. Restrict the file's ACL manually
+      with <code>icacls</code>.</li>
+  <li><strong>On POSIX</strong>, <code>chmod 0o600</code> is applied automatically.</li>
+</ul>
+<p>The recommended production approach is to encrypt with <code>vim -n -x</code>, which uses
+blowfish2 and produces the <code>VimCrypt~03!</code> prefix.</p>
+</div>
+
+<p>When plain keys are loaded the server prints a warning on stderr so the condition is visible
+in the log. <code>--passphrase-file</code> is only consulted for encrypted files; with plain
+keys it is ignored.</p>
+
+<h2 id="env-vars">Environment variables</h2>
+
+<p>These are read by the <em>server</em> process at import time. Several have CLI equivalents on
+<code>claude-retry-proxy start</code>; where both exist, the CLI flag wins.</p>
+
+<table>
+<tr><th>Variable</th><th>Default</th><th>Accepted range</th><th>Purpose</th></tr>
+<tr><td><code>PROXY_PORT</code></td><td class="num">8080</td><td class="num">1024–65535</td>
+    <td>Listen port</td></tr>
+<tr><td><code>PROXY_MAX_RETRIES</code></td><td class="num">10</td><td class="num">1–100</td>
+    <td>Retry attempts, shared by <code>429</code> and <code>503</code></td></tr>
+<tr><td><code>PROXY_INITIAL_DELAY</code></td><td class="num">1</td><td class="num">1–60</td>
+    <td>First backoff delay, in seconds</td></tr>
+<tr><td><code>PROXY_MAX_DELAY</code></td><td class="num">30</td><td class="num">1–300</td>
+    <td>Backoff cap in seconds, applied <em>before</em> jitter</td></tr>
+<tr><td><code>PROXY_MAX_BODY_SIZE</code></td><td class="num">10485760</td><td class="num">1024–104857600</td>
+    <td>Request body cap (bytes) → <code>413</code>. Also caps the give-up error-body drain.</td></tr>
+<tr><td><code>PROXY_MAX_RESPONSE_SIZE</code></td><td class="num">104857600</td><td class="num">1024–1073741824</td>
+    <td>Streaming response cap (bytes); exceeding it truncates with a trace event</td></tr>
+<tr><td><code>PROXY_LOG_ALL</code></td><td class="num">""</td><td>—</td>
+    <td>Set to <code>1</code> to record full request and response bodies. See the warning in
+        <a href="trace-log.html#all">trace-log.html</a>.</td></tr>
+<tr><td><code>PROXY_TRACE_FILE</code></td><td colspan="2"><code>~/.claude/logs/proxy-trace.jsonl</code></td>
+    <td>Trace log path</td></tr>
+<tr><td><code>PROXY_KEYS_PATH</code></td><td colspan="2"><code>~/.claude/keys-index.json</code></td>
+    <td>Keys file path</td></tr>
+<tr><td><code>PROXY_STATE_FILE</code></td><td colspan="2"><code>~/.claude/proxy/proxy-state.json</code></td>
+    <td>Heartbeat state file. Override for test isolation.</td></tr>
+<tr><td><code>PROXY_FEATURE_COMPAT_FILE</code></td><td colspan="2"><code>~/.claude/proxy/feature-compatibility.json</code></td>
+    <td>Compatibility state file. Override for test isolation.</td></tr>
+</table>
+
+<div class="note">
+<strong>A value outside its range — or one that does not parse as an integer — is silently
+ignored, and the default above is used instead.</strong> Nothing is written to stderr or to the
+trace, so an out-of-range setting is indistinguishable from an unset one. The one warn-and-clamp
+mechanism in the codebase governs the compatibility learner's internal constants, not these
+variables; see <a href="compatibility.html#constants">compatibility.html</a>.
+<p><code>PROXY_IDLE_TIMEOUT</code> is not in this table because it does not exist: the server
+defines no idle-timeout feature, and setting it has no effect.</p>
+</div>
+
+<h2 id="validation">Validation rules</h2>
+
+<p>Validation is strict and runs at startup, so a bad configuration fails loudly rather than
+producing confusing request-time errors. The proxy refuses to start when:</p>
+
+<table>
+<tr><th>Condition</th></tr>
+<tr><td><code>config.json</code> is missing — the template is copied into place and the
+    instructions printed instead</td></tr>
+<tr><td>Any of the three required tiers is absent</td></tr>
+<tr><td>A tier is not an object, or has an empty <code>provider</code> or <code>model</code></td></tr>
+<tr><td>A tier references a provider with no entry in <code>keys-index.json</code></td></tr>
+<tr><td>A provider in <code>config.models</code> has an empty, malformed, or all-blank model list</td></tr>
+<tr><td>A provider in <code>config.models</code> has no entry in <code>keys-index.json</code></td></tr>
+<tr><td>A tier's <code>key</code> is present but not a string, or names no key of its provider</td></tr>
+<tr><td><code>disable_retry_claude_count_token</code> is present but not a boolean</td></tr>
+<tr><td>Any <code>extra_request_headers</code> rule fails its type, charset, reserved-name, or
+    duplicate check</td></tr>
+<tr><td>Any vendor carries both <code>key</code> and <code>keys</code>, or neither</td></tr>
+</table>
+
+<div class="note">
+<strong>An invalid vendor <code>mode</code> is not a startup refusal.</strong> Startup prints a
+warning on stderr and carries on. The failure surfaces per request instead, as
+<code>500 invalid_provider_mode</code>. See
+<a href="provider-modes.html">provider-modes.html</a>.
+</div>
+
+<p>The direction of the config↔keys check is worth restating, because getting it backwards is a
+common mistake: <strong>config is authoritative</strong>. Every provider named in
+<code>config.json</code> must exist in the keys file. Providers that exist only in the keys file
+are ignored.</p>
+
+<footer>Last updated: 2026-09-12</footer>
+</body>
+</html>

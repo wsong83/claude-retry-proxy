@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Architecture — claude-retry-proxy</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<h1>Architecture<span class="sub">How a request is routed, retried, and rewritten</span></h1>
+
+<p><strong>Last updated:</strong> 2026-09-12</p>
+
+<p>This page describes the path a request takes from the moment it reaches the proxy to the
+moment a response leaves it. It is the reference the other pages link back into — in
+particular <a href="#retry">Retry and backoff</a> and <a href="#sinks">Trace and state
+sinks</a>, which between them explain most of the proxy's surprising behaviour.</p>
+
+<h2 id="overview">Overview</h2>
+
+<p>The proxy is a <code>ThreadingHTTPServer</code> bound to <code>127.0.0.1</code>
+(default port <code>8080</code>, overridable with <code>PROXY_PORT</code>). It is a
+<em>gateway</em>, not a transparent forward proxy: it parses enough of each request to decide
+where the request should go and what it should look like when it gets there.</p>
+
+<p>Two ideas carry most of the design weight:</p>
+
+<ul>
+  <li><strong>Tier routing.</strong> The client asks for a model by name. The proxy maps that
+      name to one of three <em>tiers</em> (<code>haiku</code>, <code>sonnet</code>,
+      <code>opus</code>), and each tier is independently pointed at a provider and a model.
+      Switching a tier's provider is a config change, not a client change.</li>
+  <li><strong>Upstream variability is absorbed, not exposed.</strong> Providers differ in
+      which features they accept, which endpoint shape they speak, and how often they return
+      <code>429</code>. The proxy retries, rewrites, and — for one specific Anthropic feature —
+      <em>learns</em> per upstream. See <a href="compatibility.html">compatibility.html</a>.</li>
+</ul>
+
+<div class="overview-grid">
+  <div class="overview-card"><div class="num">11</div><div class="label">max attempts (default)</div></div>
+  <div class="overview-card"><div class="num">30s</div><div class="label">backoff cap (default)</div></div>
+  <div class="overview-card"><div class="num">30s</div><div class="label">admin drain timeout</div></div>
+  <div class="overview-card"><div class="num">300s</div><div class="label">upstream socket timeout</div></div>
+</div>
+
+<h2 id="request-path">The request path</h2>
+
+<p>Each request is handled independently on its own thread. The sequence below runs in
+<code>ProxyHandler.do_POST</code> and <code>forward_request</code> in
+<code>src/claude_retry_proxy/server.py</code>.</p>
+
+<div class="step-box info">
+<div class="step-label">Step 1 — Extract the model</div>
+<p><code>extract_model(body_bytes)</code> parses the request body and reads its
+<code>model</code> field. It returns the literal string <code>"unknown"</code> when the body is
+empty, is not valid JSON, or has a missing, <code>null</code>, or non-string
+<code>model</code>.</p>
+</div>
+
+<div class="step-box info">
+<div class="step-label">Step 2 — Resolve the tier</div>
+<p><code>resolve_tier(model_name, config)</code> maps that name onto a tier. See
+<a href="#tier-resolution">Tier resolution</a> below. An unresolvable name is a client error,
+not a fallback.</p>
+</div>
+
+<div class="step-box info">
+<div class="step-label">Step 3 — Look up the provider and model</div>
+<p>The tier names a provider and the concrete model name to send upstream. The provider's
+entry in the decrypted keys file supplies the base URL, the credential, and the
+<em>mode</em>.</p>
+</div>
+
+<div class="step-box info">
+<div class="step-label">Step 4 — Dispatch on mode</div>
+<p>The mode (<code>anthropic</code>, <code>chat</code>, or <code>response</code>) determines
+the auth header, the upstream path, and how the request and response bodies are transformed.
+This is a large enough subject to have its own page — see
+<a href="provider-modes.html">provider-modes.html</a>.</p>
+</div>
+
+<div class="step-box info">
+<div class="step-label">Step 5 — Forward and retry</div>
+<p>A fresh connection is opened to the upstream per attempt, with a 300-second socket timeout,
+and the retry loop in <a href="#retry">Retry and backoff</a> takes over.</p>
+</div>
+
+<div class="step-box info">
+<div class="step-label">Step 6 — Rewrite the response model</div>
+<p>On success, the model name in the response is replaced with the <em>tier</em> name the
+client originally asked for, so the client sees the name it sent rather than the provider's
+internal model id. The mechanism differs by content type and mode; see
+<a href="provider-modes.html#response-rewrite">provider-modes.html</a>.</p>
+</div>
+
+<div class="step-box info">
+<div class="step-label">Step 7 — Trace</div>
+<p>One JSONL record is appended describing the outcome. See
+<a href="trace-log.html">trace-log.html</a>.</p>
+</div>
+
+<div class="note">
+<strong>Request bodies are transformed once per forward.</strong> The outbound body is built before
+the retry loop starts and is never rebuilt on a retry. A retry re-sends bytes, it does not
+re-transform them. The one exception is the compatibility retry: it strips the feature from the
+<em>client</em> body and re-enters the forward path, so that path runs the transform again — one
+upstream attempt, but a fresh pass. See
+<a href="compatibility.html">compatibility.html</a> and
+<a href="provider-modes.html#compat-retry">provider-modes.html</a>.
+</div>
+
+<h2 id="tier-resolution">Tier resolution</h2>
+
+<p><code>resolve_tier</code> applies four rules in order and stops at the first that matches.
+The order matters: an earlier rule always beats a later one.</p>
+
+<table>
+<tr><th class="num">#</th><th>Rule</th><th>Example</th><th>Result</th></tr>
+<tr>
+  <td class="num">1</td>
+  <td>Guard on type. A <code>None</code> or non-string model name cannot be resolved.</td>
+  <td><code>null</code></td>
+  <td><code>unknown</code></td>
+</tr>
+<tr>
+  <td class="num">2</td>
+  <td><strong>Direct match</strong> — the name is already a tier name.</td>
+  <td><code>sonnet</code></td>
+  <td><code>sonnet</code></td>
+</tr>
+<tr>
+  <td class="num">3</td>
+  <td><strong>Reverse lookup</strong> — scan the configured tiers for one whose <code>model</code>
+      equals this name.</td>
+  <td>a name a tier is currently pointed at</td>
+  <td>that tier</td>
+</tr>
+<tr>
+  <td class="num">4</td>
+  <td><strong>Pattern match</strong> — case-insensitive substring search, tried in the order
+      <code>opus</code>, <code>sonnet</code>, <code>haiku</code> (most specific first).</td>
+  <td><code>claude-opus-4-5</code></td>
+  <td><code>opus</code></td>
+</tr>
+</table>
+
+<p>A name matching none of these resolves to <code>unknown</code>, and the proxy returns an
+error rather than guessing a tier.</p>
+
+<div class="note">
+<strong>Two tiers may share a model name.</strong> Response rewriting uses the tier resolved
+<em>for this request</em>, not a reverse map from model name to tier — so a shared name never
+makes the rewrite ambiguous.
+</div>
+
+<h2 id="retry">Retry and backoff</h2>
+
+<p>The retry loop lives in <code>_forward_core</code>. It retries exactly three conditions:
+HTTP <code>429</code>, HTTP <code>503</code>, and connection-level errors
+(<code>socket.error</code>, <code>ConnectionError</code>, <code>OSError</code>). Every other
+status is returned to the client immediately rather than retried. Whether its body is rewritten
+on the way out is mode-dependent — see
+<a href="provider-modes.html#response-rewrite">provider-modes.html</a>.</p>
+
+<h3 id="attempts">How many attempts</h3>
+
+<p>The loop runs <code>PROXY_MAX_RETRIES + 1</code> times — the <code>+1</code> is the initial
+attempt, so the default <code>PROXY_MAX_RETRIES=10</code> means <strong>11 attempts</strong>,
+i.e. 10 retries.</p>
+
+<div class="note">
+<strong>Exception — <code>count_tokens</code>.</strong> When
+<code>disable_retry_claude_count_token</code> is set in <code>config.json</code> and the
+request targets <code>count_tokens</code>, the loop runs exactly once. Most third-party
+providers do not implement this Anthropic-specific endpoint and answer it with
+<code>503</code>; retrying ten times would burn quota for nothing. The shipped template
+enables this.
+</div>
+
+<h3 id="delay-ladder">The delay ladder</h3>
+
+<p>The exponential base is <code>PROXY_INITIAL_DELAY × 2^attempt</code>, capped at
+<code>PROXY_MAX_DELAY</code>. With the shipped defaults (initial 1 s, cap 30 s) the ladder
+is:</p>
+
+<table>
+<tr><th class="num">Attempt</th><th class="num">Base delay</th><th>Notes</th></tr>
+<tr><td class="num">1</td><td class="num">1 s</td><td></td></tr>
+<tr><td class="num">2</td><td class="num">2 s</td><td></td></tr>
+<tr><td class="num">3</td><td class="num">4 s</td><td></td></tr>
+<tr><td class="num">4</td><td class="num">8 s</td><td></td></tr>
+<tr><td class="num">5</td><td class="num">16 s</td><td></td></tr>
+<tr><td class="num">6+</td><td class="num">30 s</td><td>capped — the ladder stops growing here</td></tr>
+</table>
+
+<p>The cap is applied <em>before</em> jitter, so an actual sleep can exceed
+<code>PROXY_MAX_DELAY</code> by up to 25%.</p>
+
+<div class="warn">
+<strong>The cap is applied before the exponential on the 429 path — and is not applied
+afterwards.</strong> A <code>429</code> does not use the ladder at all: it sleeps
+<code>PROXY_MAX_DELAY</code> directly (default 30 s, jittered). A <code>503</code> and a
+connection error both use the ladder above. So a <code>429</code>-heavy request sleeps far
+longer than a <code>503</code>-heavy one, and the distinction is deliberate: a rate limit
+means "come back later", not "back off gradually".
+</div>
+
+<h3 id="jitter">Jitter</h3>
+
+<p>Every delay is jittered by a uniform ±25% of its base. The implementation is worth
+knowing about because it is not the obvious one:</p>
+
+<pre><code>jitter = uniform(-0.25, 0.25) * base
+return max(0, floor(base + jitter + 0.5))</code></pre>
+
+<p>It uses <code>floor(x + 0.5)</code> rather than Python's <code>round()</code>. That is
+deliberate: Python 3's <code>round()</code> is banker's rounding, which rounds halves to the
+nearest <em>even</em> integer and would collapse small even base values onto a single
+constant — removing exactly the de-synchronisation the jitter exists to provide.</p>
+
+<p>Jitter is still degenerate at the small end for a different reason: because the result is
+rounded to a whole second, a base of 1 s or 2 s has a ±0.25 s / ±0.5 s range that lands
+entirely inside one integer bucket, so every client sleeps for exactly the same duration.
+Effective de-synchronisation starts at a base of 3 s. On the 503 path that is the third
+retry onward; on the 429 path the base is the full 30 s, so it de-synchronises immediately.</p>
+
+<h3 id="worst-case">Worst case</h3>
+
+<p>With the shipped defaults a single stuck request holds a worker thread for:</p>
+
+<table>
+<tr><th>Scenario</th><th class="num">Worst-case hold</th></tr>
+<tr><td>10 retries, all <code>503</code></td><td class="num">≈ 3.8 min</td></tr>
+<tr><td>10 retries, all <code>429</code></td><td class="num">≈ 6.3 min</td></tr>
+<tr><td>100 retries, 300 s cap (both env vars at maximum)</td><td class="num">≈ 10.4 hours</td></tr>
+</table>
+
+<p>The last row is not hypothetical arithmetic — it is what the environment-variable bounds
+permit. Raising <code>PROXY_MAX_RETRIES</code> and <code>PROXY_MAX_DELAY</code> together is
+what produces it.</p>
+
+<h2 id="give-up">Give-up behaviour</h2>
+
+<p>When the retry budget is exhausted the two families of failure behave differently, and the
+difference is visible to the client.</p>
+
+<table>
+<tr><th>Condition exhausted</th><th>What the client receives</th></tr>
+<tr>
+  <td><code>429</code> / <code>503</code></td>
+  <td>The upstream's <strong>original error body</strong>, drained and forwarded unchanged
+      (capped at <code>PROXY_MAX_BODY_SIZE</code>). The client can read the provider's own
+      explanation of why it was refused.</td>
+</tr>
+<tr>
+  <td>Connection error</td>
+  <td>A <strong>synthesised</strong> JSON body of type <code>upstream_unreachable</code>,
+      reporting the sanitised error and the retry count, returned with status
+      <code>0</code>. There is no upstream body to preserve.</td>
+</tr>
+</table>
+
+<p>Preserving the upstream body matters because a rate-limit response usually explains the
+quota situation, and discarding it would leave the client with a bare status code. The
+consequence is that those bodies also flow into the trace log when
+<code>--all</code> is enabled — see <a href="trace-log.html#all">trace-log.html</a>.</p>
+
+<h2 id="size-caps">Response size caps</h2>
+
+<p>Two independent caps bound how much the proxy will move, and they sit at different layers:</p>
+
+<table>
+<tr><th>Cap</th><th>Applies to</th><th>On breach</th></tr>
+<tr><td><code>PROXY_MAX_BODY_SIZE</code></td>
+    <td>The <em>client's</em> request body, and the upstream error body drained on the give-up
+        path</td>
+    <td>The request is refused with <code>413</code>; the give-up drain is simply cut short</td></tr>
+<tr><td><code>PROXY_MAX_RESPONSE_SIZE</code></td>
+    <td>Every <em>response</em> body the proxy reads or forwards</td>
+    <td>The response is truncated and a <code>response_size_cap_exceeded</code> trace event is
+        recorded</td></tr>
+</table>
+
+<p>The response cap is enforced at seven read loops: four for streamed responses — the silent
+forwarding path, the client-disconnect-aware path, and the two audit paths — and three in
+<code>_forward_core</code> for buffered reads (a 2xx <code>application/json</code> body, a 2xx
+body of another content type under a non-anthropic mode, and any non-2xx body). Every one of
+those sites emits the same event when it truncates, so a truncated response is visible in the
+trace rather than silently short.</p>
+
+<p>Truncation is not something the client can act on beyond the missing bytes: on a streamed
+response the status and headers have already been sent by the time the cap is reached. The cap's
+real job is to stop an upstream that never ends from pinning a worker thread and growing the
+proxy's memory without bound.</p>
+
+<h2 id="disconnects">Client disconnects</h2>
+
+<p>A client that closes the connection mid-response is a normal event, not a fault. The proxy
+catches it and records a <code>client_disconnect</code> trace event rather than failing the
+request, and the streaming path carries an inner handler for upstream read errors as well.</p>
+
+<p>The catch is deliberately narrow — only <code>ConnectionResetError</code>,
+<code>BrokenPipeError</code>, and <code>ConnectionAbortedError</code> count as a disconnect.
+That is the set Python raises for an ordinary client-side close.</p>
+
+<div class="warn">
+<strong>An accepted residual: a non-standard write error can be mistaken for a connection
+error.</strong> A client-write <code>OSError</code> outside that tuple — <code>WSAENOBUFS</code>,
+<code>WSAENOTSOCK</code>, <code>ENOTCONN</code> and their relatives — is not caught. Raised
+<em>after</em> response headers have been sent, it propagates into the retry loop's own
+<code>except (socket.error, ConnectionError, OSError)</code> clause and is read as a failed
+upstream connection, so the proxy re-issues a POST that had already been sent.
+<p>The class is exotic and Windows-only, and the consequence is bounded to a duplicate upstream
+call. It is documented rather than fixed because widening the catch would risk swallowing real
+upstream connection errors, which the retry loop depends on. The sharpest case is a streamed
+compatibility probe: the probe owner holds the single proxy-wide probe lock, so a re-issued POST is
+a duplicate <em>unstripped</em> probe whose outcome can spuriously double the threshold or reset
+probation. The next probe cycle revalidates, so the error stays bounded to one spurious
+doubling. See <a href="compatibility.html">compatibility.html</a> for the probe mechanics.</p>
+</div>
+
+<h2 id="config-swap">Configuration snapshots and drain-and-swap</h2>
+
+<p>Tier mappings can be changed while the proxy is running, which raises the obvious question:
+what happens to a request that is halfway through when the configuration changes underneath
+it?</p>
+
+<p>The answer is that it never sees the change. <code>forward_request</code> takes a
+<strong>snapshot</strong> of both the configuration and the decrypted vendors at entry, under
+the same lock, and threads those snapshots through the entire call chain. A request admitted
+before a swap completes uses the old configuration from beginning to end.</p>
+
+<div class="state-diagram">
+<strong>drain-and-swap</strong><br>
+administrator requests a change<br>
+↓<br>
+set <code>_config_swapping</code> — new requests block on <code>_swap_done</code><br>
+↓<br>
+wait for <code>_inflight_count</code> to reach 0 &nbsp;&nbsp;<span class="optional">(up to 30 s)</span><br>
+↓<br>
+swap configuration under lock → clear flag → signal <code>_swap_done</code><br>
+↓<br>
+blocked requests proceed with the new snapshot
+</div>
+
+<p>A request that is in-flight keeps running to completion with its original snapshot; the
+administrator waits for it rather than cancelling it.</p>
+
+<div class="warn">
+<strong>The drain can time out, and the swap is then aborted.</strong> The wait is bounded at
+30 seconds. A request sitting in retry backoff can easily exceed that — the default worst case
+is about 3.8 minutes (see <a href="#worst-case">Worst case</a>). When the timeout expires the
+proxy <em>abandons the swap</em>, clears the swapping flag, and returns an error to the
+administrator. The configuration is left unmodified and the in-flight request completes
+normally. Nothing is corrupted — but the administrator's change did not take effect, and
+retrying it while the same slow request is still running will fail the same way.
+</div>
+
+<!-- Owns the heartbeat-projection fact. operations.html#state links here. -->
+<h2 id="heartbeat">The heartbeat</h2>
+
+<p>A background thread writes the proxy's liveness to <code>proxy-state.json</code> every 30
+seconds, including the PID, port, and start time that <code>claude-retry-proxy stop</code>,
+<code>status</code>, and <code>reload</code> read.</p>
+
+<p>The authoritative copy of that state is <strong>in memory</strong>. The heartbeat updates a
+module-level dictionary and writes <em>that</em> to disk; it never reads the file back. The
+practical consequence is that deleting <code>proxy-state.json</code> is recoverable — the next
+heartbeat rewrites it, complete, within 30 seconds. An external writer racing the heartbeat
+would be overwritten rather than merged.</p>
+
+<h2 id="sinks">Trace and state sinks</h2>
+
+<p>Both the trace log and the state file are written by the same guarded sink implementation
+in <code>src/claude_retry_proxy/sinks.py</code>. Two of its properties are load-bearing and
+explain most of the proxy's fault behaviour.</p>
+
+<h3 id="never-raise">Writes never raise</h3>
+
+<p>Every sink write is wrapped such that it returns <code>True</code> or <code>False</code> and
+never propagates an exception. This is not defensive padding — it prevents two specific
+misbehaviours:</p>
+
+<ul>
+  <li>An <code>OSError</code> escaping a trace write would be caught by the retry loop's own
+      <code>except (socket.error, ConnectionError, OSError)</code> clause and misread as a
+      <em>connection error</em>, causing the proxy to re-issue an upstream POST that had
+      already been sent.</li>
+  <li>An <code>OSError</code> escaping inside the heartbeat thread would kill that thread
+      permanently, silently stopping liveness reporting.</li>
+</ul>
+
+<h3 id="failure-reporting">Failure reporting and recovery</h3>
+
+<p>A failing sink is noisy once, then quiet, then loud again on recovery:</p>
+
+<table>
+<tr><th>Situation</th><th>Behaviour</th></tr>
+<tr><td>First failure of an episode</td><td>Reported on stderr immediately</td></tr>
+<tr><td>Further failures, same episode</td><td>At most one report per 60 s, carrying a count of
+    the failures suppressed in between</td></tr>
+<tr><td>A write succeeds</td><td>The episode closes and one <code>resumed</code> line is
+    emitted with the episode's total failed writes</td></tr>
+</table>
+
+<p>Because success closes the episode, an <em>intermittent</em> fault — one that alternates
+between failing and succeeding — reports on every new episode rather than being muted after
+the first minute. That is the intended reading: a flapping sink is more interesting than a
+steadily broken one.</p>
+
+<div class="error">
+<strong>Entries written during an outage are lost, not buffered.</strong> There is no queue. The
+<code>resumed after N failed write(s)</code> line is the only record of how many were dropped.
+If you need to know what happened during a gap, that count is the whole story.
+</div>
+
+<h3 id="self-healing">Self-healing, and what does not heal</h3>
+
+<p>Both sinks redo their work on every call — the trace sink re-creates the directory and
+appends, and the state sink re-creates the directory, writes a temporary file, and renames it
+into place. So the transient failure classes heal on their own, with no restart and no
+operator action:</p>
+
+<ul>
+  <li>a deleted log file or directory</li>
+  <li>a transient file lock</li>
+  <li>a disk that was full and is no longer</li>
+</ul>
+
+<p>A <em>permanently</em> unwritable path does not heal and needs a human: an ACL that denies
+the process, or a path that has been replaced by a directory.</p>
+
+<div class="warn">
+<strong>Startup is the exception to "never stop the proxy".</strong> If either sink's path is
+unwritable at startup, the proxy exits non-zero <em>before</em> printing its readiness
+marker, and the CLI reports the failure. At runtime a broken sink degrades the proxy; at
+startup it refuses to run. The asymmetry is intentional — a proxy that cannot record what it
+did is not worth starting, but one that loses a few entries mid-flight is worth keeping.
+</div>
+
+<h3 id="best-effort-stderr">Best-effort diagnostics</h3>
+
+<p>Shortly after the startup checks, the server replaces <code>sys.stderr</code> with a
+non-raising wrapper. Every later diagnostic write in the request path therefore cannot raise
+— which matters for the same reason the sinks are guarded: an exception from a <code>print</code>
+inside the retry loop would be caught by the connection-error handler and misread as a network
+failure.</p>
+
+<p>The two startup <code>ERROR</code> prints deliberately run <em>before</em> the wrapper is
+installed, so they stay loud on a healthy stderr. The wrapper covers the request path only,
+not a module imported directly.</p>
+
+<h2 id="shutdown">Shutdown</h2>
+
+<p>Shutdown is immediate rather than graceful, and that follows from one mechanism: worker
+threads are daemon threads, so the interpreter does not join them when the server closes. A
+request that is mid-retry or mid-backoff is <strong>killed</strong>, not awaited — the opposite
+of what <a href="#config-swap">drain-and-swap</a> does with the same condition.</p>
+
+<p>This is a deliberate trade, not an oversight: making shutdown wait would mean disarming the
+daemon flag and adding a bounded drain, which changes what <code>stop</code> does. What the
+client sees — and why the interrupted request's trace entry never lands — is owned by
+<a href="operations.html#shutdown">operations.html#shutdown</a>.</p>
+
+<footer>Last updated: 2026-09-12</footer>
+</body>
+</html>

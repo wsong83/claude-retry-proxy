@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>claude-retry-proxy — Documentation</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<h1>claude-retry-proxy Documentation<span class="sub">A multi-provider HTTP retry gateway for the Claude API</span></h1>
+
+<p><strong>Last updated:</strong> 2026-09-12</p>
+
+<p>The proxy listens on localhost, routes requests by model tier (haiku / sonnet / opus) to
+different upstream providers, retries <code>429</code> and <code>503</code> responses with
+jittered exponential backoff, and logs every request to a JSONL trace file. Tier routing is
+configured in <code>config.json</code>; provider credentials are stored encrypted and
+decrypted at startup.</p>
+
+<p>These pages are the deep reference. For installation and first-run setup, start with the
+<a href="../README.md">README</a>.</p>
+
+<div class="overview-grid">
+  <div class="overview-card"><div class="num">3</div><div class="label">endpoint modes</div></div>
+  <div class="overview-card"><div class="num">3</div><div class="label">tiers (haiku / sonnet / opus)</div></div>
+  <div class="overview-card"><div class="num">2</div><div class="label">retried status codes</div></div>
+  <div class="overview-card"><div class="num">11</div><div class="label">server env vars <span class="optional">(counted 2026-09-12)</span></div></div>
+</div>
+
+<div class="toc">
+<h2 id="contents">Contents</h2>
+<ul>
+  <li><a href="architecture.html">Architecture</a> — the request path end to end: tier resolution, config and key lookup, forwarding, retry and backoff, the drain-and-swap pattern, and the trace/state sink failure policy.</li>
+  <li><a href="provider-modes.html">Provider Modes</a> — the <code>anthropic</code>, <code>chat</code>, and <code>response</code> modes: auth headers, path rewrites, request and response transforms, SSE synthesis, and tool-call handling.</li>
+  <li><a href="configuration.html">Configuration</a> — the <code>config.json</code> and <code>keys-index.json</code> schemas, multi-key selection, extra request headers, the full environment-variable table, and validation rules.</li>
+  <li><a href="operations.html">Operations</a> — the CLI lifecycle, the passphrase pipe protocol, readiness probing, the admin page and API, shutdown semantics, and runtime artifacts.</li>
+  <li><a href="compatibility.html">Compatibility Learner</a> — the per-upstream <code>context_management</code> learner: probe ladder, probation, suppression, and delisting.</li>
+  <li><a href="trace-log.html">Trace Log</a> — the JSONL entry schema, every event name, the prune policy, the analysis script, and what <code>--all</code> does and does not capture.</li>
+  <li><a href="test-catalog.html">Test Catalog</a> — the test suite layout, the per-test index of every test in the suite, harness isolation, and testing patterns.</li>
+</ul>
+</div>
+
+<h2 id="orientation">Orientation</h2>
+
+<p>Three audiences read this project's documentation. Knowing which one you are tells you
+where to look.</p>
+
+<table>
+<tr><th>You want to…</th><th>Read</th></tr>
+<tr><td>Install it and route your first request</td><td><a href="../README.md">README.md</a></td></tr>
+<tr><td>Understand how a request is processed</td><td><a href="architecture.html">architecture.html</a></td></tr>
+<tr><td>Point a tier at a provider that is not the Anthropic API</td><td><a href="provider-modes.html">provider-modes.html</a></td></tr>
+<tr><td>Write a <code>config.json</code> or a keys file</td><td><a href="configuration.html">configuration.html</a></td></tr>
+<tr><td>Start, stop, reload, or debug a running proxy</td><td><a href="operations.html">operations.html</a></td></tr>
+<tr><td>Read or analyze the trace log</td><td><a href="trace-log.html">trace-log.html</a></td></tr>
+<tr><td>Work on the test suite</td><td><a href="test-catalog.html">test-catalog.html</a></td></tr>
+</table>
+
+<h2 id="reading-order">Suggested reading order</h2>
+
+<div class="step-box info">
+<div class="step-label">Step 1</div>
+<p>Skim <a href="../README.md">README.md</a> for the shape of the thing — what it does, how it is
+installed, what a config file looks like. It is self-contained; you do not need these pages to
+get running.</p>
+</div>
+
+<div class="step-box info">
+<div class="step-label">Step 2</div>
+<p>Read <a href="architecture.html">architecture.html</a>. Everything else is a facet of the
+request path described there, and its section anchors are what the other pages and the
+project's <code>CLAUDE.md</code> link back into.</p>
+</div>
+
+<div class="step-box info">
+<div class="step-label">Step 3</div>
+<p>Read the page matching the thing you are actually changing —
+<a href="provider-modes.html">provider-modes.html</a> for upstream compatibility,
+<a href="configuration.html">configuration.html</a> for settings,
+<a href="operations.html">operations.html</a> for the running process,
+<a href="compatibility.html">compatibility.html</a> for the learned-state machinery, or
+<a href="trace-log.html">trace-log.html</a> for diagnostics.</p>
+</div>
+
+<h2 id="conventions">Conventions used in these pages</h2>
+
+<ul>
+  <li>All pages link to each other <strong>relatively</strong>; there are no external links, so a
+      URL you need is shown as code rather than as a hyperlink.</li>
+  <li>Section headings carry stable <code>id</code> anchors so other documents can link to a
+      specific section — for example <a href="architecture.html#retry">architecture.html#retry</a>.</li>
+  <li>File paths shown as <code>src/claude_retry_proxy/server.py</code> are relative to the
+      repository root unless they start with <code>~</code>, which means the user's home
+      directory.</li>
+  <li>Runtime paths beginning <code>~/.claude/</code> are per-user and are not part of the
+      repository.</li>
+</ul>
+
+<footer>Last updated: 2026-09-12</footer>
+</body>
+</html>

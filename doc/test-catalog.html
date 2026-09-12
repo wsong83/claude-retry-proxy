@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Test Catalog — claude-retry-proxy</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<h1>Test Catalog<span class="sub">Suite layout, harness isolation, and testing patterns</span></h1>
+
+<p><strong>Last updated:</strong> 2026-09-12</p>
+
+<p>The suite is a set of per-area modules merged by a single aggregator. It runs against
+<em>real</em> proxy processes and <em>real</em> mock upstream servers over loopback sockets —
+there is very little mocking of the modules under test.</p>
+
+<div class="warn">
+<strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
+suite has <strong>293 test functions across 15 files</strong>, but this number moves whenever
+tests are added. Re-count before quoting it:
+<code>grep -c 'def test_' tests/*.py</code>.
+<p>The <a href="#per-test">per-test inventory</a> below is reconciled by hand, in the same
+commit as the test it documents — nothing verifies it against <code>tests/</code>.</p>
+</div>
+
+<h2 id="entry-point">Running the suite</h2>
+
+<pre><code>python tests/test_claude_proxy.py              # everything
+python tests/test_claude_proxy.py -t &lt;name&gt;    # one or more named tests</code></pre>
+
+<p><code>tests/test_claude_proxy.py</code> is an aggregator, not a test module. It imports each
+area module's <code>ALL_TESTS</code> list and concatenates them in historical section order into
+one run. Adding a test means adding it to its module's <code>ALL_TESTS</code>; the aggregator
+needs no edit unless you add a whole new module.</p>
+
+<div class="note">
+<strong>The suite is safe to run alongside a live proxy.</strong> This was not always true. The
+harness redirects the state, compatibility, and trace paths into a session temp directory at
+import time, so a test run cannot touch a running proxy's files. See
+<a href="#isolation">Isolation</a>.
+</div>
+
+<h2 id="isolation">Isolation</h2>
+
+<p>The suite's central correctness property is that it never touches real user state. This is
+achieved by setting environment variables <strong>before</strong> any server or CLI module is
+imported, because those modules read their paths at import time.</p>
+
+<table>
+<tr><th>Variable</th><th>Redirected to</th></tr>
+<tr><td><code>PROXY_TRACE_FILE</code></td><td>a session temp file</td></tr>
+<tr><td><code>PROXY_STATE_FILE</code></td><td>a session temp file</td></tr>
+<tr><td><code>PROXY_FEATURE_COMPAT_FILE</code></td><td>a session temp file</td></tr>
+</table>
+
+<p>The ordering matters and is load-bearing: <code>cli.py</code> and <code>server.py</code> bind
+these paths to module-level constants at import, so setting the variables after import has no
+effect. <code>tests/_harness.py</code> does the assignment at module scope, before importing
+anything that reads them.</p>
+
+<p>Because <code>PROXY_STATE_FILE</code> is also what CLI subprocesses read, the harness and the
+spawned CLI agree on which state file is current — so a test that starts and stops a proxy is
+checking its own proxy, not yours.</p>
+
+<h2 id="catalog">The catalog</h2>
+
+<p>Counts below are from the same snapshot as the total above — treat them as indicative of
+relative size, not as exact current figures.</p>
+
+<table>
+<tr><th>Module</th><th class="num">Tests</th><th>Covers</th></tr>
+<tr><td><code>test_compat.py</code></td><td class="num">43</td>
+    <td>The <code>context_management</code> learner — persistence, detection, state machine,
+        concurrency. See <a href="compatibility.html">compatibility.html</a>.</td></tr>
+<tr><td><code>test_chat_transform.py</code></td><td class="num">41</td>
+    <td>Anthropic → Chat Completions request and response transforms</td></tr>
+<tr><td><code>test_response_transform.py</code></td><td class="num">37</td>
+    <td>Anthropic → Responses request and response transforms</td></tr>
+<tr><td><code>test_chat_sse.py</code></td><td class="num">33</td>
+    <td>Chat-mode SSE synthesis, tool-call deltas, truncation and degradation</td></tr>
+<tr><td><code>test_mode_dispatch.py</code></td><td class="num">28</td>
+    <td>Mode dispatch, auth headers, path rewriting</td></tr>
+<tr><td><code>test_admin.py</code></td><td class="num">24</td>
+    <td>Admin API endpoints, CSRF origin rules, switch and reload</td></tr>
+<tr><td><code>test_retry_streaming.py</code></td><td class="num">22</td>
+    <td>Retry behaviour, streaming, response-size caps</td></tr>
+<tr><td><code>test_config_keys.py</code></td><td class="num">18</td>
+    <td>Config validation, key decryption, multi-key shapes</td></tr>
+<tr><td><code>test_cli.py</code></td><td class="num">14</td>
+    <td>CLI lifecycle: start, stop, status, reload</td></tr>
+<tr><td><code>test_trace.py</code></td><td class="num">12</td>
+    <td>Trace logging and trace analysis</td></tr>
+<tr><td><code>test_tier_routing.py</code></td><td class="num">11</td>
+    <td>Tier resolution, model resolution, reverse lookup</td></tr>
+<tr><td><code>test_unit.py</code></td><td class="num">2</td>
+    <td>Unit-level helpers: jitter, delay computation, small utilities</td></tr>
+<tr><td><code>test_sinks.py</code></td><td class="num">8</td>
+    <td>The sink class family: write contract, health reporting, counters</td></tr>
+<tr><td><code>_harness.py</code></td><td class="num">—</td>
+    <td><strong>Not a test module.</strong> Shared helpers, isolation setup, proxy lifecycle.</td></tr>
+<tr><td><code>test_claude_proxy.py</code></td><td class="num">—</td>
+    <td><strong>Not a test module.</strong> The aggregator and CLI entry point.</td></tr>
+</table>
+
+<!-- BEGIN per-test inventory (generated 2026-09-13) -->
+<h2 id="per-test">Per-Test Descriptions</h2>
+
+<p>Every test in the suite, grouped by the area it exercises. Use it to find which
+test covers a behaviour before writing a new one — the suite's cost is in the
+proxy and mock-upstream processes each test starts, so a duplicate is expensive.
+Descriptions are the test's own docstring, shortened.</p>
+
+<div class="note">
+<strong>This inventory is maintained by hand, and nothing verifies it.</strong> It is
+reconciled in the same commit as the test it documents — the pattern the sibling
+project uses. There is no generator: a test added without an entry here is missing
+silently. To list what is actually in a module:
+<pre><code>python - &lt;&lt;'EOF'
+import ast, pathlib
+for p in sorted(pathlib.Path('tests').glob('test_*.py')):
+    t = ast.parse(p.read_text(encoding='utf-8'))
+    for n in t.body:
+        if isinstance(n, ast.FunctionDef) and n.name.startswith('test_'):
+            print(n.name, '-', (ast.get_docstring(n) or '').split('\n')[0])
+EOF</code></pre>
+</div>
+
+<h3 id="cat-1">Category 1 — Routing and Configuration</h3>
+
+<p><strong>Scope:</strong> How a request's model name becomes a tier, and how a config is validated against the keys file before the proxy will start.</p>
+
+<h4><code>tests/test_tier_routing.py</code> (11 tests) — tier and model resolution</h4>
+<ul>
+<li><code>test_tier_routing_basic</code>: Send request with model &quot;sonnet&quot;, verify correct upstream receives the configured model name and API key.</li>
+<li><code>test_tier_routing_all_tiers</code>: Send haiku/sonnet/opus requests, verify each routes to its configured provider.</li>
+<li><code>test_model_resolution_reverse_lookup</code>: Send request with actual model name (e.g. &quot;claude-sonnet-5&quot;), verify reverse-mapping to tier.</li>
+<li><code>test_model_resolution_pattern_match</code>: Send request with model name containing tier keyword (e.g. &quot;my-sonnet-model&quot;), verify pattern-match resolves to sonnet tier.</li>
+<li><code>test_model_resolution_unknown_rejected</code>: Send request with unrecognized model name (e.g. &quot;gpt-4&quot;), verify 400 error with valid tier list.</li>
+<li><code>test_model_resolution_none_rejected</code>: Send request with {&quot;model&quot;: null}, verify 400 error (not crash).</li>
+<li><code>test_response_model_rewrite</code>: Verify response model name is replaced with tier name (non-streaming).</li>
+<li><code>test_response_model_rewrite_streaming</code>: Verify SSE message_start event has tier name, subsequent events unchanged.</li>
+<li><code>test_response_model_rewrite_streaming_non_message_start</code>: First SSE event is not message_start → forwarded unchanged, no rewrite attempted.</li>
+<li><code>test_two_tiers_same_model_same_provider</code>: Two tiers mapping to the same model from the same provider: the server starts, each request routes to the shared model, and JSON + SSE responses are rewritten to the…</li>
+<li><code>test_response_model_rewrite_upstream_model</code>: Upstream returns an arbitrary model name → rewritten to tier name (unconditional rewrite).</li>
+</ul>
+
+<h4><code>tests/test_config_keys.py</code> (18 tests) — config validation and key handling</h4>
+<ul>
+<li><code>test_config_validation_missing_tier</code>: Config with empty provider → server refuses to start.</li>
+<li><code>test_config_validation_unknown_provider</code>: Config references provider not in keys-index.json → server refuses to start.</li>
+<li><code>test_config_validation_models_to_keys</code>: Config validation direction is config→keys, not keys→config.</li>
+<li><code>test_config_validation_tier_provider_needs_models</code>: A tier-referenced provider must have an entry in config.models.</li>
+<li><code>test_heartbeat_preserves_state</code>: Heartbeat writes the in-memory startup state, never a disk-read {}.</li>
+<li><code>test_models_per_provider_validation</code>: Config.models entries must have valid shape; tier-referenced providers must have a models entry.</li>
+<li><code>test_config_template_copy</code>: Missing config.json → template copied, start fails with message.</li>
+<li><code>test_key_decryption_wrong_passphrase</code>: Wrong passphrase → start fails with clear error.</li>
+<li><code>test_key_decryption_missing_file</code>: No keys-index.json → start fails with clear error.</li>
+<li><code>test_api_key_from_keys_index</code>: Verify x-api-key sent to upstream comes from keys-index.json, not from client.</li>
+<li><code>test_extra_request_headers_validation_matrix</code>: Validation matrix for extra_request_headers: every malformed variant yields its specific validation error (never a raise), and the two valid sides (with rules / without…</li>
+<li><code>test_extra_request_headers_startup_refusal</code>: Server refuses to start with a malformed extra_request_headers and starts with a well-formed one (startup integration).</li>
+<li><code>test_multikey_keys_load_and_route</code>: Object-form keys vendor loads through the encrypted path (decrypt_keys); a tier key selector reaches the upstream with the selected payload; a tier without a selector…</li>
+<li><code>test_tier_key_absent_defaults_first</code>: A tier with no key field (legacy config) uses the provider&#x27;s first key.</li>
+<li><code>test_tier_key_empty_string_defaults_first</code>: A tier with an empty-string key selector defaults to the first key.</li>
+<li><code>test_validate_config_key_name_checks</code>: validate_config&#x27;s provider_keys mode validates per-tier key selectors for ALL config tiers; the two-arg (legacy) call skips key checks.</li>
+<li><code>test_keys_file_invalid_multikey_shapes_rejected</code>: Every malformed multi-key vendor shape refuses server startup with a per-vendor ValueError — never a silent load-and-route.</li>
+<li><code>test_string_form_empty_key_warns_not_rejects</code>: A string-form empty key still loads (startup warning on stderr) and a request through that provider fails with invalid_provider_key — no empty auth header is forwarded…</li>
+</ul>
+
+<h3 id="cat-2">Category 2 — Retry, Streaming, and Size Caps</h3>
+
+<p><strong>Scope:</strong> The retry ladder, the streaming and buffered response paths, and the body/response size limits that cut them short.</p>
+
+<h4><code>tests/test_retry_streaming.py</code> (22 tests) — retry, streaming, size caps</h4>
+<ul>
+<li><code>test_concurrent_requests</code>: 10+ parallel requests complete successfully.</li>
+<li><code>test_retry_logic</code>: Start proxy; mock upstream returns 503 3x then 200; verify exponential backoff.</li>
+<li><code>test_retry_429</code>: Mock upstream returns 429 3x then 200; assert success, trace reason:&#x27;429&#x27;.</li>
+<li><code>test_retry_429_exhaust_returns_429</code>: Mock upstream always returns 429; verify client gets 429 on exhaustion.</li>
+<li><code>test_thread_safety</code>: N parallel requests produce exactly N trace entries (no lost entries).</li>
+<li><code>test_start_no_auth_header_required</code>: Start proxy, send POST without X-Proxy-Auth header; assert 200 (forwarded).</li>
+<li><code>test_exhaust_429_preserves_body</code>: Mock upstream always returns 429 with body &#x27;{&quot;error&quot;:&quot;rate_limited&quot;}&#x27;; PROXY_MAX_RETRIES=1; verify client receives 429 with body containing &#x27;rate_limited&#x27; (not empty)…</li>
+<li><code>test_exhaust_connection_error_synthesizes_body</code>: Point proxy at a port with no listener; PROXY_MAX_RETRIES=1; verify trace &#x27;error&#x27; field contains &#x27;upstream_unreachable&#x27; (not &#x27;HTTP 0&#x27;).</li>
+<li><code>test_client_disconnect_no_traceback</code>: Start proxy with mock upstream returning 200; send request via raw socket, close socket before reading response; assert stderr has no Traceback, contains &#x27;[proxy] client…</li>
+<li><code>test_streaming_response_body</code>: Mock upstream streams 5 chunks with 50ms delays between them; proxy forwards to the client in real time; client reads incrementally. Verify: (a) first byte arrives…</li>
+<li><code>test_streaming_mid_stream_upstream_failure</code>: Two mock modes validate the proxy&#x27;s dual-path truncation detection:</li>
+<li><code>test_empty_body_429_exhaust</code>: Mock upstream always returns 429 with Content-Length: 0 (empty body) through all retries; PROXY_MAX_RETRIES=1. The client must receive a proper HTTP 429 status line (not…</li>
+<li><code>test_disable_retry_count_tokens_503</code>: Flag=true, upstream 503s /count_tokens → exactly 1 attempt, drained body returned.</li>
+<li><code>test_disable_retry_count_tokens_conn_error</code>: Flag=true, upstream connection reset → 1 attempt, upstream_unreachable body.</li>
+<li><code>test_disable_retry_count_tokens_normal_path_unaffected</code>: Flag=true, /v1/messages still retries normally (503 then 200).</li>
+<li><code>test_disable_retry_count_tokens_false_retries</code>: Flag=false, count_tokens still retries (503 then 200).</li>
+<li><code>test_disable_retry_count_tokens_path_anchoring</code>: Flag=true: only /v1/messages/count_tokens* is affected; /v1/messages, /v1/messages?x=count_tokens, /v1/messages/count_tokens_batch retry normally.</li>
+<li><code>test_disable_retry_count_tokens_invalid_type</code>: validate_config rejects non-boolean disable_retry_claude_count_token.</li>
+<li><code>test_buffered_response_size_cap</code>: Buffered 2xx-JSON and non-2xx response paths cap the upstream body at PROXY_MAX_RESPONSE_SIZE: the body is truncated, a response_size_cap_exceeded trace event fires, and…</li>
+<li><code>test_retry_stability_extra_header</code>: A 429-retried request to a ruled provider carries the SAME x-opencode-session value on every attempt.</li>
+<li><code>test_trace_write_failure_does_not_duplicate_upstream_request</code>: A trace-write failure inside the retry loop must not be misread as a connection error and re-issue the upstream POST.</li>
+<li><code>test_retry_path_print_failure_does_not_misclassify</code>: A failing print inside the retry loop must not read as a connection error.</li>
+</ul>
+
+<h4><code>tests/test_unit.py</code> (2 tests) — delay and header helpers</h4>
+<ul>
+<li><code>test_compute_jittered_delay_bounds</code>: Unit-test compute_jittered_delay: bounds, rounding, de-sync pattern, guards, thread-local RNG.</li>
+<li><code>test_crlf_header_filter</code>: In-process unit test of _crlf_safe: clean headers pass through; a header VALUE containing CR/LF is omitted; a header NAME containing CR/LF is omitted; None → {}; a mixed…</li>
+</ul>
+
+<h3 id="cat-3">Category 3 — Mode Dispatch</h3>
+
+<p><strong>Scope:</strong> Provider mode selection (<code>anthropic</code> / <code>chat</code> / <code>response</code>) and the auth header and path each one sends.</p>
+
+<h4><code>tests/test_mode_dispatch.py</code> (28 tests) — mode dispatch and auth headers</h4>
+<ul>
+<li><code>test_mode_defaults_to_anthropic</code>: Vendor without a mode field is treated as anthropic (x-api-key used).</li>
+<li><code>test_mode_null_defaults_to_anthropic</code>: Vendor with mode: null is treated as anthropic.</li>
+<li><code>test_mode_invalid_rejected</code>: Vendor with an unknown mode returns 500 invalid_provider_mode.</li>
+<li><code>test_auth_header_anthropic_mode</code>: Anthropic mode forwards with x-api-key, no Authorization header, and forwards the anthropic-beta header to upstream.</li>
+<li><code>test_auth_header_chat_mode</code>: Chat mode forwards with Authorization: Bearer, no x-api-key.</li>
+<li><code>test_auth_header_response_mode</code>: Response mode forwards with Authorization: Bearer, no x-api-key.</li>
+<li><code>test_path_anthropic_mode</code>: Anthropic mode appends the original request path to the upstream URL.</li>
+<li><code>test_path_chat_mode</code>: Chat mode upstream path is path_prefix + /v1/chat/completions.</li>
+<li><code>test_path_response_mode</code>: Response mode upstream path is path_prefix + /v1/responses.</li>
+<li><code>test_path_double_v1_prevention</code>: A vendor URL ending in /v1 must not produce a /v1/v1/ upstream path.</li>
+<li><code>test_count_tokens_rejected_chat_mode</code>: count_tokens returns 400 in chat mode.</li>
+<li><code>test_count_tokens_rejected_response_mode</code>: count_tokens returns 400 in response mode.</li>
+<li><code>test_anthropic_to_chat_basic</code>: messages, model, max_tokens, temperature map through.</li>
+<li><code>test_anthropic_to_chat_system_string</code>: system string becomes the first system message.</li>
+<li><code>test_anthropic_to_chat_system_list</code>: system content blocks are concatenated with newlines; non-text dropped.</li>
+<li><code>test_anthropic_to_chat_dropped_fields</code>: thinking, metadata, top_k absent; tools and tool_choice now transformed (plan 2026-08-29).</li>
+<li><code>test_anthropic_to_chat_stop_sequences</code>: stop_sequences is renamed to stop.</li>
+<li><code>test_chat_mode_e2e_json</code>: End-to-end chat mode request/response through the live proxy.</li>
+<li><code>test_response_mode_e2e_json</code>: End-to-end response mode request/response through the live proxy.</li>
+<li><code>test_response_mode_assistant_output_text_e2e</code>: E2E: schema-validating mock upstream enforces role-appropriate content types.</li>
+<li><code>test_response_mode_tool_loop_e2e</code>: Two-turn tool loop through response mode: tool_use then final text.</li>
+<li><code>test_anthropic_mode_unchanged</code>: Existing anthropic behavior is preserved (no mode field).</li>
+<li><code>test_chat_mode_non_2xx_passthrough</code>: Chat-mode non-2xx error body passes through untransformed.</li>
+<li><code>test_transform_failure_passthrough</code>: Malformed JSON response body passes through with a transform_failure trace event.</li>
+<li><code>test_tool_args_parse_failure_trace_has_request_id</code>: End-to-end: tool_args_parse_failure trace event carries request_id/mode/provider/tier.</li>
+<li><code>test_retry_does_not_double_transform</code>: A 429 retry sends the same single-transformed body, not double-encoded.</li>
+<li><code>test_extra_request_headers_attach_matrix</code>: Resolved extra header emission for a ruled vs unruled provider.</li>
+<li><code>test_user_agent_forwarded_all_modes</code>: Inbound User-Agent forwarded upstream for anthropic/chat/response modes, exactly one User-Agent line reaching upstream.</li>
+</ul>
+
+<h3 id="cat-4">Category 4 — Chat Completions Transforms</h3>
+
+<p><strong>Scope:</strong> The Anthropic↔Chat request and response conversions, including tool calls, thinking blocks, and cache control.</p>
+
+<h4><code>tests/test_chat_transform.py</code> (41 tests) — Anthropic → Chat request and response transforms</h4>
+<ul>
+<li><code>test_anthropic_to_chat_messages_transform</code>: Full message array (thinking/text/tool_use/tool_result) -&gt; valid OpenAI Chat messages.</li>
+<li><code>test_anthropic_to_chat_messages_thinking_stripped</code>: thinking is converted to reasoning_content; redacted_thinking non-empty data -&gt; placeholder.</li>
+<li><code>test_anthropic_to_chat_messages_redacted_thinking_trace</code>: redacted_thinking with non-empty data -&gt; placeholder reasoning_content + passthrough trace event.</li>
+<li><code>test_anthropic_to_chat_messages_tool_use_to_tool_calls</code>: tool_use block converts to tool_calls with JSON-stringified arguments.</li>
+<li><code>test_anthropic_to_chat_messages_tool_result_to_role_tool</code>: tool_result block in a user message becomes a separate role:tool message.</li>
+<li><code>test_anthropic_to_chat_messages_mixed_text_and_tool_use</code>: Assistant with both text and tool_use -&gt; text message first, then content:null + tool_calls.</li>
+<li><code>test_anthropic_to_chat_messages_mixed_text_and_tool_result</code>: User with both text and tool_result -&gt; tool message first, then user text message.</li>
+<li><code>test_anthropic_to_chat_messages_interleaved_thinking_tool_use</code>: Real-world interleaved pattern: thinking, text, tool_use, text in one assistant turn.</li>
+<li><code>test_anthropic_to_chat_messages_string_content_passthrough</code>: String content passes through unchanged in a NEW message dict (input not reused).</li>
+<li><code>test_anthropic_to_chat_messages_cache_control_stripped</code>: Block-level cache_control removed from blocks; cache_control_stripped trace event logged.</li>
+<li><code>test_anthropic_to_chat_messages_non_list_guarded</code>: Non-list messages input returns [].</li>
+<li><code>test_anthropic_to_chat_messages_non_dict_entries_skipped</code>: Non-dict message entries are skipped.</li>
+<li><code>test_anthropic_to_chat_messages_null_user_content</code>: Null user content becomes &#x27;&#x27; (OpenAI requires non-null user content).</li>
+<li><code>test_anthropic_to_chat_tools_transform</code>: Anthropic tools -&gt; OpenAI tools (input_schema -&gt; parameters).</li>
+<li><code>test_anthropic_to_chat_tools_cache_control_stripped</code>: cache_control on tool definitions is stripped; cache_control_stripped trace event logged.</li>
+<li><code>test_anthropic_to_chat_tools_non_list_guarded</code>: Non-list tools returns [] (tools: null treated as absent).</li>
+<li><code>test_anthropic_to_chat_tools_malformed_entries_skipped</code>: Entries missing name or input_schema are skipped with a content_block_dropped trace event.</li>
+<li><code>test_anthropic_to_chat_tool_choice_mapping</code>: All 4 tool_choice variants map correctly.</li>
+<li><code>test_anthropic_to_chat_tool_choice_none_omitted</code>: None/absent tool_choice is omitted from output.</li>
+<li><code>test_anthropic_to_chat_tool_choice_malformed_omitted</code>: Malformed/unknown tool_choice maps to None (omitted, defensive).</li>
+<li><code>test_anthropic_to_chat_tool_choice_only_with_tools</code>: tool_choice is omitted when the tools array is empty or absent.</li>
+<li><code>test_anthropic_to_chat_integration</code>: Full Anthropic request (system, tools, tool_choice, multi-turn) -&gt; valid OpenAI Chat request.</li>
+<li><code>test_anthropic_to_chat_content_block_dropped_trace</code>: Coalesced content_block_dropped trace event with dropped_counts (not per-block).</li>
+<li><code>test_anthropic_to_chat_cache_control_stripped_trace</code>: cache_control_stripped logged once per request (coalesced), not per block.</li>
+<li><code>test_anthropic_to_chat_nan_infinity_arguments_rejected</code>: NaN/Infinity tool_use.input degrades to a text placeholder, not silently dropped.</li>
+<li><code>test_anthropic_to_chat_tool_use_non_dict_input</code>: tool_use.input with non-dict value (string/None/number) degrades to placeholder, no non-object arguments.</li>
+<li><code>test_anthropic_to_chat_nan_placeholder_with_valid_tool_use</code>: NaN tool_use + valid tool_use coexist -&gt; placeholder as separate assistant message before tool_calls.</li>
+<li><code>test_anthropic_to_chat_tool_result_list_content</code>: tool_result.content as a list of text blocks is joined with newlines.</li>
+<li><code>test_anthropic_to_chat_no_input_mutation</code>: _anthropic_to_chat does not mutate the input dict or its nested structures.</li>
+<li><code>test_chat_to_anthropic_basic</code>: content, model, stop_reason, usage mapped correctly.</li>
+<li><code>test_chat_to_anthropic_reasoning_content_to_thinking</code>: reasoning_content in the chat message becomes a thinking block first in content.</li>
+<li><code>test_chat_to_anthropic_reasoning_field_compat</code>: vLLM &#x27;reasoning&#x27; field is also recognized; reasoning_content wins when both present.</li>
+<li><code>test_chat_to_anthropic_reasoning_content_empty</code>: Empty reasoning_content produces no thinking block.</li>
+<li><code>test_chat_to_anthropic_reasoning_content_with_tool_calls</code>: reasoning_content + tool_calls -&gt; thinking block first, then tool_use blocks.</li>
+<li><code>test_chat_to_anthropic_empty_choices</code>: Empty choices returns a minimal valid Anthropic message.</li>
+<li><code>test_chat_to_anthropic_tool_calls</code>: tool_calls map to tool_use content blocks.</li>
+<li><code>test_chat_to_anthropic_finish_reason_mapping</code>: All finish_reason values map to the correct stop_reason.</li>
+<li><code>test_chat_to_anthropic_usage_absent</code>: Missing usage maps to zero input/output tokens.</li>
+<li><code>test_chat_to_anthropic_content_array</code>: Array content blocks map individually.</li>
+<li><code>test_chat_to_anthropic_malformed_tool_args_text_block</code>: Malformed tool args degrade to a text block, not a tool_use with input {}.</li>
+<li><code>test_chat_to_anthropic_malformed_tool_args_mixed</code>: Mixed valid + malformed tool calls: valid tool_use kept, malformed degrades.</li>
+</ul>
+
+<h3 id="cat-5">Category 5 — Responses API Transforms</h3>
+
+<p><strong>Scope:</strong> The Anthropic↔Responses conversions — input items, instructions, and the streaming path.</p>
+
+<h4><code>tests/test_response_transform.py</code> (37 tests) — Anthropic → Responses request and response transforms</h4>
+<ul>
+<li><code>test_anthropic_to_response_basic</code>: model, input items, instructions, max_output_tokens, stream mapped.</li>
+<li><code>test_anthropic_to_response_system_list</code>: system content block list concatenates into instructions.</li>
+<li><code>test_anthropic_to_response_multiple_user_messages</code>: Full ordered history becomes message items (not last-user-only).</li>
+<li><code>test_anthropic_to_response_no_user_message</code>: Empty or absent messages yield input: [].</li>
+<li><code>test_anthropic_to_response_stream_forced_false</code>: stream is always false regardless of the client&#x27;s stream flag.</li>
+<li><code>test_anthropic_to_response_parallel_tool_use</code>: Parallel tool_use blocks become function_call items in original order.</li>
+<li><code>test_anthropic_to_response_tool_result_matching</code>: A tool_result for a known call id becomes function_call_output; list content joined.</li>
+<li><code>test_anthropic_to_response_tool_result_orphan_duplicate</code>: Orphan and duplicate tool_results are dropped; first valid result kept.</li>
+<li><code>test_anthropic_to_response_invalid_tool_use_degrade</code>: Non-dict/NaN tool_use.input degrades to placeholder text; results dropped.</li>
+<li><code>test_anthropic_to_response_empty_dict_arguments</code>: A zero-argument tool_use (input {}) serializes to valid JSON object args.</li>
+<li><code>test_anthropic_to_response_mixed_text_and_tool_use</code>: Mixed text/tool content keeps both kinds and original relative order.</li>
+<li><code>test_anthropic_to_response_role_coalescing</code>: Adjacent same-role message items coalesce; unsupported-only turns vanish.</li>
+<li><code>test_anthropic_to_response_assistant_output_text</code>: Assistant text block becomes output_text in the Responses input.</li>
+<li><code>test_anthropic_to_response_assistant_string_output_text</code>: Assistant string content becomes output_text.</li>
+<li><code>test_anthropic_to_response_user_input_text_unchanged</code>: User text stays input_text.</li>
+<li><code>test_anthropic_to_response_assistant_coalescing</code>: Adjacent assistant messages coalesce into a single output_text item.</li>
+<li><code>test_anthropic_to_response_assistant_coalescing_mid_history</code>: Coalesced assistant item keeps output_text even with a trailing user message.</li>
+<li><code>test_anthropic_to_response_user_coalescing_unchanged</code>: Adjacent user messages still coalesce with input_text.</li>
+<li><code>test_anthropic_to_response_mixed_roles_no_coalescing</code>: Adjacent user and assistant messages do not coalesce.</li>
+<li><code>test_anthropic_to_response_system_role_input_text</code>: System role (non-user, non-assistant) stays input_text.</li>
+<li><code>test_anthropic_to_response_mixed_history_content_types</code>: Mixed history preserves order with role-appropriate content types.</li>
+<li><code>test_anthropic_to_response_assistant_empty_string_content</code>: Empty-string assistant content is emitted as an output_text item.</li>
+<li><code>test_anthropic_to_response_flat_tools</code>: Anthropic tools become flat Responses function tools (no nested function).</li>
+<li><code>test_anthropic_to_response_tool_choice_mapping</code>: tool_choice maps auto/any/none/tool; named unknown tool omitted.</li>
+<li><code>test_anthropic_to_response_no_input_mutation</code>: The input body_json object is not mutated.</li>
+<li><code>test_anthropic_to_response_error_result</code>: An error tool_result&#x27;s text is preserved as the output string.</li>
+<li><code>test_response_to_anthropic_basic</code>: content, model, id, usage mapped correctly.</li>
+<li><code>test_response_to_anthropic_empty_output</code>: Empty output returns a minimal valid Anthropic message.</li>
+<li><code>test_response_to_anthropic_multiple_output</code>: All output items processed in order (texts + function_call).</li>
+<li><code>test_response_to_anthropic_status_completed</code>: stop_reason derived from the status field.</li>
+<li><code>test_response_to_anthropic_usage_absent</code>: Missing usage maps to zero input/output tokens.</li>
+<li><code>test_response_to_anthropic_parallel_calls</code>: Parallel function_call items become tool_use blocks in order.</li>
+<li><code>test_response_to_anthropic_mixed_text_calls</code>: Mixed message/function_call output items all processed in order.</li>
+<li><code>test_response_to_anthropic_valid_args_dict_and_string</code>: Dict arguments accepted directly; string arguments parsed; {} valid.</li>
+<li><code>test_response_to_anthropic_malformed_args_degrade</code>: Malformed/non-object arguments degrade; all-malformed completed -&gt; null stop.</li>
+<li><code>test_response_to_anthropic_missing_id_name</code>: Missing call_id or name degrades to a placeholder, not a fake empty tool.</li>
+<li><code>test_response_to_anthropic_unsupported_items_ignored</code>: Unsupported output item types are ignored without crashing.</li>
+</ul>
+
+<h3 id="cat-6">Category 6 — Chat-Mode SSE</h3>
+
+<p><strong>Scope:</strong> Synthesising Anthropic SSE events from a chat provider's stream: framing, tool-call deltas, and every degradation path.</p>
+
+<h4><code>tests/test_chat_sse.py</code> (33 tests) — chat-mode SSE synthesis and framing</h4>
+<ul>
+<li><code>test_chat_sse_basic_streaming</code>: Simulated OpenAI SSE chunks produce valid Anthropic SSE events.</li>
+<li><code>test_chat_sse_finish_reason_mapping</code>: finish_reason maps to stop_reason in the terminal message_delta.</li>
+<li><code>test_chat_sse_no_content_delta</code>: Chunks without content delta produce no content_block_delta events.</li>
+<li><code>test_chat_sse_empty_choices_usage_chunk</code>: An empty-choices usage chunk does not crash and its usage is accumulated.</li>
+<li><code>test_chat_sse_eof_without_finish_reason</code>: Terminal events are synthesized when the stream ends without finish_reason.</li>
+<li><code>test_chat_sse_first_event_has_content</code>: A first chunk that carries real content emits a content_block_delta.</li>
+<li><code>test_chat_sse_injection_prevented</code>: Provider-controlled newline/event/data text cannot inject extra SSE events.</li>
+<li><code>test_chat_sse_event_line_present</code>: Every data-bearing SSE frame has an event: line matching the JSON type field.</li>
+<li><code>test_chat_sse_single_tool_call_fragmented_arguments</code>: A single tool call split across frames emits one tool_use block with ordered deltas.</li>
+<li><code>test_chat_sse_parallel_tool_calls_interleaved</code>: Two interleaved tool indexes keep per-call association and close ascending.</li>
+<li><code>test_chat_sse_reasoning_text_then_tool_call</code>: Scalar blocks close before a tool block starts; indices stay contiguous.</li>
+<li><code>test_chat_sse_tool_call_metadata_buffering</code>: Arguments arriving before id/name are buffered and emitted in order after the start.</li>
+<li><code>test_chat_sse_malformed_tool_call_degrades</code>: Malformed tool-call deltas never emit a tool_use block; one metadata-only trace event.</li>
+<li><code>test_chat_sse_mixed_valid_and_malformed_tool_calls</code>: A valid parallel call survives alongside a malformed entry without contamination.</li>
+<li><code>test_chat_sse_tool_call_eof_without_finish</code>: EOF without finish_reason: valid blocks close and get null; no deltas get end_turn.</li>
+<li><code>test_chat_sse_non_tool_calls_finish_with_tool_blocks</code>: A length/stop finish while tool blocks are open closes them and maps normally.</li>
+<li><code>test_chat_sse_scalar_delta_after_tool_blocks</code>: Scalar deltas after the first tool block are dropped with a counted diagnostic.</li>
+<li><code>test_chat_sse_final_fragment_in_finish_frame</code>: The last argument fragment sharing the finish frame is emitted before close.</li>
+<li><code>test_chat_sse_no_deltas_tool_calls_finish</code>: finish_reason tool_calls with zero tool-call deltas degrades to null (never tool_use).</li>
+<li><code>test_chat_sse_unparseable_arguments_at_close</code>: Valid metadata + tool_calls finish but unparseable args degrade the stop reason.</li>
+<li><code>test_chat_sse_conflicting_metadata</code>: A later valid-but-different id/name on an existing index is treated as malformed.</li>
+<li><code>test_chat_sse_fragments_missing_index</code>: Non-empty fragments without an index are dropped, counted, and block tool_use.</li>
+<li><code>test_chat_sse_malformed_delta_shapes</code>: Malformed delta shapes are skipped without crashing; the stream still terminates.</li>
+<li><code>test_chat_sse_pending_buffer_cap_exceeded</code>: Pending argument fragments exceeding the per-tool cap never emit a tool_use.</li>
+<li><code>test_chat_sse_too_many_parallel_tools</code>: More than 32 tracked tool indexes overflow into the coalesced diagnostic.</li>
+<li><code>test_chat_sse_eof_empty_tool_calls_sentinel</code>: An empty tool_calls: [] sentinel frame must not mark tool deltas seen at EOF.</li>
+<li><code>test_chat_sse_mixed_parseable_unparseable_finish</code>: One unparseable parallel tool degrades the whole stream to a null stop reason.</li>
+<li><code>test_chat_sse_non_dict_arguments_at_close</code>: Arguments that parse but not as a dict (e.g. &quot;123&quot;) are counted unparseable.</li>
+<li><code>test_chat_sse_frame_dropped_guard</code>: A mid-stream oversized no-delimiter frame blocks the tool_use claim.</li>
+<li><code>test_chat_mode_streamed_tool_command_e2e</code>: State-wide: a streamed Bash tool call becomes a runnable Anthropic tool_use turn.</li>
+<li><code>test_chat_sse_reasoning_delta_to_thinking_delta</code>: reasoning_content delta -&gt; thinking block at index 0, then text block at index 1.</li>
+<li><code>test_chat_sse_reasoning_delta_no_content</code>: A stream with only reasoning deltas still emits valid thinking blocks and terminal events.</li>
+<li><code>test_chat_sse_reasoning_then_text_transition</code>: thinking content_block_stop(index 0) precedes text content_block_start(index 1).</li>
+</ul>
+
+<h3 id="cat-7">Category 7 — Compatibility Learner</h3>
+
+<p><strong>Scope:</strong> The <code>context_management</code> probe ladder, probation, suppression, and its persistence file.</p>
+
+<h4><code>tests/test_compat.py</code> (43 tests) — the context_management learner</h4>
+<ul>
+<li><code>test_compat_state_load_missing_file</code>: Missing state file means empty state: discovery still works and no startup failure occurs.</li>
+<li><code>test_compat_state_load_corrupt_fails_open</code>: A corrupt (non-JSON) state file warns and fails open with empty state: requests forward unchanged and the proxy does not crash.</li>
+<li><code>test_compat_state_load_unreadable_fails_open</code>: An unreadable state path (a directory) fails open with empty state.</li>
+<li><code>test_compat_state_roundtrip</code>: A learned entry persists with plan-pinned schema fields and survives a proxy restart (stripping resumes immediately).</li>
+<li><code>test_compat_state_one_bad_entry_keeps_valid</code>: One invalid entry among good ones: the bad entry is dropped (treated as absent), the valid entry keeps stripping.</li>
+<li><code>test_compat_state_unknown_feature_ignored</code>: A foreign-feature entry in the state file is tolerated (forward-compat) and never affects context_management behavior.</li>
+<li><code>test_compat_state_higher_version_fails_open</code>: Unknown or absent top-level schema_version: warn + fail open with empty state; fresh learning still works.</li>
+<li><code>test_compat_state_invalid_entries_normalized</code>: Out-of-range counters and off-ladder thresholds do not disable the entry: values are normalized and the entry keeps stripping.</li>
+<li><code>test_compat_state_atomic_write</code>: State writes are atomic with a unique temp name: after state-machine transitions, the state directory holds only the final file and it is valid JSON.</li>
+<li><code>test_compat_state_write_metadata_only</code>: Persisted state contains no request values, no prompt text, no raw error bodies — schema fields only.</li>
+<li><code>test_compat_state_persist_failure_retains_memory</code>: When persistence fails (unwritable path), in-memory learning still works and compatibility_persist_failed is rate-limited.</li>
+<li><code>test_compat_state_concurrent_updates_no_loss</code>: Concurrent stripped requests keep counter integrity: every client gets a 2xx, no more than the expected probe requests go unstripped, and state stays valid.</li>
+<li><code>test_compat_state_key_isolation</code>: Learned state for one (provider, mode, model) key does not strip other keys&#x27; requests.</li>
+<li><code>test_compat_locks_present</code>: The plan-named locks exist and _compat_retry_lock is non-blocking.</li>
+<li><code>test_compat_normalize_threshold_ladder</code>: Off-ladder thresholds snap onto the doubling ladder: the returned value is the largest ladder element &lt;= value, clamped to [COMPAT_INITIAL_THRESHOLD…</li>
+<li><code>test_compat_temp_file_cleanup</code>: A failed os.replace leaves no temp file behind: the persist failure path unlinks the unique-named temp file.</li>
+<li><code>test_compat_field_stripped_trace_accuracy</code>: compatibility_field_stripped fires only for requests whose outbound body was actually stripped — the probe-owning request emits compatibility_probe_started instead, so…</li>
+<li><code>test_compat_detector_message_form</code>: The exact observed message-form 400 triggers exactly one stripped compatibility retry.</li>
+<li><code>test_compat_detector_structured</code>: A structured extra_forbidden 400 identifying the top-level field triggers exactly one stripped compatibility retry.</li>
+<li><code>test_compat_detector_nested_path_rejected</code>: A nested-path rejection (tools.0.input.context_management) does not trigger a compatibility retry.</li>
+<li><code>test_compat_detector_content_type_agnostic</code>: Detection is content-type-agnostic: a JSON body with a text/plain Content-Type still matches; a non-JSON body is inconclusive.</li>
+<li><code>test_compat_detector_unrelated_400_rejected</code>: Broad invalid-request, auth, model, quota, and context-limit 400s never trigger a compatibility retry or learning.</li>
+<li><code>test_compat_detector_presence_required</code>: A matching 400 for a request whose body lacks context_management does not trigger a compatibility retry.</li>
+<li><code>test_compat_learn_on_400_stripped_2xx</code>: Initial 400 followed by a 2xx stripped retry learns unsupported state; the next matching request is stripped.</li>
+<li><code>test_compat_no_learn_when_retry_fails</code>: When the stripped retry also fails, the client gets the original 400 (model-rewritten) and nothing is learned.</li>
+<li><code>test_compat_failed_confirmation_suppression</code>: After 3 failed confirmations, compatibility retries are suppressed; discovery re-arms after a request-count interval (the threshold).</li>
+<li><code>test_compat_strip_immediate_after_learn</code>: Learned state strips on the very next matching request.</li>
+<li><code>test_compat_key_isolation_live</code>: Learning through the live flow isolates by (provider, mode, model): other providers and models are unaffected.</li>
+<li><code>test_compat_unknown_field_passthrough</code>: Other unknown fields are never stripped or learned — even when the upstream 400 names them with an extra-inputs message.</li>
+<li><code>test_compat_non_matching_400_passthrough</code>: A non-matching 400 on a context_management request passes through with no compatibility retry and no state change.</li>
+<li><code>test_compat_one_retry_cap</code>: At most one compatibility retry per client request (COMPAT_MAX_RETRIES_PER_REQUEST = 1).</li>
+<li><code>test_compat_count_tokens_excluded</code>: count_tokens requests skip compatibility processing entirely.</li>
+<li><code>test_compat_initial_threshold_probe</code>: Exactly 32 strips precede the first unstripped probe; the request whose strip count reaches the threshold IS the probe (unstripped), and its rejected result is retried…</li>
+<li><code>test_compat_rejection_doubles_threshold</code>: A rejected probe doubles the threshold (capped at max) and persists the doubled value.</li>
+<li><code>test_compat_probation_cycle</code>: After a successful probe, the entry enters probation: 8 strips, then the next probe; one success keeps probation.</li>
+<li><code>test_compat_delist_after_two_successes</code>: A seeded probation entry earns two successful probes and is delisted; afterwards requests are no longer stripped.</li>
+<li><code>test_compat_inconclusive_reschedules</code>: An inconclusive probe (non-matching 500) resets the strip counter and reschedules at the current threshold without doubling.</li>
+<li><code>test_compat_probe_counter_semantics</code>: Repeated rejection from probation resets probation to zero but keeps (and further doubles) the threshold — it never resets to base.</li>
+<li><code>test_compat_single_retry_global</code>: Concurrent first-time requests: exactly one compatibility retry occurs globally; losers receive the original 400.</li>
+<li><code>test_compat_retry_lock_released_on_exception</code>: An upstream failure during the compatibility retry releases the retry lock: later requests can still retry and learn.</li>
+<li><code>test_compat_config_swap_during_retry</code>: The compatibility retry uses the entry-time config snapshot: the in-flight request completes against its original provider, and the admin switch (drained afterwards)…</li>
+<li><code>test_compat_retry_stream_interaction</code>: Interaction with streaming and the existing retry loop: learning works from streamed 2xx (status-receipt evidence, no rollback on mid-stream failure), and the 429/503…</li>
+<li><code>test_compat_trace_metadata_only</code>: All compatibility_* trace events are metadata-only: no field values, no prompt text, no raw upstream error text.</li>
+</ul>
+
+<h3 id="cat-8">Category 8 — Admin API</h3>
+
+<p><strong>Scope:</strong> The admin page and its endpoints, including the Origin check and hot-switch behaviour.</p>
+
+<h4><code>tests/test_admin.py</code> (24 tests) — admin page, API, CSRF</h4>
+<ul>
+<li><code>test_admin_page_served</code>: GET /admin/ returns HTML.</li>
+<li><code>test_admin_api_config</code>: GET /admin/api/config returns current tiers + models.</li>
+<li><code>test_admin_api_switch</code>: POST /admin/api/switch updates tier, subsequent request routes to new provider.</li>
+<li><code>test_admin_api_switch_invalid_provider</code>: POST with unknown provider → error response.</li>
+<li><code>test_admin_api_switch_preserves_models</code>: Switch tiers, verify models section unchanged in config.json.</li>
+<li><code>test_admin_api_csrf_rejected</code>: POST with foreign Origin header → rejected.</li>
+<li><code>test_admin_api_csrf_null_origin_rejected</code>: POST with Origin: null → rejected.</li>
+<li><code>test_admin_api_csrf_missing_origin_rejected</code>: POST without Origin header → rejected.</li>
+<li><code>test_admin_api_csrf_ipv6_loopback_accepted</code>: POST with Origin: http://[::1]:&lt;port&gt; → accepted.</li>
+<li><code>test_admin_api_switch_missing_tier_rejected</code>: POST with only 2 tiers → 400 error listing missing tier.</li>
+<li><code>test_admin_api_reload</code>: Modify config.json on disk, POST /admin/api/reload, verify new mapping active.</li>
+<li><code>test_admin_models_provider_keyed</code>: Admin API serves models keyed by provider; admin.html model &lt;select&gt; is populated from config.models[provider] — no placeholder or custom options.</li>
+<li><code>test_admin_switch_preserves_disable_retry_flag</code>: Admin Apply preserves disable_retry_claude_count_token and extra_request_headers (one switch flow, both top-level keys) in the returned and on-disk config.</li>
+<li><code>test_admin_providers_detail</code>: providers-detail returns mode per provider without keys.</li>
+<li><code>test_admin_providers_detail_no_mode</code>: Providers without a mode return anthropic.</li>
+<li><code>test_admin_providers_detail_forbidden</code>: providers-detail is rejected for non-localhost clients.</li>
+<li><code>test_admin_providers_detail_invalid_mode_normalized</code>: Unknown mode in keys is normalized to anthropic in the admin endpoint.</li>
+<li><code>test_admin_providers_detail_returns_key_names</code>: providers-detail returns key NAMES per provider (insertion order for object form, [&#x27;default&#x27;] for string form) and never payloads or url.</li>
+<li><code>test_admin_switch_with_key_name</code>: An admin switch carrying a per-tier key selector persists it and routes subsequent traffic under the selected key&#x27;s payload.</li>
+<li><code>test_admin_switch_unknown_key_rejected</code>: An unknown key name in a switch payload is rejected with a 400 naming tier and provider; config is unchanged and the proxy stays live.</li>
+<li><code>test_admin_switch_invalid_key_type_rejected</code>: Non-string key values (false/0/[]) in a switch payload are rejected with 400 &#x27;invalid key name&#x27;; config on disk is unchanged.</li>
+<li><code>test_admin_switch_missing_key_defaults</code>: A switch body without key selectors succeeds and the persisted config gains the provider&#x27;s first key name (canonical config on disk).</li>
+<li><code>test_admin_reload_validates_key_names</code>: Reload re-validates per-tier key names against the in-memory vendors: an unknown key on disk refuses the reload (400); a fixed name reloads.</li>
+<li><code>test_admin_html_key_column</code>: admin.html gains a per-tier key &lt;select&gt;, a disabled-select style, a static column header row (Provider/Model/Key) above #tiers-container, and a populateKeys wired in…</li>
+</ul>
+
+<h3 id="cat-9">Category 9 — CLI Lifecycle</h3>
+
+<p><strong>Scope:</strong> Start, stop, status, and reload as the operator runs them — including the passphrase pipe and readiness probe.</p>
+
+<h4><code>tests/test_cli.py</code> (14 tests) — CLI lifecycle</h4>
+<ul>
+<li><code>test_stop_cleans_proxy_state</code>: Start proxy, force-kill server, run stop, verify proxy-state.json deleted.</li>
+<li><code>test_stop_trace_with_proxy</code>: Start proxy, run claude-retry-proxy stop; verify stderr shows graceful-stop sequence.</li>
+<li><code>test_stop_cleans_proxy_state_lock</code>: Create proxy-state.json with a dead PID; run stop; verify state file deleted.</li>
+<li><code>test_start_stdout_not_contaminated</code>: Start proxy with plain keys; assert stdout clean (no trace, no key material).</li>
+<li><code>test_cli_reload</code>: claude-retry-proxy reload sends reload request to running proxy.</li>
+<li><code>test_cli_start_no_config</code>: Start without config.json → template created, exit 1, message printed.</li>
+<li><code>test_cli_start_invalid_config</code>: Start with broken config → exit 1, specific error.</li>
+<li><code>test_cli_status_shows_tiers</code>: Status output includes tier → provider → model mapping.</li>
+<li><code>test_start_unknown_tier_key_fails_via_server_gate</code>: claude-retry-proxy start with an unknown or non-string tier key exits non-zero POST-spawn — the server&#x27;s validate_config is the single authoritative gate — and the…</li>
+<li><code>test_start_status_reload_tier_lines_show_key</code>: Tier display lines in start, status, and reload all carry the [key=NAME] suffix when a tier has a key selector set.</li>
+<li><code>test_startup_aborts_on_unwritable_trace_path</code>: An unwritable trace path aborts startup before READY.</li>
+<li><code>test_startup_aborts_on_unwritable_state_path</code>: An unwritable state path aborts startup before READY.</li>
+<li><code>test_relative_state_path_starts_and_writes</code>: A bare relative PROXY_STATE_FILE must not abort startup.</li>
+<li><code>test_startup_abort_exits_one_with_failing_stderr</code>: An unwritable trace path still aborts with exit 1 when stderr is broken.</li>
+</ul>
+
+<h3 id="cat-10">Category 10 — Trace Log and Sinks</h3>
+
+<p><strong>Scope:</strong> What the proxy records, and the write contract that keeps a failing sink from stopping it.</p>
+
+<h4><code>tests/test_trace.py</code> (12 tests) — trace log and analysis</h4>
+<ul>
+<li><code>test_trace_markers</code>: Start proxy, send requests, kill; verify trace has start/end markers with counters.</li>
+<li><code>test_relative_log_path</code>: Start proxy server directly with &#x27;-l relative.jsonl&#x27; and cwd=temp dir.</li>
+<li><code>test_trace_logs_oversized_body</code>: Send POST with body exceeding PROXY_MAX_BODY_SIZE; verify 413 AND trace entry.</li>
+<li><code>test_start_prunes_old_trace_entries</code>: Directly import prune_trace_file from claude_retry_proxy.cli; create temp trace file with entries dated now, 10 days ago, and a malformed line; assert return is (2, 1)…</li>
+<li><code>test_prune_trace_file_edge_cases</code>: Edge cases for prune_trace_file: file doesn&#x27;t exist → (0, 0); empty file → (0, 0).</li>
+<li><code>test_retry_trace_event_enriched</code>: Retry trace events include model, provider, request_id.</li>
+<li><code>test_extra_request_headers_in_trace</code>: Request trace events include extra_request_headers (resolved map) for a ruled provider, omit it for an unruled provider, and omit it on the unknown-model 400 error path…</li>
+<li><code>test_trace_includes_key_name_not_payload</code>: Request trace events carry the resolved key *name* for a multi-key tier (never the payload); the unknown-model 400 path still delivers the 400 response with a trace…</li>
+<li><code>test_sink_failure_does_not_drop_response</code>: A failing trace sink must not drop an otherwise successful response, nor make the retry loop re-issue the upstream POST.</li>
+<li><code>test_heartbeat_survives_failed_state_write</code>: The heartbeat thread survives a failing state write.</li>
+<li><code>test_sink_emission_survives_failing_stderr</code>: The guard&#x27;s own warning/recovery emission must not raise.</li>
+<li><code>test_best_effort_stderr_wrapper</code>: _BestEffortStderr makes a failing stderr stream non-raising.</li>
+</ul>
+
+<h4><code>tests/test_sinks.py</code> (8 tests) — the sink class family</h4>
+<ul>
+<li><code>test_sink_warning_rate_limit</code>: The first failure of an episode warns immediately; further failures inside the interval are silent; the next failure after the interval warns once and reports how many…</li>
+<li><code>test_sink_recovery_notice</code>: The first successful write after a failure episode emits one line carrying the episode&#x27;s dropped-write count; later successes are silent; and a *new* episode after a…</li>
+<li><code>test_sink_write_contract_class_level</code>: A directly-constructed sink on an unwritable path returns False and records exactly one failure on its *own* health.</li>
+<li><code>test_trace_sink_creates_missing_directories</code>: TraceSink.write creates missing parent directories and writes the entry.</li>
+<li><code>test_trace_sink_markers_write_to_own_path</code>: The lifecycle markers land in the constructed sink&#x27;s own file, carrying the port, this process&#x27;s pid, and the counters read back under the lock.</li>
+<li><code>test_state_sink_write_round_trips</code>: StateSink.write emits one JSON document at its own path, atomically.</li>
+<li><code>test_configure_rebinds_paths_and_resets_counters</code>: A rebuild rebinds the path and starts fresh counters; an omitted (None) argument keeps the sink it belongs to.</li>
+<li><code>test_configure_health_only_rebinds_live_sinks</code>: configure(health=H) reaches BOTH live sinks, and a health-only call does not reset the counters.</li>
+</ul>
+
+<!-- END per-test inventory -->
+<h2 id="harness">The harness</h2>
+
+<p>Most tests are written by composing a small number of harness helpers rather than by
+hand-rolling setup. The ones you are most likely to need:</p>
+
+<h3 id="lifecycle-helpers">Proxy lifecycle</h3>
+
+<table>
+<tr><th>Helper</th><th>Purpose</th></tr>
+<tr><td><code>start_proxy(port, extra_args)</code></td><td>Start a proxy on a given port and wait for readiness</td></tr>
+<tr><td><code>stop_proxy()</code></td><td>Stop it and clean up</td></tr>
+<tr><td><code>proxy_status()</code></td><td>Read the recorded state</td></tr>
+<tr><td><code>find_free_port()</code></td><td>Pick an unused port — always prefer this over a hard-coded one</td></tr>
+</table>
+
+<h3 id="fixture-builders">Fixture builders</h3>
+
+<table>
+<tr><th>Helper</th><th>Purpose</th></tr>
+<tr><td><code>_create_test_config(temp_dir, tiers, models, extra_request_headers)</code></td>
+    <td>Write a valid <code>config.json</code></td></tr>
+<tr><td><code>_create_test_keys(temp_dir, vendors, passphrase)</code></td>
+    <td>Write an <em>encrypted</em> keys file</td></tr>
+<tr><td><code>_create_test_keys_plain(temp_dir, vendors)</code></td>
+    <td>Write a plain-JSON keys file</td></tr>
+<tr><td><code>_start_mock_upstream(port, req_list)</code></td>
+    <td>Start a loopback upstream that records the requests it receives</td></tr>
+<tr><td><code>_start_mode_mock_upstream(port, req_list, responder)</code></td>
+    <td>As above, but with a per-request responder for mode testing</td></tr>
+</table>
+
+<p>The <code>req_list</code> pattern is the workhorse: the mock upstream appends every request it
+receives to a list the test owns, so a test can assert on what the proxy actually <em>sent</em> —
+headers, path, and body — rather than only on what came back.</p>
+
+<h3 id="request-helpers">Requests and assertions</h3>
+
+<table>
+<tr><th>Helper</th><th>Purpose</th></tr>
+<tr><td><code>_send_proxy_request(port, path, body, headers)</code></td><td>Send a buffered request</td></tr>
+<tr><td><code>_send_proxy_request_stream(port, body, path)</code></td><td>Send and read a streaming response</td></tr>
+<tr><td><code>_admin_get</code> / <code>_admin_post</code></td><td>Hit the admin API with a correct Origin by default</td></tr>
+<tr><td><code>_parse_sse_frames(raw)</code>, <code>_sse_types(frames)</code>, <code>_sse_frames_with_type</code></td>
+    <td>Decode an SSE stream into frames and assert on their types</td></tr>
+<tr><td><code>_trace_events_for_request(request_id)</code></td>
+    <td>Pull the trace entries for one request — the standard way to assert on internal events</td></tr>
+<tr><td><code>_cc(delta, finish)</code></td><td>Build a chat-completions stream chunk</td></tr>
+</table>
+
+<h2 id="patterns">Testing patterns</h2>
+
+<h3 id="pattern-beam">Assert on the wire, not on the return value</h3>
+
+<p>The proxy's contract is what it sends upstream and what it returns to the client. A test that
+only checks the returned body will not catch a wrong auth header, a missing path rewrite, or a
+stripped field. Point a mock upstream at the proxy, capture the request, and assert on it.</p>
+
+<h3 id="pattern-trace">Use the trace log as the internal observation channel</h3>
+
+<p>Internal decisions — which mode dispatched, whether a retry happened, whether a tool call
+degraded — are not visible in the response body. They <em>are</em> recorded as trace events, and
+<code>_trace_events_for_request(request_id)</code> retrieves them by correlation id. This is the
+sanctioned way to assert on internals, and it avoids reaching into module state.</p>
+
+<h3 id="pattern-isolation">Let the harness own the paths</h3>
+
+<p>Never hard-code a trace, state, or keys path in a test — build a temp directory and let the
+fixture builders place the files. A test that writes to a real path will pass locally and fail
+whenever a proxy is running.</p>
+
+<h2 id="anti-patterns">Anti-patterns</h2>
+
+<table>
+<tr><th>Don't</th><th>Why</th></tr>
+<tr><td>Hard-code a port</td><td>Collides with a live proxy or a parallel run. Use <code>find_free_port()</code>.</td></tr>
+<tr><td>Assert on a trace file path you chose</td>
+    <td>Bypasses the isolation the harness establishes, and will read the wrong file.</td></tr>
+<tr><td>Test a transform by calling it directly and checking the return value only</td>
+    <td>Misses the failure path — a transform that raises falls back to the original body, which
+        a direct call cannot exercise.</td></tr>
+<tr><td>Mock the upstream with a plain socket echo</td>
+    <td>The mock upstreams exist to record requests and to script per-request responses. A raw
+        echo loses the recording.</td></tr>
+<tr><td>Rely on ordering between independent tests</td>
+    <td>Tests share a session temp directory and a set of ports; do not assume a clean slate
+        beyond what a fixture builds.</td></tr>
+</table>
+
+<h2 id="adding-tests">Adding a test</h2>
+
+<ol>
+  <li>Put it in the module matching the area it exercises (see <a href="#catalog">the catalog</a>).</li>
+  <li>Add the function to that module's <code>ALL_TESTS</code> list — the aggregator picks it up
+      from there.</li>
+  <li>Build fixtures with the harness helpers rather than inline setup.</li>
+  <li>Verify it runs both alone (<code>-t &lt;name&gt;</code>) and as part of the full suite, and
+      that the full suite passes with a live proxy running.</li>
+</ol>
+
+<footer>Last updated: 2026-09-12</footer>
+</body>
+</html>

@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trace Log — claude-retry-proxy</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<h1>Trace Log<span class="sub">What the proxy records, and what it deliberately does not</span></h1>
+
+<p><strong>Last updated:</strong> 2026-09-12</p>
+
+<p>The trace log is a JSONL file — one JSON object per line — at
+<code>~/.claude/logs/proxy-trace.jsonl</code> by default, overridable with
+<code>PROXY_TRACE_FILE</code> or <code>--log</code>. Every request the proxy <em>forwards</em> appends
+one <code>request</code> entry, and the proxy's own lifecycle and internal events append their own
+entries alongside it. Requests rejected before forwarding — a malformed <code>Content-Length</code>,
+or any admin API call — write nothing.</p>
+
+<p>It is append-only and line-oriented on purpose: a partially written final line costs you one
+entry, not the file.</p>
+
+<h2 id="entry-schema">The <code>request</code> entry</h2>
+
+<p>This is the entry you will actually read. Every field below is present on every
+<code>request</code> entry unless noted.</p>
+
+<table>
+<tr><th>Field</th><th>Type</th><th>Meaning</th></tr>
+<tr><td><code>timestamp</code></td><td>string</td><td>UTC, <code>YYYY-MM-DDTHH:MM:SSZ</code></td></tr>
+<tr><td><code>event</code></td><td>string</td><td>Always <code>"request"</code> for this entry type</td></tr>
+<tr><td><code>request_id</code></td><td>string</td><td>Correlates this entry with every other entry for the same request</td></tr>
+<tr><td><code>method</code></td><td>string</td><td>HTTP method of the <em>client</em> request</td></tr>
+<tr><td><code>path</code></td><td>string</td><td>Request path (<code>count_tokens</code> is distinguishable here)</td></tr>
+<tr><td><code>model</code></td><td>string</td><td>The upstream model actually requested</td></tr>
+<tr><td><code>tier</code></td><td>string</td><td>The resolved tier</td></tr>
+<tr><td><code>provider</code></td><td>string</td><td>The provider that served it</td></tr>
+<tr><td><code>key</code></td><td>string</td><td>The resolved key <em>name</em>. <strong>Omitted entirely</strong> when resolution is impossible.</td></tr>
+<tr><td><code>status</code></td><td>string</td><td><code>"success"</code> or <code>"failure"</code></td></tr>
+<tr><td><code>http_status</code></td><td>number</td><td>Upstream status. <code>0</code> means a connection-level failure.</td></tr>
+<tr><td><code>retries</code></td><td>number</td><td>How many retries were performed</td></tr>
+<tr><td><code>total_latency_sec</code></td><td>number</td><td>Entire request, including all retry waits. Rounded to 3 decimals.</td></tr>
+<tr><td><code>first_byte_latency_ms</code></td><td>number or null</td><td>Time to first byte; <code>null</code> when not measured</td></tr>
+<tr><td><code>error</code></td><td>string or null</td><td>Redacted error text on failure; <code>null</code> on success</td></tr>
+<tr><td><code>extra_request_headers</code></td><td>object</td><td><strong>Only present when non-empty</strong> — the resolved extra-header values for this request</td></tr>
+<tr><td><code>request_body</code>, <code>response_body</code></td><td>any</td><td><strong>Only under <code>--all</code></strong> — see <a href="#all">below</a></td></tr>
+</table>
+
+<div class="warn">
+<strong>The "present on every entry" invariant above has two exceptions.</strong> The oversized-body
+rejection writes its entry <em>before</em> routing, so it carries no <code>tier</code> and no
+<code>provider</code>. Separately, on the pre-routing 400 paths — an unrecognised model, a
+disallowed method, a disallowed path — the entry carries <code>provider: null</code>, even though the
+table above types <code>provider</code> as a string. Both follow from where the entry is written: at
+the point the request failed, before any provider had been chosen.
+</div>
+
+<div class="note">
+<strong><code>key</code> is a name, never a credential.</strong> It records which of a
+provider's keys was selected — <code>"default"</code> for a single-key provider, or the name
+from a <code>keys</code> object. This field is recorded regardless of <code>--all</code>, and
+applies to any tier present in the configuration, not only the three standard ones.
+</div>
+
+<h2 id="markers">Lifecycle markers</h2>
+
+<p>Two entries bracket each run of the proxy. They are what tell you the process was restarted,
+and they survive things the request entries do not.</p>
+
+<table>
+<tr><th>Event</th><th>Fields</th><th>Written</th></tr>
+<tr><td><code>proxy_start</code></td><td><code>timestamp</code>, <code>port</code>, <code>pid</code></td>
+    <td>At startup, before the server begins serving</td></tr>
+<tr><td><code>proxy_stop</code></td><td><code>timestamp</code>, <code>pid</code>,
+    <code>requests_total</code>, <code>requests_retried</code></td>
+    <td>During shutdown, in a <code>finally</code> block</td></tr>
+</table>
+
+<p>The stop marker carries the run's request and retry counts, so a run's totals are recoverable
+from the marker pair even if you do not want to aggregate the request entries.</p>
+
+<div class="warn">
+<strong>A missing <code>request</code> entry does not mean the request did not happen.</strong>
+Shutdown does not drain in-flight requests — a request killed mid-retry never writes its entry.
+If you are reconciling a trace against a client-side log and the counts disagree at the tail of
+a run, that is the likely cause. See <a href="operations.html#shutdown">operations.html</a>.
+<p>Separately, the marker timestamps include a millisecond component
+(<code>.000Z</code>) that the <code>request</code> entries do not. A strict timestamp parser
+looking for one exact format will fail on the other.</p>
+</div>
+
+<h2 id="events">Event inventory</h2>
+
+<p>These are the events emitted outside the compatibility learner. The learner's ten events are
+listed in <a href="compatibility.html#events">compatibility.html</a>; together the two lists are
+the complete set the proxy can write.</p>
+
+<table>
+<tr><th>Event</th><th>When</th></tr>
+<tr><td><code>request</code></td><td>one per completed request</td></tr>
+<tr><td><code>proxy_start</code> / <code>proxy_stop</code></td><td>process lifecycle — see above</td></tr>
+<tr><td><code>retry</code></td><td>a retry was scheduled. Carries <code>attempt</code>,
+    <code>delay_s</code>, and a <code>reason</code> of <code>"429"</code>, <code>"503"</code>, or
+    <code>"connection_error"</code>.</td></tr>
+<tr><td><code>mode_dispatch</code></td><td>a non-anthropic mode handled a request</td></tr>
+<tr><td><code>client_disconnect</code></td><td>the client went away before the response was fully sent</td></tr>
+<tr><td><code>response_size_cap_exceeded</code></td><td>a response was truncated at
+    <code>PROXY_MAX_RESPONSE_SIZE</code></td></tr>
+<tr><td><code>transform_failure</code></td><td>a body transform raised; the original body was used instead</td></tr>
+<tr><td><code>cache_control_stripped</code></td><td><code>cache_control</code> was removed while converting to chat format</td></tr>
+<tr><td><code>redacted_thinking_passthrough</code></td><td>a <code>redacted_thinking</code> block became a placeholder</td></tr>
+<tr><td><code>content_block_dropped</code></td><td>an unrepresentable content block was removed</td></tr>
+<tr><td><code>tool_args_parse_failure</code></td><td>tool arguments could not be parsed or serialised</td></tr>
+<tr><td><code>chat_sse_tool_degradation</code></td><td>one or more streaming tool calls degraded (once per stream)</td></tr>
+<tr><td><code>chat_sse_truncated</code>, <code>chat_sse_malformed_json</code>,
+    <code>chat_sse_frame_cap_exceeded</code>, <code>chat_sse_buffer_cap_exceeded</code></td>
+    <td>chat-mode SSE framing problems</td></tr>
+<tr><td><code>sse_buffer_cap_exceeded</code>, <code>sse_rewrite_malformed_json</code></td>
+    <td>anthropic-mode SSE buffering and rewrite problems</td></tr>
+<tr><td><code>response_sse_unexpected</code></td><td>a response-mode provider streamed despite <code>stream: false</code></td></tr>
+</table>
+
+<p>Several of these are <strong>metadata-only by design</strong>. <code>transform_failure</code>,
+<code>chat_sse_tool_degradation</code>, and the learner's events carry counts and identifiers
+but never body content, so a failed transform cannot leak model output into the log.</p>
+
+<h2 id="all">The <code>--all</code> flag</h2>
+
+<p><code>--all</code> (or <code>PROXY_LOG_ALL=1</code>) adds <code>request_body</code> and
+<code>response_body</code> to the <code>request</code> entry. Bodies are stored as parsed JSON
+where possible and as a decoded string otherwise.</p>
+
+<div class="error">
+<strong><code>--all</code> writes raw prompts and completions to a plaintext file.</strong>
+Whatever you or your users send through the proxy — source code, credentials pasted into a
+prompt, personal data — ends up readable on disk. Enable it for debugging, then turn it off.
+<p>Two mitigations are worth knowing:</p>
+<ul>
+  <li><strong>Streamed 2xx response bodies are never captured, even under
+      <code>--all</code>.</strong> A streaming success is consumed by the client in real time, so
+      there is no buffered body to record. This is a deliberate reduction in data-at-rest
+      exposure, not an oversight. Error-path bodies <em>are</em> captured.</li>
+  <li>The trace file is set to owner-only permissions on POSIX
+      (<code>chmod 0o600</code>).</li>
+</ul>
+</div>
+
+<h3 id="exposure">File permissions on Windows</h3>
+
+<div class="warn">
+<strong>On Windows, <code>chmod</code> is a near-no-op.</strong> It sets the read-only bit and
+nothing else — Windows has no POSIX group/other permission model for <code>chmod</code> to
+express. The trace log, the state file, and the keys file are therefore readable by any account
+that can reach your home directory unless you restrict them yourself.
+<p>Restrict the directory ACL manually with <code>icacls</code>. This applies to
+<code>~/.claude/logs/</code> and <code>~/.claude/proxy/</code>, and it applies whether or not
+you use <code>--all</code>, because error text and resolved extra-header values are recorded
+regardless.</p>
+</div>
+
+<div class="note">
+<strong>The <code>extra_request_headers</code> field is not gated by <code>--all</code>.</strong>
+Resolved header values — for example a client's per-conversation session identifier — are
+recorded on every request for a provider that has rules. If you configure such a rule, assume
+that identifier is in the trace log.
+</div>
+
+<!-- Owns the pruning fact: retention window, best-effort behaviour, malformed-line handling.
+     operations.html links here. -->
+<h2 id="prune">Pruning</h2>
+
+<p>Each <code>claude-retry-proxy start</code> removes entries older than <strong>5 days</strong>
+before launching the server. There is no separate rotation or size cap.</p>
+
+<p>Pruning is best-effort and never blocks startup: a log locked by another process is left
+alone rather than failing the start. Entries are matched by their timestamp; a line the parser
+cannot read is left alone rather than discarded, so a malformed line persists until it ages out
+by whatever other means you apply.</p>
+
+<h2 id="analysis">Analysis</h2>
+
+<p><code>scripts/analyze_proxy_trace.py</code> aggregates the log per model:</p>
+
+<table>
+<tr><th>Metric</th><th>Meaning</th></tr>
+<tr><td>Request count</td><td>Entries in the window</td></tr>
+<tr><td>Average retries</td><td>Retries per request</td></tr>
+<tr><td>Query success rate</td><td>Success treating all retries of one request as a single query</td></tr>
+<tr><td>Attempt success rate</td><td>Success counted per upstream attempt</td></tr>
+<tr><td>Geometric-mean TTFT</td><td>Time to first byte, geometric mean</td></tr>
+<tr><td>Geometric-mean latency</td><td>Total latency, geometric mean</td></tr>
+</table>
+
+<p>Two filters keep an outage from dominating the averages: requests with a latency above 30
+minutes, and requests at maximum retries that also failed — the signature of a complete upstream
+outage rather than normal operation.</p>
+
+<pre><code>python scripts/analyze_proxy_trace.py --days 3
+python scripts/analyze_proxy_trace.py --days 7 --trace-file /path/to/proxy-trace.jsonl</code></pre>
+
+<p><code>--days</code> defaults to 3. The geometric mean is used rather than the arithmetic mean
+because latency distributions are heavily right-skewed: a handful of slow requests would
+otherwise move the average far away from anything a user experiences.</p>
+
+<h2 id="sinks">When writes fail</h2>
+
+<p>The trace file is written by a guarded sink that never raises. A failing sink reports the
+first failure of an episode on stderr immediately, then at most once per 60 seconds while the
+episode continues, and emits a <code>resumed after N failed write(s)</code> line when writing
+succeeds again.</p>
+
+<div class="warn">
+<strong>Entries written during an outage are lost, not buffered.</strong> There is no queue and
+no replay. The count in the <code>resumed</code> line is the only record of how many entries
+were dropped — if you need to know what happened during a gap, that number is the whole story.
+<p>The failure mode is also the noisiest thing you can do to this log: an unwritable trace
+directory means every request loses its entry until the condition is fixed. See
+<a href="architecture.html#sinks">architecture.html</a> for the full policy.</p>
+</div>
+
+<footer>Last updated: 2026-09-12</footer>
+</body>
+</html>

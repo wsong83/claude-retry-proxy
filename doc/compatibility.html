@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Compatibility Learner — claude-retry-proxy</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<h1>Compatibility Learner<span class="sub">How the proxy learns which upstream rejects <code>context_management</code></span></h1>
+
+<p><strong>Last updated:</strong> 2026-09-12</p>
+
+<p>Third-party providers that speak the Anthropic wire format do not always implement every
+field. One field is common enough to be worth handling automatically:
+<code>context_management</code>. Rather than requiring you to configure a per-provider
+workaround, the proxy <em>discovers</em> which upstreams reject it, strips it from subsequent
+requests, and periodically re-tests whether the upstream has started supporting it.</p>
+
+<p>This page documents that state machine. It is the most behaviourally intricate part of the
+proxy, and it is the one place where the proxy's behaviour changes over time without
+configuration.</p>
+
+<div class="note">
+<strong>Scope.</strong> The learner applies to <code>anthropic</code>-mode providers only.
+Chat and response modes never run it. <code>count_tokens</code> requests are excluded, and so
+are compatibility retries themselves. See
+<a href="provider-modes.html#compat-retry">provider-modes.html</a>.
+</div>
+
+<h2 id="constants">Policy constants</h2>
+
+<p>These are maintainer-tunable and have no user-facing configuration surface. They live at the
+top of the compatibility section of <code>src/claude_retry_proxy/server.py</code>.</p>
+
+<table>
+<tr><th>Constant</th><th class="num">Value</th><th>Meaning</th></tr>
+<tr><td><code>COMPAT_INITIAL_THRESHOLD</code></td><td class="num">32</td>
+    <td>Strips before the first revalidation probe</td></tr>
+<tr><td><code>COMPAT_PROBATION_THRESHOLD</code></td><td class="num">8</td>
+    <td>Strips between probes while in the probation state</td></tr>
+<tr><td><code>COMPAT_BACKOFF_MULTIPLIER</code></td><td class="num">2</td>
+    <td>Factor by which the threshold doubles after a repeated rejection</td></tr>
+<tr><td><code>COMPAT_MAX_THRESHOLD</code></td><td class="num">4096</td>
+    <td>Ceiling on the threshold</td></tr>
+<tr><td><code>COMPAT_DELISTING_SUCCESSES</code></td><td class="num">2</td>
+    <td>Consecutive probe successes required to delist</td></tr>
+<tr><td><code>COMPAT_MAX_RETRIES_PER_REQUEST</code></td><td class="num">1</td>
+    <td>Compatibility retries per client request</td></tr>
+<tr><td><code>COMPAT_FAILED_CONFIRMATION_SUPPRESSION</code></td><td class="num">3</td>
+    <td>Failed confirmations before the key is suppressed</td></tr>
+</table>
+
+<p>Startup validates the relationships between these rather than trusting them. Each violation
+prints a warning on stderr and <strong>clamps</strong> the value — it does not refuse to start:
+<code>COMPAT_BACKOFF_MULTIPLIER</code> is raised to at least 2,
+<code>COMPAT_DELISTING_SUCCESSES</code> to at least 2, and
+<code>COMPAT_INITIAL_THRESHOLD</code> is lowered to <code>COMPAT_MAX_THRESHOLD</code> if it
+exceeds it.</p>
+
+<p>Three further constants describe the feature and the persisted schema:
+<code>COMPAT_FEATURE</code> is <code>"context_management"</code>,
+<code>COMPAT_FEATURE_MODE</code> is <code>"anthropic"</code>, and
+<code>COMPAT_SCHEMA_VERSION</code> is <code>1</code>.</p>
+
+<h2 id="scope-and-state">Scope and states</h2>
+
+<p>Learned state is keyed by the tuple <code>(provider, mode, actual_model, feature)</code>. The
+<em>model</em> is part of the key, so two tiers pointing at the same provider but different
+models learn independently — which matters, because a provider may proxy several backends with
+different capabilities.</p>
+
+<p>There are exactly <strong>two</strong> states:</p>
+
+<table>
+<tr><th>State</th><th>Meaning</th></tr>
+<tr><td><code>unsupported</code></td><td>The upstream rejected the feature; strip it pre-emptively</td></tr>
+<tr><td><code>probation</code></td><td>The upstream accepted a probe; strip, but re-test sooner</td></tr>
+</table>
+
+<div class="warn">
+<strong>"Delisted" is an event, not a state.</strong> When an entry is delisted it is
+<em>removed</em> from the state dictionary entirely — the proxy reverts to sending the field and
+learning from scratch if it is rejected again. There is no third "supported" state, and
+consequently no persisted record that a provider was ever known to be fine.
+</div>
+
+<h2 id="transitions">Transitions</h2>
+
+<div class="state-diagram">
+<strong>learn</strong> — stripped retry succeeded, or a matching 400 was confirmed<br>
+↓<br>
+<code>unsupported</code> &nbsp;&nbsp;threshold = 32<br>
+↓ &nbsp;<span class="optional">32 strips</span><br>
+<strong>probe</strong> — send the request <em>unstripped</em><br>
+↓<br>
+2xx → <code>probation</code> &nbsp;·&nbsp; matching 400 → back to <code>unsupported</code>, threshold ×2 &nbsp;·&nbsp; anything else → inconclusive<br>
+↓ &nbsp;<span class="optional">8 strips while in probation</span><br>
+<strong>probe again</strong> &nbsp;·&nbsp; two consecutive successes → <strong>delist</strong>
+</div>
+
+<h3 id="learn">Learning</h3>
+
+<p>An entry is created when a request carrying the feature is rejected with a recognised
+<code>400</code> and a single stripped retry then succeeds. The new entry starts in
+<code>unsupported</code> with <code>threshold = COMPAT_INITIAL_THRESHOLD</code> (32) and all
+counters at zero. Learning also clears the failed-confirmation counter for the key.</p>
+
+<h3 id="stripping">Stripping and the effective threshold</h3>
+
+<p>Each request carrying the feature for an already-known key increments a strip counter. The
+counter is compared against an <em>effective</em> threshold that depends on state:</p>
+
+<table>
+<tr><th>State</th><th>Effective threshold</th></tr>
+<tr><td><code>unsupported</code></td><td>the entry's own <code>threshold</code></td></tr>
+<tr><td><code>probation</code></td><td><code>COMPAT_PROBATION_THRESHOLD</code> — always 8</td></tr>
+</table>
+
+<p>So a provider that has shown signs of supporting the feature is re-tested four times more
+often than one that has never accepted it.</p>
+
+<h3 id="probe">Probing</h3>
+
+<p>A probe is a request sent <em>without</em> stripping. Only one probe may be in flight at a time
+<em>across the whole proxy</em> — the throttle is a single lock, not one per key — and it is
+acquired non-blockingly. If it is unavailable, which is the common case under concurrency, the
+request strips instead of probing and does not disturb the state machine. The strip counter resets
+to zero when a probe starts, so strips that occur concurrently with an in-flight probe count toward
+the <em>next</em> threshold rather than the current one.</p>
+
+<p>The proxy-wide scope has a fairness consequence worth knowing: a slow probe for one provider
+holds the lock for the duration of its upstream call, so threshold-reaching for <em>every</em> other
+provider and model is delayed until it completes. Those requests strip rather than probe, so none of
+them loses state — they simply wait their turn to be re-tested.</p>
+
+<p>The probe's response is interpreted in three ways:</p>
+
+<table>
+<tr><th>Probe result</th><th>Effect</th></tr>
+<tr><td><strong>2xx</strong></td>
+    <td>Increments the success count and resets the strip counter. At
+        <code>COMPAT_DELISTING_SUCCESSES</code> (2) the entry is <strong>removed</strong>;
+        below that the entry moves to (or stays in) <code>probation</code>.</td></tr>
+<tr><td><strong>matching 400</strong></td>
+    <td>Resets the success count, returns the entry to <code>unsupported</code>, resets the
+        strip counter, and <strong>doubles</strong> the threshold — capped at 4096. The client
+        still gets a working response: the proxy immediately retries once with the stripped
+        body.</td></tr>
+<tr><td><strong>anything else</strong></td>
+    <td>Inconclusive. State and success count are left unchanged; only the strip counter is
+        cleared. No evidence is inferred from an ambiguous result.</td></tr>
+</table>
+
+<p>The doubling ladder is what stops a permanently-incompatible provider from being re-tested
+forever: 32 → 64 → 128 → … → 4096, after which probes become rare enough to be free in
+practice.</p>
+
+<div class="note">
+<strong>What counts as a "matching 400".</strong> The proxy recognises two specific shapes, and
+deliberately not a general one. One is a message-form match anchored so the feature token must
+appear at the start of the message or immediately after <code>": "</code> or <code>"] "</code> —
+which means a dotted path such as <code>tools.0.context_management</code> never matches. The
+other is a structured validation error whose location ends at the feature at top level, and is
+not a nested path. A <code>400</code> that does not match is treated as a client error and is
+not learned from.
+<p>Upstream error text is only ever <em>matched</em> against these patterns — it is never copied
+into state keys, strip logic, or trace events.</p>
+</div>
+
+<h2 id="suppression">Suppression</h2>
+
+<p>A key whose rejection keeps failing to be confirmed is eventually left alone. This branch has
+no configuration surface and is easy to miss when reasoning about why a provider stopped being
+probed.</p>
+
+<ul>
+  <li>Each time a stripped retry <em>also</em> fails to confirm the learned state, a
+      failed-confirmation counter for that key increments.</li>
+  <li>At <strong>3</strong> (<code>COMPAT_FAILED_CONFIRMATION_SUPPRESSION</code>) the key is
+      <strong>suppressed</strong>: the learner stops probing it.</li>
+  <li>A request that arrives while suppressed is counted and skipped, and a
+      <code>compatibility_failed_confirmation_suppressed</code> event is recorded.</li>
+  <li>After <strong>32</strong> suppressed requests — the same value as
+      <code>COMPAT_INITIAL_THRESHOLD</code> — the counter is cleared and the key re-enters
+      discovery.</li>
+</ul>
+
+<p>The effect is a slow retry: a provider that cannot be reasoned about is dropped from active
+probing, then quietly re-examined after enough traffic has passed. The 32-request reset is
+counted per key, so a rarely-used model re-enters discovery very slowly.</p>
+
+<h2 id="persistence">Persistence</h2>
+
+<p>Learned state is written to <code>~/.claude/proxy/feature-compatibility.json</code>
+(overridable with <code>PROXY_FEATURE_COMPAT_FILE</code>). Writes are atomic: a temporary file
+is written and then renamed into place, so a crash mid-write cannot leave a truncated state
+file.</p>
+
+<table>
+<tr><th>Field</th><th>Meaning</th></tr>
+<tr><td><code>schema_version</code></td><td>Currently <code>1</code></td></tr>
+<tr><td><code>provider</code>, <code>mode</code>, <code>actual_model</code>, <code>feature</code></td>
+    <td>The key, serialised with a <code>\x1f</code> (unit separator) delimiter so a value
+        containing an ordinary separator cannot forge a collision</td></tr>
+<tr><td><code>state</code></td><td><code>unsupported</code> or <code>probation</code></td></tr>
+<tr><td><code>threshold</code></td><td>The entry's current strip threshold</td></tr>
+<tr><td><code>strip_counter</code>, <code>probation_successes</code></td>
+    <td>Progress counters</td></tr>
+</table>
+
+<p>On load, the threshold is <em>snapped</em> onto the doubling ladder rather than trusted, so a
+hand-edited or corrupted value cannot produce an off-ladder threshold. Entries that fail
+validation are dropped individually with a redacted warning — one bad entry does not discard the
+file.</p>
+
+<div class="warn">
+<strong>Counters reset to zero on load, by design.</strong> A restart forgets how many strips a
+provider has accumulated and how many probe successes it had. The direction of the resulting
+error is deliberate: the proxy will <em>over-strip</em> (harmless — the upstream simply never
+sees a field it did not want) rather than <em>under-strip</em> (which would surface as repeated
+client-visible failures). A restart therefore cannot delist a provider; it can only delay one.
+<p>If the state file is unreadable or malformed, the proxy <strong>fails open</strong> with empty
+state and a warning. It does not refuse to start.</p>
+</div>
+
+<div class="note">
+<strong>A vestigial field.</strong> Each persisted entry also carries a
+<code>failed_confirmations</code> field. It is validated on load and always written as
+<code>0</code> — no code path ever increments it. The counter that actually drives suppression
+lives in a separate in-memory map and is never persisted. Treat the on-disk value as
+informational only; it is not a live count. (Tracked as a deferred issue.)
+</div>
+
+<h2 id="events">Trace events</h2>
+
+<p>All ten events below are emitted by the learner. They are metadata-only: none carries request
+or response content.</p>
+
+<table>
+<tr><th>Event</th><th>Fires when</th></tr>
+<tr><td><code>compatibility_learned</code></td><td>a new entry is created</td></tr>
+<tr><td><code>compatibility_field_stripped</code></td><td>the feature was removed from an outbound request</td></tr>
+<tr><td><code>compatibility_probe_started</code></td><td>a probe was scheduled and the lock acquired</td></tr>
+<tr><td><code>compatibility_probe_succeeded</code></td><td>a probe returned 2xx; carries <code>probation_successes</code></td></tr>
+<tr><td><code>compatibility_delisted</code></td><td>the final required success was reached and the entry was removed</td></tr>
+<tr><td><code>compatibility_probe_rejected</code></td><td>a probe was rejected; carries the doubled <code>threshold</code></td></tr>
+<tr><td><code>compatibility_probe_inconclusive</code></td><td>a probe returned neither 2xx nor a matching 400</td></tr>
+<tr><td><code>compatibility_rejection_detected</code></td><td>a recognised 400 was seen in the normal (non-probe) path</td></tr>
+<tr><td><code>compatibility_failed_confirmation_suppressed</code></td><td>a request was skipped because the key is suppressed</td></tr>
+<tr><td><code>compatibility_persist_failed</code></td><td>writing the state file failed; rate-limited to once per key per 60 s</td></tr>
+</table>
+
+<p>The full trace schema, including the fields common to every entry, is in
+<a href="trace-log.html">trace-log.html</a>.</p>
+
+<footer>Last updated: 2026-09-12</footer>
+</body>
+</html>

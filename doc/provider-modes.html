@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Provider Modes — claude-retry-proxy</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<h1>Provider Modes<span class="sub">anthropic, chat, and response — and what each one rewrites</span></h1>
+
+<p><strong>Last updated:</strong> 2026-09-12</p>
+
+<p>The proxy speaks Anthropic Messages to its clients. What it speaks <em>upstream</em> is
+configurable per provider, because not every provider implements the Anthropic API. A
+provider's <code>mode</code> decides the auth header, the upstream path, and how request and
+response bodies are translated.</p>
+
+<table>
+<tr><th>Mode</th><th>Upstream API</th><th>Path</th><th>Auth header</th></tr>
+<tr>
+  <td><span class="badge badge-anthropic">anthropic</span></td>
+  <td>Anthropic Messages</td>
+  <td>the request's own path, unchanged</td>
+  <td><code>x-api-key</code></td>
+</tr>
+<tr>
+  <td><span class="badge badge-chat">chat</span></td>
+  <td>OpenAI Chat Completions</td>
+  <td><code>/v1/chat/completions</code></td>
+  <td><code>Authorization: Bearer</code></td>
+</tr>
+<tr>
+  <td><span class="badge badge-response">response</span></td>
+  <td>OpenAI Responses</td>
+  <td><code>/v1/responses</code></td>
+  <td><code>Authorization: Bearer</code></td>
+</tr>
+</table>
+
+<p><code>anthropic</code> is the default: a provider entry with no <code>mode</code> field, or
+one whose value is empty, is treated as <code>anthropic</code>. Any other value draws a warning on
+stderr at startup — the proxy still starts — and requests through that provider then fail with
+<code>500 invalid_provider_mode</code>. Because startup does not refuse, a bad mode is not caught
+until the first request reaches that provider.</p>
+
+<div class="note">
+<strong>Why this exists.</strong> Tier routing already lets you send a tier to a different
+provider. Modes are what let that provider be one that does not speak Anthropic at all —
+a self-hosted model, an OpenAI-compatible gateway, or a provider with an Anthropic-shaped
+surface but a different backend. The transforms are necessarily lossy in places; where they
+are, the proxy degrades visibly rather than silently (see
+<a href="#degradation">Degradation</a>).
+</div>
+
+<h2 id="auth">Authentication and forwarded headers</h2>
+
+<p>The proxy is the only holder of the upstream credential. It never forwards the client's.</p>
+
+<ul>
+  <li>The client's <code>authorization</code> and <code>x-api-key</code> headers are
+      <strong>discarded</strong>, unconditionally, in every mode.</li>
+  <li>The provider's credential is injected per mode: <code>x-api-key: &lt;key&gt;</code> for
+      <code>anthropic</code>, <code>Authorization: Bearer &lt;key&gt;</code> for
+      <code>chat</code> and <code>response</code>.</li>
+  <li>Only an allowlist of client headers is forwarded at all:
+      <code>content-type</code>, <code>anthropic-version</code>, <code>accept</code>,
+      <code>anthropic-beta</code>, and <code>user-agent</code>. Everything else the client
+      sent is dropped.</li>
+</ul>
+
+<p>Config-driven extra headers are applied <em>after</em> key injection and outside the retry
+loop, so an injected credential cannot be overwritten and a resolved header value stays stable
+across retries of the same request. See
+<a href="configuration.html#extra-headers">configuration.html</a>.</p>
+
+<h2 id="paths">Upstream paths</h2>
+
+<p>Anthropic mode forwards the request's own path, prefixed by whatever the provider's base URL
+contributes. The OpenAI-shaped modes ignore the incoming path entirely and substitute their
+own endpoint.</p>
+
+<table>
+<tr><th>Mode</th><th>Resulting upstream path</th></tr>
+<tr><td><code>anthropic</code></td><td><code>&lt;path_prefix&gt;</code> + <code>&lt;incoming path&gt;</code></td></tr>
+<tr><td><code>chat</code></td><td><code>&lt;path_prefix&gt;</code><em> (trailing <code>/v1</code> removed)</em> + <code>/v1/chat/completions</code></td></tr>
+<tr><td><code>response</code></td><td><code>&lt;path_prefix&gt;</code><em> (trailing <code>/v1</code> removed)</em> + <code>/v1/responses</code></td></tr>
+</table>
+
+<p>The trailing-<code>/v1</code> removal is what stops a base URL that already ends in
+<code>/v1</code> from producing a doubled <code>/v1/v1/…</code> prefix — the common case, since
+most OpenAI-compatible base URLs are documented with the <code>/v1</code> included.</p>
+
+<div class="warn">
+<strong><code>count_tokens</code> is rejected in <code>chat</code> and <code>response</code>
+mode</strong> with a <code>400</code>. The endpoint has no OpenAI equivalent, so there is
+nothing to translate it into. The check is tolerant of a trailing slash and a query string.
+Related: retrying <code>count_tokens</code> can be disabled separately — see
+<a href="configuration.html#count-tokens-flag">configuration.html</a>.
+</div>
+
+<h2 id="request-transforms">Request transforms</h2>
+
+<p>The outbound body is built <strong>once</strong>, before the retry loop, and is never
+rebuilt on a retry. A retry re-sends bytes; it does not re-transform them. The one exception
+is the compatibility retry described in <a href="#compat-retry">Compatibility retry</a>.</p>
+
+<ul>
+  <li><span class="badge badge-anthropic">anthropic</span> — the bare minimum: the
+      <code>model</code> field is replaced with the provider's configured model name and
+      everything else is passed through.</li>
+  <li><span class="badge badge-chat">chat</span> — the full
+      Anthropic&nbsp;→&nbsp;Chat&nbsp;Completions transform
+      (<a href="#chat-request">details</a>).</li>
+  <li><span class="badge badge-response">response</span> — the full
+      Anthropic&nbsp;→&nbsp;Responses transform
+      (<a href="#response-request">details</a>).</li>
+</ul>
+
+<p>If a transform raises, the proxy falls back to sending the original body unchanged and
+records a <code>transform_failure</code> event — so a transform bug degrades to
+"upstream sees Anthropic-shaped JSON" rather than dropping the request. See
+<a href="#failures">Transform failures</a>.</p>
+
+<h3 id="chat-request">Chat mode — request details</h3>
+
+<table>
+<tr><th>Anthropic input</th><th>Becomes</th></tr>
+<tr><td><code>thinking</code> blocks</td><td><code>reasoning_content</code> on the assistant message</td></tr>
+<tr><td><code>redacted_thinking</code> with non-empty <code>data</code></td><td>a placeholder <code>reasoning_content</code>, plus a <code>redacted_thinking_passthrough</code> event</td></tr>
+<tr><td><code>image</code> and unknown blocks</td><td><strong>stripped</strong></td></tr>
+<tr><td><code>tool_use</code></td><td><code>tool_calls</code>, with the input dict-validated</td></tr>
+<tr><td><code>tool_result</code></td><td>a <code>role: "tool"</code> message, paired by <code>tool_use_id</code></td></tr>
+<tr><td><code>cache_control</code> on kept blocks</td><td>stripped; one coalesced <code>cache_control_stripped</code> event per request</td></tr>
+<tr><td>tool definitions</td><td>function tools — <code>input_schema</code> → <code>parameters</code></td></tr>
+</table>
+
+<p>Dropped at the request level entirely, with no equivalent downstream: <code>thinking</code>,
+<code>metadata</code>, and <code>top_k</code>.</p>
+
+<p><code>tool_choice</code> maps as follows. An unmappable shape is omitted rather than
+guessed:</p>
+
+<table>
+<tr><th>Anthropic</th><th>OpenAI Chat</th></tr>
+<tr><td><code>{"type": "none"}</code></td><td><code>"none"</code></td></tr>
+<tr><td><code>{"type": "auto"}</code></td><td><code>"auto"</code></td></tr>
+<tr><td><code>{"type": "any"}</code></td><td><code>"required"</code></td></tr>
+<tr><td><code>{"type": "tool", "name": "X"}</code></td><td><code>{"type": "function", "function": {"name": "X"}}</code></td></tr>
+</table>
+
+<h3 id="response-request">Response mode — request details</h3>
+
+<p>Response mode is <strong>buffered only</strong>: <code>stream</code> is forced to
+<code>false</code> on the outgoing request. There is no streaming path — see
+<a href="#streaming">Streaming</a> for what happens if the provider streams anyway.</p>
+
+<p>The full conversation history is converted, in order, into Responses input items:</p>
+
+<table>
+<tr><th>Anthropic input</th><th>Becomes</th></tr>
+<tr><td>text, in a user / system / developer role</td><td>a <code>message</code> item with <code>input_text</code></td></tr>
+<tr><td>text, in a historical assistant turn</td><td>a <code>message</code> item with <code>output_text</code></td></tr>
+<tr><td><code>tool_use</code> with valid arguments</td><td>a <code>function_call</code></td></tr>
+<tr><td><code>tool_result</code></td><td>a <code>function_call_output</code> — <strong>only</strong> when its
+    <code>tool_use_id</code> matches a call that was actually emitted</td></tr>
+<tr><td>tool definitions</td><td>flat Responses function tools
+    (<code>type</code>, <code>name</code>, <code>description</code>, <code>parameters</code>)</td></tr>
+</table>
+
+<p>The <code>tool_result</code> rule is an ordering constraint, not a formatting one: a result
+whose matching call was never emitted is dropped, because a dangling
+<code>function_call_output</code> is an upstream error rather than a recoverable one.
+<code>tool_choice</code> is likewise mapped only against tool names that were actually
+emitted.</p>
+
+<h2 id="response-rewrite">Response rewriting</h2>
+
+<p>On success, the model name the provider returns is replaced with the <strong>tier</strong>
+name the client asked for, so a client tracking its own model selection sees what it sent
+rather than the provider's internal id.</p>
+
+<table>
+<tr><th>Mode</th><th>Content-Type</th><th>Mechanism</th></tr>
+<tr>
+  <td><span class="badge badge-anthropic">anthropic</span></td>
+  <td><code>application/json</code></td>
+  <td>Parse, replace <code>model</code>, re-serialise</td>
+</tr>
+<tr>
+  <td><span class="badge badge-anthropic">anthropic</span></td>
+  <td><code>text/event-stream</code></td>
+  <td>Buffer the first event (64 KB cap), rewrite <code>model</code> inside
+      <code>message_start</code>, then forward that and every later event unchanged</td>
+</tr>
+<tr>
+  <td><span class="badge badge-chat">chat</span> / <span class="badge badge-response">response</span></td>
+  <td>any</td>
+  <td>Full body transform — the rewrite falls out of the translation</td>
+</tr>
+<tr>
+  <td>any</td>
+  <td>anything else</td>
+  <td>Passed through untouched</td>
+</tr>
+</table>
+
+<p>Content-Type is checked <em>first</em>, before any buffering or parsing, so an unexpected
+content type is never parsed speculatively.</p>
+
+<div class="warn">
+<strong>Error responses are not translated between formats.</strong> Chat and response modes pass a
+non-2xx response through byte-for-byte, so the client sees the provider's own error shape and
+wording. Anthropic mode is the one exception: it still applies its JSON model rewrite when an error
+body carries a top-level <code>model</code> field, so those bytes — and the model name reported in
+them — can change even on an error path. Not translating is deliberate: a translated error is
+harder to act on than an upstream one, and the proxy cannot know which error fields matter to the
+caller. It is also why the <a href="architecture.html#give-up">give-up path</a> can promise the
+upstream's original body.
+</div>
+
+<h3 id="chat-response">Chat mode — response details</h3>
+
+<p>An OpenAI Chat Completions body is converted back into Anthropic Messages. A
+<code>reasoning_content</code> field — or <code>reasoning</code>, which vLLM uses — becomes a
+<code>thinking</code> content block with an empty <code>signature</code>, inserted
+<strong>first</strong> in the content array, ahead of any text or tool-use blocks.</p>
+
+<p><code>finish_reason</code> maps to <code>stop_reason</code>:</p>
+
+<table>
+<tr><th>OpenAI <code>finish_reason</code></th><th>Anthropic <code>stop_reason</code></th></tr>
+<tr><td><code>stop</code></td><td><code>end_turn</code></td></tr>
+<tr><td><code>length</code></td><td><code>max_tokens</code></td></tr>
+<tr><td><code>tool_calls</code></td><td><code>tool_use</code></td></tr>
+<tr><td>anything else</td><td><code>null</code></td></tr>
+</table>
+
+<h3 id="response-mode-response">Response mode — response details</h3>
+
+<p>Every output item is inspected in order. <code>message</code> /
+<code>output_text</code> items become text blocks; <code>function_call</code> items become
+<code>tool_use</code> blocks, with arguments validated strictly (a dict is accepted, and
+<code>{}</code> is valid for a zero-argument tool).</p>
+
+<p><code>stop_reason</code> follows from what was actually emitted, which matters because the
+client uses it to decide whether to wait for a tool result:</p>
+
+<table>
+<tr><th>Situation</th><th><code>stop_reason</code></th></tr>
+<tr><td>At least one valid function call was emitted</td><td><code>"tool_use"</code></td></tr>
+<tr><td>Calls were present but <em>all</em> degraded</td><td><code>null</code></td></tr>
+<tr><td>Completed without calls</td><td><code>"end_turn"</code></td></tr>
+<tr><td>Any other status</td><td><code>null</code></td></tr>
+</table>
+
+<p>The middle row is the important one: reporting <code>"tool_use"</code> with zero usable
+tool blocks would leave the client waiting for a result that can never arrive.</p>
+
+<h2 id="streaming">Streaming</h2>
+
+<p>Only the Anthropic-shaped path is a true stream. The other two modes differ sharply.</p>
+
+<table>
+<tr><th>Mode</th><th>Streaming behaviour</th></tr>
+<tr>
+  <td><span class="badge badge-anthropic">anthropic</span></td>
+  <td>Upstream SSE is forwarded to the client, with the first <code>message_start</code> event's
+      <code>model</code> rewritten in place.</td>
+</tr>
+<tr>
+  <td><span class="badge badge-chat">chat</span></td>
+  <td>Upstream OpenAI SSE is <strong>synthesised</strong> into Anthropic SSE frame by frame.
+      This is a real streaming path — see below.</td>
+</tr>
+<tr>
+  <td><span class="badge badge-response">response</span></td>
+  <td><code>stream: false</code> is forced, so the normal path is a buffered JSON response.
+      If a provider streams anyway, the stream is drained and a clean empty Anthropic terminal
+      sequence is synthesised, with a <code>response_sse_unexpected</code> event. Raw OpenAI
+      SSE is never leaked to the client.</td>
+</tr>
+</table>
+
+<h3 id="chat-sse">Chat mode SSE synthesis</h3>
+
+<p>The converter assembles upstream frames on the <code>\n\n</code> delimiter (CRLF-normalised)
+and never splits mid-frame. <code>[DONE]</code> sentinels and non-<code>data</code> frames are
+skipped.</p>
+
+<p>Two details shape the output:</p>
+
+<ul>
+  <li><strong>The first <code>content_block_start</code> is deferred</strong> until the first
+      delta's type is known. A <code>reasoning_content</code> / <code>reasoning</code> delta
+      opens a thinking block at index 0; a content delta opens a text block. Opening the block
+      eagerly would mean guessing, and guessing wrong would mis-number every later block.</li>
+  <li><strong>Terminal events are emitted exactly once</strong> — on the
+      <code>finish_reason</code> chunk, or synthesised at EOF or on truncation. An Anthropic
+      client that never receives <code>message_stop</code> hangs, so the synthesis is
+      unconditional.</li>
+</ul>
+
+<p>Anthropic block indices come from a single monotonic allocator that is incremented only on
+<code>content_block_start</code> and never on close, which keeps indices contiguous even when
+tool blocks and text blocks interleave.</p>
+
+<h2 id="tool-calls">Tool calls</h2>
+
+<p>Tool-call translation is the most fragile part of every mode, because it is the only place
+where the proxy must <em>parse</em> model output it did not generate. Arguments arrive as a
+JSON <em>string</em> the model wrote, and models write invalid JSON.</p>
+
+<h3 id="sse-tool-bounds">Chat SSE tool-call bounds</h3>
+
+<p>Streaming tool calls arrive as fragments spread across many deltas, so the converter
+accumulates per-index state. Three bounds keep a misbehaving upstream from exhausting memory:</p>
+
+<table>
+<tr><th>Bound</th><th class="num">Value</th><th>Applies to</th></tr>
+<tr><td><code>MAX_CHAT_TOOL_PENDING_BYTES</code></td><td class="num">64 KiB</td><td>buffered argument fragments per tool call</td></tr>
+<tr><td><code>MAX_CHAT_TRACKED_TOOL_INDEXES</code></td><td class="num">32</td><td>distinct tool-call indices tracked at once</td></tr>
+<tr><td><code>MAX_CHAT_OPEN_TOOL_BLOCKS</code></td><td class="num">32</td><td>Anthropic tool blocks left open simultaneously</td></tr>
+</table>
+
+<p>Overflow in any of these does not error the stream. The affected tool call degrades, the
+rest of the stream continues, and the stream is reported once via a single bounded,
+metadata-only <code>chat_sse_tool_degradation</code> event. That event deliberately carries no
+tool names, ids, or arguments — only counts — so a degraded stream does not write model output
+into the trace log.</p>
+
+<h3 id="malformed-args">Malformed arguments</h3>
+
+<p>When tool-call arguments cannot be parsed as a JSON dict — a parse error, a non-dict result,
+an empty dict, a non-dict <code>function</code> value, or a non-dict tool-call entry — the proxy
+does <strong>not</strong> emit a <code>tool_use</code> block with empty input. Silently
+substituting <code>{}</code> would make a broken call look like a deliberate zero-argument call
+and could execute the wrong operation.</p>
+
+<p>Instead it emits a visible text block naming the tool and call id, so the failure is
+legible in the transcript rather than invisible:</p>
+
+<pre><code>[Tool call failed: arguments for '&lt;name&gt;' (call &lt;id&gt;) could not be parsed as JSON]</code></pre>
+
+<p>A <code>tool_args_parse_failure</code> trace event is recorded alongside it.</p>
+
+<div class="error">
+<strong>When every tool call in a response is malformed, <code>stop_reason</code> is forced to
+<code>null</code>.</strong> This is the same hazard as the Responses-mode all-degraded case: a
+client seeing <code>stop_reason: "tool_use"</code> with zero <code>tool_use</code> blocks waits
+for a tool result that will never come, and hangs until it times out. Forcing
+<code>null</code> lets the client stop waiting and surface the placeholder text instead.
+</div>
+
+<p>The <em>request</em> direction has the same problem in reverse: an
+<code>input</code> that is <code>NaN</code>, <code>Infinity</code>, or otherwise not
+<code>json.dumps</code>-serialisable cannot be sent. Those emit a placeholder reading
+<code>… could not be serialized as JSON</code> and a <code>tool_args_parse_failure</code>
+event. When a failed <code>tool_use</code> sits alongside valid ones in the same assistant
+message, the placeholder is emitted as a separate assistant message placed <em>before</em> the
+message carrying the <code>tool_calls</code>, so the ordering the upstream expects is preserved.</p>
+
+<h2 id="degradation">Degradation and trace events</h2>
+
+<p>Every lossy step in the transforms reports itself. None of them fail the request.</p>
+
+<table>
+<tr><th>Event</th><th>Fires when</th></tr>
+<tr><td><code>mode_dispatch</code></td><td>a non-anthropic mode handles a request</td></tr>
+<tr><td><code>transform_failure</code></td><td>a transform raised; the original body was used instead</td></tr>
+<tr><td><code>cache_control_stripped</code></td><td><code>cache_control</code> was removed from blocks (coalesced per request)</td></tr>
+<tr><td><code>redacted_thinking_passthrough</code></td><td>a <code>redacted_thinking</code> block became a placeholder</td></tr>
+<tr><td><code>content_block_dropped</code></td><td>an unrepresentable content block was removed</td></tr>
+<tr><td><code>tool_args_parse_failure</code></td><td>tool arguments could not be parsed or serialised</td></tr>
+<tr><td><code>chat_sse_tool_degradation</code></td><td>one or more streaming tool calls degraded (metadata only, once per stream)</td></tr>
+<tr><td><code>response_sse_unexpected</code></td><td>a response-mode provider streamed despite <code>stream: false</code></td></tr>
+<tr><td><code>chat_sse_truncated</code>, <code>chat_sse_malformed_json</code>, <code>chat_sse_frame_cap_exceeded</code>, <code>chat_sse_buffer_cap_exceeded</code>, <code>sse_buffer_cap_exceeded</code>, <code>sse_rewrite_malformed_json</code></td><td>an SSE frame was truncated, malformed, or exceeded a buffer bound</td></tr>
+</table>
+
+<p>Full field lists and the complete event inventory live in
+<a href="trace-log.html">trace-log.html</a>.</p>
+
+<h2 id="failures">Transform failures</h2>
+
+<p>Both response transforms run inside a guard that treats a failed transform as "pass the
+original bytes through" rather than as an error. Crucially, the JSON parse happens
+<em>inside</em> that guard, so a body that is not JSON at all takes the same path as one that
+parses into an unexpected shape.</p>
+
+<p>A <code>transform_failure</code> event is recorded — metadata only, never body content. The
+client receives the upstream's untransformed body. The trade is deliberate: for a
+<code>chat</code>-mode provider this means the client gets OpenAI-shaped JSON it may not
+understand, which is worse to debug than an Anthropic-shaped error but strictly better than a
+dropped response.</p>
+
+<h2 id="compat-retry">Compatibility retry</h2>
+
+<p>Anthropic mode has one extra behaviour layered over the retry loop. A single learnable
+feature (<code>context_management</code>) can be stripped from a request after an upstream
+rejects it, and the result learned per <code>(provider, mode, model)</code> so later requests
+strip it pre-emptively.</p>
+
+<p>For this page, the relevant properties are:</p>
+
+<ul>
+  <li>It applies to <code>anthropic</code> mode only. Chat and response modes never run it.</li>
+  <li><code>count_tokens</code> is excluded.</li>
+  <li>The compatibility retry is a <strong>single</strong> upstream attempt. The stripped variant
+      is derived from the original client body with the feature field removed, and is re-sent
+      through the normal forward path — one upstream attempt, but a fresh transform pass.</li>
+  <li>It runs under a single proxy-wide lock that allows at most one probe at a time; a request
+      that cannot take the lock strips rather than probes.</li>
+</ul>
+
+<p>The state machine, the probe ladder, and the suppression rules are documented in
+<a href="compatibility.html">compatibility.html</a>.</p>
+
+<footer>Last updated: 2026-09-12</footer>
+</body>
+</html>

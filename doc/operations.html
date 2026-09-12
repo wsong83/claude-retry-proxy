@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Operations — claude-retry-proxy</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<h1>Operations<span class="sub">Running, inspecting, and stopping the proxy</span></h1>
+
+<p><strong>Last updated:</strong> 2026-09-12</p>
+
+<p>The <code>claude-retry-proxy</code> command manages a <em>background server process</em>. It
+does not run in the foreground. Understanding that split explains most of the command's
+behaviour: the CLI decrypts keys, validates configuration, and spawns a detached server; the
+server owns the listening socket and the request path.</p>
+
+<h2 id="cli">The CLI</h2>
+
+<table>
+<tr><th>Command</th><th>What it does</th></tr>
+<tr><td><code>start</code></td><td>Validates configuration, decrypts keys, prunes the trace log,
+    spawns the server, waits for readiness</td></tr>
+<tr><td><code>stop</code></td><td>Reads the state file and terminates the process</td></tr>
+<tr><td><code>status</code></td><td>Reports running / stopped / stale, plus the current tier mapping</td></tr>
+<tr><td><code>reload</code></td><td>Re-reads <code>config.json</code> into the running proxy without restarting it</td></tr>
+</table>
+
+<h3 id="start-options"><code>start</code> options</h3>
+
+<table>
+<tr><th>Option</th><th>Meaning</th></tr>
+<tr><td><code>--port &lt;n&gt;</code></td><td>Listen port (default <code>8080</code>)</td></tr>
+<tr><td><code>--log &lt;path&gt;</code></td><td>Trace file path. Relative paths resolve against the
+    current working directory, not the config directory.</td></tr>
+<tr><td><code>--all</code></td><td>Record full request and response bodies. Read
+    <a href="trace-log.html#all">the data-exposure warning</a> before using this.</td></tr>
+<tr><td><code>--config-path &lt;path&gt;</code></td><td>Alternative <code>config.json</code> location</td></tr>
+<tr><td><code>--keys-path &lt;path&gt;</code></td><td>Alternative <code>keys-index.json</code> location</td></tr>
+<tr><td><code>--passphrase-file &lt;path&gt;</code></td><td>Read the keys passphrase from a file instead of
+    prompting. Only used when the keys file is encrypted.</td></tr>
+</table>
+
+<div class="note">
+<strong><code>start</code> prunes the trace log.</strong> Entries older than
+<strong>5 days</strong> are removed before the server launches, best-effort — a failure to prune
+does not block startup. The retention policy itself is documented at
+<a href="trace-log.html#prune">trace-log.html#prune</a>.
+</div>
+
+<h2 id="readiness">Two-phase readiness</h2>
+
+<p>After spawning the server, <code>start</code> confirms it is actually serving before
+reporting success. Two independent checks run in sequence, because they catch different
+failures.</p>
+
+<div class="step-box info">
+<div class="step-label">Phase 1 — the READY marker</div>
+<p>The CLI waits for the server to print <code>READY</code> on stdout, with a
+<strong>5-second</strong> timeout. It is read by a daemon thread consuming stdout line by line.</p>
+<p>This catches early failures — a wrong passphrase, a config validation error — <em>before</em>
+the socket is ever bound. Without this phase those failures would be indistinguishable from a
+slow start.</p>
+</div>
+
+<div class="step-box info">
+<div class="step-label">Phase 2 — the TCP probe</div>
+<p>The CLI connects to the listen port, with a <strong>2-second</strong> timeout. This confirms
+the server is genuinely accepting connections.</p>
+<p>The marker is printed after the socket is constructed but before the server begins serving,
+so phase 1 alone would not prove the port is reachable.</p>
+</div>
+
+<p>If either phase fails, the CLI rolls back and reports what it saw — including the tail of the
+server's stderr, which is usually where the real error is.</p>
+
+<div class="note">
+The line-by-line stdout reader replaced an earlier <code>select.select()</code> based approach
+that does not work with pipe file descriptors on Windows. On Windows, the current approach is
+the only one of the two that functions.
+</div>
+
+<h2 id="passphrase">Passphrase protocol</h2>
+
+<p>The CLI decrypts the keys file itself to validate the configuration, then needs the server —
+a separate process — to decrypt it again for its own use. The passphrase is transferred over the
+child's stdin.</p>
+
+<div class="state-diagram">
+CLI prompts for the passphrase (input hidden)<br>
+↓<br>
+CLI writes <code>&lt;passphrase&gt;\n</code> to the server's stdin, then <strong>closes</strong> it<br>
+↓<br>
+server reads exactly one line from stdin in <code>main()</code>, before serving<br>
+↓<br>
+decryption failure → error on stderr, non-zero exit<br>
+↓<br>
+CLI observes the non-zero exit and reports a startup failure
+</div>
+
+<p>When the keys file is <strong>plain JSON</strong>, no passphrase exists to send: the CLI
+closes stdin immediately and the server skips the stdin read entirely. The two processes
+therefore agree on the protocol by inspecting the same file, not by a flag.</p>
+
+<div class="warn">
+<strong><code>--passphrase-file</code> puts the passphrase in the process command line</strong>,
+where same-host process listings can read it. It exists for non-interactive starts — CI,
+supervisors, container entrypoints — where an interactive prompt is impossible. Prefer the
+stdin path (the default) whenever a human is present to type it.
+</div>
+
+<h2 id="admin">Admin page and API</h2>
+
+<p>The admin page is served at <code>http://localhost:&lt;port&gt;/admin/</code> and lets you
+hot-switch tier mappings: change which provider and model a tier points at, and which credential
+it uses, without restarting the proxy.</p>
+
+<table>
+<tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+<tr><td><span class="badge badge-local">GET</span></td><td><code>/admin/</code></td>
+    <td>The admin page itself</td></tr>
+<tr><td><span class="badge badge-local">GET</span></td><td><code>/admin/api/config</code></td>
+    <td>Current tiers (including each tier's key selection) and the model catalog</td></tr>
+<tr><td><span class="badge badge-local">GET</span></td><td><code>/admin/api/providers</code></td>
+    <td>Available provider names</td></tr>
+<tr><td><span class="badge badge-local">GET</span></td><td><code>/admin/api/providers-detail</code></td>
+    <td>Per provider: its mode and its key <em>names</em></td></tr>
+<tr><td><span class="badge badge-anthropic">POST</span></td><td><code>/admin/api/switch</code></td>
+    <td>Update tier mappings</td></tr>
+<tr><td><span class="badge badge-anthropic">POST</span></td><td><code>/admin/api/reload</code></td>
+    <td>Re-read <code>config.json</code> from disk</td></tr>
+<tr><td><span class="badge badge-anthropic">POST</span></td><td><code>/admin/shutdown</code></td>
+    <td>Stop the proxy gracefully</td></tr>
+</table>
+
+<p><code>providers-detail</code> returns key <strong>names only</strong> — never credential
+payloads. The admin page uses those names to populate its Key column. For a single-key provider
+the column shows a fixed, disabled <code>default</code>.</p>
+
+<p>A switch validates the same rules a startup does: all three tiers must be present, provider
+names must exist, and each tier's optional key selector must name a real key of its provider.
+An absent selector is defaulted to the provider's first key and written back into the persisted
+configuration, so what is on disk always matches what is running.</p>
+
+<p>A switch <strong>preserves everything it does not change</strong>: the models catalog,
+<code>disable_retry_claude_count_token</code>, and any <code>extra_request_headers</code> rules all
+survive a hot tier switch. Applying a switch cannot silently discard your header rules.</p>
+
+<h3 id="csrf">CSRF protection</h3>
+
+<p>Admin <code>POST</code> endpoints are guarded by an <code>Origin</code> check. The server
+rejects the request unless the header matches the proxy's own origin exactly:</p>
+
+<table>
+<tr><th>Origin header</th><th>Result</th></tr>
+<tr><td><code>http://localhost:&lt;port&gt;</code></td><td><span class="ok-inline">accepted</span></td></tr>
+<tr><td><code>http://127.0.0.1:&lt;port&gt;</code></td><td><span class="ok-inline">accepted</span></td></tr>
+<tr><td><code>http://[::1]:&lt;port&gt;</code></td><td><span class="ok-inline">accepted</span></td></tr>
+<tr><td><code>null</code></td><td><span class="error-inline">rejected</span></td></tr>
+<tr><td>absent</td><td><span class="error-inline">rejected</span></td></tr>
+<tr><td>any other origin</td><td><span class="error-inline">rejected</span></td></tr>
+</table>
+
+<p>The match is exact, including the port — a browser page served from a different port cannot
+drive the admin API.</p>
+
+<div class="warn">
+<strong>Non-browser clients must send an <code>Origin</code> header.</strong> <code>curl</code>
+does not add one by default, so pass it explicitly —
+<code>-H "Origin: http://localhost:&lt;port&gt;"</code>. A missing header is rejected, not treated
+as trusted. The CLI's own <code>stop</code> and <code>reload</code> commands do supply it, so only
+hand-rolled requests need this. Admin request bodies are capped at <strong>64 KB</strong>.
+</div>
+
+<!-- Owns the shutdown fact: what is killed, what the client sees, which trace entry is lost.
+     architecture.html#shutdown carries the mechanism and links here. -->
+<h2 id="shutdown">Shutdown</h2>
+
+<p>Both <code>claude-retry-proxy stop</code> and <code>POST /admin/shutdown</code> terminate the
+process promptly — typically within about a second — <strong>regardless of what is in
+flight</strong>.</p>
+
+<div class="error">
+<strong>Shutdown kills in-flight requests; it does not drain them.</strong> A request that is
+midway through a retry backoff is terminated where it stands — the daemon-thread mechanism
+behind that is in <a href="architecture.html#shutdown">architecture.html#shutdown</a>.
+<p>The client sees a dropped connection, and <strong>that request's trace entry never
+lands</strong> — so a trace log can be missing the very request that was interrupted. The
+<code>proxy_stop</code> marker still appears, which is what tells you the proxy went down at
+that point.</p>
+</div>
+
+<p>This differs from the <a href="architecture.html#config-swap">drain-and-swap</a> used by
+config changes, which <em>does</em> wait for in-flight requests — up to 30 seconds. The two
+paths treat the same condition (a request sitting in retry backoff) in opposite ways: a config
+swap waits, a shutdown does not wait at all.</p>
+
+<h2 id="artifacts">Runtime artifacts</h2>
+
+<p>Everything the proxy writes at runtime lives under <code>~/.claude/</code>:</p>
+
+<table>
+<tr><th>Path</th><th>Written by</th><th>Purpose</th></tr>
+<tr><td><code>proxy/config.json</code></td><td>you, and the admin API</td>
+    <td>Tier routing and policy — <span class="ok-inline">safe to share</span></td></tr>
+<tr><td><code>keys-index.json</code></td><td>you</td>
+    <td>Provider URLs <em>and credentials</em> — <span class="error-inline">never share</span></td></tr>
+<tr><td><code>proxy/proxy-state.json</code></td><td>the heartbeat, every 30 s</td>
+    <td>PID, port, start time; read by <code>stop</code>, <code>status</code>, <code>reload</code></td></tr>
+<tr><td><code>proxy/proxy-stderr.log</code></td><td>the CLI</td>
+    <td>The spawned server's stderr</td></tr>
+<tr><td><code>logs/proxy-trace.jsonl</code></td><td>the request path</td>
+    <td>The trace log — see <a href="trace-log.html">trace-log.html</a></td></tr>
+<tr><td><code>proxy/feature-compatibility.json</code></td><td>the compatibility learner</td>
+    <td>Learned per-upstream feature support — see <a href="compatibility.html">compatibility.html</a></td></tr>
+</table>
+
+<p>Several of these paths can be relocated with environment variables
+(<code>PROXY_TRACE_FILE</code>, <code>PROXY_STATE_FILE</code>,
+<code>PROXY_FEATURE_COMPAT_FILE</code>, <code>PROXY_KEYS_PATH</code>), which is how the test
+suite keeps its proxies isolated from a live one. See
+<a href="configuration.html#env-vars">configuration.html</a>.</p>
+
+<h3 id="state">The state file</h3>
+
+<p><code>proxy-state.json</code> is how the CLI finds a running proxy — <code>stop</code>,
+<code>status</code>, and <code>reload</code> all read it. If the CLI reports a proxy as
+<em>stale</em>, it has found a state file whose PID is no longer alive, which usually means the
+process died without cleaning up.</p>
+
+<p>The file is a projection rather than the source of truth: the authoritative copy lives in the
+server's memory and is rewritten every 30 seconds, so deleting the file is harmless and an
+external edit is overwritten rather than merged. The mechanism is owned by
+<a href="architecture.html#heartbeat">architecture.html#heartbeat</a>.</p>
+
+<footer>Last updated: 2026-09-12</footer>
+</body>
+</html>

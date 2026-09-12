@@ -12,6 +12,11 @@ providers simultaneously.
 
 Python 3.8+. `cryptography` package required (for encrypted key storage; plain JSON keys files don't need it). MIT licensed.
 
+**Going deeper:** this README is self-contained for setup and daily use. The
+[`doc/`](doc/content.html) tree holds the detailed reference — request path,
+retry mechanics, provider-mode transforms, and the compatibility learner. See
+[Going deeper](#going-deeper) below for the full index.
+
 ## Why
 
 Some upstream endpoints return `503` under load or `429` when rate-limiting.
@@ -342,8 +347,8 @@ Chat-mode streaming correctly converts tool-call SSE deltas to Anthropic
 `tool_use` content blocks (per-index state, parallel/interleaved support,
 dict-only JSON validation, conservative degradation on malformed/truncated
 streams). Image content blocks are not mapped between Anthropic and OpenAI
-formats. Error responses (non-2xx) pass
-through untransformed in the upstream format.
+formats. In chat and response modes, error responses (non-2xx) pass through
+untransformed in the upstream format.
 
 ### Admin page (`http://localhost:8080/admin/`)
 
@@ -503,6 +508,27 @@ The suite covers tier routing, model rewriting, admin API, config validation,
 key decryption, retry logic, streaming delivery, disconnect handling, and trace
 logging. Tests use mock upstream servers and temporary config/keys files — no
 live `~/.claude/settings.json` mutation required.
+
+The suite is safe to run while a proxy is live: it redirects its state,
+compatibility, and trace paths into a session temp directory at import time, so a
+test proxy can never touch a running proxy's files. See
+[doc/test-catalog.html](doc/test-catalog.html) for the module map, the harness
+helpers, and the testing patterns.
+
+## Going deeper
+
+This README is self-contained for setup and daily use. The `doc/` tree is the
+detailed reference, indexed by [doc/content.html](doc/content.html):
+
+| Page | Covers |
+|------|--------|
+| [doc/architecture.html](doc/architecture.html) | Request path, tier resolution, retry and backoff, give-up, size caps, disconnects, config swap, heartbeat, sinks, shutdown |
+| [doc/provider-modes.html](doc/provider-modes.html) | The `anthropic` / `chat` / `response` modes: auth headers, path rewriting, request and response transforms, SSE, tool-call degradation |
+| [doc/configuration.html](doc/configuration.html) | `config.json` and `keys-index.json` schemas, environment variables, validation rules |
+| [doc/operations.html](doc/operations.html) | CLI commands, readiness protocol, passphrase handling, admin API and CSRF, shutdown, runtime artifacts |
+| [doc/compatibility.html](doc/compatibility.html) | The `context_management` compatibility learner: states, transitions, suppression, persistence |
+| [doc/trace-log.html](doc/trace-log.html) | Trace entry schema, event inventory, `--all`, file permissions, pruning, analysis |
+| [doc/test-catalog.html](doc/test-catalog.html) | Test suite layout, harness helpers, isolation, patterns, anti-patterns |
 
 ## Dependencies
 
