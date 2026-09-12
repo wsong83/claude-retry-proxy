@@ -9,7 +9,6 @@ import http
 import io
 import json
 import os
-import re
 import shutil
 import socket
 import subprocess
@@ -964,26 +963,6 @@ def test_trace_includes_key_name_not_payload():
 # OSError)` clause would be misread as a connection error and re-issue the
 # upstream POST.
 
-def _reset_sink_warn_state(sink):
-    """Drop any in-flight failure episode for `sink` (module state is shared
-    across the in-process tests below)."""
-    import claude_retry_proxy.server as srv
-    with srv._sink_warn_lock:
-        srv._sink_warn_state.pop(sink, None)
-
-
-def _parse_suppressed(line):
-    """Exact integer from '(N further failures suppressed)', or None."""
-    m = re.search(r"\((\d+) further failures? suppressed\)", line)
-    return int(m.group(1)) if m else None
-
-
-def _parse_resumed_count(line):
-    """Exact integer from 'resumed after N failed write(s)', or None."""
-    m = re.search(r"resumed after (\d+) failed write", line)
-    return int(m.group(1)) if m else None
-
-
 class _FastTime(object):
     """Delegates to the real time module, but shortens sleep().
 
@@ -1061,135 +1040,6 @@ def test_sink_failure_does_not_drop_response():
         cleanup()
 
 
-def test_sink_warning_rate_limit():
-    """The first failure of an episode warns immediately; further failures
-    inside SINK_WARN_INTERVAL are silent; the next failure after the interval
-    warns once and reports how many were suppressed."""
-    print("\n--- Test: Sink Warning Rate Limit ---")
-
-    import claude_retry_proxy.server as srv
-
-    sink = "trace"
-    rapid = 5
-    _reset_sink_warn_state(sink)
-    try:
-        buf = io.StringIO()
-        with contextlib.redirect_stderr(buf):
-            for _ in range(rapid):
-                srv._warn_sink_failure(sink, OSError("boom"))
-        first = [l for l in buf.getvalue().splitlines()
-                 if "[proxy] WARNING:" in l and sink in l]
-        if len(first) == 1:
-            pass_("1 warning for {} rapid failures: {!r}".format(rapid, first[0]))
-        else:
-            fail("expected exactly 1 warning for {} rapid failures, got {}".format(
-                rapid, len(first)))
-
-        # Force the interval to lapse, then fail once more. Only the failures
-        # that were actually silent (rapid - 1) are reported: the failure
-        # triggering the emission is never counted as suppressed.
-        with srv._sink_warn_lock:
-            srv._sink_warn_state[sink]["last_warn"] = \
-                time.time() - (srv.SINK_WARN_INTERVAL + 1)
-        later_buf = io.StringIO()
-        with contextlib.redirect_stderr(later_buf):
-            srv._warn_sink_failure(sink, OSError("boom"))
-        later = [l for l in later_buf.getvalue().splitlines()
-                 if "[proxy] WARNING:" in l]
-        expected = rapid - 1
-        got = _parse_suppressed(later[0]) if len(later) == 1 else None
-        if got == expected:
-            pass_("failure past the interval reports exactly {} suppressed: "
-                  "{!r}".format(expected, later[0]))
-        else:
-            fail("expected exactly 1 warning reporting {} suppressed, parsed "
-                 "{!r} from {!r}".format(expected, got, later))
-    finally:
-        _reset_sink_warn_state(sink)
-
-
-def test_sink_recovery_notice():
-    """The first successful write after a failure episode emits one line
-    carrying the episode's dropped-write count; later successes are silent."""
-    print("\n--- Test: Sink Recovery Notice ---")
-
-    import claude_retry_proxy.server as srv
-
-    sink = "state"
-    _reset_sink_warn_state(sink)
-    try:
-        quiet = io.StringIO()
-        with contextlib.redirect_stderr(quiet):
-            srv._note_sink_recovery(sink)
-        if "resumed" not in quiet.getvalue():
-            pass_("recovery with no open episode emits nothing")
-        else:
-            fail("recovery notice without a failure episode: {!r}".format(
-                quiet.getvalue()))
-
-        failures = 3
-        buf = io.StringIO()
-        with contextlib.redirect_stderr(buf):
-            for _ in range(failures):
-                srv._warn_sink_failure(sink, OSError("nope"))
-            srv._note_sink_recovery(sink)
-        lines = [l for l in buf.getvalue().splitlines() if "resumed" in l]
-        got = _parse_resumed_count(lines[0]) if len(lines) == 1 else None
-        if got == failures and sink in lines[0]:
-            pass_("recovery line reports exactly {} failed write(s): {!r}".format(
-                failures, lines[0]))
-        else:
-            fail("expected 1 recovery line reporting exactly {} failed writes, "
-                 "parsed {!r} from {!r}".format(failures, got, lines))
-
-        second = io.StringIO()
-        with contextlib.redirect_stderr(second):
-            srv._note_sink_recovery(sink)
-        if "resumed" not in second.getvalue():
-            pass_("episode closed — a second recovery emits nothing")
-        else:
-            fail("second recovery notice emitted: {!r}".format(second.getvalue()))
-    finally:
-        _reset_sink_warn_state(sink)
-
-
-def test_trace_sink_creates_missing_directories():
-    """log_trace still creates missing parent directories and writes the entry.
-
-    Guards the makedirs self-heal against regression by the sink guard: a
-    deleted trace directory must recover on the next call with no intervention.
-    """
-    print("\n--- Test: Trace Sink Creates Missing Directories ---")
-
-    import claude_retry_proxy.server as srv
-
-    root = tempfile.mkdtemp(prefix="proxy_trace_mkdir_")
-    target = os.path.join(root, "missing", "nested", "trace.jsonl")
-    saved = srv.PROXY_TRACE_FILE
-    srv.PROXY_TRACE_FILE = target
-    try:
-        ok = srv.log_trace({"event": "sink_mkdir_probe", "value": 1})
-        if ok is True:
-            pass_("log_trace returned True")
-        else:
-            fail("log_trace returned {!r}, expected True".format(ok))
-            return
-        if not os.path.exists(target):
-            fail("trace file not created at {!r}".format(target))
-            return
-        pass_("missing parent directories were created and the entry written")
-
-        with open(target) as f:
-            lines = [l for l in f if l.strip()]
-        if len(lines) == 1 and json.loads(lines[0])["event"] == "sink_mkdir_probe":
-            pass_("entry round-trips through the newly created directory")
-        else:
-            fail("unexpected trace contents: {!r}".format(lines))
-    finally:
-        srv.PROXY_TRACE_FILE = saved
-        shutil.rmtree(root, ignore_errors=True)
-
-
 def test_heartbeat_survives_failed_state_write():
     """The heartbeat thread survives a failing state write.
 
@@ -1207,14 +1057,19 @@ def test_heartbeat_survives_failed_state_write():
     print("\n--- Test: Heartbeat Survives Failed State Write ---")
 
     import claude_retry_proxy.server as srv
+    from claude_retry_proxy import sinks
 
     root = tempfile.mkdtemp(prefix="proxy_hb_blocked_")
     blocked = os.path.join(root, "state.json")
     os.mkdir(blocked)
 
-    _reset_sink_warn_state("state")
-    saved = (srv.STATE_FILE, srv._startup_state, srv._shutting_down, srv.time)
-    srv.STATE_FILE = blocked
+    # The state sink is redirected through configure(); the fresh health keeps
+    # this test's failure episode off the process-wide reporter that later
+    # tests share. Both are restored in the finally block.
+    prev_health = sinks._health
+    prev_state_path = sinks._state._path
+    saved = (srv._startup_state, srv._shutting_down, srv.time)
+    sinks.configure(state_path=blocked, health=sinks._SinkHealth())
     srv._startup_state = {
         "pid": 12345,
         "port": 8080,
@@ -1269,8 +1124,8 @@ def test_heartbeat_survives_failed_state_write():
         srv._shutting_down = True
         if thread is not None:
             thread.join(timeout=5)
-        srv.STATE_FILE, srv._startup_state, srv._shutting_down, srv.time = saved
-        _reset_sink_warn_state("state")
+        srv._startup_state, srv._shutting_down, srv.time = saved
+        sinks.configure(state_path=prev_state_path, health=prev_health)
         shutil.rmtree(root, ignore_errors=True)
 
 
@@ -1286,6 +1141,7 @@ def test_sink_emission_survives_failing_stderr():
     print("\n--- Test: Sink Emission Survives Failing stderr ---")
 
     import claude_retry_proxy.server as srv
+    from claude_retry_proxy import sinks
 
     root = tempfile.mkdtemp(prefix="proxy_stderr_fail_")
     good_state = os.path.join(root, "state.json")
@@ -1294,16 +1150,21 @@ def test_sink_emission_survives_failing_stderr():
     os.mkdir(blocked_state)
     os.mkdir(blocked_trace)
 
-    _reset_sink_warn_state("trace")
-    _reset_sink_warn_state("state")
-    saved = (srv.PROXY_TRACE_FILE, srv.STATE_FILE, srv._startup_state,
-             srv._shutting_down, srv.time, sys.stderr)
+    # Redirect the process-wide sinks through configure(), with a fresh health
+    # that keeps the DEFAULT stderr report: a capturing report would make the
+    # "must not raise while stderr is broken" assertion vacuous.
+    prev_health = sinks._health
+    prev_trace_path = sinks._trace._path
+    prev_state_path = sinks._state._path
+    saved = (srv._startup_state, srv._shutting_down, srv.time, sys.stderr)
+    health = sinks._SinkHealth()
+    sinks.configure(trace_path=blocked_trace, state_path=blocked_state,
+                    health=health)
     thread = None
     try:
         sys.stderr = _FailingStderr()
 
         # (1) Blocked trace path — the sink fails AND the warning print fails.
-        srv.PROXY_TRACE_FILE = blocked_trace
         try:
             result = srv.log_trace({"event": "stderr_fail_probe"})
             if result is False:
@@ -1314,7 +1175,7 @@ def test_sink_emission_survives_failing_stderr():
             fail("log_trace raised with a failing stderr: {!r}".format(e))
 
         # (2) Success path — the recovery emission cannot raise either.
-        srv.STATE_FILE = good_state
+        sinks.configure(state_path=good_state)
         try:
             result = srv.write_state({"pid": 1})
             if result is True:
@@ -1325,7 +1186,7 @@ def test_sink_emission_survives_failing_stderr():
             fail("write_state raised with a failing stderr: {!r}".format(e))
 
         # (3) Blocked state path — fails and opens a reportable episode.
-        srv.STATE_FILE = blocked_state
+        sinks.configure(state_path=blocked_state)
         try:
             result = srv.write_state({"pid": 1})
             if result is False:
@@ -1337,10 +1198,10 @@ def test_sink_emission_survives_failing_stderr():
 
         # (4) Closing the open episode must not raise.
         try:
-            srv._note_sink_recovery("state")
-            pass_("_note_sink_recovery did not raise")
+            health.success("state")
+            pass_("the health reporter's success() did not raise")
         except Exception as e:
-            fail("_note_sink_recovery raised with a failing stderr: {!r}".format(e))
+            fail("health.success() raised with a failing stderr: {!r}".format(e))
 
         # (5) A real heartbeat thread survives the whole condition.
         srv._startup_state = {
@@ -1367,10 +1228,9 @@ def test_sink_emission_survives_failing_stderr():
         srv._shutting_down = True
         if thread is not None:
             thread.join(timeout=5)
-        srv.PROXY_TRACE_FILE, srv.STATE_FILE, srv._startup_state, \
-            srv._shutting_down, srv.time, sys.stderr = saved
-        _reset_sink_warn_state("trace")
-        _reset_sink_warn_state("state")
+        srv._startup_state, srv._shutting_down, srv.time, sys.stderr = saved
+        sinks.configure(trace_path=prev_trace_path, state_path=prev_state_path,
+                        health=prev_health)
         shutil.rmtree(root, ignore_errors=True)
 
 
@@ -1450,9 +1310,6 @@ ALL_TESTS = [
     ("extra-request-headers-in-trace", test_extra_request_headers_in_trace),
     ("trace-includes-key-name-not-payload", test_trace_includes_key_name_not_payload),
     ("sink-failure-does-not-drop-response", test_sink_failure_does_not_drop_response),
-    ("sink-warning-rate-limit", test_sink_warning_rate_limit),
-    ("sink-recovery-notice", test_sink_recovery_notice),
-    ("trace-sink-creates-missing-directories", test_trace_sink_creates_missing_directories),
     ("heartbeat-survives-failed-state-write", test_heartbeat_survives_failed_state_write),
     ("sink-emission-survives-failing-stderr", test_sink_emission_survives_failing_stderr),
     ("best-effort-stderr-wrapper", test_best_effort_stderr_wrapper),

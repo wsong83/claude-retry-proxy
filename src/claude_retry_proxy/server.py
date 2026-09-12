@@ -28,7 +28,11 @@ import time
 import uuid
 from urllib.parse import urlparse
 
+from . import sinks
 from . import vimcrypt
+from .sanitize import sanitize_error
+from .sinks import (log_trace, write_state, increment_total, increment_retried,
+                    write_start_marker, write_stop_marker)
 
 
 # ---------------------------------------------------------------------------
@@ -731,70 +735,9 @@ STATE_FILE = os.environ.get("PROXY_STATE_FILE",
                             os.path.join(os.path.expanduser("~"), ".claude", "proxy",
                                          "proxy-state.json"))
 
-
-# ---------------------------------------------------------------------------
-# Sink failure recording (thread-safe)
-# ---------------------------------------------------------------------------
-
-# The trace and state sinks are written from the request path and the heartbeat
-# thread. Their writes must never raise into the caller: a trace-write OSError
-# inside the retry loop's `except (socket.error, ConnectionError, OSError)`
-# clause would be misread as a connection error and re-issue the upstream POST.
-# Failures are recorded here and reported on stderr at most once per interval.
-
-SINK_WARN_INTERVAL = 60.0
-
-_sink_warn_lock = threading.Lock()
-_sink_warn_state = {}
-
-
-def _warn_sink_failure(sink, exc):
-    """Record a failed sink write and warn on stderr, rate-limited per sink.
-
-    The first failure of an episode always warns; later failures warn at most
-    once per SINK_WARN_INTERVAL and report how many were suppressed. Carries
-    only the sink name and the sanitized cause — never the entry contents,
-    which can hold raw prompts under --all.
-    """
-    now = time.time()
-    with _sink_warn_lock:
-        entry = _sink_warn_state.setdefault(
-            sink, {"failed": False, "last_warn": 0.0, "episode": 0,
-                   "since_warn": 0})
-        entry["episode"] += 1
-        if not entry["failed"]:
-            entry["failed"] = True
-            emit, suppressed = True, 0
-        else:
-            suppressed = entry["since_warn"]
-            emit = now - entry["last_warn"] >= SINK_WARN_INTERVAL
-            if not emit:
-                entry["since_warn"] += 1
-        if emit:
-            entry["last_warn"] = now
-            entry["since_warn"] = 0
-    if not emit:
-        return
-    detail = (" ({} further failures suppressed)".format(suppressed)
-              if suppressed else "")
-    try:
-        print("[proxy] WARNING: {} sink write failed{}: {}".format(
-            sink, detail, sanitize_error(str(exc))), file=sys.stderr)
-    except Exception:
-        pass
-
-
-def _note_sink_recovery(sink):
-    """Close a sink's failure episode, reporting its dropped-write count once."""
-    with _sink_warn_lock:
-        entry = _sink_warn_state.pop(sink, None)
-    if entry is None:
-        return
-    try:
-        print("[proxy] WARNING: {} sink write resumed after {} failed "
-              "write(s)".format(sink, entry["episode"]), file=sys.stderr)
-    except Exception:
-        pass
+# Bind the process-wide sinks to the resolved paths, exactly as the module-level
+# path constants did before the extraction.
+sinks.configure(trace_path=PROXY_TRACE_FILE, state_path=STATE_FILE)
 
 
 class _BestEffortStderr:
@@ -829,52 +772,6 @@ class _BestEffortStderr:
         return getattr(self._stream, name)
 
 
-def read_state():
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def write_state(state):
-    """Write the state file. Returns True on success, False on failure.
-
-    Never raises: a failing state sink must not kill the heartbeat thread.
-    """
-    try:
-        d = os.path.dirname(STATE_FILE)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(state, f)
-        os.replace(tmp, STATE_FILE)
-        # Restrict permissions on POSIX (best-effort; Windows chmod is a near-no-op).
-        if os.name == "posix":
-            try:
-                os.chmod(STATE_FILE, 0o600)
-            except OSError:
-                pass
-    except Exception as e:
-        _warn_sink_failure("state", e)
-        return False
-    _note_sink_recovery("state")
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Trace logging (thread-safe)
-# ---------------------------------------------------------------------------
-
-_trace_lock = threading.Lock()
-
-# Request counters for stop marker
-_request_counter_lock = threading.Lock()
-_requests_total = 0
-_requests_retried = 0
-
-
 # Shutdown flag — checked by background threads to avoid interfering with
 # graceful shutdown. Set True by the /admin/shutdown handler.
 _shutting_down = False
@@ -886,67 +783,6 @@ _shutting_down = False
 # ConnectionAbortedError covers Windows WinError 10053; ConnectionResetError
 # covers WinError 10054 and POSIX ECONNRESET; BrokenPipeError covers POSIX EPIPE.
 _DISCONNECT_ERRORS = (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)
-
-
-def increment_total():
-    global _requests_total
-    with _request_counter_lock:
-        _requests_total += 1
-
-
-def increment_retried():
-    global _requests_retried
-    with _request_counter_lock:
-        _requests_retried += 1
-
-
-def log_trace(entry):
-    """Append one trace entry. Returns True on success, False on failure.
-
-    Never raises: callers include the retry loop's error paths, where an
-    escaping OSError would be misclassified as a connection error.
-    """
-    try:
-        d = os.path.dirname(PROXY_TRACE_FILE)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        with _trace_lock:
-            with open(PROXY_TRACE_FILE, "a") as f:
-                f.write(json.dumps(entry) + "\n")
-        # Restrict permissions on POSIX (best-effort; Windows chmod is a near-no-op).
-        if os.name == "posix":
-            try:
-                os.chmod(PROXY_TRACE_FILE, 0o600)
-            except OSError:
-                pass
-    except Exception as e:
-        _warn_sink_failure("trace", e)
-        return False
-    _note_sink_recovery("trace")
-    return True
-
-
-def write_start_marker():
-    """Write the proxy_start trace marker. Returns the sink write result."""
-    return log_trace({
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-        "event": "proxy_start",
-        "port": PROXY_PORT,
-        "pid": os.getpid()
-    })
-
-
-def write_stop_marker():
-    with _request_counter_lock:
-        total = _requests_total
-        retried = _requests_retried
-    log_trace({
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-        "event": "proxy_stop",
-        "pid": os.getpid(),
-        "requests_total": total,
-        "requests_retried": retried
-    })
 
 
 def compute_delay(attempt):
@@ -2325,21 +2161,6 @@ def resolve_tier(model_name, config):
             return tier
 
     return "unknown"
-
-
-# ---------------------------------------------------------------------------
-# Error message sanitization
-# ---------------------------------------------------------------------------
-
-def sanitize_error(msg):
-    if not msg:
-        return None
-    msg = str(msg)
-    msg = re.sub(r'(?:/[^\s"]*)+([/\\]\.(?:claude|ssh|gnupg|aws|azure|config|local))[^\s"]*',
-                 r'[redacted-path]', msg)
-    msg = re.sub(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b',
-                 '[redacted-ip]', msg)
-    return msg[:200]
 
 
 # ---------------------------------------------------------------------------
@@ -4681,6 +4502,7 @@ def main():
         PROXY_TRACE_FILE = args.log
     if getattr(args, "all"):
         PROXY_LOG_ALL = True
+    sinks.configure(trace_path=PROXY_TRACE_FILE, state_path=STATE_FILE)
 
     # Resolve paths
     config_path = args.config_path or DEFAULT_CONFIG_PATH
@@ -4778,7 +4600,7 @@ def main():
     _startup_state = state
 
     # Write start marker to trace
-    if not write_start_marker():
+    if not write_start_marker(PROXY_PORT):
         try:
             print("[proxy] ERROR: trace file {} is not writable — aborting startup".format(
                 PROXY_TRACE_FILE), file=sys.stderr)

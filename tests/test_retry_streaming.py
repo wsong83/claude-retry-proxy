@@ -2756,17 +2756,22 @@ def test_retry_path_print_failure_does_not_misclassify():
     print("\n--- Test: Retry-Path Print Failure Does Not Misclassify ---")
 
     import claude_retry_proxy.server as srv
+    from claude_retry_proxy import sinks
 
     upstream_port = find_free_port()
     reqs = []
     mock_server = _start_mode_mock_upstream(upstream_port, reqs, _responder_503)
     root = tempfile.mkdtemp(prefix="proxy_retryprint_")
-    saved = (srv.PROXY_TRACE_FILE, srv.STATE_FILE, srv._current_config,
+    # The sinks hold their own path, so the redirection goes through
+    # configure(); assigning server.PROXY_TRACE_FILE would be inert here.
+    prev_trace_path = sinks._trace._path
+    prev_state_path = sinks._state._path
+    saved = (srv._current_config,
              srv._vendors, srv.PROXY_MAX_RETRIES, srv.PROXY_INITIAL_DELAY,
              srv.PROXY_MAX_DELAY, sys.stderr)
     try:
-        srv.PROXY_TRACE_FILE = os.path.join(root, "trace.jsonl")
-        srv.STATE_FILE = os.path.join(root, "state.json")
+        sinks.configure(trace_path=os.path.join(root, "trace.jsonl"),
+                        state_path=os.path.join(root, "state.json"))
         # One retry (2 attempts), fast backoff.
         srv.PROXY_MAX_RETRIES = 1
         srv.PROXY_INITIAL_DELAY = 1
@@ -2806,9 +2811,10 @@ def test_retry_path_print_failure_does_not_misclassify():
         else:
             fail("expected exactly 2 upstream requests, got {}".format(len(reqs)))
     finally:
-        (srv.PROXY_TRACE_FILE, srv.STATE_FILE, srv._current_config,
+        (srv._current_config,
          srv._vendors, srv.PROXY_MAX_RETRIES, srv.PROXY_INITIAL_DELAY,
          srv.PROXY_MAX_DELAY, sys.stderr) = saved
+        sinks.configure(trace_path=prev_trace_path, state_path=prev_state_path)
         try:
             mock_server.shutdown()
         except Exception:

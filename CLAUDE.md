@@ -22,7 +22,9 @@ decryption). Python 3.8+.
 ```
 src/claude_retry_proxy/
   __init__.py           __version__
-  server.py             the HTTP retry gateway server (ThreadingHTTPServer, tier routing, model rewriting, admin API, retry/backoff, trace logging)
+  server.py             the HTTP retry gateway server (ThreadingHTTPServer, tier routing, model rewriting, admin API, retry/backoff)
+  sanitize.py           error-text redaction leaf: `sanitize_error`, the chokepoint for text reaching stderr, trace `error` fields and client-facing error bodies
+  sinks.py              sink class family: private `_Sink` base, `TraceSink` (JSONL append + counters + markers), `StateSink` (atomic state document), shared `_SinkHealth` failure reporter, process-wide pair + `configure()`
   cli.py                the claude-retry-proxy CLI: start / stop / status / reload (passphrase prompt, config validation, no URL swap)
   vimcrypt.py           vim blowfish2 (VimCrypt~03!) decryption (derived from claude-config bin/vimcrypt.py)
   admin.html            admin page for hot-switching tier mappings (served at /admin/)
@@ -42,6 +44,7 @@ tests/
   test_mode_dispatch.py mode dispatch and auth header tests
   test_response_transform.py  response-mode transform tests
   test_retry_streaming.py  retry, streaming, and buffered-response-cap tests
+  test_sinks.py         sink class family unit tests: write contract, health-reporter episode policy, counters/markers
   test_tier_routing.py  tier routing and model resolution tests
   test_trace.py         trace logging and analysis tests
   test_unit.py          unit-level tests (jitter, delay, helpers)
@@ -198,7 +201,16 @@ paths resolve against cwd), `--all` (log full request/response bodies),
     `PROXY_MAX_BODY_SIZE` via `_read_capped`) and returns it to the client.
     On connection-error exhaustion, a synthesized `upstream_unreachable`
     JSON body is returned.
-- **Sink I/O failure policy (trace + state).** `log_trace` and `write_state`
+- **Sink I/O failure policy (trace + state).** As of 2026-09-12 the code below
+  lives in `sinks.py`, not `server.py`: the module-level `log_trace` /
+  `write_state` are thin delegates over `TraceSink.write` / `StateSink.write`,
+  which share **one** never-raising implementation in the private `_Sink` base.
+  That shared path carries both inner guards (the `if d:` wrapper around
+  `makedirs`, and `chmod`'s own `except OSError: pass`), so trace and state can
+  no longer drift apart. `_SinkHealth` owns the episode state and its lock, and
+  takes an injectable clock and report callback. `SINK_WARN_INTERVAL` and the
+  three locks moved with it. Behavior is unchanged; only the home is.
+  `log_trace` and `write_state`
   never raise: each wraps its body in a broad `except Exception` and returns
   `True`/`False`. This is load-bearing, not defensive padding — a trace-write
   `OSError` escaping into the retry loop's `except (socket.error, ConnectionError,
@@ -309,7 +321,11 @@ does not block startup on failure).
   — it never reads from disk. If `proxy-state.json` is deleted externally, the
   next heartbeat recreates it with all fields intact within 30s.
 - **Trace/state I/O failures degrade the proxy; they never stop it — except at
-  startup.** An unwritable trace or state path at startup aborts before `READY`
+  startup.** As of 2026-09-12 both sinks are implemented in `sinks.py` (see the
+  sink I/O failure policy in Architecture); the behavior here is identical,
+  only the file changed. **New fact worth keeping:** because the never-raise
+  policy now has a single implementation shared by both sinks, trace and state
+  cannot drift apart. An unwritable trace or state path at startup aborts before `READY`
   (fail fast); from then on the sinks keep serving and record failures on stderr
   — the first failure of an episode always reports, and further failures in that
   episode at most once per 60s, but a successful write closes the episode, so an
@@ -504,7 +520,17 @@ does not block startup on failure).
   SSE is synthesized from OpenAI SSE (frame-assembled on `\n\n`, terminal
   synthesized on EOF).
 - **Malformed tool arguments in chat mode.** When `_chat_to_anthropic` encounters tool-call arguments that cannot be parsed as a JSON dict (including `json.JSONDecodeError`, non-dict parse results, empty dicts, non-dict `function` values, and non-dict tool-call entries), it emits a user-visible text block `[Tool call failed: arguments for '<name>' (call <id>) could not be parsed as JSON]` instead of a `tool_use` block with `input: {}`. A `tool_args_parse_failure` trace event is also logged. When all tool calls in a response are malformed, `stop_reason` is forced to `None` to prevent the client from hanging on `stop_reason: "tool_use"` with zero tool_use blocks. **Request-transform path:** `_transform_anthropic_messages_to_chat` applies the same degradation pattern for NaN/Infinity/non-dict `tool_use.input` values (rejected by `json.dumps(input, allow_nan=False)`), emitting the placeholder `[Tool call failed: arguments for '<name>' (call <id>) could not be serialized as JSON]` and a `tool_args_parse_failure` trace event. When a failed tool_use coexists with valid tool_use(s) in the same assistant message, the placeholder is emitted as a separate assistant message before the tool_calls message (content: null). (Behavior changes landed 2026-08-28 and 2026-08-29.)
-- **Test suite is safe alongside a live proxy.** The test suite sets `os.environ["PROXY_STATE_FILE"]` and `os.environ["PROXY_FEATURE_COMPAT_FILE"]` to session temp paths at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read these env vars at import time, so test proxies use isolated state files and can never touch the live proxy's `~/.claude/proxy/proxy-state.json` or `~/.claude/proxy/feature-compatibility.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite passes with the live proxy up (landed 2026-08-28) — 288 tests across 14 files as of 2026-09-11: `tests/_harness.py` + `tests/test_compat.py` + 11 cluster modules + `tests/test_claude_proxy.py` aggregator. That count is a snapshot, not a fixed figure: it has moved 275 → 283 → 284 → 288 in a single day of work, so re-count before quoting it rather than trusting this line.
+- **Test suite is safe alongside a live proxy.** The test suite sets `os.environ["PROXY_STATE_FILE"]` and `os.environ["PROXY_FEATURE_COMPAT_FILE"]` to session temp paths at module load time (mirroring the existing `PROXY_TRACE_FILE` isolation). `cli.py` and `server.py` read these env vars at import time, so test proxies use isolated state files and can never touch the live proxy's `~/.claude/proxy/proxy-state.json` or `~/.claude/proxy/feature-compatibility.json`. The old docstring warning about not running tests alongside a live proxy is obsolete. The full suite passes with the live proxy up (landed 2026-08-28) — 293 tests across 15 files as of 2026-09-12: `tests/_harness.py` + `tests/test_compat.py` + 12 cluster modules + `tests/test_claude_proxy.py` aggregator. (`test_sinks.py` is the 15th file and the 12th cluster module, added by the sinks extraction.) That count is a snapshot, not a fixed figure: it has moved 275 → 283 → 284 → 288 → 293 in two days of work, so re-count before quoting it rather than trusting this line.
+
+## Refactoring
+
+- **Before planning any code split — extracting a module, a class family, or a
+  cluster of functions out of a large file — read
+  [`.claude/cluster-extraction-criteria.md`](.claude/cluster-extraction-criteria.md)
+  first.** It carries the membership tests, the state doctrine, the blast-radius
+  ordering rule, and the staging discipline this repo's extractions follow.
+  Deliberately not inlined here: it is needed only when a refactor is on the
+  table, not in every session.
 
 ## Documentation
 
@@ -564,8 +590,13 @@ No other supplementary docs.
 
 ```json
 [
+  {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "target_repo": null, "report": "./tmp/reports/defer-issue-image-content-blocks-chat-mode.json", "deferred": "2026-08-29", "date_source": "creation"},
   {"issue_id": "break-up-large-source-and-test-files", "title": "Break up large source and test files into smaller modules", "target_repo": null, "report": "./tmp/reports/defer-issue-break-up-large-source-and-test-files.json", "deferred": "2026-09-01", "date_source": "creation"},
-  {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "target_repo": null, "report": "./tmp/reports/defer-issue-image-content-blocks-chat-mode.json", "deferred": "2026-08-29", "date_source": "creation"}
+  {"issue_id": "write-state-no-lock-concurrent-replace", "title": "write_state takes no lock and writes through a fixed temp path, so concurrent writers can interleave before os.replace", "target_repo": null, "report": "./tmp/reports/defer-issue-write-state-no-lock-concurrent-replace.json", "deferred": "2026-09-11", "date_source": "creation"},
+  {"issue_id": "sanitize-error-path-redaction-inert-on-windows", "title": "sanitize_error's path-redaction arm requires a forward slash, so it silently does nothing for native Windows paths", "target_repo": null, "report": "./tmp/reports/defer-issue-sanitize-error-path-redaction-inert-on-windows.json", "deferred": "2026-09-12", "date_source": "creation"},
+  {"issue_id": "sanitize-error-regex-catastrophic-backtracking", "title": "sanitize_error's first regex arm backtracks exponentially, so upstream-controlled error text can hang a worker thread", "target_repo": null, "report": "./tmp/reports/defer-issue-sanitize-error-regex-catastrophic-backtracking.json", "deferred": "2026-09-12", "date_source": "creation"},
+  {"issue_id": "sink-chmod-branch-untested-outside-posix", "title": "The sink chmod 0o600 branch is POSIX-only, so no test on the Windows dev box ever executes it", "target_repo": null, "report": "./tmp/reports/defer-issue-sink-chmod-branch-untested-outside-posix.json", "deferred": "2026-09-12", "date_source": "creation"},
+  {"issue_id": "state-sink-empty-path-stray-tmp", "title": "An empty state path makes the state sink leave a stray .tmp file in the process working directory", "target_repo": null, "report": "./tmp/reports/defer-issue-state-sink-empty-path-stray-tmp.json", "deferred": "2026-09-12", "date_source": "creation"}
 ]
 ```
 
@@ -576,7 +607,16 @@ The chat-mode thinking/reasoning round-trip is now implemented
 (thinking blocks → reasoning_content, reasoning_content → thinking blocks,
 SSE reasoning delta handling — landed 2026-08-30). The chat-mode SSE
 streaming tool-call delta conversion is now implemented (landed
-2026-08-30). Two deferred issues remain (see `## Unresolved Deferred
-Issues` above): chat-mode image content block mapping and the large
-source/test file split. Future hardening work can also focus on
+2026-08-30). Seven deferred issues remain (see `## Unresolved Deferred
+Issues` above): chat-mode image content block mapping, the large
+source/test file split, `sanitize_error`'s exponential-backtracking
+regex, `sanitize_error`'s path redaction being inert on Windows native
+paths, `write_state`'s lock-free concurrent `os.replace`, the state
+sink leaving a stray `.tmp` in the CWD on an empty path, and the sink
+`chmod 0o600` branch being POSIX-only and therefore never executed by
+any test on the Windows dev box. The first
+sinks extraction landed 2026-09-12 (`sanitize.py` + `sinks.py`), the
+first step of the staged decomposition in
+`.claude/cluster-extraction-criteria.md`; the remaining clusters are
+listed there. Future hardening work can also focus on
 additional features or performance optimizations.
