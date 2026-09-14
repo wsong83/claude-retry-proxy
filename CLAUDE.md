@@ -39,6 +39,7 @@ src/templates/
 tests/            per-area test modules + aggregator; see doc/test-catalog.html
 scripts/
   analyze_proxy_trace.py  trace log analysis tool (model stats, latency, success rates)
+  check_doc_anchors.py    doc anchor + credential-shape checker (invoked by the test suite)
 doc/              human-facing HTML reference, indexed by content.html
 pyproject.toml   setuptools src-layout, console scripts, cryptography dependency
 LICENSE          MIT
@@ -324,18 +325,21 @@ No other supplementary docs.
 {"issue_id": "compat-entry-failed-confirmations-dead-field", "title": "The persisted compatibility entry carries a failed_confirmations field that is never incremented, so it always reads 0", "target_repo": null, "report": "./tmp/reports/defer-issue-compat-entry-failed-confirmations-dead-field.json", "deferred": "2026-09-12", "date_source": "creation"},
 {"issue_id": "extract-model-raises-on-non-object-json", "title": "extract_model raises AttributeError on valid JSON that is not an object, so do_POST aborts with no HTTP response; the unguarded call at do_POST pre-empts the whole downstream guard chain", "target_repo": null, "report": "./tmp/reports/defer-issue-extract-model-raises-on-non-object-json.json", "deferred": "2026-09-12", "date_source": "creation"},
 {"issue_id": "extraction-criteria-link-dead-in-public", "title": "CLAUDE.md tells the reader to read .claude/cluster-extraction-criteria.md first, but that file is untracked in a public repo", "target_repo": null, "report": "./tmp/reports/defer-issue-extraction-criteria-link-dead-in-public.json", "deferred": "2026-09-12", "date_source": "creation"},
-{"issue_id": "review-anchor-resolver-not-committed", "title": "No committed check keeps the doc anchors referenced from CLAUDE.md and README.md valid", "target_repo": null, "report": "./tmp/reports/defer-issue-review-anchor-resolver-not-committed.json", "deferred": "2026-09-13", "date_source": "creation"},
-{"issue_id": "review-content-readme-link-raw-markdown", "title": "doc/content.html links ../README.md, which renders as raw Markdown in a browser", "target_repo": null, "report": "./tmp/reports/defer-issue-review-content-readme-link-raw-markdown.json", "deferred": "2026-09-13", "date_source": "creation"}
+{"issue_id": "no-proxy-stop-trace-warning", "title": "Full-suite run warns 'No proxy_stop event in trace' when the proxy is terminated abruptly (low priority)", "target_repo": null, "report": "./tmp/reports/defer-issue-no-proxy-stop-trace-warning.json", "deferred": "2026-09-14", "date_source": "creation"},
+{"issue_id": "codegraph-prompt-hook-matches-ordinary-words", "title": "CodeGraph's prompt hook matches ordinary English words and injects spurious symbol suggestions", "target_repo": null, "report": "./tmp/reports/defer-issue-codegraph-prompt-hook-matches-ordinary-words.json", "deferred": "2026-09-13", "date_source": "creation"}
 ]```
 
 ## Future Work — TODO
 
-Twelve deferred issues remain (see above). Five are newly indexed: the doc-tree
-plan's two — no committed check keeps the anchors CLAUDE.md cites into `doc/` valid,
-and the raw-Markdown `../README.md` link — plus three pre-existing defects catalogued
-for the first time (`extract_model` raising on non-object JSON, the compatibility
-entry's dead `failed_confirmations` field, and the dead extraction-criteria link).
-The other seven are unchanged: chat-mode image content block mapping, the large
+Twelve deferred issues remain (see above). This plan resolved the doc-tree plan's
+two findings — the missing committed anchor check and the raw-Markdown
+`../README.md` link — and two new entries landed: the no-`proxy_stop` trace warning
+(deferred this session, low priority) and the CodeGraph prompt-hook noise (user-filed
+2026-09-13, surfaced as a possibly-orphaned report from an interrupted session and
+indexed for tracking). The other ten entries are unchanged: the doc-tree plan's three
+surviving findings (`extract_model` raising on non-object JSON, the compatibility
+entry's dead `failed_confirmations` field, the dead extraction-criteria link) plus the
+seven pre-existing defects — chat-mode image content block mapping, the large
 source/test file split, `sanitize_error`'s exponential-backtracking regex and its
 inert Windows path redaction, `write_state`'s lock-free concurrent `os.replace`, the
 state sink's stray `.tmp` on an empty path, and the POSIX-only sink `chmod` branch,

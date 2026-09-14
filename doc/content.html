@@ -10,7 +10,7 @@
 
 <h1>claude-retry-proxy Documentation<span class="sub">A multi-provider HTTP retry gateway for the Claude API</span></h1>
 
-<p><strong>Last updated:</strong> 2026-09-12</p>
+<p><strong>Last updated:</strong> 2026-09-14</p>
 
 <p>The proxy listens on localhost, routes requests by model tier (haiku / sonnet / opus) to
 different upstream providers, retries <code>429</code> and <code>503</code> responses with
@@ -18,8 +18,8 @@ jittered exponential backoff, and logs every request to a JSONL trace file. Tier
 configured in <code>config.json</code>; provider credentials are stored encrypted and
 decrypted at startup.</p>
 
-<p>These pages are the deep reference. For installation and first-run setup, start with the
-<a href="../README.md">README</a>.</p>
+<p>These pages are the deep reference. For installation and first-run setup, start with
+<code>README.md</code> in the repository root.</p>
 
 <div class="overview-grid">
   <div class="overview-card"><div class="num">3</div><div class="label">endpoint modes</div></div>
@@ -48,7 +48,7 @@ where to look.</p>
 
 <table>
 <tr><th>You want to…</th><th>Read</th></tr>
-<tr><td>Install it and route your first request</td><td><a href="../README.md">README.md</a></td></tr>
+<tr><td>Install it and route your first request</td><td><code>README.md</code></td></tr>
 <tr><td>Understand how a request is processed</td><td><a href="architecture.html">architecture.html</a></td></tr>
 <tr><td>Point a tier at a provider that is not the Anthropic API</td><td><a href="provider-modes.html">provider-modes.html</a></td></tr>
 <tr><td>Write a <code>config.json</code> or a keys file</td><td><a href="configuration.html">configuration.html</a></td></tr>
@@ -61,9 +61,9 @@ where to look.</p>
 
 <div class="step-box info">
 <div class="step-label">Step 1</div>
-<p>Skim <a href="../README.md">README.md</a> for the shape of the thing — what it does, how it is
-installed, what a config file looks like. It is self-contained; you do not need these pages to
-get running.</p>
+<p>Skim <code>README.md</code> in the repository root for the shape of the thing — what it does,
+how it is installed, what a config file looks like. It is self-contained; you do not need these
+pages to get running.</p>
 </div>
 
 <div class="step-box info">
@@ -90,6 +90,10 @@ project's <code>CLAUDE.md</code> link back into.</p>
       URL you need is shown as code rather than as a hyperlink.</li>
   <li>Section headings carry stable <code>id</code> anchors so other documents can link to a
       specific section — for example <a href="architecture.html#retry">architecture.html#retry</a>.</li>
+  <li>A committed checker, <code>scripts/check_doc_anchors.py</code>, runs with the test suite
+      and verifies that every <code>doc/*.html#id</code> reference in <code>CLAUDE.md</code>, the
+      README, and these pages resolves to a real page and heading — renaming a heading fails the
+      suite.</li>
   <li>File paths shown as <code>src/claude_retry_proxy/server.py</code> are relative to the
       repository root unless they start with <code>~</code>, which means the user's home
       directory.</li>
@@ -97,6 +101,6 @@ project's <code>CLAUDE.md</code> link back into.</p>
       repository.</li>
 </ul>
 
-<footer>Last updated: 2026-09-12</footer>
+<footer>Last updated: 2026-09-14</footer>
 </body>
 </html>

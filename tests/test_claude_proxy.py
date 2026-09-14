@@ -20,6 +20,7 @@ from test_chat_sse import ALL_TESTS as CHAT_SSE_TESTS
 from test_response_transform import ALL_TESTS as RESPONSE_TRANSFORM_TESTS
 from test_compat import ALL_TESTS as COMPAT_TESTS
 from test_sinks import ALL_TESTS as SINKS_TESTS
+from test_docs import ALL_TESTS as DOCS_TESTS
 
 ALL_TESTS = (
     UNIT_TESTS +
@@ -34,7 +35,8 @@ ALL_TESTS = (
     CHAT_SSE_TESTS +
     RESPONSE_TRANSFORM_TESTS +
     COMPAT_TESTS +
-    SINKS_TESTS
+    SINKS_TESTS +
+    DOCS_TESTS
 )
 
 if __name__ == "__main__":

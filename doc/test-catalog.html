@@ -10,7 +10,7 @@
 
 <h1>Test Catalog<span class="sub">Suite layout, harness isolation, and testing patterns</span></h1>
 
-<p><strong>Last updated:</strong> 2026-09-12</p>
+<p><strong>Last updated:</strong> 2026-09-14</p>
 
 <p>The suite is a set of per-area modules merged by a single aggregator. It runs against
 <em>real</em> proxy processes and <em>real</em> mock upstream servers over loopback sockets —
@@ -18,9 +18,12 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>293 test functions across 15 files</strong>, but this number moves whenever
+suite has <strong>304 test functions across 16 files</strong>, but this number moves whenever
 tests are added. Re-count before quoting it:
-<code>grep -c 'def test_' tests/*.py</code>.
+<code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
+such as <code>doc_</code>). The aggregator's own tally is the authoritative figure — the
+recipe only approximates it, so a <code>doc_</code>-prefixed function must be a test case,
+never a helper.
 <p>The <a href="#per-test">per-test inventory</a> below is reconciled by hand, in the same
 commit as the test it documents — nothing verifies it against <code>tests/</code>.</p>
 </div>
@@ -98,6 +101,8 @@ relative size, not as exact current figures.</p>
     <td>Unit-level helpers: jitter, delay computation, small utilities</td></tr>
 <tr><td><code>test_sinks.py</code></td><td class="num">8</td>
     <td>The sink class family: write contract, health reporting, counters</td></tr>
+<tr><td><code>test_docs.py</code></td><td class="num">11</td>
+    <td>The committed doc-anchor checker — anchor resolution for CLAUDE.md / README.md / doc pages, credential-shape scan, exit-code mapping</td></tr>
 <tr><td><code>_harness.py</code></td><td class="num">—</td>
     <td><strong>Not a test module.</strong> Shared helpers, isolation setup, proxy lifecycle.</td></tr>
 <tr><td><code>test_claude_proxy.py</code></td><td class="num">—</td>
@@ -512,6 +517,28 @@ EOF</code></pre>
 <li><code>test_configure_health_only_rebinds_live_sinks</code>: configure(health=H) reaches BOTH live sinks, and a health-only call does not reset the counters.</li>
 </ul>
 
+<h3 id="cat-11">Category 11 — Documentation Checks</h3>
+
+<p><strong>Scope:</strong> The committed doc-anchor checker (<code>scripts/check_doc_anchors.py</code>, run
+by the suite): every <code>doc/*.html#id</code> reference in <code>CLAUDE.md</code>,
+<code>README.md</code>, and the doc pages resolves to a real file and heading, and no
+credential-shaped string sits in a public doc page without a placeholder marker.</p>
+
+<h4><code>tests/test_docs.py</code> (11 tests) — the committed doc-anchor checker</h4>
+<ul>
+<li><code>doc_real_tree_success</code>: The committed checker passes on the real repo tree with a positive anchor count — a referrer wipe cannot silently green the suite.</li>
+<li><code>doc_missing_anchor_file</code>: A referrer anchor to a missing doc page is flagged.</li>
+<li><code>doc_missing_fragment</code>: A referrer fragment not matching any id on an existing page is flagged.</li>
+<li><code>doc_missing_bare_doc_link</code>: A referrer bare doc/page.html link (no fragment) to a missing page is flagged.</li>
+<li><code>doc_page_sibling_anchor_miss</code>: A doc page&#x27;s sibling anchor to a missing fragment is flagged.</li>
+<li><code>doc_page_bare_href_missing</code>: A doc page&#x27;s bare sibling href to a missing page is flagged.</li>
+<li><code>doc_secret_without_marker</code>: A credential-shaped string without a placeholder marker is flagged.</li>
+<li><code>doc_secret_with_marker</code>: The same credential shape with a placeholder marker is not flagged.</li>
+<li><code>doc_url_host_disallowed</code>: A URL whose host is neither allowlisted nor reserved-TLD is flagged.</li>
+<li><code>doc_url_host_allowed</code>: Allowlisted and reserved-TLD URL hosts are not flagged.</li>
+<li><code>doc_cli_exit_codes</code>: main() maps statuses to exit codes 0/1/2, including the no-tree and no-referrers exits.</li>
+</ul>
+
 <!-- END per-test inventory -->
 <h2 id="harness">The harness</h2>
 
@@ -612,6 +639,6 @@ whenever a proxy is running.</p>
       that the full suite passes with a live proxy running.</li>
 </ol>
 
-<footer>Last updated: 2026-09-12</footer>
+<footer>Last updated: 2026-09-14</footer>
 </body>
 </html>
