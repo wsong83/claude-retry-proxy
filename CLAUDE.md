@@ -29,6 +29,9 @@ src/claude_retry_proxy/
   server.py             the HTTP retry gateway server (ThreadingHTTPServer, tier routing, model rewriting, admin API, retry/backoff)
   sanitize.py           error-text redaction leaf: `sanitize_error`, the chokepoint for text reaching stderr, trace `error` fields and client-facing error bodies
   sinks.py              sink class family: private `_Sink` base, `TraceSink` (JSONL append + counters + markers), `StateSink` (atomic state document), shared `_SinkHealth` failure reporter, process-wide pair + `configure()`
+  transforms_common.py  shared endpoint-mode transform mechanism: `_transform_and_guard` (passthrough-on-failure response guard) + `_request_transform_timestamp` helper
+  transforms_chat.py    Anthropic↔Chat (OpenAI chat-completions) body transforms, both directions
+  transforms_response.py Anthropic↔Responses body transforms, both directions
   cli.py                the claude-retry-proxy CLI: start / stop / status / reload (passphrase prompt, config validation, no URL swap)
   vimcrypt.py           vim blowfish2 (VimCrypt~03!) decryption (derived from claude-config bin/vimcrypt.py)
   admin.html            admin page for hot-switching tier mappings (served at /admin/)
@@ -326,12 +329,15 @@ No other supplementary docs.
 {"issue_id": "extract-model-raises-on-non-object-json", "title": "extract_model raises AttributeError on valid JSON that is not an object, so do_POST aborts with no HTTP response; the unguarded call at do_POST pre-empts the whole downstream guard chain", "target_repo": null, "report": "./tmp/reports/defer-issue-extract-model-raises-on-non-object-json.json", "deferred": "2026-09-12", "date_source": "creation"},
 {"issue_id": "extraction-criteria-link-dead-in-public", "title": "CLAUDE.md tells the reader to read .claude/cluster-extraction-criteria.md first, but that file is untracked in a public repo", "target_repo": null, "report": "./tmp/reports/defer-issue-extraction-criteria-link-dead-in-public.json", "deferred": "2026-09-12", "date_source": "creation"},
 {"issue_id": "no-proxy-stop-trace-warning", "title": "Full-suite run warns 'No proxy_stop event in trace' when the proxy is terminated abruptly (low priority)", "target_repo": null, "report": "./tmp/reports/defer-issue-no-proxy-stop-trace-warning.json", "deferred": "2026-09-14", "date_source": "creation"},
-{"issue_id": "codegraph-prompt-hook-matches-ordinary-words", "title": "CodeGraph's prompt hook matches ordinary English words and injects spurious symbol suggestions", "target_repo": null, "report": "./tmp/reports/defer-issue-codegraph-prompt-hook-matches-ordinary-words.json", "deferred": "2026-09-13", "date_source": "creation"}
+{"issue_id": "codegraph-prompt-hook-matches-ordinary-words", "title": "CodeGraph's prompt hook matches ordinary English words and injects spurious symbol suggestions", "target_repo": null, "report": "./tmp/reports/defer-issue-codegraph-prompt-hook-matches-ordinary-words.json", "deferred": "2026-09-13", "date_source": "creation"},
+{"issue_id": "consolidate-module-split-guidance-docs", "title": "Consolidate the two module-split guidance documents and lift the merged doctrine into the global guides", "target_repo": null, "report": "./tmp/reports/defer-issue-consolidate-module-split-guidance-docs.json", "deferred": "2026-09-14", "date_source": "creation"}
 ]```
 
 ## Future Work — TODO
 
-Twelve deferred issues remain (see above). This plan resolved the doc-tree plan's
+Thirteen deferred issues remain (see above) — the twelve prior entries plus the
+user-filed consolidation of the two module-split guidance documents
+(2026-09-14). This plan resolved the doc-tree plan's
 two findings — the missing committed anchor check and the raw-Markdown
 `../README.md` link — and two new entries landed: the no-`proxy_stop` trace warning
 (deferred this session, low priority) and the CodeGraph prompt-hook noise (user-filed
@@ -346,5 +352,10 @@ state sink's stray `.tmp` on an empty path, and the POSIX-only sink `chmod` bran
 untested on the Windows dev box.
 
 The `sanitize.py` + `sinks.py` extraction (2026-09-12) was the first step of the
-staged decomposition in `.claude/cluster-extraction-criteria.md`. New deep
-detail belongs in `doc/`, not here.
+staged decomposition in `.claude/cluster-extraction-criteria.md`; the transforms
+extraction (`2026-09-14-extract-transforms`) landed 2026-09-15 as step 2 —
+`server.py` 4,650 → 3,719 wc lines, with the mode-transform cluster now in
+`transforms_common.py` / `transforms_chat.py` / `transforms_response.py`. The
+deferred `break-up-large-source-and-test-files` issue stays Open until the
+remaining clusters (settings, compat, router/forwarder, admin/handler) are
+extracted. New deep detail belongs in `doc/`, not here.
