@@ -318,38 +318,31 @@ No other supplementary docs.
 
 ```json
 [
-{"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "target_repo": null, "report": "./tmp/reports/defer-issue-image-content-blocks-chat-mode.json", "deferred": "2026-08-29", "date_source": "creation"},
 {"issue_id": "break-up-large-source-and-test-files", "title": "Break up large source and test files into smaller modules", "target_repo": null, "report": "./tmp/reports/defer-issue-break-up-large-source-and-test-files.json", "deferred": "2026-09-01", "date_source": "creation"},
-{"issue_id": "write-state-no-lock-concurrent-replace", "title": "write_state takes no lock and writes through a fixed temp path, so concurrent writers can interleave before os.replace", "target_repo": null, "report": "./tmp/reports/defer-issue-write-state-no-lock-concurrent-replace.json", "deferred": "2026-09-11", "date_source": "creation"},
-{"issue_id": "sanitize-error-path-redaction-inert-on-windows", "title": "sanitize_error's path-redaction arm requires a forward slash, so it silently does nothing for native Windows paths", "target_repo": null, "report": "./tmp/reports/defer-issue-sanitize-error-path-redaction-inert-on-windows.json", "deferred": "2026-09-12", "date_source": "creation"},
-{"issue_id": "sanitize-error-regex-catastrophic-backtracking", "title": "sanitize_error's first regex arm backtracks exponentially, so upstream-controlled error text can hang a worker thread", "target_repo": null, "report": "./tmp/reports/defer-issue-sanitize-error-regex-catastrophic-backtracking.json", "deferred": "2026-09-12", "date_source": "creation"},
-{"issue_id": "sink-chmod-branch-untested-outside-posix", "title": "The sink chmod 0o600 branch is POSIX-only, so no test on the Windows dev box ever executes it", "target_repo": null, "report": "./tmp/reports/defer-issue-sink-chmod-branch-untested-outside-posix.json", "deferred": "2026-09-12", "date_source": "creation"},
-{"issue_id": "state-sink-empty-path-stray-tmp", "title": "An empty state path makes the state sink leave a stray .tmp file in the process working directory", "target_repo": null, "report": "./tmp/reports/defer-issue-state-sink-empty-path-stray-tmp.json", "deferred": "2026-09-12", "date_source": "creation"},
 {"issue_id": "compat-entry-failed-confirmations-dead-field", "title": "The persisted compatibility entry carries a failed_confirmations field that is never incremented, so it always reads 0", "target_repo": null, "report": "./tmp/reports/defer-issue-compat-entry-failed-confirmations-dead-field.json", "deferred": "2026-09-12", "date_source": "creation"},
+{"issue_id": "consolidate-module-split-guidance-docs", "title": "Consolidate the two module-split guidance documents and lift the merged doctrine into the global guides", "target_repo": null, "report": "./tmp/reports/defer-issue-consolidate-module-split-guidance-docs.json", "deferred": "2026-09-14", "date_source": "creation"},
 {"issue_id": "extract-model-raises-on-non-object-json", "title": "extract_model raises AttributeError on valid JSON that is not an object, so do_POST aborts with no HTTP response; the unguarded call at do_POST pre-empts the whole downstream guard chain", "target_repo": null, "report": "./tmp/reports/defer-issue-extract-model-raises-on-non-object-json.json", "deferred": "2026-09-12", "date_source": "creation"},
 {"issue_id": "extraction-criteria-link-dead-in-public", "title": "CLAUDE.md tells the reader to read .claude/cluster-extraction-criteria.md first, but that file is untracked in a public repo", "target_repo": null, "report": "./tmp/reports/defer-issue-extraction-criteria-link-dead-in-public.json", "deferred": "2026-09-12", "date_source": "creation"},
-{"issue_id": "no-proxy-stop-trace-warning", "title": "Full-suite run warns 'No proxy_stop event in trace' when the proxy is terminated abruptly (low priority)", "target_repo": null, "report": "./tmp/reports/defer-issue-no-proxy-stop-trace-warning.json", "deferred": "2026-09-14", "date_source": "creation"},
-{"issue_id": "codegraph-prompt-hook-matches-ordinary-words", "title": "CodeGraph's prompt hook matches ordinary English words and injects spurious symbol suggestions", "target_repo": null, "report": "./tmp/reports/defer-issue-codegraph-prompt-hook-matches-ordinary-words.json", "deferred": "2026-09-13", "date_source": "creation"},
-{"issue_id": "consolidate-module-split-guidance-docs", "title": "Consolidate the two module-split guidance documents and lift the merged doctrine into the global guides", "target_repo": null, "report": "./tmp/reports/defer-issue-consolidate-module-split-guidance-docs.json", "deferred": "2026-09-14", "date_source": "creation"}
+{"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "target_repo": null, "report": "./tmp/reports/defer-issue-image-content-blocks-chat-mode.json", "deferred": "2026-08-29", "date_source": "creation"},
+{"issue_id": "no-proxy-stop-trace-warning", "title": "Full-suite run warns 'No proxy_stop event in trace' when the proxy is terminated abruptly (low priority)", "target_repo": null, "report": "./tmp/reports/defer-issue-no-proxy-stop-trace-warning.json", "deferred": "2026-09-14", "date_source": "creation"}
 ]```
 
 ## Future Work — TODO
 
-Thirteen deferred issues remain (see above) — the twelve prior entries plus the
-user-filed consolidation of the two module-split guidance documents
-(2026-09-14). This plan resolved the doc-tree plan's
-two findings — the missing committed anchor check and the raw-Markdown
-`../README.md` link — and two new entries landed: the no-`proxy_stop` trace warning
-(deferred this session, low priority) and the CodeGraph prompt-hook noise (user-filed
-2026-09-13, surfaced as a possibly-orphaned report from an interrupted session and
-indexed for tracking). The other ten entries are unchanged: the doc-tree plan's three
-surviving findings (`extract_model` raising on non-object JSON, the compatibility
-entry's dead `failed_confirmations` field, the dead extraction-criteria link) plus the
-seven pre-existing defects — chat-mode image content block mapping, the large
-source/test file split, `sanitize_error`'s exponential-backtracking regex and its
-inert Windows path redaction, `write_state`'s lock-free concurrent `os.replace`, the
-state sink's stray `.tmp` on an empty path, and the POSIX-only sink `chmod` branch,
-untested on the Windows dev box.
+Seven deferred issues remain (see above). Plan
+2026-09-15-sanitize-sinks-deferred resolved the five extract-sinks deferred
+issues — the `sanitize_error` exponential-backtracking regex and its inert
+Windows path redaction, `write_state`'s lock-free concurrent `os.replace`, the
+state sink's stray `.tmp` on an empty path, and the POSIX-only sink `chmod`
+branch, untested on the Windows dev box. The doc-tree plan's two findings —
+the missing committed anchor check and the raw-Markdown `../README.md` link —
+were resolved by 2026-09-14-commit-doc-anchor-check. The CodeGraph prompt-hook
+entry (indexed 2026-09-13 without a report file) was removed on 2026-09-15 —
+resolved by other repos. Unresolved: chat-mode image content block mapping,
+the large source/test file split, the doc-tree plan's three surviving findings
+(`extract_model` raising on non-object JSON, the compatibility entry's dead
+`failed_confirmations` field, the dead extraction-criteria link), the
+no-`proxy_stop` trace warning, and the module-split guidance consolidation.
 
 The `sanitize.py` + `sinks.py` extraction (2026-09-12) was the first step of the
 staged decomposition in `.claude/cluster-extraction-criteria.md`; the transforms

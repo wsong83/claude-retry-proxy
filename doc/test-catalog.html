@@ -10,7 +10,7 @@
 
 <h1>Test Catalog<span class="sub">Suite layout, harness isolation, and testing patterns</span></h1>
 
-<p><strong>Last updated:</strong> 2026-09-14</p>
+<p><strong>Last updated:</strong> 2026-09-16</p>
 
 <p>The suite is a set of per-area modules merged by a single aggregator. It runs against
 <em>real</em> proxy processes and <em>real</em> mock upstream servers over loopback sockets —
@@ -18,7 +18,7 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>304 test functions across 16 files</strong>, but this number moves whenever
+suite has <strong>318 test functions across 17 files</strong>, but this number moves whenever
 tests are added. Re-count before quoting it:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
 such as <code>doc_</code>). The aggregator's own tally is the authoritative figure — the
@@ -99,10 +99,12 @@ relative size, not as exact current figures.</p>
     <td>Tier resolution, model resolution, reverse lookup</td></tr>
 <tr><td><code>test_unit.py</code></td><td class="num">2</td>
     <td>Unit-level helpers: jitter, delay computation, small utilities</td></tr>
-<tr><td><code>test_sinks.py</code></td><td class="num">8</td>
-    <td>The sink class family: write contract, health reporting, counters</td></tr>
+<tr><td><code>test_sinks.py</code></td><td class="num">12</td>
+    <td>The sink class family: write contract, health reporting, counters, chmod mode, temp-file hygiene</td></tr>
 <tr><td><code>test_docs.py</code></td><td class="num">11</td>
     <td>The committed doc-anchor checker — anchor resolution for CLAUDE.md / README.md / doc pages, credential-shape scan, exit-code mapping</td></tr>
+<tr><td><code>test_sanitize.py</code></td><td class="num">10</td>
+    <td>The <code>sanitize_error</code> redaction chokepoint — path and IP redaction, case variants, boundary cases, linear-time bound</td></tr>
 <tr><td><code>_harness.py</code></td><td class="num">—</td>
     <td><strong>Not a test module.</strong> Shared helpers, isolation setup, proxy lifecycle.</td></tr>
 <tr><td><code>test_claude_proxy.py</code></td><td class="num">—</td>
@@ -505,7 +507,7 @@ EOF</code></pre>
 <li><code>test_best_effort_stderr_wrapper</code>: _BestEffortStderr makes a failing stderr stream non-raising.</li>
 </ul>
 
-<h4><code>tests/test_sinks.py</code> (8 tests) — the sink class family</h4>
+<h4><code>tests/test_sinks.py</code> (12 tests) — the sink class family</h4>
 <ul>
 <li><code>test_sink_warning_rate_limit</code>: The first failure of an episode warns immediately; further failures inside the interval are silent; the next failure after the interval warns once and reports how many…</li>
 <li><code>test_sink_recovery_notice</code>: The first successful write after a failure episode emits one line carrying the episode&#x27;s dropped-write count; later successes are silent; and a *new* episode after a…</li>
@@ -515,6 +517,24 @@ EOF</code></pre>
 <li><code>test_state_sink_write_round_trips</code>: StateSink.write emits one JSON document at its own path, atomically.</li>
 <li><code>test_configure_rebinds_paths_and_resets_counters</code>: A rebuild rebinds the path and starts fresh counters; an omitted (None) argument keeps the sink it belongs to.</li>
 <li><code>test_configure_health_only_rebinds_live_sinks</code>: configure(health=H) reaches BOTH live sinks, and a health-only call does not reset the counters.</li>
+<li><code>test_chmod_posix_mode_and_swallow</code>: POSIX-gated — after a write through either sink the landed mode is 0600, and a failing os.chmod is swallowed (write still True, payload landed). Skipped with notice on Windows by design (do not delete the permanently-skipped test — it gates the branch on POSIX environments).</li>
+<li><code>test_state_sink_empty_path_rejected_no_stray_tmp</code>: StateSink("") rejects before any file is created — write returns False and the pre-fix stray `.tmp` (a bare file in the process CWD) does not exist; the assertion is name-pinned against os.getcwd(), not a set-diff snapshot.</li>
+<li><code>test_state_sink_replace_failure_leaves_no_temp</code>: A failing os.replace (realistic on Windows when a reader holds the state file open) returns False via the swallow path AND unlinks the unique mkstemp temp.</li>
+<li><code>test_state_sink_concurrent_writes_last_writer_wins</code>: N ≥ 16 concurrent writers through one StateSink produce exactly one complete payload (unique-temp + atomic-replace needs no mutex) and no temp file survives.</li>
+</ul>
+
+<h4><code>tests/test_sanitize.py</code> (10 tests) — the redaction chokepoint</h4>
+<ul>
+<li><code>test_redaction_table_dotdirs_shapes</code>: Each of the seven sensitive dotdirs redacts fully in all three path shapes (POSIX, native Windows, forward-slash Windows).</li>
+<li><code>test_redaction_case_insensitive</code>: The dotdir alternation is compiled IGNORECASE — capitalized dotdirs still redact (Windows paths are case-insensitive).</li>
+<li><code>test_redaction_errno_quote_shape</code>: OSError messages carrying a quoted POSIX path keep their prefix and lose the stray quote.</li>
+<li><code>test_redaction_boundary_cases</code>: Prefix attachment (whole-token), the \b guard (.claudefoo passes through), no-separator and bare-dotdir cases.</li>
+<li><code>test_redaction_ip_arm</code>: The unchanged IPv4 arm — dotted-quads redact inside surrounding text; a 5-digit first octet stays.</li>
+<li><code>test_redaction_both_arms_together</code>: One message carrying an IP and a native Windows .gnupg path redacts both.</li>
+<li><code>test_redaction_falsy_contract</code>: None, the empty string, and the falsy integer 0 all resolve to None — the pinned falsy-input contract.</li>
+<li><code>test_redaction_truncation_last</code>: The [:200] cap applies after redaction; a 300-char plain message is its exact first 200 chars.</li>
+<li><code>test_redaction_exception_object_input</code>: A non-str input (an OSError carrying a path) is str()-ed and redacted.</li>
+<li><code>test_redaction_linear_time_bound</code>: ReDoS tripwire — sanitize_error on 64 slashes completes inside a hard subprocess timeout; a regression is a FAIL (timeout or nonzero exit), never a suite hang.</li>
 </ul>
 
 <h3 id="cat-11">Category 11 — Documentation Checks</h3>

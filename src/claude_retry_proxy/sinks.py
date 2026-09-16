@@ -11,6 +11,7 @@ once per interval.
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 
@@ -184,16 +185,32 @@ class TraceSink(_Sink):
 
 
 class StateSink(_Sink):
-    """Atomic replace of one JSON document. Lock-free, as before the extraction."""
+    """Atomic replace of one JSON document. Unique per-write temp names make
+    concurrent writers safe without a mutex; an empty path is rejected before
+    any file is created."""
 
     def __init__(self, path, name="state", health=None):
         super().__init__(path, name, health)
 
     def _emit(self, payload):
-        tmp = self._path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(payload, f)
-        os.replace(tmp, self._path)
+        if not self._path:
+            raise ValueError("state sink path is empty")
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self._path))
+        try:
+            try:
+                f = os.fdopen(fd, "w", encoding="utf-8")
+            except Exception:
+                os.close(fd)
+                raise
+            with f:
+                json.dump(payload, f)
+            os.replace(tmp, self._path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 _health = _SinkHealth()

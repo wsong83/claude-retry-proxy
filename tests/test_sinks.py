@@ -16,7 +16,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
+import threading
+import unittest.mock
 
 from _harness import (
     fail,
@@ -456,6 +459,181 @@ def test_configure_health_only_rebinds_live_sinks():
         shutil.rmtree(root, ignore_errors=True)
 
 
+# ===========================================================================
+# Plan 2026-09-15-sanitize-sinks-deferred: chmod, empty path, replace
+# failure, and concurrent-writer integrity
+# ===========================================================================
+
+def test_chmod_posix_mode_and_swallow():
+    """POSIX-gated: after a write through either sink, the landed file's mode
+    is 0600; and a failing os.chmod is swallowed — write still returns True
+    and the payload lands.
+
+    Skipped on Windows by design: os.chmod there is a near-no-op (read-only
+    bit only), so the POSIX-only branch in _Sink.write never executes on the
+    dev box. Do not delete this test for being permanently skipped — it
+    gates the branch on every POSIX environment.
+    """
+    print("\n--- Test: Chmod POSIX Mode And Swallow ---")
+    if os.name != "posix":
+        pass_("skipped on Windows — POSIX chmod branch by design; see "
+              "docstring")
+        return
+
+    root = tempfile.mkdtemp(prefix="proxy_sinks_chmod_")
+    trace_path = os.path.join(root, "trace.jsonl")
+    state_path = os.path.join(root, "state.json")
+    try:
+        trace_ok = sinks.TraceSink(trace_path).write({"event": "chmod_probe"})
+        state_ok = sinks.StateSink(state_path).write({"pid": 1})
+        if trace_ok is True and state_ok is True:
+            pass_("both sinks wrote successfully")
+        else:
+            fail("sink write failed (trace={!r}, state={!r})".format(
+                trace_ok, state_ok))
+            return
+
+        for label, path in [("trace", trace_path), ("state", state_path)]:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            if mode == 0o600:
+                pass_("{} sink file landed with mode 0600".format(label))
+            else:
+                fail("{} sink file mode is {:o}, expected 600".format(
+                    label, mode))
+
+        with unittest.mock.patch(
+                "claude_retry_proxy.sinks.os.chmod",
+                side_effect=OSError(1, "chmod denied")):
+            ok = sinks.TraceSink(
+                os.path.join(root, "swallow.jsonl")).write(
+                {"event": "chmod_swallow_probe"})
+        if ok is not True:
+            fail("write returned {!r} with a failing chmod, expected True"
+                 .format(ok))
+            return
+        with open(os.path.join(root, "swallow.jsonl")) as f:
+            landed = json.loads([l for l in f if l.strip()][-1])
+        if landed.get("event") == "chmod_swallow_probe":
+            pass_("a failing chmod is swallowed and the payload landed")
+        else:
+            fail("payload did not land past a failing chmod: {!r}".format(
+                landed))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_state_sink_empty_path_rejected_no_stray_tmp():
+    """StateSink("") rejects the write before any file is created: write
+    returns False and the pre-fix stray '.tmp' (a file literally named
+    '.tmp' in the process CWD, from open('' + '.tmp')) does not exist.
+
+    The assertion is name-pinned against os.getcwd() rather than a
+    before/after set-diff snapshot, so the result does not depend on other
+    CWD activity and holds whatever the CWD is.
+    """
+    print("\n--- Test: State Sink Empty Path Rejected No Stray Tmp ---")
+    sink = sinks.StateSink("")
+    result = sink.write({"pid": 1})
+    if result is not False:
+        fail("StateSink(\"\").write returned {!r}, expected False".format(
+            result))
+        return
+    pass_("empty-path write returned False")
+    if os.path.exists(".tmp"):
+        fail("stray '.tmp' exists at the CWD {!r} — the empty-path guard "
+             "did not fire before file creation".format(os.getcwd()))
+    else:
+        pass_("no stray '.tmp' at the CWD")
+
+
+def test_state_sink_replace_failure_leaves_no_temp():
+    """A failing os.replace (realistic on Windows: a reader holds the state
+    file open) returns False via the swallow path AND unlinks the unique
+    mkstemp temp — none accumulates in the target directory."""
+    print("\n--- Test: State Sink Replace Failure Leaves No Temp ---")
+    root = tempfile.mkdtemp(prefix="proxy_sinks_replace_")
+    target = os.path.join(root, "state.json")
+    try:
+        with unittest.mock.patch(
+                "claude_retry_proxy.sinks.os.replace",
+                side_effect=PermissionError(13, "denied")):
+            ok = sinks.StateSink(target).write({"pid": 1})
+        if ok is not False:
+            fail("write returned {!r} with a failing replace, expected "
+                 "False".format(ok))
+            return
+        pass_("replace-failure write returned False")
+        leftovers = os.listdir(root)
+        if leftovers:
+            fail("stray temp files left in the target directory after a "
+                 "replace failure: {!r}".format(leftovers))
+        else:
+            pass_("no leftover temp in the target directory")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_state_sink_concurrent_writes_last_writer_wins():
+    """N >= 16 concurrent writers through one StateSink produce exactly one
+    complete payload — the unique-temp + atomic-replace design needs no
+    mutex — and no temp file survives in the target directory."""
+    print("\n--- Test: State Sink Concurrent Writes Last Writer Wins ---")
+    root = tempfile.mkdtemp(prefix="proxy_sinks_concurrent_")
+    target = os.path.join(root, "state.json")
+    payloads = [{"payload": i, "marker": "w{}".format(i)} for i in range(16)]
+    try:
+        sink = sinks.StateSink(target)
+        results = []
+
+        def writer(p):
+            results.append(sink.write(p))
+
+        def writer_wrapped(p):
+            try:
+                writer(p)
+            except Exception as e:
+                results.append(e)
+
+        threads = [threading.Thread(target=writer_wrapped, args=(p,))
+                   for p in payloads]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        bad = [r for r in results if isinstance(r, Exception)]
+        if bad:
+            fail("writer threads raised: {!r}".format(bad))
+            return
+        # False is a valid result under the never-raise contract: on Windows
+        # a concurrent os.replace can transiently hit PermissionError, and
+        # the failure path handles it (unlink temp, return False). What must
+        # hold is: no exceptions, exactly one complete payload in the file,
+        # and no leftover temps.
+        lost = [r for r in results if r is not True]
+        if lost:
+            pass_("{}/{} writes returned False (swallowed replace races on "
+                  "Windows; documented never-raise contract)".format(
+                      len(lost), len(payloads)))
+        else:
+            pass_("all {} writes returned True".format(len(payloads)))
+        with open(target) as f:
+            landed = json.load(f)
+        if landed in payloads:
+            pass_("file holds exactly one complete payload ({!r}) — last "
+                  "writer wins, no interleaving".format(landed))
+        else:
+            fail("file content is not one of the writer payloads "
+                 "(interleaving or corruption): {!r}".format(landed))
+        leftovers = [n for n in os.listdir(root) if n != "state.json"]
+        if not leftovers:
+            pass_("no leftover temp files in the target directory")
+        else:
+            fail("stray files in the target directory: {!r}".format(leftovers))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 ALL_TESTS = [
     ("sink-warning-rate-limit", test_sink_warning_rate_limit),
     ("sink-recovery-notice", test_sink_recovery_notice),
@@ -467,6 +645,13 @@ ALL_TESTS = [
      test_configure_rebinds_paths_and_resets_counters),
     ("configure-health-only-rebinds-live-sinks",
      test_configure_health_only_rebinds_live_sinks),
+    ("chmod-posix-mode-and-swallow", test_chmod_posix_mode_and_swallow),
+    ("state-sink-empty-path-rejected-no-stray-tmp",
+     test_state_sink_empty_path_rejected_no_stray_tmp),
+    ("state-sink-replace-failure-leaves-no-temp",
+     test_state_sink_replace_failure_leaves_no_temp),
+    ("state-sink-concurrent-writes-last-writer-wins",
+     test_state_sink_concurrent_writes_last_writer_wins),
 ]
 
 if __name__ == "__main__":
