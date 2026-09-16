@@ -274,12 +274,12 @@ what you need in context, and the link has the rest.
 ## Refactoring
 
 - **Before planning any code split — extracting a module, a class family, or a
-  cluster of functions out of a large file — read
-  [`.claude/cluster-extraction-criteria.md`](.claude/cluster-extraction-criteria.md)
-  first.** It carries the membership tests, the state doctrine, the blast-radius
-  ordering rule, and the staging discipline this repo's extractions follow.
-  Deliberately not inlined here: it is needed only when a refactor is on the
-  table, not in every session.
+  cluster of functions out of a large file — run `/refactor-split` and read
+  `~/.claude/guides/refactor-split-guidance.md` first.** Together they carry
+  the membership tests, the state doctrine, the blast-radius ordering rule,
+  the move mechanics, the gate disciplines, and the staging discipline this
+  repo's extractions follow. Deliberately not inlined here: it is needed only
+  when a refactor is on the table, not in every session.
 
 ## Documentation
 
@@ -318,18 +318,15 @@ No other supplementary docs.
 
 ```json
 [
-{"issue_id": "break-up-large-source-and-test-files", "title": "Break up large source and test files into smaller modules", "target_repo": null, "report": "./tmp/reports/defer-issue-break-up-large-source-and-test-files.json", "deferred": "2026-09-01", "date_source": "creation"},
 {"issue_id": "compat-entry-failed-confirmations-dead-field", "title": "The persisted compatibility entry carries a failed_confirmations field that is never incremented, so it always reads 0", "target_repo": null, "report": "./tmp/reports/defer-issue-compat-entry-failed-confirmations-dead-field.json", "deferred": "2026-09-12", "date_source": "creation"},
-{"issue_id": "consolidate-module-split-guidance-docs", "title": "Consolidate the two module-split guidance documents and lift the merged doctrine into the global guides", "target_repo": null, "report": "./tmp/reports/defer-issue-consolidate-module-split-guidance-docs.json", "deferred": "2026-09-14", "date_source": "creation"},
 {"issue_id": "extract-model-raises-on-non-object-json", "title": "extract_model raises AttributeError on valid JSON that is not an object, so do_POST aborts with no HTTP response; the unguarded call at do_POST pre-empts the whole downstream guard chain", "target_repo": null, "report": "./tmp/reports/defer-issue-extract-model-raises-on-non-object-json.json", "deferred": "2026-09-12", "date_source": "creation"},
-{"issue_id": "extraction-criteria-link-dead-in-public", "title": "CLAUDE.md tells the reader to read .claude/cluster-extraction-criteria.md first, but that file is untracked in a public repo", "target_repo": null, "report": "./tmp/reports/defer-issue-extraction-criteria-link-dead-in-public.json", "deferred": "2026-09-12", "date_source": "creation"},
 {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "target_repo": null, "report": "./tmp/reports/defer-issue-image-content-blocks-chat-mode.json", "deferred": "2026-08-29", "date_source": "creation"},
 {"issue_id": "no-proxy-stop-trace-warning", "title": "Full-suite run warns 'No proxy_stop event in trace' when the proxy is terminated abruptly (low priority)", "target_repo": null, "report": "./tmp/reports/defer-issue-no-proxy-stop-trace-warning.json", "deferred": "2026-09-14", "date_source": "creation"}
 ]```
 
 ## Future Work — TODO
 
-Seven deferred issues remain (see above). Plan
+Four deferred issues remain (see above). Plan
 2026-09-15-sanitize-sinks-deferred resolved the five extract-sinks deferred
 issues — the `sanitize_error` exponential-backtracking regex and its inert
 Windows path redaction, `write_state`'s lock-free concurrent `os.replace`, the
@@ -339,16 +336,20 @@ the missing committed anchor check and the raw-Markdown `../README.md` link —
 were resolved by 2026-09-14-commit-doc-anchor-check. The CodeGraph prompt-hook
 entry (indexed 2026-09-13 without a report file) was removed on 2026-09-15 —
 resolved by other repos. Unresolved: chat-mode image content block mapping,
-the large source/test file split, the doc-tree plan's three surviving findings
-(`extract_model` raising on non-object JSON, the compatibility entry's dead
-`failed_confirmations` field, the dead extraction-criteria link), the
-no-`proxy_stop` trace warning, and the module-split guidance consolidation.
+the doc-tree plan's two surviving findings (`extract_model` raising on
+non-object JSON and the compatibility entry's dead `failed_confirmations`
+field), and the no-`proxy_stop` trace warning. The large source/test file
+split and the module-split guidance consolidation were retired 2026-09-16 by
+the global refactor-split consolidation (claude-config plan
+2026-09-16-refactor-split-skill): the extraction doctrine now lives in the
+global guide, and the /refactor-split survey tracks oversized-file state,
+superseding the retired break-up backlog report.
 
 The `sanitize.py` + `sinks.py` extraction (2026-09-12) was the first step of the
-staged decomposition in `.claude/cluster-extraction-criteria.md`; the transforms
-extraction (`2026-09-14-extract-transforms`) landed 2026-09-15 as step 2 —
-`server.py` 4,650 → 3,719 wc lines, with the mode-transform cluster now in
-`transforms_common.py` / `transforms_chat.py` / `transforms_response.py`. The
-deferred `break-up-large-source-and-test-files` issue stays Open until the
-remaining clusters (settings, compat, router/forwarder, admin/handler) are
-extracted. New deep detail belongs in `doc/`, not here.
+staged decomposition prescribed by the global refactor-split guidance; the
+transforms extraction (`2026-09-14-extract-transforms`) landed 2026-09-15 as
+step 2 — `server.py` 4,650 → 3,719 wc lines, with the mode-transform cluster
+now in `transforms_common.py` / `transforms_chat.py` / `transforms_response.py`.
+The remaining clusters (settings, compat, router/forwarder, admin/handler) are
+tracked by the /refactor-split survey, which replaced the retired break-up
+backlog report on 2026-09-16. New deep detail belongs in `doc/`, not here.
