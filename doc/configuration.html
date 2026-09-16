@@ -265,8 +265,10 @@ keys it is ignored.</p>
 
 <h2 id="env-vars">Environment variables</h2>
 
-<p>These are read by the <em>server</em> process at import time. Several have CLI equivalents on
-<code>claude-retry-proxy start</code>; where both exist, the CLI flag wins.</p>
+<p>These are read at import time by <code>settings.py</code> (the <code>SETTINGS</code> object),
+which both the server and the CLI import. Several have CLI equivalents on
+<code>claude-retry-proxy start</code>; where both exist, the CLI flag wins, and where the flag
+is absent both processes honor the same variable.</p>
 
 <table>
 <tr><th>Variable</th><th>Default</th><th>Accepted range</th><th>Purpose</th></tr>

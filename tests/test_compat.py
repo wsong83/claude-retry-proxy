@@ -558,10 +558,10 @@ def test_compat_state_unknown_feature_ignored():
         # The foreign entry must not be loaded into state at all (plan load
         # contract: "unknown feature keys -> ignore (forward-compat)").
         import claude_retry_proxy.server as srv
-        saved_path = srv.PROXY_FEATURE_COMPAT_FILE
+        saved_path = srv.SETTINGS.feature_compat_file
         saved_state = srv._compat_state
         try:
-            srv.PROXY_FEATURE_COMPAT_FILE = state_path
+            srv.SETTINGS.feature_compat_file = state_path
             srv._load_compat_state()
             loaded_features = [e.get("feature")
                                for e in srv._compat_state.values()]
@@ -573,7 +573,7 @@ def test_compat_state_unknown_feature_ignored():
                 return
             pass_("foreign-feature entry not loaded; learned entry loaded")
         finally:
-            srv.PROXY_FEATURE_COMPAT_FILE = saved_path
+            srv.SETTINGS.feature_compat_file = saved_path
             srv._compat_state = saved_state
 
         responders = {"p": _reject_unstripped_responder()}
@@ -946,10 +946,10 @@ def test_compat_temp_file_cleanup():
     from unittest import mock
     import claude_retry_proxy.server as srv
     state_dir, state_path = _make_state_dir()
-    saved_path = srv.PROXY_FEATURE_COMPAT_FILE
+    saved_path = srv.SETTINGS.feature_compat_file
     saved_state = srv._compat_state
     try:
-        srv.PROXY_FEATURE_COMPAT_FILE = state_path
+        srv.SETTINGS.feature_compat_file = state_path
         srv._compat_state = {
             ("p", "anthropic", "m", "context_management"): {
                 "schema_version": 1, "provider": "p", "mode": "anthropic",
@@ -971,7 +971,7 @@ def test_compat_temp_file_cleanup():
             return
         pass_("no temp file left after failed persist")
     finally:
-        srv.PROXY_FEATURE_COMPAT_FILE = saved_path
+        srv.SETTINGS.feature_compat_file = saved_path
         srv._compat_state = saved_state
         shutil.rmtree(state_dir, ignore_errors=True)
 

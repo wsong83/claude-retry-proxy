@@ -40,50 +40,8 @@ from .transforms_chat import (_anthropic_to_chat, _chat_to_anthropic,
                               _transform_anthropic_tools_to_chat)
 from .transforms_common import _transform_and_guard
 from .transforms_response import (_anthropic_to_response, _response_to_anthropic)
+from .settings import SETTINGS, resolve_trace_file
 
-
-# ---------------------------------------------------------------------------
-# Configuration (environment variables with validation and defaults)
-# ---------------------------------------------------------------------------
-
-def _env_int(name, default, min_val=None, max_val=None):
-    val = os.environ.get(name, "")
-    if val == "":
-        return default
-    try:
-        v = int(val)
-        if min_val is not None and v < min_val:
-            return default
-        if max_val is not None and v > max_val:
-            return default
-        return v
-    except ValueError:
-        return default
-
-
-def _env_str(name, default):
-    val = os.environ.get(name, "")
-    return val if val else default
-
-
-PROXY_PORT = _env_int("PROXY_PORT", 8080, 1024, 65535)
-PROXY_MAX_RETRIES = _env_int("PROXY_MAX_RETRIES", 10, 1, 100)
-PROXY_INITIAL_DELAY = _env_int("PROXY_INITIAL_DELAY", 1, 1, 60)
-PROXY_MAX_DELAY = _env_int("PROXY_MAX_DELAY", 30, 1, 300)
-PROXY_MAX_BODY_SIZE = _env_int("PROXY_MAX_BODY_SIZE", 10 * 1024 * 1024, 1024, 100 * 1024 * 1024)
-PROXY_MAX_RESPONSE_SIZE = _env_int("PROXY_MAX_RESPONSE_SIZE", 100 * 1024 * 1024, 1024, 1024 * 1024 * 1024)
-
-PROXY_LOG_ALL = _env_str("PROXY_LOG_ALL", "") == "1"
-
-_default_trace = os.path.join(os.path.expanduser("~"), ".claude", "logs", "proxy-trace.jsonl")
-PROXY_TRACE_FILE = _env_str("PROXY_TRACE_FILE", _default_trace)
-
-# Config paths
-DEFAULT_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".claude", "proxy", "config.json")
-_src_root = os.path.dirname(os.path.dirname(__file__))
-CONFIG_TEMPLATE_PATH = os.path.join(_src_root, "templates", "config.json")
-_default_keys = os.path.join(os.path.expanduser("~"), ".claude", "keys-index.json")
-PROXY_KEYS_PATH = _env_str("PROXY_KEYS_PATH", _default_keys)
 
 # Thread-safe config access (read by worker threads, written by admin API)
 _config_lock = threading.RLock()
@@ -181,9 +139,6 @@ EXTRA_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
 # 'from' entries may not name the client auth headers — copying the client's
 # key into an arbitrary outbound header (or the trace) is not permissible.
 EXTRA_FROM_FORBIDDEN = {"authorization", "x-api-key"}
-
-# Provider endpoint modes
-MODE_VALUES = ("anthropic", "chat", "response")
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +465,7 @@ def install_template(dest_path):
     """Copy config.json template from src/templates/ to dest_path."""
     import shutil
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    shutil.copy2(CONFIG_TEMPLATE_PATH, dest_path)
+    shutil.copy2(SETTINGS.config_template_path, dest_path)
 
 
 def vendor_key_entries(vendor):
@@ -701,7 +656,7 @@ def load_keys_file(path, passphrase=None):
         if mode is None or mode == "":
             print("[proxy] WARNING: provider '{}' has no 'mode' field — "
                   "defaulting to 'anthropic'".format(name), file=sys.stderr)
-        elif not isinstance(mode, str) or mode not in MODE_VALUES:
+        elif not isinstance(mode, str) or mode not in SETTINGS.mode_values:
             print("[proxy] WARNING: provider '{}' has unknown mode '{}' — "
                   "requests will fail with invalid_provider_mode".format(
                       name, mode), file=sys.stderr)
@@ -738,13 +693,9 @@ def read_passphrase_from_stdin():
         return passphrase
 
 
-STATE_FILE = os.environ.get("PROXY_STATE_FILE",
-                            os.path.join(os.path.expanduser("~"), ".claude", "proxy",
-                                         "proxy-state.json"))
-
 # Bind the process-wide sinks to the resolved paths, exactly as the module-level
 # path constants did before the extraction.
-sinks.configure(trace_path=PROXY_TRACE_FILE, state_path=STATE_FILE)
+sinks.configure(trace_path=SETTINGS.trace_file, state_path=SETTINGS.state_file)
 
 
 class _BestEffortStderr:
@@ -793,9 +744,9 @@ _DISCONNECT_ERRORS = (ConnectionResetError, BrokenPipeError, ConnectionAbortedEr
 
 
 def compute_delay(attempt):
-    """Exponential backoff: 2^attempt seconds, capped at PROXY_MAX_DELAY."""
-    delay = PROXY_INITIAL_DELAY * (2 ** attempt)
-    return min(delay, PROXY_MAX_DELAY)
+    """Exponential backoff: 2^attempt seconds, capped at SETTINGS.max_delay."""
+    delay = SETTINGS.initial_delay * (2 ** attempt)
+    return min(delay, SETTINGS.max_delay)
 
 
 def compute_jittered_delay(base):
@@ -867,11 +818,6 @@ COMPAT_FAILED_CONFIRMATION_SUPPRESSION = 3  # failed confirmations before suppre
 COMPAT_FEATURE = "context_management"
 COMPAT_FEATURE_MODE = "anthropic"
 COMPAT_SCHEMA_VERSION = 1
-
-PROXY_FEATURE_COMPAT_FILE = _env_str(
-    "PROXY_FEATURE_COMPAT_FILE",
-    os.path.join(os.path.expanduser("~"), ".claude", "proxy",
-                 "feature-compatibility.json"))
 
 COMPAT_STATE_UNSUPPORTED = "unsupported"
 COMPAT_STATE_PROBATION = "probation"
@@ -986,7 +932,7 @@ def _compat_validate_entry(entry):
 
 
 def _load_compat_state():
-    """Load learned compatibility state from PROXY_FEATURE_COMPAT_FILE.
+    """Load learned compatibility state from SETTINGS.feature_compat_file.
 
     Missing file → empty state (no warning). Malformed/unreadable file →
     warn to stderr and fail open with empty state. Known schema version with
@@ -996,7 +942,7 @@ def _load_compat_state():
     global _compat_state
     loaded = {}
     try:
-        with open(PROXY_FEATURE_COMPAT_FILE, "r", encoding="utf-8") as f:
+        with open(SETTINGS.feature_compat_file, "r", encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
         return
@@ -1047,8 +993,8 @@ def _persist_compat_state_locked():
         "schema_version": COMPAT_SCHEMA_VERSION,
         "entries": {_compat_file_key(k): v for k, v in _compat_state.items()},
     }
-    d = os.path.dirname(PROXY_FEATURE_COMPAT_FILE)
-    tmp = "{}.{}.tmp".format(PROXY_FEATURE_COMPAT_FILE,
+    d = os.path.dirname(SETTINGS.feature_compat_file)
+    tmp = "{}.{}.tmp".format(SETTINGS.feature_compat_file,
                              "{}-{}".format(os.getpid(),
                                             uuid.uuid4().hex[:8]))
     try:
@@ -1056,10 +1002,10 @@ def _persist_compat_state_locked():
             os.makedirs(d, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f)
-        os.replace(tmp, PROXY_FEATURE_COMPAT_FILE)
+        os.replace(tmp, SETTINGS.feature_compat_file)
         if os.name == "posix":
             try:
-                os.chmod(PROXY_FEATURE_COMPAT_FILE, 0o600)
+                os.chmod(SETTINGS.feature_compat_file, 0o600)
             except OSError:
                 pass
     except OSError:
@@ -1326,7 +1272,7 @@ def forward_request(method, path, headers, body, handler=None, request_id=None):
     Returns (status, response_headers, body_bytes, first_byte_ms, total_sec, retries, tier, provider).
     total_sec covers the entire request including all retry waits.
     On 429 and 503, retries with jittered exponential backoff. 429 uses the
-    maximal delay (PROXY_MAX_DELAY); 503 uses the exponential.
+    maximal delay (SETTINGS.max_delay); 503 uses the exponential.
     When handler is provided and the upstream responds 2xx, the body is
     streamed to the client in real time via the handler (body_bytes is then
     b""); otherwise the body is buffered and returned.
@@ -1406,12 +1352,12 @@ def _compat_rejection_match(status, resp_body):
     """Recognize the two enumerated unsupported-feature 400 shapes.
 
     Content-type agnostic: the drained body is parsed as JSON regardless of
-    the upstream Content-Type header. Bodies exceeding PROXY_MAX_BODY_SIZE
+    the upstream Content-Type header. Bodies exceeding SETTINGS.max_body_size
     or failing to parse are inconclusive (False — never learn).
     """
     if status != 400 or not resp_body:
         return False
-    if len(resp_body) > PROXY_MAX_BODY_SIZE:
+    if len(resp_body) > SETTINGS.max_body_size:
         return False
     try:
         data = json.loads(resp_body)
@@ -1552,7 +1498,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     if not ALLOWED_PATH_RE.match(path):
         return 400, {}, b'{"error":"Path not allowed"}', 0, 0, 0, "unknown", None, None
 
-    if body and len(body) > PROXY_MAX_BODY_SIZE:
+    if body and len(body) > SETTINGS.max_body_size:
         return 413, {}, b'{"error":"Payload too large"}', 0, 0, 0, "unknown", None, None
 
     # Resolve tier from model name
@@ -1592,12 +1538,12 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
 
     # Read endpoint mode (None/''/missing normalize to "anthropic")
     mode = vendor.get("mode") or "anthropic"
-    if mode not in MODE_VALUES:
+    if mode not in SETTINGS.mode_values:
         err_msg = json.dumps({
             "error": {
                 "type": "invalid_provider_mode",
                 "message": "Provider '{}' has invalid mode '{}'. Valid modes: {}".format(
-                    provider_name, mode, ", ".join(MODE_VALUES))
+                    provider_name, mode, ", ".join(SETTINGS.mode_values))
             }
         })
         return 500, {}, err_msg.encode("utf-8"), 0, 0, 0, tier, provider_name, actual_model
@@ -1853,7 +1799,7 @@ def _forward_core(method, path, handler, request_id, config,
                   mode, is_count_tokens, max_attempts=None):
     """Forwarding pass: 429/503/connection retry loop and response handling.
 
-    max_attempts=None derives the attempt count from config (PROXY_MAX_RETRIES,
+    max_attempts=None derives the attempt count from config (SETTINGS.max_retries,
     count_tokens exclusion); an explicit value overrides both — compatibility
     retries pass 1 so a compat retry is a single upstream attempt.
     """
@@ -1866,7 +1812,7 @@ def _forward_core(method, path, handler, request_id, config,
     if max_attempts is None:
         disable_retry = config.get("disable_retry_claude_count_token", False)
         max_attempts = 1 if (disable_retry and is_count_tokens) \
-                       else PROXY_MAX_RETRIES + 1
+                       else SETTINGS.max_retries + 1
 
     for attempt in range(max_attempts):
         try:
@@ -1881,7 +1827,7 @@ def _forward_core(method, path, handler, request_id, config,
                 last_status = resp.status
                 if attempt < max_attempts - 1:
                     if resp.status == 429:
-                        delay = compute_jittered_delay(PROXY_MAX_DELAY)
+                        delay = compute_jittered_delay(SETTINGS.max_delay)
                         reason = "429"
                     elif resp.status == 503:
                         delay = compute_jittered_delay(compute_delay(attempt))
@@ -1913,7 +1859,7 @@ def _forward_core(method, path, handler, request_id, config,
                     conn.close()
                     continue
                 else:
-                    err_body = _read_capped(resp, PROXY_MAX_BODY_SIZE)
+                    err_body = _read_capped(resp, SETTINGS.max_body_size)
                     try:
                         conn.close()
                     except OSError:
@@ -1952,13 +1898,13 @@ def _forward_core(method, path, handler, request_id, config,
                             first_byte = False
                         chunks.append(chunk)
                         total_bytes += len(chunk)
-                        if total_bytes > PROXY_MAX_RESPONSE_SIZE:
+                        if total_bytes > SETTINGS.max_response_size:
                             log_trace({
                                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                                 "event": "response_size_cap_exceeded",
                                 "request_id": request_id,
                                 "bytes_read": total_bytes,
-                                "limit": PROXY_MAX_RESPONSE_SIZE,
+                                "limit": SETTINGS.max_response_size,
                             })
                             print("[proxy] Response size limit exceeded ({} bytes), rid={}".format(
                                 total_bytes, request_id), file=sys.stderr)
@@ -2000,13 +1946,13 @@ def _forward_core(method, path, handler, request_id, config,
                                 first_byte = False
                             chunks.append(chunk)
                             total_bytes += len(chunk)
-                            if total_bytes > PROXY_MAX_RESPONSE_SIZE:
+                            if total_bytes > SETTINGS.max_response_size:
                                 log_trace({
                                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                                     "event": "response_size_cap_exceeded",
                                     "request_id": request_id,
                                     "bytes_read": total_bytes,
-                                    "limit": PROXY_MAX_RESPONSE_SIZE,
+                                    "limit": SETTINGS.max_response_size,
                                 })
                                 print("[proxy] Response size limit exceeded ({} bytes), rid={}".format(
                                     total_bytes, request_id), file=sys.stderr)
@@ -2045,13 +1991,13 @@ def _forward_core(method, path, handler, request_id, config,
                     first_byte = False
                 chunks.append(chunk)
                 total_bytes += len(chunk)
-                if total_bytes > PROXY_MAX_RESPONSE_SIZE:
+                if total_bytes > SETTINGS.max_response_size:
                     log_trace({
                         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "event": "response_size_cap_exceeded",
                         "request_id": request_id,
                         "bytes_read": total_bytes,
-                        "limit": PROXY_MAX_RESPONSE_SIZE,
+                        "limit": SETTINGS.max_response_size,
                     })
                     print("[proxy] Response size limit exceeded ({} bytes), rid={}".format(
                         total_bytes, request_id), file=sys.stderr)
@@ -2430,13 +2376,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     if not chunk:
                         break
                     bytes_streamed += len(chunk)
-                    if bytes_streamed > PROXY_MAX_RESPONSE_SIZE:
+                    if bytes_streamed > SETTINGS.max_response_size:
                         log_trace({
                             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                             "event": "response_size_cap_exceeded",
                             "request_id": request_id,
                             "bytes_streamed": bytes_streamed,
-                            "limit": PROXY_MAX_RESPONSE_SIZE,
+                            "limit": SETTINGS.max_response_size,
                         })
                         print("[proxy] Response size limit exceeded ({} bytes)".format(
                             bytes_streamed), file=sys.stderr)
@@ -2454,13 +2400,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     if not chunk:
                         break
                     bytes_streamed += len(chunk)
-                    if bytes_streamed > PROXY_MAX_RESPONSE_SIZE:
+                    if bytes_streamed > SETTINGS.max_response_size:
                         log_trace({
                             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                             "event": "response_size_cap_exceeded",
                             "request_id": request_id,
                             "bytes_streamed": bytes_streamed,
-                            "limit": PROXY_MAX_RESPONSE_SIZE,
+                            "limit": SETTINGS.max_response_size,
                         })
                         print("[proxy] Response size limit exceeded ({} bytes)".format(
                             bytes_streamed), file=sys.stderr)
@@ -2896,7 +2842,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 # Degraded mode (first-frame cap exceeded): forward raw bytes
                 if buf is None:
                     bytes_streamed += len(chunk)
-                    if bytes_streamed > PROXY_MAX_RESPONSE_SIZE:
+                    if bytes_streamed > SETTINGS.max_response_size:
                         self._log_response_cap_exceeded(request_id, bytes_streamed)
                         break
                     self.wfile.write(chunk)
@@ -2960,7 +2906,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         })
                         frame_dropped = True
                         buf.clear()
-                if bytes_streamed > PROXY_MAX_RESPONSE_SIZE:
+                if bytes_streamed > SETTINGS.max_response_size:
                     self._log_response_cap_exceeded(request_id, bytes_streamed)
                     break
         except _DISCONNECT_ERRORS:
@@ -3030,7 +2976,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "event": "response_size_cap_exceeded",
             "request_id": request_id,
             "bytes_streamed": bytes_streamed,
-            "limit": PROXY_MAX_RESPONSE_SIZE,
+            "limit": SETTINGS.max_response_size,
         })
         print("[proxy] Response size limit exceeded ({} bytes)".format(
             bytes_streamed), file=sys.stderr)
@@ -3128,7 +3074,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             providers_detail = {}
             for name, vendor in (_vendors or {}).items():
                 mode = vendor.get("mode")
-                if mode not in MODE_VALUES:
+                if mode not in SETTINGS.mode_values:
                     mode = "anthropic"
                 providers_detail[name] = {
                     "mode": mode,
@@ -3156,7 +3102,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             # CSRF check
-            if not _validate_csrf_origin(self, PROXY_PORT):
+            if not _validate_csrf_origin(self, SETTINGS.port):
                 self._send_response(403, b'{"error":"forbidden: invalid Origin"}')
                 return
 
@@ -3189,7 +3135,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             # CSRF check
-            if not _validate_csrf_origin(self, PROXY_PORT):
+            if not _validate_csrf_origin(self, SETTINGS.port):
                 self._send_response(403, b'{"error":"forbidden: invalid Origin"}')
                 return
 
@@ -3340,7 +3286,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             # CSRF check
-            if not _validate_csrf_origin(self, PROXY_PORT):
+            if not _validate_csrf_origin(self, SETTINGS.port):
                 self._send_response(403, b'{"error":"forbidden: invalid Origin"}')
                 return
 
@@ -3409,7 +3355,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         except (ValueError, TypeError):
             self._send_response(400, b'{"error":"invalid Content-Length"}')
             return
-        if content_length > PROXY_MAX_BODY_SIZE:
+        if content_length > SETTINGS.max_body_size:
             try:
                 self._send_response(413,
                     b'{"error":"Payload too large"}')
@@ -3507,7 +3453,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if trace_entry.get("key") is None:
             trace_entry.pop("key", None)
 
-        if PROXY_LOG_ALL:
+        if SETTINGS.log_all:
             # Include full request/response bodies
             try:
                 trace_entry["request_body"] = json.loads(body.decode("utf-8"))
@@ -3560,22 +3506,18 @@ def main():
                         help="Read passphrase from file instead of stdin")
     args = parser.parse_args()
 
-    global PROXY_PORT, PROXY_TRACE_FILE, PROXY_LOG_ALL
     global _current_config, _vendors, _config_path, _startup_state
 
     if args.port is not None:
-        PROXY_PORT = args.port
-    if args.log is not None:
-        if not os.path.isabs(args.log):
-            args.log = os.path.join(os.getcwd(), args.log)
-        PROXY_TRACE_FILE = args.log
+        SETTINGS.port = args.port
+    SETTINGS.trace_file = resolve_trace_file(args.log)
     if getattr(args, "all"):
-        PROXY_LOG_ALL = True
-    sinks.configure(trace_path=PROXY_TRACE_FILE, state_path=STATE_FILE)
+        SETTINGS.log_all = True
+    sinks.configure(trace_path=SETTINGS.trace_file, state_path=SETTINGS.state_file)
 
     # Resolve paths
-    config_path = args.config_path or DEFAULT_CONFIG_PATH
-    keys_path = args.keys_path or PROXY_KEYS_PATH
+    config_path = args.config_path or SETTINGS.config_path
+    keys_path = args.keys_path or SETTINGS.keys_path
 
     # Read keys file and detect format
     try:
@@ -3642,10 +3584,10 @@ def main():
     # Check if another proxy is already running on this port
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        sock.bind(("127.0.0.1", PROXY_PORT))
+        sock.bind(("127.0.0.1", SETTINGS.port))
     except OSError:
         print("[proxy] Port {} is already in use. Proxy may already be running.".format(
-            PROXY_PORT), file=sys.stderr)
+            SETTINGS.port), file=sys.stderr)
         sys.exit(1)
     finally:
         sock.close()
@@ -3653,7 +3595,7 @@ def main():
     # Write initial state
     state = {
         "pid": os.getpid(),
-        "port": PROXY_PORT,
+        "port": SETTINGS.port,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "owner_pid": os.getppid(),
         "last_heartbeat": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -3662,17 +3604,17 @@ def main():
     if not write_state(state):
         try:
             print("[proxy] ERROR: state file {} is not writable — aborting startup".format(
-                STATE_FILE), file=sys.stderr)
+                SETTINGS.state_file), file=sys.stderr)
         except Exception:
             pass
         sys.exit(1)
     _startup_state = state
 
     # Write start marker to trace
-    if not write_start_marker(PROXY_PORT):
+    if not write_start_marker(SETTINGS.port):
         try:
             print("[proxy] ERROR: trace file {} is not writable — aborting startup".format(
-                PROXY_TRACE_FILE), file=sys.stderr)
+                SETTINGS.trace_file), file=sys.stderr)
         except Exception:
             pass
         sys.exit(1)
@@ -3685,8 +3627,8 @@ def main():
     threading.Thread(target=heartbeat_loop, daemon=True).start()
 
     # Start server with ThreadingHTTPServer for concurrent requests
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
-    print("[proxy] Listening on 127.0.0.1:{}".format(PROXY_PORT), file=sys.stderr)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", SETTINGS.port), ProxyHandler)
+    print("[proxy] Listening on 127.0.0.1:{}".format(SETTINGS.port), file=sys.stderr)
     print("[proxy] Providers: {}".format(", ".join(_vendors.keys())), file=sys.stderr)
     # Print readiness marker to stdout for CLI to detect (separate from stderr logs)
     print("READY", flush=True)
@@ -3711,7 +3653,7 @@ def main():
         write_stop_marker()
         # Clean up state file
         try:
-            os.remove(STATE_FILE)
+            os.remove(SETTINGS.state_file)
         except OSError:
             pass
 

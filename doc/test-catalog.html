@@ -18,7 +18,7 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>318 test functions across 17 files</strong>, but this number moves whenever
+suite has <strong>322 test functions across 18 files</strong>, but this number moves whenever
 tests are added. Re-count before quoting it:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
 such as <code>doc_</code>). The aggregator's own tally is the authoritative figure — the
@@ -58,8 +58,9 @@ imported, because those modules read their paths at import time.</p>
 <tr><td><code>PROXY_FEATURE_COMPAT_FILE</code></td><td>a session temp file</td></tr>
 </table>
 
-<p>The ordering matters and is load-bearing: <code>cli.py</code> and <code>server.py</code> bind
-these paths to module-level constants at import, so setting the variables after import has no
+<p>The ordering matters and is load-bearing: <code>settings.py</code> binds
+these paths at import and both <code>cli.py</code> and <code>server.py</code> import it,
+so setting the variables after import has no
 effect. <code>tests/_harness.py</code> does the assignment at module scope, before importing
 anything that reads them.</p>
 
@@ -105,13 +106,15 @@ relative size, not as exact current figures.</p>
     <td>The committed doc-anchor checker — anchor resolution for CLAUDE.md / README.md / doc pages, credential-shape scan, exit-code mapping</td></tr>
 <tr><td><code>test_sanitize.py</code></td><td class="num">10</td>
     <td>The <code>sanitize_error</code> redaction chokepoint — path and IP redaction, case variants, boundary cases, linear-time bound</td></tr>
+<tr><td><code>test_settings.py</code></td><td class="num">4</td>
+    <td>The settings module: env fallback branches, singleton shape, trace-path resolver chain</td></tr>
 <tr><td><code>_harness.py</code></td><td class="num">—</td>
     <td><strong>Not a test module.</strong> Shared helpers, isolation setup, proxy lifecycle.</td></tr>
 <tr><td><code>test_claude_proxy.py</code></td><td class="num">—</td>
     <td><strong>Not a test module.</strong> The aggregator and CLI entry point.</td></tr>
 </table>
 
-<!-- BEGIN per-test inventory (generated 2026-09-13) -->
+<!-- BEGIN per-test inventory (generated 2026-09-16) -->
 <h2 id="per-test">Per-Test Descriptions</h2>
 
 <p>Every test in the suite, grouped by the area it exercises. Use it to find which
@@ -535,6 +538,14 @@ EOF</code></pre>
 <li><code>test_redaction_truncation_last</code>: The [:200] cap applies after redaction; a 300-char plain message is its exact first 200 chars.</li>
 <li><code>test_redaction_exception_object_input</code>: A non-str input (an OSError carrying a path) is str()-ed and redacted.</li>
 <li><code>test_redaction_linear_time_bound</code>: ReDoS tripwire — sanitize_error on 64 slashes completes inside a hard subprocess timeout; a regression is a FAIL (timeout or nonzero exit), never a suite hang.</li>
+</ul>
+
+<h4><code>tests/test_settings.py</code> (4 tests) — the settings module</h4>
+<ul>
+<li><code>test_env_int_fallback_semantics</code>: The five <code>_env_int</code> cases — valid in-range parses; unparseable, below-min, above-max and empty/unset each fall back to the default.</li>
+<li><code>test_env_str_fallback_semantics</code>: Set returns the value; set-but-empty falls back to the default.</li>
+<li><code>test_settings_object_shape</code>: <code>srv.SETTINGS is settings.SETTINGS</code> (the shared-singleton patch-coherence guarantee); the pinned attributes and types; the exact mode tuple.</li>
+<li><code>test_resolve_trace_file_chain</code>: An absolute log arg passes through; a relative arg is joined against the cwd; env set at call time wins over a None arg; empty env falls back to <code>SETTINGS.trace_file</code>.</li>
 </ul>
 
 <h3 id="cat-11">Category 11 — Documentation Checks</h3>

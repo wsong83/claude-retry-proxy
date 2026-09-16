@@ -291,7 +291,7 @@ def test_heartbeat_preserves_state():
 
     import claude_retry_proxy.server as srv
 
-    state_path = srv.STATE_FILE
+    state_path = srv.SETTINGS.state_file
     state_backup = None
     if os.path.exists(state_path):
         with open(state_path) as f:

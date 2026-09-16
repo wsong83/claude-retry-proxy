@@ -14,18 +14,15 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from .settings import SETTINGS, resolve_trace_file
 
 HOME = os.path.expanduser("~")
-PROXY_DIR = os.path.join(HOME, ".claude", "proxy")
-PROXY_STATE_FILE = os.environ.get("PROXY_STATE_FILE", os.path.join(PROXY_DIR, "proxy-state.json"))
-CONFIG_FILE = os.path.join(PROXY_DIR, "config.json")
-KEYS_FILE = os.path.join(HOME, ".claude", "keys-index.json")
-_src_root = os.path.dirname(os.path.dirname(__file__))
-CONFIG_TEMPLATE_PATH = os.path.join(_src_root, "templates", "config.json")
+PROXY_DIR = SETTINGS.proxy_dir
+PROXY_STATE_FILE = SETTINGS.state_file
+CONFIG_FILE = SETTINGS.config_path
+KEYS_FILE = SETTINGS.keys_path
+CONFIG_TEMPLATE_PATH = SETTINGS.config_template_path
 
-# Trace file defaults — MUST mirror server.py main()'s resolution so the CLI
-# prunes the same file the server writes to.
-TRACE_FILE_DEFAULT = os.path.join(HOME, ".claude", "logs", "proxy-trace.jsonl")
 PRUNE_RETENTION_DAYS = 5
 
 
@@ -136,19 +133,6 @@ def kill_process_windows(pid):
 # ---------------------------------------------------------------------------
 # Trace log pruning (best-effort maintenance)
 # ---------------------------------------------------------------------------
-
-def resolve_trace_path(log_arg):
-    """Resolve the trace file path the same way server.py main() does.
-
-    MUST mirror server.py main()'s resolution so the CLI prunes the same file
-    the server writes to. Order: --log (relative to cwd) > $PROXY_TRACE_FILE
-    > default. If you change this, change server.py main() too.
-    """
-    if log_arg:
-        return log_arg if os.path.isabs(log_arg) else os.path.join(os.getcwd(), log_arg)
-    env = os.environ.get("PROXY_TRACE_FILE", "")
-    return env if env else TRACE_FILE_DEFAULT
-
 
 _TS_FORMATS = ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.000Z")
 
@@ -356,8 +340,8 @@ def cmd_start(args):
     from . import vimcrypt
 
     parser = argparse.ArgumentParser(prog="claude-retry-proxy start")
-    parser.add_argument("--port", "-p", type=int, default=8080,
-                        help="Port to listen on (default: 8080)")
+    parser.add_argument("--port", "-p", type=int, default=SETTINGS.port,
+                        help="Port to listen on (default: $PROXY_PORT or 8080)")
     parser.add_argument("--log", "-l", type=str, default=None,
                         help="Trace log file path")
     parser.add_argument("--all", "-a", action="store_true",
@@ -484,7 +468,7 @@ def cmd_start(args):
 
     # 7. Prune trace log (best-effort)
     try:
-        prune_trace_file(resolve_trace_path(parsed.log))
+        prune_trace_file(resolve_trace_file(parsed.log))
     except Exception as e:
         print("WARNING: trace log check failed ({}); continuing".format(e),
               file=sys.stderr)

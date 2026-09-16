@@ -2767,15 +2767,15 @@ def test_retry_path_print_failure_does_not_misclassify():
     prev_trace_path = sinks._trace._path
     prev_state_path = sinks._state._path
     saved = (srv._current_config,
-             srv._vendors, srv.PROXY_MAX_RETRIES, srv.PROXY_INITIAL_DELAY,
-             srv.PROXY_MAX_DELAY, sys.stderr)
+             srv._vendors, srv.SETTINGS.max_retries,
+             srv.SETTINGS.initial_delay, srv.SETTINGS.max_delay, sys.stderr)
     try:
         sinks.configure(trace_path=os.path.join(root, "trace.jsonl"),
                         state_path=os.path.join(root, "state.json"))
         # One retry (2 attempts), fast backoff.
-        srv.PROXY_MAX_RETRIES = 1
-        srv.PROXY_INITIAL_DELAY = 1
-        srv.PROXY_MAX_DELAY = 1
+        srv.SETTINGS.max_retries = 1
+        srv.SETTINGS.initial_delay = 1
+        srv.SETTINGS.max_delay = 1
         srv._current_config = {
             "tiers": {
                 "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
@@ -2812,8 +2812,8 @@ def test_retry_path_print_failure_does_not_misclassify():
             fail("expected exactly 2 upstream requests, got {}".format(len(reqs)))
     finally:
         (srv._current_config,
-         srv._vendors, srv.PROXY_MAX_RETRIES, srv.PROXY_INITIAL_DELAY,
-         srv.PROXY_MAX_DELAY, sys.stderr) = saved
+         srv._vendors, srv.SETTINGS.max_retries,
+         srv.SETTINGS.initial_delay, srv.SETTINGS.max_delay, sys.stderr) = saved
         sinks.configure(trace_path=prev_trace_path, state_path=prev_state_path)
         try:
             mock_server.shutdown()

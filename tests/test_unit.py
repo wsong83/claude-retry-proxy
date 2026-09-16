@@ -23,8 +23,7 @@ def test_compute_jittered_delay_bounds():
     print("\n--- Test 5b: Jittered Delay Bounds ---")
 
     import math
-    from claude_retry_proxy.server import compute_jittered_delay, compute_delay, _rng, \
-        PROXY_INITIAL_DELAY, PROXY_MAX_DELAY
+    from claude_retry_proxy.server import compute_jittered_delay, compute_delay, _rng, SETTINGS
 
     bases = [1, 2, 3, 4, 8, 16, 30, 300]
     draws_per_base = 2000
@@ -96,15 +95,15 @@ def test_compute_jittered_delay_bounds():
         fail(f"compute_jittered_delay(-5) = {compute_jittered_delay(-5)}, expected 0")
 
     # Regression guard on unchanged compute_delay
-    if compute_delay(0) == PROXY_INITIAL_DELAY:
-        pass_(f"compute_delay(0) == PROXY_INITIAL_DELAY ({PROXY_INITIAL_DELAY})")
+    if compute_delay(0) == SETTINGS.initial_delay:
+        pass_(f"compute_delay(0) == SETTINGS.initial_delay ({SETTINGS.initial_delay})")
     else:
-        fail(f"compute_delay(0) = {compute_delay(0)}, expected {PROXY_INITIAL_DELAY}")
+        fail(f"compute_delay(0) = {compute_delay(0)}, expected {SETTINGS.initial_delay}")
 
-    if compute_delay(100) == PROXY_MAX_DELAY:
-        pass_(f"compute_delay(100) == PROXY_MAX_DELAY ({PROXY_MAX_DELAY})")
+    if compute_delay(100) == SETTINGS.max_delay:
+        pass_(f"compute_delay(100) == SETTINGS.max_delay ({SETTINGS.max_delay})")
     else:
-        fail(f"compute_delay(100) = {compute_delay(100)}, expected {PROXY_MAX_DELAY}")
+        fail(f"compute_delay(100) = {compute_delay(100)}, expected {SETTINGS.max_delay}")
 
     # Thread-local RNG correctness: same object within one thread
     r1 = _rng()

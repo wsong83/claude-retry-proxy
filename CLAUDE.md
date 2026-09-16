@@ -29,6 +29,7 @@ src/claude_retry_proxy/
   server.py             the HTTP retry gateway server (ThreadingHTTPServer, tier routing, model rewriting, admin API, retry/backoff)
   sanitize.py           error-text redaction leaf: `sanitize_error`, the chokepoint for text reaching stderr, trace `error` fields and client-facing error bodies
   sinks.py              sink class family: private `_Sink` base, `TraceSink` (JSONL append + counters + markers), `StateSink` (atomic state document), shared `_SinkHealth` failure reporter, process-wide pair + `configure()`
+  settings.py           env-derived settings singleton: `SETTINGS` value object (the `PROXY_*` limits/flags, runtime paths incl. state/compat files, mode values) + `resolve_trace_file` — built at import from env, adjusted by `main()` at startup; imported by both the server and the CLI
   transforms_common.py  shared endpoint-mode transform mechanism: `_transform_and_guard` (passthrough-on-failure response guard) + `_request_transform_timestamp` helper
   transforms_chat.py    Anthropic↔Chat (OpenAI chat-completions) body transforms, both directions
   transforms_response.py Anthropic↔Responses body transforms, both directions
@@ -243,7 +244,7 @@ startup on failure).
 - **Test suite is safe alongside a live proxy.** The suite sets
   `PROXY_TRACE_FILE`, `PROXY_STATE_FILE`, and `PROXY_FEATURE_COMPAT_FILE` to
   session temp paths at module load, *before* importing `cli.py` or `server.py`
-  (both bind those env vars to module constants at import time). A test proxy
+  (`settings.py` binds those env vars at import — both modules import it). A test proxy
   therefore cannot touch the live proxy's files, and the old docstring warning
   about not running tests alongside a live proxy is obsolete.
   [doc/test-catalog.html#isolation](doc/test-catalog.html#isolation)
@@ -350,6 +351,12 @@ staged decomposition prescribed by the global refactor-split guidance; the
 transforms extraction (`2026-09-14-extract-transforms`) landed 2026-09-15 as
 step 2 — `server.py` 4,650 → 3,719 wc lines, with the mode-transform cluster
 now in `transforms_common.py` / `transforms_chat.py` / `transforms_response.py`.
-The remaining clusters (settings, compat, router/forwarder, admin/handler) are
+The settings extraction (`2026-09-16-extract-settings`) landed 2026-09-16 as
+step 3 — `server.py` 3,719 → 3,661 wc lines, with the env-derived `SETTINGS`
+value object and the shared `resolve_trace_file` chain in `settings.py`
+(imported by both the server and the CLI; the import-time `SETTINGS`
+derivation is a declared override of the guide's build-in-`main()` rule,
+recorded in that plan's Document Overrides).
+The remaining clusters (compat, router/forwarder, admin/handler) are
 tracked by the /refactor-split survey, which replaced the retired break-up
 backlog report on 2026-09-16. New deep detail belongs in `doc/`, not here.

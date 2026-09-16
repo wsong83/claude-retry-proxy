@@ -21,6 +21,7 @@ from test_response_transform import ALL_TESTS as RESPONSE_TRANSFORM_TESTS
 from test_compat import ALL_TESTS as COMPAT_TESTS
 from test_sinks import ALL_TESTS as SINKS_TESTS
 from test_sanitize import ALL_TESTS as SANITIZE_TESTS
+from test_settings import ALL_TESTS as SETTINGS_TESTS
 from test_docs import ALL_TESTS as DOCS_TESTS
 
 ALL_TESTS = (
@@ -38,6 +39,7 @@ ALL_TESTS = (
     COMPAT_TESTS +
     SINKS_TESTS +
     SANITIZE_TESTS +
+    SETTINGS_TESTS +
     DOCS_TESTS
 )
 
