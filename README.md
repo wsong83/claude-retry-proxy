@@ -87,10 +87,11 @@ When you run `claude-retry-proxy start`:
    a template and tells you to populate it with your tier→provider mappings.
 2. It prompts for your passphrase and decrypts `~/.claude/keys-index.json`
    (provider URLs and API keys, vim blowfish2 encrypted).
-3. It validates the config: all 3 tiers present with valid provider references,
-   every provider in `config.models` has a corresponding entry in `keys-index.json`,
-   every provider in `config.models` has at least one valid model name, and every
-   tier-referenced provider has a models entry.
+3. It validates the config with the same canonical rules the server enforces
+   (one shared policy, housed in the source package's `config.py`/`keys.py`):
+   required tiers, valid provider references, models-catalog shape, tier key
+   selectors, extra-header rules, and the count-token flag.
+   See `doc/configuration.html#validation` for the full rule list.
 4. It checks the trace log and prunes entries older than 5 days.
 5. It launches the proxy server, piping the passphrase via stdin.
 

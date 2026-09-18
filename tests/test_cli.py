@@ -546,68 +546,280 @@ def test_cli_reload():
 
 
 # ===========================================================================
-# Test: CLI Start No Config
+# Test: CLI Start Invalid Config
 # ===========================================================================
 
-def test_cli_start_no_config():
-    """Start without config.json → template created, exit 1, message printed."""
-    print("\n--- Test: CLI Start No Config ---")
+# ===========================================================================
+# Plan 2026-09-17-extract-config-keys: canonical validation at CLI start
+# (single-sourced validate_config) and the parameterized template flow
+# ===========================================================================
+
+def test_start_rejects_uncatalogued_model_selector_at_cli():
+    """A config the old CLI copy accepted but canonical validate_config
+    refuses fails cmd_start pre-spawn with the aggregated
+    "Config validation failed:" list — the same config and the same error
+    string are refused by the spawned server too (dual enforcement points).
+
+    Two refusal variants, each checked at both points:
+    - a tier "key" selector naming no key of the provider;
+    - a tier-referenced provider with no config.models catalog entry.
+
+    Keyed deliberately on key selectors and catalog presence, NOT on a
+    tier-model-name typo — validate_config does not check model names
+    against the catalog (that fails per-request at resolve_tier, unchanged).
+    """
+    print("\n--- Test: Start Rejects Uncatalogued Model Selector At CLI (dual enforcement) ---")
     state_backup = _backup_proxy_state()
     cleanup_lock_files()
 
-    try:
+    p_port = find_free_port()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(p_port),
+                     "keys": {"SW": "p1", "CZ": "p2"}}}
+    key_sel_err = ("tier 'sonnet' references unknown key 'NOPE' for provider "
+                   "'p' (available: SW, CZ)")
+
+    def try_cli_start(config_path, keys_path, port=None):
+        argv = ["start"]
+        if port is not None:
+            argv += ["--port", str(port)]
+        proc = subprocess.Popen(
+            CLAUDE_PROXY + argv + ["--config-path", config_path,
+                                   "--keys-path", keys_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE, text=True)
         try:
-            os.remove(PROXY_STATE_FILE)
+            proc.stdin.close()
         except OSError:
             pass
-
-        temp_dir = tempfile.mkdtemp(prefix="proxy_cli_noconfig_")
         try:
-            nonexistent_config = os.path.join(temp_dir, "config.json")
-            keys_path = _create_test_keys_plain(temp_dir, {
-                "p": {"url": "http://127.0.0.1:1", "key": "k"}
-            })
+            stdout, stderr = proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return -1, "", ""
+        return proc.returncode, stdout, stderr
 
-            proc = subprocess.Popen(
-                CLAUDE_PROXY + ["start", "--config-path", nonexistent_config,
-                                "--keys-path", keys_path],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE, text=True
-            )
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
-            stdout, stderr = proc.communicate(timeout=30)
+    try:
+        temp_dir = tempfile.mkdtemp(prefix="proxy_cli_canon_gate_")
+        try:
+            keys_path = _create_test_keys_plain(temp_dir, vendors)
 
-            if proc.returncode == 1:
-                pass_("Start without config exited 1")
+            # --- Variant 1: unknown key selector ---
+            tiers_v1 = {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5", "key": "NOPE"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            }
+            config_path = _create_test_config(temp_dir, tiers_v1, models={
+                "p": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]})
+
+            # Enforcement point 1 — the CLI's pre-spawn check
+            rc, stdout, stderr = try_cli_start(config_path, keys_path)
+            combined = stdout + stderr
+            if rc == 1:
+                pass_("start with unknown key selector exited 1")
             else:
-                fail(f"Start without config exited {proc.returncode} (expected 1): {stdout} {stderr}")
-
-            if os.path.exists(nonexistent_config):
-                pass_("Template created at config path")
+                fail("expected start exit 1 (pre-spawn refusal), got {}: {!r} {!r}".format(
+                    rc, stdout[:400], stderr[:400]))
+            if "ERROR: Config validation failed:" in stdout:
+                pass_("CLI start prints the aggregated 'Config validation failed:' list")
             else:
-                fail("Template NOT created at config path")
-
-            if "Created config template" in stdout:
-                pass_("stdout mentions 'Created config template'")
+                fail("stdout missing aggregated validation list header: {!r}".format(stdout[:400]))
+            if key_sel_err in stdout:
+                pass_("CLI start rejection names the exact validate_config error string")
             else:
-                fail(f"stdout missing 'Created config template'. stdout: {stdout[:300]}")
+                fail("stdout missing exact error {!r}: {!r}".format(key_sel_err, stdout[:400]))
+            if "cmd_start: proxy spawned" in stderr:
+                fail("CLI spawned the server although pre-spawn validation "
+                     "should have refused (policy no longer single-sourced)")
+            else:
+                pass_("CLI refused pre-spawn: no server spawn appears in the stderr trace")
+
+            # Enforcement point 2 — the spawned server refuses the same files,
+            # with the same error string
+            proc, probe_ok = _start_proxy_server_directly(
+                find_free_port(), config_path=config_path, keys_path=keys_path)
+            if probe_ok:
+                fail("server started although validate_config must refuse the key selector")
+                proc.kill()
+            else:
+                try:
+                    _, srv_err = proc.communicate(timeout=10)
+                except Exception:
+                    srv_err = ""
+                if ("[proxy] ERROR: Config validation failed:" in srv_err
+                        and key_sel_err in srv_err):
+                    pass_("spawned server refused with the same error string "
+                          "(dual enforcement point)")
+                else:
+                    fail("server refusal missing the expected gate header or "
+                         "exact error string: {!r}".format(srv_err[:500]))
+
+            # --- Variant 2: tier-referenced provider without a models entry ---
+            tiers_v2 = {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            }
+            config_path2 = _create_test_config(temp_dir, tiers_v2, models={})
+            catalog_err = ("provider 'p' (used by tier 'opus') has no entry in "
+                           "config.models — add at least one model name for "
+                           "this provider")
+
+            rc, stdout, stderr = try_cli_start(config_path2, keys_path)
+            if rc == 1 and ("ERROR: Config validation failed:" in stdout
+                            and catalog_err in stdout):
+                pass_("CLI start rejects a tier-referenced provider with an "
+                      "empty models catalog, with the exact lists error")
+            else:
+                fail("expected aggregated catalog refusal, got rc={} stdout={!r}".format(
+                    rc, stdout[:400]))
+
+            proc, probe_ok = _start_proxy_server_directly(
+                find_free_port(), config_path=config_path2, keys_path=keys_path)
+            if probe_ok:
+                fail("server started although the empty models catalog must be refused")
+                proc.kill()
+            else:
+                try:
+                    _, srv_err = proc.communicate(timeout=10)
+                except Exception:
+                    srv_err = ""
+                if "[proxy] ERROR: Config validation failed:" in srv_err and catalog_err in srv_err:
+                    pass_("spawned server refused the empty-catalog config with "
+                          "the same error string")
+                else:
+                    fail("server refusal not matching: {!r}".format(srv_err[:500]))
+
+            # Sanity: a clean config still passes the same gate (the test rig
+            # cannot have broken start for valid configs).
+            config_ok = _create_test_config(temp_dir, {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            }, models={"p": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]})
+            rc, stdout, stderr = try_cli_start(config_ok, keys_path,
+                                               port=find_free_port())
+            if rc == 0:
+                pass_("clean config passes the canonical CLI gate and starts")
+                subprocess.run(CLAUDE_PROXY + ["stop"],
+                               capture_output=True, text=True, timeout=10)
+            else:
+                fail("clean config unexpectedly refused at the CLI gate (rc={}): "
+                     "{!r} {!r}".format(rc, stdout[:400], stderr[:400]))
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
-
     finally:
         cleanup_lock_files()
         subprocess.run(CLAUDE_PROXY + ["stop"], capture_output=True, text=True, timeout=10)
         _restore_proxy_state(state_backup)
 
 
+def test_cli_start_template_flow():
+    """Parameterized template copy flow: template present → copied and
+    'Created config template at:' printed (exit 1); template absent →
+    'ERROR: Config file not found:' plus the path install_template actually
+    reads ('Template not available at:'), exit 1.
+
+    In-process invocation: the branch is simulated by patching
+    settings.SETTINGS.config_template_path, which the CLI's
+    install_template (config.py) reads — a cli-side constant no longer
+    participates. Patches are saved/restored around each run.
+    """
+    print("\n--- Test: CLI Start Template Flow (both branches) ---")
+    import io
+    from contextlib import redirect_stdout
+
+    import claude_retry_proxy.cli as cli_mod
+    import claude_retry_proxy.settings as settings_mod
+
+    SETTINGS = settings_mod.SETTINGS
+    real_template = settings_mod.SETTINGS.config_template_path
+    if not os.path.exists(real_template):
+        fail("precondition: package template expected at {!r}".format(real_template))
+        return
+
+    original = SETTINGS.config_template_path
+
+    def run_start(config_path):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli_mod.cmd_start(["--config-path", config_path])
+        return rc, buf.getvalue()
+
+    # cmd_start returns inside the config-exists branch before any keys path
+    # or state read, so in-process runs touch nothing outside temp_dir.
+    try:
+        temp_dir = tempfile.mkdtemp(prefix="proxy_template_flow_")
+
+        # Branch A: template present → copied
+        SETTINGS.config_template_path = real_template
+        try:
+            os.remove(os.path.join(temp_dir, "config.json"))
+        except OSError:
+            pass
+        config_path = os.path.join(temp_dir, "config.json")
+        rc, out = run_start(config_path)
+        if rc == 1:
+            pass_("template-present branch exits 1")
+        else:
+            fail("expected exit 1 in the template-present branch, got {}".format(rc))
+        if os.path.exists(config_path):
+            pass_("template copied to the config path")
+        else:
+            fail("template NOT copied in the present branch")
+        if "Created config template at: {}".format(config_path) in out:
+            pass_("present branch prints 'Created config template at:' with the path")
+        else:
+            fail("present branch message wrong: {!r}".format(out[:400]))
+
+        # Branch B: template absent → both errors, no file created
+        missing_template = os.path.join(temp_dir, "no", "template", "config.json")
+        SETTINGS.config_template_path = missing_template
+        try:
+            os.remove(config_path)
+        except OSError:
+            pass
+        rc, out = run_start(config_path)
+        if rc == 1:
+            pass_("template-absent branch exits 1")
+        else:
+            fail("expected exit 1 in the template-absent branch, got {}".format(rc))
+        if not os.path.exists(config_path):
+            pass_("no config file created when the template is absent")
+        else:
+            fail("config file created despite a missing template")
+        if "ERROR: Config file not found: {}".format(config_path) in out:
+            pass_("absent branch prints 'ERROR: Config file not found:'")
+        else:
+            fail("absent branch missing 'ERROR: Config file not found:': {!r}".format(out[:400]))
+        if "Template not available at: {}".format(missing_template) in out:
+            pass_("absent branch prints the path install_template actually reads")
+        else:
+            fail("absent branch 'Template not available at:' missing the "
+                 "SETTINGS path: {!r}".format(out[:400]))
+
+        # Branch C (truthfulness addition, plan Risks #2): template present but
+        # the copy fails (unwritable destination) → 'ERROR: Cannot create
+        # config at …' instead of a false missing-template claim.
+        SETTINGS.config_template_path = real_template
+        # The install target's parent chain runs through a plain file, so
+        # install_template's makedirs raises OSError (verified: WinError 3
+        # through a file component on this platform).
+        blocker_file = os.path.join(temp_dir, "blocker-file")
+        with open(blocker_file, "w") as f:
+            f.write("placeholder-not-a-directory")
+        rc, out = run_start(os.path.join(blocker_file, "sub", "config.json"))
+        if rc == 1 and "ERROR: Cannot create config at" in out:
+            pass_("create-failure branch prints the truthful 'Cannot create config' error")
+        else:
+            fail("expected 'Cannot create config at' refusal, got rc={} out={!r}".format(
+                rc, out[:400]))
+    finally:
+        SETTINGS.config_template_path = original
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-# ===========================================================================
-# Test: CLI Start Invalid Config
-# ===========================================================================
 
 def test_cli_start_invalid_config():
     """Start with broken config → exit 1, specific error."""
@@ -734,87 +946,6 @@ def test_cli_status_shows_tiers():
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    finally:
-        cleanup_lock_files()
-        subprocess.run(CLAUDE_PROXY + ["stop"], capture_output=True, text=True, timeout=10)
-        _restore_proxy_state(state_backup)
-
-
-# ===========================================================================
-# Multi-key provider selection (plan 2026-09-10-multi-key-provider-selection)
-# ===========================================================================
-
-def test_start_unknown_tier_key_fails_via_server_gate():
-    """claude-retry-proxy start with an unknown or non-string tier key exits
-    non-zero POST-spawn — the server's validate_config is the single
-    authoritative gate — and the surfaced error names the key."""
-    print("\n--- Test: Start Unknown Tier Key Fails Via Server Gate ---")
-    state_backup = _backup_proxy_state()
-    cleanup_lock_files()
-
-    try:
-        try:
-            os.remove(PROXY_STATE_FILE)
-        except OSError:
-            pass
-
-        p_port = find_free_port()
-        temp_dir = tempfile.mkdtemp(prefix="proxy_cli_key_")
-        try:
-            vendors = {"p": {"url": "http://127.0.0.1:{}".format(p_port),
-                             "keys": {"SW": "p1", "CZ": "p2"}}}
-
-            def try_start(tiers):
-                config_path = _create_test_config(temp_dir, tiers, models={
-                    "p": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]})
-                keys_path = _create_test_keys_plain(temp_dir, vendors)
-                proc = subprocess.Popen(
-                    CLAUDE_PROXY + ["start", "--config-path", config_path,
-                                    "--keys-path", keys_path],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    stdin=subprocess.PIPE, text=True
-                )
-                try:
-                    proc.stdin.close()
-                except OSError:
-                    pass
-                try:
-                    stdout, stderr = proc.communicate(timeout=60)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-                    return -1, "", "timeout"
-                return proc.returncode, stdout, stderr
-
-            # Unknown key name on the sonnet tier -> the server gate rejects
-            # post-spawn and the CLI surfaces the server's error
-            rc, stdout, stderr = try_start({
-                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
-                "sonnet": {"provider": "p", "model": "claude-sonnet-5", "key": "NOPE"},
-                "opus": {"provider": "p", "model": "claude-opus-5"},
-            })
-            combined = stdout + stderr
-            if (rc == 1 and "Proxy exited during startup" in combined
-                    and "unknown key" in combined and "NOPE" in combined and "sonnet" in combined):
-                pass_("start with unknown tier key fails post-spawn via the server gate (error names key/tier)")
-            else:
-                fail("expected post-spawn server-gate rejection naming sonnet/NOPE, got rc={} "
-                     "stdout={!r} stderr={!r}".format(rc, stdout[:400], stderr[:400]))
-
-            # Non-string truthy key (false) -> 'must be a string' from the server gate
-            rc, stdout, stderr = try_start({
-                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
-                "sonnet": {"provider": "p", "model": "claude-sonnet-5", "key": False},
-                "opus": {"provider": "p", "model": "claude-opus-5"},
-            })
-            combined = stdout + stderr
-            if rc == 1 and "must be a string" in combined:
-                pass_("start with non-string selector 'false' fails post-spawn (must be a string)")
-            else:
-                fail("expected 'must be a string' via the server gate, got rc={} stdout={!r}".format(
-                    rc, stdout[:400]))
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
     finally:
         cleanup_lock_files()
         subprocess.run(CLAUDE_PROXY + ["stop"], capture_output=True, text=True, timeout=10)
@@ -1155,10 +1286,10 @@ def test_startup_abort_exits_one_with_failing_stderr():
 
 ALL_TESTS = [
     ("cli-reload", test_cli_reload),
-    ("cli-start-no-config", test_cli_start_no_config),
+    ("start-rejects-uncatalogued-model-selector-at-cli", test_start_rejects_uncatalogued_model_selector_at_cli),
+    ("cli-start-template-flow", test_cli_start_template_flow),
     ("cli-start-invalid-config", test_cli_start_invalid_config),
     ("cli-status-shows-tiers", test_cli_status_shows_tiers),
-    ("start-unknown-tier-key-fails-via-server-gate", test_start_unknown_tier_key_fails_via_server_gate),
     ("start-status-reload-tier-lines-show-key", test_start_status_reload_tier_lines_show_key),
     ("cli-stop-cleans-proxy-state-lock", test_stop_cleans_proxy_state_lock),
     ("cli-stop-cleans-proxy-state", test_stop_cleans_proxy_state),

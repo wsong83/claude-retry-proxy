@@ -10,7 +10,7 @@
 
 <h1>Test Catalog<span class="sub">Suite layout, harness isolation, and testing patterns</span></h1>
 
-<p><strong>Last updated:</strong> 2026-09-16</p>
+<p><strong>Last updated:</strong> 2026-09-18</p>
 
 <p>The suite is a set of per-area modules merged by a single aggregator. It runs against
 <em>real</em> proxy processes and <em>real</em> mock upstream servers over loopback sockets —
@@ -18,7 +18,7 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>322 test functions across 18 files</strong>, but this number moves whenever
+suite has <strong>321 test functions across 18 files</strong>, but this number moves whenever
 tests are added. Re-count before quoting it:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
 such as <code>doc_</code>). The aggregator's own tally is the authoritative figure — the
@@ -156,7 +156,7 @@ EOF</code></pre>
 <li><code>test_response_model_rewrite_upstream_model</code>: Upstream returns an arbitrary model name → rewritten to tier name (unconditional rewrite).</li>
 </ul>
 
-<h4><code>tests/test_config_keys.py</code> (18 tests) — config validation and key handling</h4>
+<h4><code>tests/test_config_keys.py</code> (17 tests) — config validation and key handling</h4>
 <ul>
 <li><code>test_config_validation_missing_tier</code>: Config with empty provider → server refuses to start.</li>
 <li><code>test_config_validation_unknown_provider</code>: Config references provider not in keys-index.json → server refuses to start.</li>
@@ -164,7 +164,6 @@ EOF</code></pre>
 <li><code>test_config_validation_tier_provider_needs_models</code>: A tier-referenced provider must have an entry in config.models.</li>
 <li><code>test_heartbeat_preserves_state</code>: Heartbeat writes the in-memory startup state, never a disk-read {}.</li>
 <li><code>test_models_per_provider_validation</code>: Config.models entries must have valid shape; tier-referenced providers must have a models entry.</li>
-<li><code>test_config_template_copy</code>: Missing config.json → template copied, start fails with message.</li>
 <li><code>test_key_decryption_wrong_passphrase</code>: Wrong passphrase → start fails with clear error.</li>
 <li><code>test_key_decryption_missing_file</code>: No keys-index.json → start fails with clear error.</li>
 <li><code>test_api_key_from_keys_index</code>: Verify x-api-key sent to upstream comes from keys-index.json, not from client.</li>
@@ -479,10 +478,10 @@ EOF</code></pre>
 <li><code>test_stop_cleans_proxy_state_lock</code>: Create proxy-state.json with a dead PID; run stop; verify state file deleted.</li>
 <li><code>test_start_stdout_not_contaminated</code>: Start proxy with plain keys; assert stdout clean (no trace, no key material).</li>
 <li><code>test_cli_reload</code>: claude-retry-proxy reload sends reload request to running proxy.</li>
-<li><code>test_cli_start_no_config</code>: Start without config.json → template created, exit 1, message printed.</li>
+<li><code>test_cli_start_template_flow</code>: Parameterized start flow — template present → copied + message; template absent → both ERROR lines, exit 1; capture-failure branch → truthful create error.</li>
+<li><code>test_start_rejects_uncatalogued_model_selector_at_cli</code>: A config the canonical validate_config refuses (e.g. a tier key selector naming no key) fails cmd_start pre-spawn with the aggregated list — the same config is refused by the spawned server (dual enforcement point).</li>
 <li><code>test_cli_start_invalid_config</code>: Start with broken config → exit 1, specific error.</li>
 <li><code>test_cli_status_shows_tiers</code>: Status output includes tier → provider → model mapping.</li>
-<li><code>test_start_unknown_tier_key_fails_via_server_gate</code>: claude-retry-proxy start with an unknown or non-string tier key exits non-zero POST-spawn — the server&#x27;s validate_config is the single authoritative gate — and the…</li>
 <li><code>test_start_status_reload_tier_lines_show_key</code>: Tier display lines in start, status, and reload all carry the [key=NAME] suffix when a tier has a key selector set.</li>
 <li><code>test_startup_aborts_on_unwritable_trace_path</code>: An unwritable trace path aborts startup before READY.</li>
 <li><code>test_startup_aborts_on_unwritable_state_path</code>: An unwritable state path aborts startup before READY.</li>

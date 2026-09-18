@@ -468,66 +468,6 @@ def test_models_per_provider_validation():
 
 
 # ===========================================================================
-# Test: Config Template Copy
-# ===========================================================================
-
-def test_config_template_copy():
-    """Missing config.json → template copied, start fails with message."""
-    print("\n--- Test: Config Template Copy ---")
-    state_backup = _backup_proxy_state()
-    cleanup_lock_files()
-
-    try:
-        try:
-            os.remove(PROXY_STATE_FILE)
-        except OSError:
-            pass
-
-        temp_dir = tempfile.mkdtemp(prefix="proxy_template_copy_")
-        try:
-            nonexistent_config = os.path.join(temp_dir, "config.json")
-            keys_path = _create_test_keys_plain(temp_dir, {
-                "p": {"url": "http://127.0.0.1:1", "key": "k"}
-            })
-
-            proc = subprocess.Popen(
-                CLAUDE_PROXY + ["start", "--config-path", nonexistent_config,
-                                "--keys-path", keys_path],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE, text=True
-            )
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
-            stdout, stderr = proc.communicate(timeout=30)
-
-            if proc.returncode == 1:
-                pass_("Start without config exited 1")
-            else:
-                fail(f"Start without config exited {proc.returncode} (expected 1): {stdout} {stderr}")
-
-            if os.path.exists(nonexistent_config):
-                pass_("Template created at config path")
-            else:
-                fail("Template NOT created at config path")
-
-            if "Created config template" in stdout:
-                pass_("stdout mentions 'Created config template'")
-            else:
-                fail(f"stdout missing 'Created config template'. stdout: {stdout[:300]}")
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-    finally:
-        cleanup_lock_files()
-        subprocess.run(CLAUDE_PROXY + ["stop"], capture_output=True, text=True, timeout=10)
-        _restore_proxy_state(state_backup)
-
-
-
-
-# ===========================================================================
 # Test: Key Decryption Wrong Passphrase
 # ===========================================================================
 
@@ -928,7 +868,7 @@ def test_extra_request_headers_startup_refusal():
 # ===========================================================================
 
 def test_multikey_keys_load_and_route():
-    """Object-form keys vendor loads through the encrypted path (decrypt_keys);
+    """Object-form keys vendor loads through the encrypted path (load_keys_file);
     a tier key selector reaches the upstream with the selected payload; a tier
     without a selector defaults to the first insertion-order entry."""
     print("\n--- Test: Multi-key keys load and route ---")
@@ -1260,7 +1200,6 @@ ALL_TESTS = [
     ("config-validation-tier-provider-needs-models", test_config_validation_tier_provider_needs_models),
     ("models-per-provider-validation", test_models_per_provider_validation),
     ("heartbeat-preserves-state", test_heartbeat_preserves_state),
-    ("config-template-copy", test_config_template_copy),
     ("key-decryption-wrong-passphrase", test_key_decryption_wrong_passphrase),
     ("key-decryption-missing-file", test_key_decryption_missing_file),
     ("api-key-from-keys-index", test_api_key_from_keys_index),

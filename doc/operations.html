@@ -50,6 +50,14 @@ does not block startup. The retention policy itself is documented at
 <a href="trace-log.html#prune">trace-log.html#prune</a>.
 </div>
 
+<div class="note">
+<strong><code>start</code> validates with the canonical rules before spawning.</strong>
+The same validation policy as the server, from the same source modules (single policy —
+see <a href="configuration.html#validation">configuration.html#validation</a>), with the
+aggregated error list printed at the command. Keys-file errors carry the loader's own
+messages, and keys mode warnings print during <code>start</code>.
+</div>
+
 <h2 id="readiness">Two-phase readiness</h2>
 
 <p>After spawning the server, <code>start</code> confirms it is actually serving before

@@ -15,13 +15,14 @@ import time
 from datetime import datetime, timezone
 
 from .settings import SETTINGS, resolve_trace_file
+from .config import _load_config_for_validation, validate_config
+from .keys import load_keys_file, vendor_key_names
 
 HOME = os.path.expanduser("~")
 PROXY_DIR = SETTINGS.proxy_dir
 PROXY_STATE_FILE = SETTINGS.state_file
 CONFIG_FILE = SETTINGS.config_path
 KEYS_FILE = SETTINGS.keys_path
-CONFIG_TEMPLATE_PATH = SETTINGS.config_template_path
 
 PRUNE_RETENTION_DAYS = 5
 
@@ -299,45 +300,15 @@ def _format_tier_line(tier_name, tier, indent="  "):
     return label
 
 
-def _load_config_for_validation(path=None):
-    """Load and validate config.json. Returns (config, error_msg)."""
-    if path is None:
-        path = CONFIG_FILE
-    if not os.path.exists(path):
-        return None, "config file not found: {}".format(path)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-    except json.JSONDecodeError as e:
-        return None, "invalid JSON in config: {}".format(e)
-    if not isinstance(config, dict):
-        return None, "config must be a JSON object"
-    if "tiers" not in config:
-        return None, "config missing 'tiers' key"
-    # Validate each tier has non-empty provider and model
-    tiers = config.get("tiers", {})
-    for tier_name in ("haiku", "sonnet", "opus"):
-        if tier_name not in tiers:
-            return None, "missing required tier: {}".format(tier_name)
-        tier = tiers[tier_name]
-        if not isinstance(tier, dict):
-            return None, "tier '{}' must be an object".format(tier_name)
-        if not tier.get("provider"):
-            return None, "tier '{}' has empty provider".format(tier_name)
-        if not tier.get("model"):
-            return None, "tier '{}' has empty model".format(tier_name)
-    return config, None
-
-
 def cmd_start(args):
     """Start the proxy."""
     import argparse
-    import shutil
     import socket
     import subprocess
     import threading
 
     from . import vimcrypt
+    from .config import install_template
 
     parser = argparse.ArgumentParser(prog="claude-retry-proxy start")
     parser.add_argument("--port", "-p", type=int, default=SETTINGS.port,
@@ -361,15 +332,18 @@ def cmd_start(args):
 
     # 1. Check config.json exists
     if not os.path.exists(config_path):
-        # Copy template
-        os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        if os.path.exists(CONFIG_TEMPLATE_PATH):
-            shutil.copy2(CONFIG_TEMPLATE_PATH, config_path)
-            print("Created config template at: {}".format(config_path))
-            print("Please populate the config and run 'claude-retry-proxy start' again.")
+        if os.path.exists(SETTINGS.config_template_path):
+            try:
+                install_template(config_path)
+            except OSError as e:
+                print("ERROR: Cannot create config at {}: {}".format(config_path, e))
+                return 1
         else:
             print("ERROR: Config file not found: {}".format(config_path))
-            print("Template not available at: {}".format(CONFIG_TEMPLATE_PATH))
+            print("Template not available at: {}".format(SETTINGS.config_template_path))
+            return 1
+        print("Created config template at: {}".format(config_path))
+        print("Please populate the config and run 'claude-retry-proxy start' again.")
         return 1
 
     # 2. Load and validate config
@@ -381,12 +355,12 @@ def cmd_start(args):
     # 3. Load keys file (plain JSON or encrypted)
     try:
         with open(keys_path, "rb") as f:
-            keys_data = f.read()
+            head = f.read(14)
     except FileNotFoundError:
         print("ERROR: Keys file not found: {}".format(keys_path))
         return 1
 
-    _keys_encrypted = keys_data.startswith(b"VimCrypt~03!")
+    _keys_encrypted = head.startswith(b"VimCrypt~03!")
 
     if _keys_encrypted:
         # Encrypted: prompt for passphrase and decrypt
@@ -405,47 +379,21 @@ def cmd_start(args):
         except (ValueError, KeyboardInterrupt) as e:
             print("\nERROR: {}".format(e))
             return 1
-        try:
-            plaintext = vimcrypt.decrypt(keys_data, passphrase)
-            keys_json = json.loads(plaintext.decode("utf-8"))
-        except ValueError as e:
-            print("ERROR: Decryption failed: {}".format(e))
-            return 1
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            print("ERROR: Invalid keys file: {}".format(e))
-            return 1
     else:
-        # Plain JSON: parse directly, no passphrase needed
+        # Plain JSON: no passphrase needed
         passphrase = None  # signal to skip stdin piping below
-        try:
-            keys_json = json.loads(keys_data.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            print("ERROR: Invalid keys file: {}".format(e))
-            return 1
 
-    if "vendors" not in keys_json:
-        print("ERROR: keys file missing 'vendors' key")
+    try:
+        vendors = load_keys_file(keys_path, passphrase if _keys_encrypted else None)
+    except (ValueError, OSError) as e:
+        print("ERROR: {}".format(e))
         return 1
-    vendors = keys_json["vendors"]
     _trace("cmd_start: loaded {} vendors".format(len(vendors)))
 
     # 5. Validate config against vendors
     tiers = config.get("tiers", {})
-    provider_names = set(vendors.keys())
-    errors = []
-    required_tiers = {"haiku", "sonnet", "opus"}
-    missing = required_tiers - set(tiers.keys())
-    if missing:
-        errors.append("missing tiers: {}".format(", ".join(sorted(missing))))
-    for tier_name in required_tiers:
-        if tier_name in tiers:
-            tier = tiers[tier_name]
-            if not isinstance(tier, dict):
-                errors.append("tier '{}' must be an object".format(tier_name))
-                continue
-            provider = tier.get("provider", "")
-            if provider and provider not in provider_names:
-                errors.append("tier '{}' references unknown provider '{}'".format(tier_name, provider))
+    provider_keys = {name: vendor_key_names(v) for name, v in vendors.items()}
+    errors = validate_config(config, set(vendors.keys()), provider_keys)
     if errors:
         print("ERROR: Config validation failed:")
         for e in errors:

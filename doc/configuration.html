@@ -312,6 +312,14 @@ defines no idle-timeout feature, and setting it has no effect.</p>
 <p>Validation is strict and runs at startup, so a bad configuration fails loudly rather than
 producing confusing request-time errors. The proxy refuses to start when:</p>
 
+<div class="note">
+<strong>Single policy, two enforcement points.</strong> The rules below live in one place —
+the source package's <code>config.py</code> and <code>keys.py</code> modules — and are
+enforced both by the server at startup and by <code>claude-retry-proxy start</code>
+<em>before</em> it spawns the server, so a bad configuration fails at the command, not
+after the spawn. The CLI's pre-spawn check prints the same aggregated error list.
+</div>
+
 <table>
 <tr><th>Condition</th></tr>
 <tr><td><code>config.json</code> is missing — the template is copied into place and the

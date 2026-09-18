@@ -30,10 +30,13 @@ src/claude_retry_proxy/
   sanitize.py           error-text redaction leaf: `sanitize_error`, the chokepoint for text reaching stderr, trace `error` fields and client-facing error bodies
   sinks.py              sink class family: private `_Sink` base, `TraceSink` (JSONL append + counters + markers), `StateSink` (atomic state document), shared `_SinkHealth` failure reporter, process-wide pair + `configure()`
   settings.py           env-derived settings singleton: `SETTINGS` value object (the `PROXY_*` limits/flags, runtime paths incl. state/compat files, mode values) + `resolve_trace_file` — built at import from env, adjusted by `main()` at startup; imported by both the server and the CLI
+  config.py             config.json pipeline: `load_config` / `validate_config` (the canonical validation policy) / `write_config` / `install_template` + extra-header specs; serves the server and the CLI
+  keys.py               keys-index pipeline: `vendor_key_entries`/`vendor_key_names`, `_validate_vendor_keys_shape`, `load_keys_file` (encrypted or plain), `read_passphrase_from_stdin`
+  safety.py             task-shaped utility leaf: string-emission-safety predicates (`_validate_admin_name` charset allowlist); docstring indexes the stay-behind safety idioms
   transforms_common.py  shared endpoint-mode transform mechanism: `_transform_and_guard` (passthrough-on-failure response guard) + `_request_transform_timestamp` helper
   transforms_chat.py    Anthropic↔Chat (OpenAI chat-completions) body transforms, both directions
   transforms_response.py Anthropic↔Responses body transforms, both directions
-  cli.py                the claude-retry-proxy CLI: start / stop / status / reload (passphrase prompt, config validation, no URL swap)
+  cli.py                the claude-retry-proxy CLI: start / stop / status / reload (passphrase prompt, template copy, canonical validation shared with config.py/keys.py, no URL swap)
   vimcrypt.py           vim blowfish2 (VimCrypt~03!) decryption (derived from claude-config bin/vimcrypt.py)
   admin.html            admin page for hot-switching tier mappings (served at /admin/)
 src/templates/
@@ -93,10 +96,13 @@ for the rest.
   standard tier model names, and a dummy API key. The proxy never reads or
   writes it. (See Gotchas.)
 
-- **CLI `start`:** ensure `~/.claude/proxy/config.json` exists (else copy the
-  template, exit 1); prompt the passphrase via `vimcrypt.prompt_hidden`; decrypt
-  the keys file; validate the config against the decrypted vendors; prune the
-  trace log (>5 days); spawn `python -m claude_retry_proxy.server --port <port>
+- **CLI `start`:** ensure `~/.claude/proxy/config.json` exists (else install the
+  template via the shared `install_template`, exit 1); prompt the passphrase via
+  `vimcrypt.prompt_hidden`; load the keys via `load_keys_file` (its shape
+  validation and mode-warning diagnostics surface at the command); validate with
+  the canonical `validate_config` — single policy with the server, aggregated
+  error list; prune the trace log (>5 days); spawn `python -m
+  claude_retry_proxy.server --port <port>
   --config-path <path> --keys-path <path>`; pipe the passphrase via stdin; write
   `proxy-state.json`; probe readiness; roll back on failure. PID liveness/kill
   uses `ctypes` on Windows, `os.kill` on POSIX. Readiness:
@@ -260,7 +266,7 @@ what you need in context, and the link has the rest.
 | Chat mode degrades unparseable tool arguments to a visible placeholder block, never `input: {}` | [doc/provider-modes.html#malformed-args](doc/provider-modes.html#malformed-args) |
 | A vendor carries either `key` (string) or `keys` (name→payload); a tier's `key` selector picks one | [doc/configuration.html#multi-key](doc/configuration.html#multi-key) |
 | The keys file may be plain JSON — convenient, but the keys then sit unencrypted on disk | [doc/configuration.html#encryption](doc/configuration.html#encryption) |
-| Validation flows config→keys, not the reverse, and is strict | [doc/configuration.html#validation](doc/configuration.html#validation) |
+| Validation flows config→keys, not the reverse, and is strict — single-sourced in `config.py`/`keys.py`, enforced by both the server and CLI `start` | [doc/configuration.html#validation](doc/configuration.html#validation) |
 | `disable_retry_claude_count_token` skips retrying `count_tokens` (template default `true`) | [doc/configuration.html#count-tokens-flag](doc/configuration.html#count-tokens-flag) |
 | Trace/state I/O failures degrade the proxy; they never stop it — except at startup, which fails fast | [doc/architecture.html#sinks](doc/architecture.html#sinks) |
 | Responses are truncated at `PROXY_MAX_RESPONSE_SIZE` with a `response_size_cap_exceeded` event | [doc/architecture.html#size-caps](doc/architecture.html#size-caps) |
@@ -322,12 +328,15 @@ No other supplementary docs.
 {"issue_id": "compat-entry-failed-confirmations-dead-field", "title": "The persisted compatibility entry carries a failed_confirmations field that is never incremented, so it always reads 0", "target_repo": null, "report": "./tmp/reports/defer-issue-compat-entry-failed-confirmations-dead-field.json", "deferred": "2026-09-12", "date_source": "creation"},
 {"issue_id": "extract-model-raises-on-non-object-json", "title": "extract_model raises AttributeError on valid JSON that is not an object, so do_POST aborts with no HTTP response; the unguarded call at do_POST pre-empts the whole downstream guard chain", "target_repo": null, "report": "./tmp/reports/defer-issue-extract-model-raises-on-non-object-json.json", "deferred": "2026-09-12", "date_source": "creation"},
 {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "target_repo": null, "report": "./tmp/reports/defer-issue-image-content-blocks-chat-mode.json", "deferred": "2026-08-29", "date_source": "creation"},
-{"issue_id": "no-proxy-stop-trace-warning", "title": "Full-suite run warns 'No proxy_stop event in trace' when the proxy is terminated abruptly (low priority)", "target_repo": null, "report": "./tmp/reports/defer-issue-no-proxy-stop-trace-warning.json", "deferred": "2026-09-14", "date_source": "creation"}
+{"issue_id": "no-proxy-stop-trace-warning", "title": "Full-suite run warns 'No proxy_stop event in trace' when the proxy is terminated abruptly (low priority)", "target_repo": null, "report": "./tmp/reports/defer-issue-no-proxy-stop-trace-warning.json", "deferred": "2026-09-14", "date_source": "creation"},
+{"issue_id": "refactor-split-utility-cluster-doctrine", "title": "The refactor-split doctrine lacks a utility-cluster genus: the role-grouping rule misclassifies task-shaped leaf collections (e.g., a safety.py of string-integrity predicates)", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-refactor-split-utility-cluster-doctrine.json", "deferred": "2026-09-17", "date_source": "creation"},
+{"issue_id": "port-default-collision-hazard", "title": "A start on the default port can report success against a pre-existing listener: the readiness TCP probe cannot distinguish the spawned child's socket from a live proxy already on 8080", "target_repo": null, "report": "./tmp/reports/defer-issue-port-default-collision-hazard.json", "deferred": "2026-09-18", "date_source": "creation"},
+{"issue_id": "proxy-stderr-append-stale-tail", "title": "proxy-stderr.log is append-only across runs, so read_tail failure diagnostics can surface lines from previous sessions instead of the current attempt", "target_repo": null, "report": "./tmp/reports/defer-issue-proxy-stderr-append-stale-tail.json", "deferred": "2026-09-18", "date_source": "creation"}
 ]```
 
 ## Future Work — TODO
 
-Four deferred issues remain (see above). Plan
+Seven deferred issues remain (see above). Plan
 2026-09-15-sanitize-sinks-deferred resolved the five extract-sinks deferred
 issues — the `sanitize_error` exponential-backtracking regex and its inert
 Windows path redaction, `write_state`'s lock-free concurrent `os.replace`, the
@@ -357,6 +366,13 @@ value object and the shared `resolve_trace_file` chain in `settings.py`
 (imported by both the server and the CLI; the import-time `SETTINGS`
 derivation is a declared override of the guide's build-in-`main()` rule,
 recorded in that plan's Document Overrides).
+The config/keys extraction (`2026-09-17-extract-config-keys`) landed
+2026-09-18 as step 4 — `server.py` 3,661 → 3,129 wc lines, with the config
+pipeline in `config.py`, the keys pipeline in `keys.py`, the
+string-emission-safety utility leaf in `safety.py` (a declared override of the
+guide's §2/§3 role-grouping rule — see the plan's Document Overrides; the
+doctrine amendment itself is deferred to claude-config), and the CLI's
+template/keys/validation single-sourced onto the shared policy.
 The remaining clusters (compat, router/forwarder, admin/handler) are
 tracked by the /refactor-split survey, which replaced the retired break-up
 backlog report on 2026-09-16. New deep detail belongs in `doc/`, not here.
