@@ -27,6 +27,7 @@ rationale, mechanisms, and edge cases — and is indexed by
 src/claude_retry_proxy/
   __init__.py           __version__
   server.py             the HTTP retry gateway server (ThreadingHTTPServer, tier routing, model rewriting, admin API, retry/backoff)
+  compat.py             the compatibility learner: COMPAT_* policy constants, the owned `_CompatState` state object (4 dicts + fast lock + probe lock, default-param `state=` injection), the learner state machine and the 400-shape matchers (extracted from server.py; the probe-outcome + retry orchestration slice stays in server.py)
   sanitize.py           error-text redaction leaf: `sanitize_error`, the chokepoint for text reaching stderr, trace `error` fields and client-facing error bodies
   sinks.py              sink class family: private `_Sink` base, `TraceSink` (JSONL append + counters + markers), `StateSink` (atomic state document), shared `_SinkHealth` failure reporter, process-wide pair + `configure()`
   settings.py           env-derived settings singleton: `SETTINGS` value object (the `PROXY_*` limits/flags, runtime paths incl. state/compat files, mode values) + `resolve_trace_file` — built at import from env, adjusted by `main()` at startup; imported by both the server and the CLI
@@ -373,6 +374,13 @@ string-emission-safety utility leaf in `safety.py` (a declared override of the
 guide's §2/§3 role-grouping rule — see the plan's Document Overrides; the
 doctrine amendment itself is deferred to claude-config), and the CLI's
 template/keys/validation single-sourced onto the shared policy.
-The remaining clusters (compat, router/forwarder, admin/handler) are
+The compat extraction (`2026-09-18-extract-compat`) landed 2026-09-19 as
+step 5 — `server.py` 3,129 → 2,613 wc lines, with the compatibility learner
+cluster in `compat.py` (569 wc lines) behind an owned `_CompatState` state
+object with default-parameter injection; the extraction was a verbatim move
+plus a design step, and the moving plan's two verification gates were
+revised twice during implementation (nested-def walkers, HEAD-sourced
+byte-identity, dotless ImportFrom matching).
+The remaining clusters (router/forwarder, admin/handler) are
 tracked by the /refactor-split survey, which replaced the retired break-up
 backlog report on 2026-09-16. New deep detail belongs in `doc/`, not here.

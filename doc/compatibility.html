@@ -32,7 +32,7 @@ are compatibility retries themselves. See
 <h2 id="constants">Policy constants</h2>
 
 <p>These are maintainer-tunable and have no user-facing configuration surface. They live at the
-top of the compatibility section of <code>src/claude_retry_proxy/server.py</code>.</p>
+top of the compatibility learner module, <code>src/claude_retry_proxy/compat.py</code>.</p>
 
 <table>
 <tr><th>Constant</th><th class="num">Value</th><th>Meaning</th></tr>
@@ -70,6 +70,16 @@ exceeds it.</p>
 <em>model</em> is part of the key, so two tiers pointing at the same provider but different
 models learn independently — which matters, because a provider may proxy several backends with
 different capabilities.</p>
+
+<p>In memory the learned set is a single owned <code>_CompatState</code> object
+(<code>_state</code> in <code>compat.py</code>): its <code>entries</code> dict holds the keyed
+entries and its <code>lock</code> serializes access and persistence. The learner functions take
+the state by default parameter (<code>state=_state</code>), so tests can inject a fresh
+instance; the single proxy-wide probe/retry lock is the object's <code>retry_lock</code>, and
+<code>server.py</code>'s forward path keeps referencing it through the module-level aliases
+<code>_compat_state_lock</code> / <code>_compat_retry_lock</code>. The retry lock's
+acquire/release discipline belongs to its caller (the forward path in <code>server.py</code>),
+which holds it across the unstripped probe's upstream HTTP call.</p>
 
 <p>There are exactly <strong>two</strong> states:</p>
 

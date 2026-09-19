@@ -18,7 +18,7 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>321 test functions across 18 files</strong>, but this number moves whenever
+suite has <strong>322 test functions across 18 files</strong>, but this number moves whenever
 tests are added. Re-count before quoting it:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
 such as <code>doc_</code>). The aggregator's own tally is the authoritative figure — the
@@ -75,7 +75,7 @@ relative size, not as exact current figures.</p>
 
 <table>
 <tr><th>Module</th><th class="num">Tests</th><th>Covers</th></tr>
-<tr><td><code>test_compat.py</code></td><td class="num">43</td>
+<tr><td><code>test_compat.py</code></td><td class="num">44</td>
     <td>The <code>context_management</code> learner — persistence, detection, state machine,
         concurrency. See <a href="compatibility.html">compatibility.html</a>.</td></tr>
 <tr><td><code>test_chat_transform.py</code></td><td class="num">41</td>
@@ -388,7 +388,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> The <code>context_management</code> probe ladder, probation, suppression, and its persistence file.</p>
 
-<h4><code>tests/test_compat.py</code> (43 tests) — the context_management learner</h4>
+<h4><code>tests/test_compat.py</code> (44 tests) — the context_management learner</h4>
 <ul>
 <li><code>test_compat_state_load_missing_file</code>: Missing state file means empty state: discovery still works and no startup failure occurs.</li>
 <li><code>test_compat_state_load_corrupt_fails_open</code>: A corrupt (non-JSON) state file warns and fails open with empty state: requests forward unchanged and the proxy does not crash.</li>
@@ -404,6 +404,7 @@ EOF</code></pre>
 <li><code>test_compat_state_concurrent_updates_no_loss</code>: Concurrent stripped requests keep counter integrity: every client gets a 2xx, no more than the expected probe requests go unstripped, and state stays valid.</li>
 <li><code>test_compat_state_key_isolation</code>: Learned state for one (provider, mode, model) key does not strip other keys&#x27; requests.</li>
 <li><code>test_compat_locks_present</code>: The plan-named locks exist and _compat_retry_lock is non-blocking.</li>
+  <li><code>test_compat_state_object_shape</code>: The owned state exists as one <code>_CompatState</code> singleton with live lock aliases; explicit <code>state=</code> injection isolates state (valid-file fill, failure branch leaves the injected entries empty, a <code>persist=False</code> mutate keeps the real state file untouched).</li>
 <li><code>test_compat_normalize_threshold_ladder</code>: Off-ladder thresholds snap onto the doubling ladder: the returned value is the largest ladder element &lt;= value, clamped to [COMPAT_INITIAL_THRESHOLD…</li>
 <li><code>test_compat_temp_file_cleanup</code>: A failed os.replace leaves no temp file behind: the persist failure path unlinks the unique-named temp file.</li>
 <li><code>test_compat_field_stripped_trace_accuracy</code>: compatibility_field_stripped fires only for requests whose outbound body was actually stripped — the probe-owning request emits compatibility_probe_started instead, so…</li>

@@ -558,13 +558,14 @@ def test_compat_state_unknown_feature_ignored():
         # The foreign entry must not be loaded into state at all (plan load
         # contract: "unknown feature keys -> ignore (forward-compat)").
         import claude_retry_proxy.server as srv
+        import claude_retry_proxy.compat as compat
         saved_path = srv.SETTINGS.feature_compat_file
-        saved_state = srv._compat_state
+        saved_entries = compat._state.entries
         try:
             srv.SETTINGS.feature_compat_file = state_path
             srv._load_compat_state()
             loaded_features = [e.get("feature")
-                               for e in srv._compat_state.values()]
+                               for e in compat._state.entries.values()]
             if "some_future_beta_field" in loaded_features:
                 fail("foreign-feature entry was loaded into state")
                 return
@@ -574,7 +575,7 @@ def test_compat_state_unknown_feature_ignored():
             pass_("foreign-feature entry not loaded; learned entry loaded")
         finally:
             srv.SETTINGS.feature_compat_file = saved_path
-            srv._compat_state = saved_state
+            compat._state.entries = saved_entries
 
         responders = {"p": _reject_unstripped_responder()}
         temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
@@ -921,6 +922,95 @@ def test_compat_locks_present():
         fail("_compat_retry_lock could not be acquired when free")
 
 
+def test_compat_state_object_shape():
+    """compat._state is a _CompatState singleton owning the two lock aliases;
+    explicit state injection isolates state operations from the singleton."""
+    print("\n--- Test: Compat State Object Shape ---")
+    import claude_retry_proxy.server as srv
+    import claude_retry_proxy.compat as compat
+    if not isinstance(compat._state, compat._CompatState):
+        fail("compat._state is not a _CompatState instance")
+        return
+    if compat._compat_state_lock is not compat._state.lock:
+        fail("_compat_state_lock does not alias _state.lock")
+        return
+    if compat._compat_retry_lock is not compat._state.retry_lock:
+        fail("_compat_retry_lock does not alias _state.retry_lock")
+        return
+    pass_("state singleton and lock aliases hold")
+
+    state_dir, state_path = _make_state_dir()
+    saved_path = srv.SETTINGS.feature_compat_file
+    stub_key = "stub-provider\x1fanthropic\x1fstub-model\x1fcontext_management"
+    stub_entry = {
+        "schema_version": 1, "provider": "stub-provider",
+        "mode": "anthropic", "actual_model": "stub-model",
+        "feature": "context_management", "state": "unsupported",
+        "threshold": 32, "strip_counter": 0,
+        "probation_successes": 0, "failed_confirmations": 0,
+    }
+    try:
+        # Injection isolation: load fills ONLY the injected state (valid
+        # state file pinned via SETTINGS).
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump({"schema_version": 1, "entries": {stub_key: stub_entry}},
+                      f)
+        srv.SETTINGS.feature_compat_file = state_path
+        fresh = compat._CompatState()
+        compat._load_compat_state(state=fresh)
+        if list(fresh.entries) != \
+                [("stub-provider", "anthropic", "stub-model",
+                  "context_management")]:
+            fail("injected load did not fill fresh.entries: %r"
+                 % (list(fresh.entries),))
+            return
+        if compat._state.entries != {}:
+            fail("singleton entries changed by injected load")
+            return
+        pass_("valid state file loads into the injected object only")
+
+        # Failure branch: a corrupt (non-JSON) file leaves the injected
+        # object empty (fail-open) and the singleton untouched.
+        garbage_path = state_path + ".garbage"
+        with open(garbage_path, "w", encoding="utf-8") as f:
+            f.write("this is not json")
+        srv.SETTINGS.feature_compat_file = garbage_path
+        untouched = dict(compat._state.entries)
+        fresh2 = compat._CompatState()
+        compat._load_compat_state(state=fresh2)
+        if fresh2.entries != {}:
+            fail("unreadable path polluted fresh2.entries: %r" % fresh2.entries)
+            return
+        if compat._state.entries != untouched:
+            fail("unreadable path touched the singleton")
+            return
+        pass_("corrupt state file leaves the injected object empty; "
+              "singleton untouched")
+
+        # Injection isolation under _compat_update: a mutate returning
+        # persist=False touches only the injected object (never the real
+        # SETTINGS.feature_compat_file).
+        key = ("stub-provider", "anthropic", "stub-model",
+               "context_management")
+        result2 = compat._compat_update(
+            key, lambda cur: (dict(stub_entry), False), state=fresh2)
+        if result2 != stub_entry:
+            fail("_compat_update returned unexpected entry")
+            return
+        if key not in fresh2.entries:
+            fail("injected _compat_update did not store into the injected "
+                 "state")
+            return
+        if compat._state.entries != {}:
+            fail("_compat_update wrote to the singleton instead of the "
+                 "injected state")
+            return
+        pass_("injected _compat_update isolates state (persist=False)")
+    finally:
+        srv.SETTINGS.feature_compat_file = saved_path
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
 def test_compat_normalize_threshold_ladder():
     """Off-ladder thresholds snap onto the doubling ladder: the returned
     value is the largest ladder element <= value, clamped to
@@ -945,12 +1035,13 @@ def test_compat_temp_file_cleanup():
     print("\n--- Test: Compat Temp File Cleanup ---")
     from unittest import mock
     import claude_retry_proxy.server as srv
+    import claude_retry_proxy.compat as compat
     state_dir, state_path = _make_state_dir()
     saved_path = srv.SETTINGS.feature_compat_file
-    saved_state = srv._compat_state
+    saved_entries = compat._state.entries
     try:
         srv.SETTINGS.feature_compat_file = state_path
-        srv._compat_state = {
+        compat._state.entries = {
             ("p", "anthropic", "m", "context_management"): {
                 "schema_version": 1, "provider": "p", "mode": "anthropic",
                 "actual_model": "m", "feature": "context_management",
@@ -972,7 +1063,7 @@ def test_compat_temp_file_cleanup():
         pass_("no temp file left after failed persist")
     finally:
         srv.SETTINGS.feature_compat_file = saved_path
-        srv._compat_state = saved_state
+        compat._state.entries = saved_entries
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
@@ -2408,6 +2499,7 @@ ALL_TESTS = [
     ("compat-state-concurrent-updates-no-loss", test_compat_state_concurrent_updates_no_loss),
     ("compat-state-key-isolation", test_compat_state_key_isolation),
     ("compat-locks-present", test_compat_locks_present),
+    ("compat-state-object-shape", test_compat_state_object_shape),
     ("compat-normalize-threshold-ladder", test_compat_normalize_threshold_ladder),
     ("compat-temp-file-cleanup", test_compat_temp_file_cleanup),
     ("compat-field-stripped-trace-accuracy", test_compat_field_stripped_trace_accuracy),
