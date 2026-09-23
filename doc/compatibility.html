@@ -235,14 +235,6 @@ client-visible failures). A restart therefore cannot delist a provider; it can o
 state and a warning. It does not refuse to start.</p>
 </div>
 
-<div class="note">
-<strong>A vestigial field.</strong> Each persisted entry also carries a
-<code>failed_confirmations</code> field. It is validated on load and always written as
-<code>0</code> — no code path ever increments it. The counter that actually drives suppression
-lives in a separate in-memory map and is never persisted. Treat the on-disk value as
-informational only; it is not a live count. (Tracked as a deferred issue.)
-</div>
-
 <h2 id="events">Trace events</h2>
 
 <p>All ten events below are emitted by the learner. They are metadata-only: none carries request
@@ -265,6 +257,6 @@ or response content.</p>
 <p>The full trace schema, including the fields common to every entry, is in
 <a href="trace-log.html">trace-log.html</a>.</p>
 
-<footer>Last updated: 2026-09-12</footer>
+<footer>Last updated: 2026-09-23</footer>
 </body>
 </html>

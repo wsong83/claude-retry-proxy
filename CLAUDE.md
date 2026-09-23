@@ -326,18 +326,20 @@ No other supplementary docs.
 
 ```json
 [
-{"issue_id": "compat-entry-failed-confirmations-dead-field", "title": "The persisted compatibility entry carries a failed_confirmations field that is never incremented, so it always reads 0", "target_repo": null, "report": "./tmp/reports/defer-issue-compat-entry-failed-confirmations-dead-field.json", "deferred": "2026-09-12", "date_source": "creation"},
 {"issue_id": "extract-model-raises-on-non-object-json", "title": "extract_model raises AttributeError on valid JSON that is not an object, so do_POST aborts with no HTTP response; the unguarded call at do_POST pre-empts the whole downstream guard chain", "target_repo": null, "report": "./tmp/reports/defer-issue-extract-model-raises-on-non-object-json.json", "deferred": "2026-09-12", "date_source": "creation"},
 {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "target_repo": null, "report": "./tmp/reports/defer-issue-image-content-blocks-chat-mode.json", "deferred": "2026-08-29", "date_source": "creation"},
 {"issue_id": "no-proxy-stop-trace-warning", "title": "Full-suite run warns 'No proxy_stop event in trace' when the proxy is terminated abruptly (low priority)", "target_repo": null, "report": "./tmp/reports/defer-issue-no-proxy-stop-trace-warning.json", "deferred": "2026-09-14", "date_source": "creation"},
-{"issue_id": "refactor-split-utility-cluster-doctrine", "title": "The refactor-split doctrine lacks a utility-cluster genus: the role-grouping rule misclassifies task-shaped leaf collections (e.g., a safety.py of string-integrity predicates)", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-refactor-split-utility-cluster-doctrine.json", "deferred": "2026-09-17", "date_source": "creation"},
 {"issue_id": "port-default-collision-hazard", "title": "A start on the default port can report success against a pre-existing listener: the readiness TCP probe cannot distinguish the spawned child's socket from a live proxy already on 8080", "target_repo": null, "report": "./tmp/reports/defer-issue-port-default-collision-hazard.json", "deferred": "2026-09-18", "date_source": "creation"},
 {"issue_id": "proxy-stderr-append-stale-tail", "title": "proxy-stderr.log is append-only across runs, so read_tail failure diagnostics can surface lines from previous sessions instead of the current attempt", "target_repo": null, "report": "./tmp/reports/defer-issue-proxy-stderr-append-stale-tail.json", "deferred": "2026-09-18", "date_source": "creation"}
 ]```
 
 ## Future Work — TODO
 
-Seven deferred issues remain (see above). Plan
+Five deferred issues remain (see above). Plan
+2026-09-23-drop-dead-failed-confirmations-field resolved the compatibility
+entry's dead `failed_confirmations` field — the persisted schema no longer
+carries it, and the in-memory suppression counter it shadowed is unchanged.
+Plan
 2026-09-15-sanitize-sinks-deferred resolved the five extract-sinks deferred
 issues — the `sanitize_error` exponential-backtracking regex and its inert
 Windows path redaction, `write_state`'s lock-free concurrent `os.replace`, the
@@ -347,9 +349,8 @@ the missing committed anchor check and the raw-Markdown `../README.md` link —
 were resolved by 2026-09-14-commit-doc-anchor-check. The CodeGraph prompt-hook
 entry (indexed 2026-09-13 without a report file) was removed on 2026-09-15 —
 resolved by other repos. Unresolved: chat-mode image content block mapping,
-the doc-tree plan's two surviving findings (`extract_model` raising on
-non-object JSON and the compatibility entry's dead `failed_confirmations`
-field), and the no-`proxy_stop` trace warning. The large source/test file
+the doc-tree plan's surviving finding (`extract_model` raising on
+non-object JSON), and the no-`proxy_stop` trace warning. The large source/test file
 split and the module-split guidance consolidation were retired 2026-09-16 by
 the global refactor-split consolidation (claude-config plan
 2026-09-16-refactor-split-skill): the extraction doctrine now lives in the

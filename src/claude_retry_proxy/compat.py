@@ -147,8 +147,7 @@ def _compat_validate_entry(entry):
         return None
     strip_counter = entry.get("strip_counter", 0)
     probation_successes = entry.get("probation_successes", 0)
-    failed_confirmations = entry.get("failed_confirmations", 0)
-    for v in (strip_counter, probation_successes, failed_confirmations):
+    for v in (strip_counter, probation_successes):
         if not isinstance(v, int) or isinstance(v, bool):
             return None
     return {
@@ -163,7 +162,6 @@ def _compat_validate_entry(entry):
         # (fail-safe direction — over-stripping, never under-stripping).
         "strip_counter": 0,
         "probation_successes": 0,
-        "failed_confirmations": 0,
     }
 
 
@@ -352,7 +350,6 @@ def _compat_learn(key, request_id, tier, state=_state):
             "threshold": COMPAT_INITIAL_THRESHOLD,
             "strip_counter": 0,
             "probation_successes": 0,
-            "failed_confirmations": 0,
         }, True)
 
     _compat_update(key, mutate, state=state)

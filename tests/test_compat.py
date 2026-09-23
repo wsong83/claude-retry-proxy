@@ -80,7 +80,6 @@ SSE_BODY = (
 ALLOWED_STATE_KEYS = {
     "schema_version", "provider", "mode", "actual_model", "feature",
     "state", "threshold", "strip_counter", "probation_successes",
-    "failed_confirmations",
 }
 
 
@@ -551,7 +550,6 @@ def test_compat_state_unknown_feature_ignored():
             "threshold": 32,
             "strip_counter": 0,
             "probation_successes": 0,
-            "failed_confirmations": 0,
         }
         _write_state_file(state_path, state)
 
@@ -947,7 +945,7 @@ def test_compat_state_object_shape():
         "mode": "anthropic", "actual_model": "stub-model",
         "feature": "context_management", "state": "unsupported",
         "threshold": 32, "strip_counter": 0,
-        "probation_successes": 0, "failed_confirmations": 0,
+        "probation_successes": 0,
     }
     try:
         # Injection isolation: load fills ONLY the injected state (valid
@@ -1047,7 +1045,6 @@ def test_compat_temp_file_cleanup():
                 "actual_model": "m", "feature": "context_management",
                 "state": "unsupported", "threshold": 32,
                 "strip_counter": 0, "probation_successes": 0,
-                "failed_confirmations": 0,
             },
         }
         with mock.patch("os.replace", side_effect=OSError("disk full")):
