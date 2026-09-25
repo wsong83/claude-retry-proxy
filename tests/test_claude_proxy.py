@@ -12,6 +12,7 @@ from test_trace import ALL_TESTS as TRACE_TESTS
 from test_retry_streaming import ALL_TESTS as RETRY_STREAMING_TESTS
 from test_tier_routing import ALL_TESTS as TIER_ROUTING_TESTS
 from test_config_keys import ALL_TESTS as CONFIG_KEYS_TESTS
+from test_config_split import ALL_TESTS as CONFIG_SPLIT_TESTS
 from test_admin import ALL_TESTS as ADMIN_TESTS
 from test_cli import ALL_TESTS as CLI_TESTS
 from test_mode_dispatch import ALL_TESTS as MODE_DISPATCH_TESTS
@@ -30,6 +31,7 @@ ALL_TESTS = (
     RETRY_STREAMING_TESTS +
     TIER_ROUTING_TESTS +
     CONFIG_KEYS_TESTS +
+    CONFIG_SPLIT_TESTS +
     ADMIN_TESTS +
     CLI_TESTS +
     MODE_DISPATCH_TESTS +

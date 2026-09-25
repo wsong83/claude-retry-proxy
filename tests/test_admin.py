@@ -314,14 +314,23 @@ def test_admin_api_switch_preserves_models():
         else:
             fail(f"Models section changed: {config.get('models')}")
 
-        # On-disk config.json still has models section
+        # On-disk config.json is tiers-only after the split-aware switch
         config_path = os.path.join(temp_dir, "config.json")
         with open(config_path) as f:
             disk_config = json.load(f)
-        if disk_config.get("models") == models:
-            pass_("Models section still present in on-disk config.json")
+        missing = [k for k in ("models", "extra_request_headers",
+                               "disable_retry_claude_count_token") if k in disk_config]
+        if missing:
+            fail(f"Catalog keys re-injected into on-disk config.json by the switch: {missing}")
         else:
-            fail(f"Models section missing from on-disk config.json: {disk_config.get('models')}")
+            pass_("On-disk config.json is tiers-only after the switch")
+        disk_tiers = disk_config.get("tiers", {})
+        if all(disk_tiers[t].get("provider") == switch_body["tiers"][t]["provider"]
+               and disk_tiers[t].get("model") == switch_body["tiers"][t]["model"]
+               for t in switch_body["tiers"]):
+            pass_("On-disk tiers updated by the switch")
+        else:
+            fail(f"On-disk tiers changed unexpectedly: {disk_tiers}")
     finally:
         cleanup()
 
@@ -547,7 +556,15 @@ def test_admin_api_switch_missing_tier_rejected():
 # ===========================================================================
 
 def test_admin_api_reload():
-    """Modify config.json on disk, POST /admin/api/reload, verify new mapping active."""
+    """Reload re-reads the provider catalog from models.json only.
+
+    A catalog edit (a model added to models.json) becomes visible after a
+    reload even while config.json on disk is hand-edited in the meantime —
+    tiers do NOT follow the disk edit and routing keeps the in-memory
+    mapping. A reload whose catalog drops a model a tier is pinned to is
+    refused with 400 and performs no swap: the previous catalog stays in
+    effect. A missing or malformed models.json is also a 400.
+    """
     print("\n--- Test: Admin API Reload ---")
 
     p_port = find_free_port()
@@ -605,31 +622,131 @@ def test_admin_api_reload():
         else:
             fail(f"Baseline sonnet request did not route to model-a. last: {req_list[-1] if req_list else 'none'}")
 
-        # Modify config.json on disk: sonnet → model-b
+        models_path = os.path.join(temp_dir, "models.json")
+
+        # Catalog edit: model-b added to models.json. Simultaneously hand-edit
+        # config.json's tiers on disk (sonnet → model-b) — reload must ignore
+        # that edit entirely.
+        with open(models_path, "w") as f:
+            json.dump({"models": {"p": ["claude-haiku-4-5", "claude-opus-5",
+                                        "model-a", "model-b"]}}, f)
         tiers_b = dict(tiers_a)
         tiers_b["sonnet"] = {"provider": "p", "model": "model-b"}
         with open(config_path, "w") as f:
-            # Reload re-validates: provider "p" needs >=1 model in config.models
-            json.dump({"tiers": tiers_b, "models": _derive_models_from_tiers(tiers_b)}, f)
+            json.dump({"tiers": tiers_b}, f)
 
         # POST /admin/api/reload
         status, data = _admin_post(proxy_port, "/admin/api/reload", {})
         if status == 200:
-            pass_("Admin API reload returned 200")
+            pass_("Admin API reload with an added catalog model returned 200")
         else:
             fail(f"Admin API reload returned {status}: {data}")
             return
 
-        # Post-reload: sonnet routes to model-b
+        # GET /admin/api/config: catalog refreshed, tiers NOT from disk edit
+        status, body, _ = _admin_get(proxy_port, "/admin/api/config")
+        if status != 200:
+            fail(f"GET /admin/api/config after reload returned {status}")
+            return
+        merged = json.loads(body)
+        if isinstance(merged.get("models"), dict) \
+                and "model-b" in merged["models"].get("p", []):
+            pass_("Reload refreshed the catalog from models.json (model-b present)")
+        else:
+            fail(f"Reloaded catalog missing model-b: {merged.get('models')}")
+        if merged.get("tiers", {}).get("sonnet", {}).get("model") == "model-a":
+            pass_("Reload tiers stayed in-memory (disk edit not followed)")
+        else:
+            fail("Reload adopted disk tiers: sonnet={!r}".format(
+                merged.get("tiers", {}).get("sonnet")))
+
+        # Post-reload: sonnet still routes to model-a
         status, resp_body = _send_proxy_request(proxy_port, body=json.dumps({
             "model": "sonnet", "messages": [{"role": "user", "content": "hi"}]}))
         if status != 200:
             fail(f"Post-reload request returned {status}")
             return
-        if req_list and b"model-b" in req_list[-1]["body"]:
-            pass_("Post-reload sonnet request routed to model-b")
+        if req_list and b"model-a" in req_list[-1]["body"]:
+            pass_("Post-reload sonnet request still routes to model-a")
         else:
-            fail(f"Post-reload sonnet request did not route to model-b. last: {req_list[-1] if req_list else 'none'}")
+            fail(f"Post-reload sonnet routing changed. last: {req_list[-1] if req_list else 'none'}")
+
+        # Catalog what drops the tier-pinned model -> 400, no swap
+        with open(models_path, "w") as f:
+            json.dump({"models": {"p": ["model-b"]}}, f)
+        status, data = _admin_post(proxy_port, "/admin/api/reload", {})
+        if status == 400 and "not in the reloaded catalog" in data:
+            pass_("Reload refused 400 when a tier's model is absent from the catalog")
+        else:
+            fail(f"expected 400 for a dropped tier model, got {status}: {data[:300]}")
+
+        # Previous catalog still in effect (no swap)
+        status, body, _ = _admin_get(proxy_port, "/admin/api/config")
+        if status == 200:
+            merged = json.loads(body)
+            prev = merged.get("models", {}).get("p", [])
+            if "model-a" in prev:
+                pass_("Refused reload performed no swap (previous catalog in effect)")
+            else:
+                fail(f"Refused reload swapped anyway (catalog lost model-a): {prev}")
+        else:
+            fail(f"GET /admin/api/config after refused reload returned {status}")
+
+        # Missing models.json -> 400
+        os.remove(models_path)
+        status, data = _admin_post(proxy_port, "/admin/api/reload", {})
+        if status == 400 and "models" in data:
+            pass_("Reload refused 400 with missing models.json")
+        else:
+            fail(f"expected 400 for missing models.json, got {status}: {data[:300]}")
+
+        # Malformed models.json -> 400
+        with open(models_path, "w") as f:
+            f.write("{not json")
+        status, data = _admin_post(proxy_port, "/admin/api/reload", {})
+        if status == 400 and "models" in data:
+            pass_("Reload refused 400 with malformed models.json")
+        else:
+            fail(f"expected 400 for malformed models.json, got {status}: {data[:300]}")
+    finally:
+        cleanup()
+
+
+def test_admin_reload_non_dict_extra_tier():
+    """A non-dict extra tier (which startup validation lets through) must
+    not crash the reload gate: reload answers 400 naming the tier and never
+    drops the connection with no response."""
+    print("\n--- Test: Admin Reload Non-Dict Extra Tier ---")
+
+    p_port = find_free_port()
+    tiers = {
+        "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+        # A hand-edited non-dict tier; validate_config type-checks only the
+        # three required tiers, so startup accepts it.
+        "preview": "claude-x",
+    }
+    vendors = {"p": {"url": f"http://127.0.0.1:{p_port}", "key": "k"}}
+
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(
+        tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+
+    try:
+        status, data = _admin_post(proxy_port, "/admin/api/reload", {})
+        if status == 400 and "tier 'preview' is not an object" in data:
+            pass_("Non-dict extra tier refused with its own 400")
+        elif status == 400:
+            fail("Non-dict tier refused but without the pinned message: {!r}".format(
+                data[:300]))
+        elif status == 200:
+            fail("Non-dict extra tier passed the reload gate (gate is not total): "
+                 "{!r}".format(data[:300]))
+        else:
+            fail("Non-dict tier: expected 400, got {}: {!r}".format(status, data[:300]))
     finally:
         cleanup()
 
@@ -753,7 +870,11 @@ def test_admin_models_provider_keyed():
 def test_admin_switch_preserves_disable_retry_flag():
     """Admin Apply preserves disable_retry_claude_count_token and
     extra_request_headers (one switch flow, both top-level keys) in the
-    returned and on-disk config."""
+    returned (in-memory) config. After the split the flag and the header
+    rules live in models.json, so the on-disk config.json is tiers-only
+    and the in-memory preservation is asserted instead (its replacement
+    for the former on-disk flag assertion is the loader-precedence case in
+    tests/test_config_split.py)."""
     print("\n--- Test: Admin Switch Preserves Top-Level Keys (flag + extra headers) ---")
 
     upstream_port = find_free_port()
@@ -814,26 +935,34 @@ def test_admin_switch_preserves_disable_retry_flag():
             else:
                 fail(f"Returned config missing/preserved flag: {config.get('disable_retry_claude_count_token')}")
 
-            # Check on-disk config.json
-            with open(config_path) as f:
-                disk_config = json.load(f)
-            if disk_config.get("disable_retry_claude_count_token") is True:
-                pass_("On-disk config preserves disable_retry_claude_count_token=true")
-            else:
-                fail(f"On-disk config missing/preserved flag: {disk_config.get('disable_retry_claude_count_token')}")
-
-            # extra_request_headers survives the switch in both the returned
-            # (in-memory) and on-disk config.
+            # extra_request_headers survives the switch in the returned
+            # (in-memory) config.
             if config.get("extra_request_headers") == seeded_extra:
                 pass_("Returned config preserves extra_request_headers")
             else:
                 fail(f"Returned config missing/preserved extra_request_headers: "
                      f"{config.get('extra_request_headers')}")
-            if disk_config.get("extra_request_headers") == seeded_extra:
-                pass_("On-disk config preserves extra_request_headers")
+
+            # On-disk config.json is tiers-only: the flag and the header
+            # rules live in models.json now and the split-aware switch
+            # never re-injects them.
+            with open(config_path) as f:
+                disk_config = json.load(f)
+            leftovers = [k for k in ("models", "extra_request_headers",
+                                     "disable_retry_claude_count_token")
+                         if k in disk_config]
+            if leftovers:
+                fail(f"Catalog/flag keys remain in on-disk config.json after the switch: {leftovers}")
             else:
-                fail(f"On-disk config missing/preserved extra_request_headers: "
-                     f"{disk_config.get('extra_request_headers')}")
+                pass_("On-disk config.json is tiers-only after the switch")
+            posted = json.loads(switch_body)["tiers"]
+            disk_tiers = disk_config.get("tiers", {})
+            if all(disk_tiers[t].get("provider") == posted[t]["provider"]
+                   and disk_tiers[t].get("model") == posted[t]["model"]
+                   for t in posted):
+                pass_("On-disk tiers updated by the switch")
+            else:
+                fail(f"On-disk tiers changed unexpectedly: {disk_tiers}")
 
         finally:
             proc.terminate()
@@ -1201,10 +1330,12 @@ def test_admin_switch_missing_key_defaults():
         cleanup()
 
 
-def test_admin_reload_validates_key_names():
-    """Reload re-validates per-tier key names against the in-memory vendors:
-    an unknown key on disk refuses the reload (400); a fixed name reloads."""
-    print("\n--- Test: Admin Reload Validates Key Names ---")
+def test_admin_switch_validates_key_names():
+    """Key-name validation moved to the switch path (reload no longer reads
+    tiers from disk, so a bad key on disk is never seen by reload): a switch
+    with an unknown key name refuses with 400; a valid key name switches and
+    the tier keeps its explicit key."""
+    print("\n--- Test: Admin Switch Validates Key Names ---")
     port = find_free_port()
     tiers = {
         "haiku": {"provider": "mkp", "model": "claude-haiku-4-5", "key": "SW"},
@@ -1241,9 +1372,8 @@ def test_admin_reload_validates_key_names():
         mock_servers["mkp"]["server"].shutdown()
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def write_tiers(tiers_cfg):
-        with open(config_path, "w") as f:
-            json.dump({"tiers": tiers_cfg, "models": _derive_models_from_tiers(tiers_cfg)}, f)
+    def switch_tiers(tiers_cfg):
+        return _admin_post(proxy_port, "/admin/api/switch", {"tiers": tiers_cfg})
 
     try:
         bad_tiers = {
@@ -1251,24 +1381,30 @@ def test_admin_reload_validates_key_names():
             "sonnet": {"provider": "mkp", "model": "claude-sonnet-5", "key": "NOPE"},
             "opus": {"provider": "mkp", "model": "claude-opus-5", "key": "SW"},
         }
-        write_tiers(bad_tiers)
-        status, data = _admin_post(proxy_port, "/admin/api/reload", {})
+        status, data = switch_tiers(bad_tiers)
         if status == 400 and "NOPE" in data:
-            pass_("reload rejects an unknown key name (400)")
+            pass_("switch rejects an unknown key name (400)")
         else:
-            fail("expected reload 400 for unknown key, got {} {!r}".format(status, data[:300]))
+            fail("expected switch 400 for unknown key, got {} {!r}".format(status, data[:300]))
+
+        # After a refused switch the config is untouched
+        status, data = _admin_post(proxy_port, "/admin/api/reload", {})
+        if status == 200:
+            pass_("reload succeeds with an untouched config after the refused switch")
+        else:
+            fail("expected reload 200 after refused switch, got {} {!r}".format(
+                status, data[:300]))
 
         fixed_tiers = {
             "haiku": {"provider": "mkp", "model": "claude-haiku-4-5", "key": "SW"},
             "sonnet": {"provider": "mkp", "model": "claude-sonnet-5", "key": "CZ"},
             "opus": {"provider": "mkp", "model": "claude-opus-5", "key": "SW"},
         }
-        write_tiers(fixed_tiers)
-        status, data = _admin_post(proxy_port, "/admin/api/reload", {})
+        status, data = switch_tiers(fixed_tiers)
         if status == 200:
-            pass_("reload succeeds after the key name is fixed")
+            pass_("switch succeeds with valid key names")
         else:
-            fail("expected reload 200 after fix, got {} {!r}".format(status, data[:300]))
+            fail("expected switch 200, got {} {!r}".format(status, data[:300]))
     finally:
         cleanup()
 
@@ -1338,6 +1474,7 @@ ALL_TESTS = [
     ("admin-api-csrf-ipv6-loopback-accepted", test_admin_api_csrf_ipv6_loopback_accepted),
     ("admin-api-switch-missing-tier-rejected", test_admin_api_switch_missing_tier_rejected),
     ("admin-api-reload", test_admin_api_reload),
+    ("admin-reload-non-dict-extra-tier", test_admin_reload_non_dict_extra_tier),
     ("admin-models-provider-keyed", test_admin_models_provider_keyed),
     ("admin-providers-detail", test_admin_providers_detail),
     ("admin-providers-detail-no-mode", test_admin_providers_detail_no_mode),
@@ -1349,7 +1486,7 @@ ALL_TESTS = [
     ("admin-switch-unknown-key-rejected", test_admin_switch_unknown_key_rejected),
     ("admin-switch-invalid-key-type-rejected", test_admin_switch_invalid_key_type_rejected),
     ("admin-switch-missing-key-defaults", test_admin_switch_missing_key_defaults),
-    ("admin-reload-validates-key-names", test_admin_reload_validates_key_names),
+    ("admin-switch-validates-key-names", test_admin_switch_validates_key_names),
     ("admin-html-key-column", test_admin_html_key_column),
 ]
 

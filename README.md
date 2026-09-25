@@ -54,7 +54,7 @@ Requires `setuptools >= 64` (for PEP 660 src-layout editable installs). Python
 #    ANTHROPIC_API_KEY = <any value — the proxy injects the real key>
 
 # 2. Prepare ~/.claude/keys-index.json with your provider URLs and API keys.
-#    Copy the template: src/templates/keys-index.json → ~/.claude/keys-index.json
+#    Copy the template: src/claude_retry_proxy/templates/keys-index.json → ~/.claude/keys-index.json
 #    Can be plain JSON (convenient for testing/automation) or encrypted
 #    with `vim -n -x` (blowfish2, VimCrypt~03!, recommended for production).
 #    See "Keys file" section below for format details.
@@ -76,15 +76,18 @@ Check state at any time:
 
 ```bash
 claude-retry-proxy status     # running/stopped + tier mapping
-claude-retry-proxy reload     # reload config.json from disk
+claude-retry-proxy reload     # refresh the provider catalog from models.json
 ```
 
 ## How it works
 
 When you run `claude-retry-proxy start`:
 
-1. It checks that `~/.claude/proxy/config.json` exists. On first run, it copies
-   a template and tells you to populate it with your tier→provider mappings.
+1. It checks that `~/.claude/proxy/config.json` and its sibling
+   `~/.claude/proxy/models.json` both exist. On first run it copies the template
+   pair and tells you to populate the config with your tier→provider mappings.
+   If either file is missing later, the install re-runs and provisions **only**
+   what is absent — an existing file is never overwritten.
 2. It prompts for your passphrase and decrypts `~/.claude/keys-index.json`
    (provider URLs and API keys, vim blowfish2 encrypted).
 3. It validates the config with the same canonical rules the server enforces
@@ -116,7 +119,7 @@ Commands:
   start   Start the proxy (passphrase prompt + config validation + launch server)
   stop    Stop the proxy
   status  Show proxy status + current tier mapping
-  reload  Reload config.json from disk into running proxy
+  reload  Refresh the provider catalog from models.json (tier mapping untouched)
 ```
 
 ### `start` options
@@ -150,13 +153,34 @@ for non-interactive use.
 
 ### Config file (`~/.claude/proxy/config.json`)
 
-A template is provided at [`src/templates/config.json`](src/templates/config.json). On first
-`claude-retry-proxy start`, if `~/.claude/proxy/config.json` doesn't exist,
-the template is copied there automatically.
+A template is provided at
+[`src/claude_retry_proxy/templates/config.json`](src/claude_retry_proxy/templates/config.json).
+On first `claude-retry-proxy start`, if `~/.claude/proxy/config.json` doesn't exist, the template
+pair is copied there automatically.
 
-Maps each tier to a provider, model name, and an optional key selector.
-Editable via the admin page or directly on disk (use
-`claude-retry-proxy reload` after manual edits).
+Maps each tier to a provider, model name, and an optional key selector. It holds **only** the tier
+mapping — the provider catalog, the header rules, and the count-tokens flag live in the sibling
+`models.json`.
+
+Editable via the admin page: "Apply Config" writes this file. Direct edits on disk are read at
+startup, but `claude-retry-proxy reload` no longer picks them up — reload refreshes the provider
+catalog, not the tier mapping.
+
+### Provider catalog (`~/.claude/proxy/models.json`)
+
+The sibling of `config.json`, resolved from the same directory — so
+`--config-path /tmp/x/config.json` reads `/tmp/x/models.json`. It carries `models`,
+`extra_request_headers`, and `disable_retry_claude_count_token`, and **both files must exist**: a
+missing `models.json` stops the proxy from starting rather than degrading it.
+
+It is normally written by `update-claude-env`, or by hand. The proxy never writes it, with one
+exception: provisioning the template on a first install, and only when the file is absent. Because
+it is import-owned, a header rule narrowed — or a flag set — only on this machine does not survive
+a deploy; change it in the repo's copy instead.
+
+"Reload Providers" in the admin page (or `claude-retry-proxy reload`) re-reads it in place, and
+refuses — naming the tier — if the reloaded catalog has dropped a model a tier is using. Reload is
+stricter than startup here: startup only requires a tier's provider to have *some* catalog entry.
 
 ```json
 {
@@ -252,7 +276,7 @@ providers can identify the client instead of logging "Unknown client".
 
 ### Keys file format (`~/.claude/keys-index.json`)
 
-A template is provided at [`src/templates/keys-index.json`](src/templates/keys-index.json). Copy it to
+A template is provided at [`src/claude_retry_proxy/templates/keys-index.json`](src/claude_retry_proxy/templates/keys-index.json). Copy it to
 `~/.claude/keys-index.json` and fill in your provider details.
 
 The keys file can be either:
@@ -493,7 +517,8 @@ While the proxy runs, it creates (all under `~/.claude/`):
 
 | Path | Purpose |
 |------|---------|
-| `proxy/config.json` | Tier→provider mapping (editable via admin page or manually) |
+| `proxy/config.json` | Tier→provider mapping (written by "Apply Config" in the admin page) |
+| `proxy/models.json` | Provider catalog, header rules, and the count-tokens flag (written by `update-claude-env` or by hand — never by the proxy) |
 | `proxy/proxy-state.json` | Runtime state (PID, port, heartbeat); removed on clean shutdown |
 | `proxy/proxy-stderr.log` | Server stderr (startup messages, retry notices) |
 | `logs/proxy-trace.jsonl` | The JSONL request trace (pruned of entries >5 days on each `start`) |
@@ -525,7 +550,7 @@ detailed reference, indexed by [doc/content.html](doc/content.html):
 |------|--------|
 | [doc/architecture.html](doc/architecture.html) | Request path, tier resolution, retry and backoff, give-up, size caps, disconnects, config swap, heartbeat, sinks, shutdown |
 | [doc/provider-modes.html](doc/provider-modes.html) | The `anthropic` / `chat` / `response` modes: auth headers, path rewriting, request and response transforms, SSE, tool-call degradation |
-| [doc/configuration.html](doc/configuration.html) | `config.json` and `keys-index.json` schemas, environment variables, validation rules |
+| [doc/configuration.html](doc/configuration.html) | the `config.json`, `models.json`, and `keys-index.json` documents, environment variables, validation rules |
 | [doc/operations.html](doc/operations.html) | CLI commands, readiness protocol, passphrase handling, admin API and CSRF, shutdown, runtime artifacts |
 | [doc/compatibility.html](doc/compatibility.html) | The `context_management` compatibility learner: states, transitions, suppression, persistence |
 | [doc/trace-log.html](doc/trace-log.html) | Trace entry schema, event inventory, `--all`, file permissions, pruning, analysis |

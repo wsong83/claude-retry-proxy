@@ -5,7 +5,7 @@ Commands:
     start    Start the proxy (load config, decrypt keys, launch proxy server)
     stop     Stop the proxy (kill process)
     status   Show proxy status (running/stopped/stale)
-    reload   Reload config from disk
+    reload   Reload the provider catalog from models.json
 """
 
 import json
@@ -308,7 +308,7 @@ def cmd_start(args):
     import threading
 
     from . import vimcrypt
-    from .config import install_template
+    from .config import install_template, models_path_for
 
     parser = argparse.ArgumentParser(prog="claude-retry-proxy start")
     parser.add_argument("--port", "-p", type=int, default=SETTINGS.port,
@@ -330,21 +330,40 @@ def cmd_start(args):
 
     _trace("cmd_start: entering (port={})".format(port))
 
-    # 1. Check config.json exists
-    if not os.path.exists(config_path):
-        if os.path.exists(SETTINGS.config_template_path):
-            try:
-                install_template(config_path)
-            except OSError as e:
-                print("ERROR: Cannot create config at {}: {}".format(config_path, e))
-                return 1
-        else:
-            print("ERROR: Config file not found: {}".format(config_path))
-            print("Template not available at: {}".format(SETTINGS.config_template_path))
+    # 1. Ensure the config.json + models.json pair exists (template install)
+    models_path = models_path_for(config_path)
+    config_missing = not os.path.exists(config_path)
+    models_missing = not os.path.exists(models_path)
+    if config_missing or models_missing:
+        # Availability check covers both template paths; each error names the
+        # path it actually checked.
+        unavailable = []
+        if config_missing and not os.path.exists(SETTINGS.config_template_path):
+            unavailable.append(SETTINGS.config_template_path)
+        if models_missing and not os.path.exists(SETTINGS.models_template_path):
+            unavailable.append(SETTINGS.models_template_path)
+        if unavailable:
+            # Name the missing live destination(s), not only the template
+            # path: with config.json present the config-side line would
+            # otherwise never print, leaving the operator unable to tell
+            # which file of the pair failed to provision.
+            if config_missing:
+                print("ERROR: Config file not found: {}".format(config_path))
+            if models_missing:
+                print("ERROR: Models file not found: {}".format(models_path))
+            for template_path in unavailable:
+                print("Template not available at: {}".format(template_path))
             return 1
-        print("Created config template at: {}".format(config_path))
-        print("Please populate the config and run 'claude-retry-proxy start' again.")
-        return 1
+        try:
+            install_template(config_path)
+        except OSError as e:
+            # The message names the path that actually failed, not
+            # unconditionally config_path.
+            print("ERROR: {}".format(e))
+            return 1
+        if config_missing:
+            print("Please populate the config and run 'claude-retry-proxy start' again.")
+            return 1
 
     # 2. Load and validate config
     config, err = _load_config_for_validation(config_path)
@@ -694,7 +713,9 @@ def cmd_status(args):
 
         # Show tier mapping from config
         config, err = _load_config_for_validation(config_path)
-        if not err and config:
+        if err:
+            print("  Config error: {}".format(err))
+        elif config:
             tiers = config.get("tiers", {})
             if tiers:
                 print("  Tiers:")
@@ -711,7 +732,7 @@ def cmd_status(args):
 
 
 def cmd_reload(args):
-    """Reload config from disk."""
+    """Reload the provider catalog from models.json into the running proxy."""
     _trace("cmd_reload: entering")
 
     state = _read_state()
@@ -728,16 +749,24 @@ def cmd_reload(args):
 
     try:
         import urllib.request
+        import urllib.error
         req = urllib.request.Request(
             "http://127.0.0.1:{}/admin/api/reload".format(port),
             method="POST",
             headers={"Origin": "http://127.0.0.1:{}".format(port)})
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        # The timeout must exceed the server's 30 s drain window; a busy
+        # proxy is a reload that subsequently succeeds, not a CLI failure.
+        with urllib.request.urlopen(req, timeout=40) as resp:
             body = resp.read().decode("utf-8")
             data = json.loads(body)
             if data.get("status") == "ok":
-                print("Config reloaded successfully")
                 config = data.get("config", {})
+                print("Providers reloaded successfully")
+                models_catalog = config.get("models", {})
+                print("  {} provider{} available: {}".format(
+                    len(models_catalog),
+                    "" if len(models_catalog) == 1 else "s",
+                    ", ".join(sorted(models_catalog.keys()))))
                 tiers = config.get("tiers", {})
                 if tiers:
                     print("Tiers:")
@@ -749,6 +778,19 @@ def cmd_reload(args):
             else:
                 print("ERROR: {}".format(data.get("error", "unknown error")))
                 return 1
+    except urllib.error.HTTPError as e:
+        # A 400 refusal (or a drain-timeout 503) surfaces as an HTTPError;
+        # without reading its body the refusal's own tier/provider/model
+        # detail is discarded and the operator sees only the status line.
+        try:
+            refusal = json.loads(e.read().decode("utf-8")).get("error", "")
+        except Exception:
+            refusal = ""
+        if refusal:
+            print("ERROR: {}".format(refusal))
+        else:
+            print("ERROR: Reload failed: HTTP Error {}: {}".format(e.code, e.reason))
+        return 1
     except Exception as e:
         print("ERROR: Reload failed: {}".format(e))
         return 1
@@ -765,7 +807,7 @@ def print_usage():
     print("  start   Start the proxy (load config, decrypt keys, launch server)")
     print("  stop    Stop the proxy")
     print("  status  Show proxy status")
-    print("  reload  Reload config from disk")
+    print("  reload  Reload the provider catalog from models.json")
 
 
 def main():

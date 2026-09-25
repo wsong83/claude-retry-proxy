@@ -31,6 +31,28 @@ from _harness import (
 
 
 
+def _write_split_pair(dir_path, merged_config, config_name="config.json"):
+    """Write a pre-split-era merged config dict as the split pair.
+
+    Only the tier mapping goes into config.json; the catalog and its
+    riders (models, extra_request_headers,
+    disable_retry_claude_count_token) go into the sibling models.json the
+    loader resolves beside the config path. Returns the config path.
+    """
+    body = {"tiers": merged_config["tiers"]}
+    cpath = os.path.join(dir_path, config_name)
+    with open(cpath, "w") as f:
+        json.dump(body, f)
+    models_doc = {"models": merged_config.get("models", {})}
+    for rider in ("extra_request_headers", "disable_retry_claude_count_token"):
+        if rider in merged_config:
+            models_doc[rider] = merged_config[rider]
+    mpath = os.path.join(dir_path, "models.json")
+    with open(mpath, "w") as f:
+        json.dump(models_doc, f)
+    return cpath
+
+
 # ===========================================================================
 # Test: Config Validation Missing Tier
 # ===========================================================================
@@ -50,9 +72,7 @@ def test_config_validation_missing_tier():
             },
             "models": {"p": ["claude-sonnet-5", "claude-opus-5"]}
         }
-        config_path = os.path.join(temp_dir, "config.json")
-        with open(config_path, "w") as f:
-            json.dump(invalid_config, f)
+        config_path = _write_split_pair(temp_dir, invalid_config)
 
         keys_path = os.path.join(temp_dir, "keys-index.json")
         with open(keys_path, "w") as f:
@@ -96,9 +116,7 @@ def test_config_validation_unknown_provider():
             # "p" has models so the only validation error is the unknown provider
             "models": {"p": ["claude-sonnet-5", "claude-opus-5"]}
         }
-        config_path = os.path.join(temp_dir, "config.json")
-        with open(config_path, "w") as f:
-            json.dump(invalid_config, f)
+        config_path = _write_split_pair(temp_dir, invalid_config)
 
         keys_path = os.path.join(temp_dir, "keys-index.json")
         with open(keys_path, "w") as f:
@@ -137,6 +155,14 @@ def test_config_validation_models_to_keys():
     print("\n--- Test: Config Validation Models To Keys ---")
 
     temp_dir = tempfile.mkdtemp(prefix="proxy_cfg_models_keys_")
+
+    # Subdirectory split: the two halves need different catalogs, and under
+    # the sibling rule every config.json in one directory shares one
+    # models.json — so each half gets its own directory.
+    temp_dir_a = os.path.join(temp_dir, "half_refuses")
+    temp_dir_b = os.path.join(temp_dir, "half_starts")
+    os.makedirs(temp_dir_a)
+    os.makedirs(temp_dir_b)
     try:
         # Config models references "orphan" which has no entry in keys-index.json
         invalid_config = {
@@ -147,11 +173,9 @@ def test_config_validation_models_to_keys():
             },
             "models": {"p": ["claude-sonnet-5", "claude-opus-5"], "orphan": ["some-model"]}
         }
-        config_path = os.path.join(temp_dir, "config.json")
-        with open(config_path, "w") as f:
-            json.dump(invalid_config, f)
+        config_path = _write_split_pair(temp_dir_a, invalid_config)
 
-        keys_path = os.path.join(temp_dir, "keys-index.json")
+        keys_path = os.path.join(temp_dir_a, "keys-index.json")
         with open(keys_path, "w") as f:
             json.dump({"vendors": {"p": {"url": "http://127.0.0.1:9999", "key": "k"}}}, f)
 
@@ -181,12 +205,10 @@ def test_config_validation_models_to_keys():
             },
             "models": {"p": ["claude-sonnet-5", "claude-opus-5"]}
         }
-        config_path2 = os.path.join(temp_dir, "config2.json")
-        with open(config_path2, "w") as f:
-            json.dump(valid_config, f)
+        config_path2 = _write_split_pair(temp_dir_b, valid_config)
 
         # keys-index.json contains an extra "legacy" provider not in config.models
-        keys_path2 = os.path.join(temp_dir, "keys2-index.json")
+        keys_path2 = os.path.join(temp_dir_b, "keys-index.json")
         with open(keys_path2, "w") as f:
             json.dump({"vendors": {
                 "p": {"url": "http://127.0.0.1:9999", "key": "k"},
@@ -239,9 +261,7 @@ def test_config_validation_tier_provider_needs_models():
             },
             "models": {"p": ["claude-sonnet-5", "claude-opus-5"]}
         }
-        config_path = os.path.join(temp_dir, "config.json")
-        with open(config_path, "w") as f:
-            json.dump(invalid_config, f)
+        config_path = _write_split_pair(temp_dir, invalid_config)
 
         keys_path = os.path.join(temp_dir, "keys-index.json")
         with open(keys_path, "w") as f:
@@ -382,10 +402,8 @@ def test_models_per_provider_validation():
                     "opus": {"provider": "p", "model": "claude-opus-5"},
                 },
                 "models": models,
-            }
-            config_path = os.path.join(temp_dir, "config.json")
-            with open(config_path, "w") as f:
-                json.dump(config, f)
+                }
+            config_path = _write_split_pair(temp_dir, config)
             if keys_vendors is None:
                 keys_vendors = {"p": {"url": "http://127.0.0.1:1", "key": "k"}}
             keys_path = _create_test_keys(temp_dir, keys_vendors)
@@ -828,9 +846,7 @@ def test_extra_request_headers_startup_refusal():
         try:
             cfg = _base_valid_config()
             cfg["extra_request_headers"] = extra
-            config_path = os.path.join(temp_dir, "config.json")
-            with open(config_path, "w") as f:
-                json.dump(cfg, f)
+            config_path = _write_split_pair(temp_dir, cfg)
             keys_path = _create_test_keys_plain(temp_dir, {"p": {"url": "http://127.0.0.1:9999", "key": "k"}})
             proc, probe_ok = _start_proxy_server_directly(
                 find_free_port(), config_path=config_path, keys_path=keys_path)
@@ -851,7 +867,10 @@ def test_extra_request_headers_startup_refusal():
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     started, err = try_start("not-a-map")
-    if not started and "extra_request_headers must be an object" in err:
+    # The refusal may be loader-level (models.json naming the file) or the
+    # validate_config-level message; both must refuse and name the key.
+    if not started and "extra_request_headers" in err \
+            and "must be an object" in err:
         pass_("Server refused to start with malformed extra_request_headers (top-level string)")
     else:
         fail(f"Expected malformed extra_request_headers to refuse startup, got started={started}, stderr={err[:300]!r}")

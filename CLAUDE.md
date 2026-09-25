@@ -8,7 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 It listens on localhost, routes requests by model tier (haiku/sonnet/opus) to
 different upstream providers, retries `429` and `503` responses with jittered
 exponential backoff, and logs every request to a JSONL trace file. Tier routing
-is configured via `~/.claude/proxy/config.json`; provider credentials are stored
+is configured via `~/.claude/proxy/config.json`, and the provider catalog in its
+sibling `~/.claude/proxy/models.json`; provider credentials are stored
 encrypted in `~/.claude/keys-index.json` (vim blowfish2) and decrypted at
 startup via a passphrase prompt. An admin HTML page at `/admin/` allows
 hot-switching tier mappings at runtime.
@@ -31,19 +32,21 @@ src/claude_retry_proxy/
   sanitize.py           error-text redaction leaf: `sanitize_error`, the chokepoint for text reaching stderr, trace `error` fields and client-facing error bodies
   sinks.py              sink class family: private `_Sink` base, `TraceSink` (JSONL append + counters + markers), `StateSink` (atomic state document), shared `_SinkHealth` failure reporter, process-wide pair + `configure()`
   settings.py           env-derived settings singleton: `SETTINGS` value object (the `PROXY_*` limits/flags, runtime paths incl. state/compat files, mode values) + `resolve_trace_file` — built at import from env, adjusted by `main()` at startup; imported by both the server and the CLI
-  config.py             config.json pipeline: `load_config` / `validate_config` (the canonical validation policy) / `write_config` / `install_template` + extra-header specs; serves the server and the CLI
+  config.py             the config.json + models.json document pair: `models_path_for` / `load_models_document` / `load_config` / `validate_config` (the canonical validation policy) / `write_config` / `install_template` + extra-header specs; serves the server and the CLI
   keys.py               keys-index pipeline: `vendor_key_entries`/`vendor_key_names`, `_validate_vendor_keys_shape`, `load_keys_file` (encrypted or plain), `read_passphrase_from_stdin`
   safety.py             task-shaped utility leaf: string-emission-safety predicates (`_validate_admin_name` charset allowlist); docstring indexes the stay-behind safety idioms
   transforms_common.py  shared endpoint-mode transform mechanism: `_transform_and_guard` (passthrough-on-failure response guard) + `_request_transform_timestamp` helper
   transforms_chat.py    Anthropic↔Chat (OpenAI chat-completions) body transforms, both directions
   transforms_response.py Anthropic↔Responses body transforms, both directions
-  cli.py                the claude-retry-proxy CLI: start / stop / status / reload (passphrase prompt, template copy, canonical validation shared with config.py/keys.py, no URL swap)
+  cli.py                the claude-retry-proxy CLI: start / stop / status / reload (passphrase prompt, two-file template provisioning, canonical validation shared with config.py/keys.py, no URL swap; `reload` refreshes the provider catalog only)
   vimcrypt.py           vim blowfish2 (VimCrypt~03!) decryption (derived from claude-config bin/vimcrypt.py)
   admin.html            admin page for hot-switching tier mappings (served at /admin/)
-src/templates/
-  config.json     template for ~/.claude/proxy/config.json (copied on first start)
-  keys-index.json template for ~/.claude/keys-index.json (single-key `key` string
-                  or multi-key `keys` name→payload object)
+  templates/            shipped inside the package, so they survive a wheel install
+    config.json     template for ~/.claude/proxy/config.json (copied on first start)
+    models.json     template for ~/.claude/proxy/models.json (catalog + header rules
+                    + the count-tokens flag)
+    keys-index.json template for ~/.claude/keys-index.json (single-key `key` string
+                    or multi-key `keys` name→payload object)
 tests/            per-area test modules + aggregator; see doc/test-catalog.html
 scripts/
   analyze_proxy_trace.py  trace log analysis tool (model stats, latency, success rates)
@@ -64,7 +67,7 @@ pip install -e .                              # editable install (needs setuptoo
 claude-retry-proxy start                      # start the proxy (passphrase prompt + config validation + launch server)
 claude-retry-proxy status                     # show running/stopped/stale + tier mapping
 claude-retry-proxy stop                       # stop the proxy
-claude-retry-proxy reload                     # reload config.json from disk into running proxy
+claude-retry-proxy reload                     # refresh the provider catalog from models.json
 python tests/test_claude_proxy.py             # run the test suite
 python -m claude_retry_proxy.cli --help       # PATH-independent invocation
 python -m claude_retry_proxy.server --help
@@ -97,8 +100,10 @@ for the rest.
   standard tier model names, and a dummy API key. The proxy never reads or
   writes it. (See Gotchas.)
 
-- **CLI `start`:** ensure `~/.claude/proxy/config.json` exists (else install the
-  template via the shared `install_template`, exit 1); prompt the passphrase via
+- **CLI `start`:** ensure `~/.claude/proxy/config.json` **and its sibling
+  `models.json`** both exist (else install via the shared `install_template`,
+  which existence-gates both writes and provisions only what is absent, exit 1);
+  prompt the passphrase via
   `vimcrypt.prompt_hidden`; load the keys via `load_keys_file` (its shape
   validation and mode-warning diagnostics surface at the command); validate with
   the canonical `validate_config` — single policy with the server, aggregated
@@ -156,7 +161,9 @@ for the rest.
 - **Admin API** (localhost-only, CSRF-protected via Origin validation): the page
   at `GET /admin/` is served from package data; `GET /admin/api/config`,
   `/providers`, `/providers-detail` (mode + key *names* per provider — never
-  payloads); `POST /admin/api/switch` and `/reload`; `POST /admin/shutdown`.
+  payloads); `POST /admin/api/switch` (writes a **tiers-only** `config.json`) and
+  `/reload` (re-reads `models.json` — the provider catalog — and **never** the
+  tier mapping); `POST /admin/shutdown`.
   Bodies are capped at 64 KB. Endpoint table and the Origin accept/reject sets:
   [doc/operations.html#admin](doc/operations.html#admin).
 
@@ -210,7 +217,7 @@ for the rest.
 authoritative reference and carries the same table with prose.
 
 Runtime artifacts (all under `~/.claude/`, paths overridable via env vars — see
-table above): `proxy/config.json`, `proxy/proxy-state.json`,
+table above): `proxy/config.json`, `proxy/models.json`, `proxy/proxy-state.json`,
 `proxy/proxy-stderr.log`, `logs/proxy-trace.jsonl`,
 `proxy/feature-compatibility.json`. The trace log is pruned of entries older
 than 5 days on each `claude-retry-proxy start` (best-effort; does not block
@@ -299,7 +306,7 @@ what you need in context, and the link has the rest.
   - [provider-modes.html](doc/provider-modes.html) — the three endpoint modes,
     auth, paths, request/response transforms, SSE, tool-call degradation
   - [configuration.html](doc/configuration.html) — `config.json`,
-    `keys-index.json`, environment variables, validation
+    `models.json`, `keys-index.json`, environment variables, validation
   - [operations.html](doc/operations.html) — CLI, readiness, passphrase, admin
     API and CSRF, shutdown, runtime artifacts
   - [compatibility.html](doc/compatibility.html) — the `context_management`

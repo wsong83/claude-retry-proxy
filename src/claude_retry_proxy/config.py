@@ -1,9 +1,15 @@
-"""config.json pipeline: loading, validation, header-rule safety constants,
-and template installation.
+"""config.json + models.json pipeline: two-document loading, validation,
+header-rule safety constants, and template installation.
 
 The config family lives here extracted verbatim from server.py:
 ``load_config`` / ``validate_config`` / ``write_config`` / ``install_template``,
 plus the extra_request_headers safety constants that move with them.
+The load is two-document: config.json carries the tier mapping (``tiers`` and
+nothing else), the sibling models.json — resolved beside the resolved config
+path — carries ``models``, ``extra_request_headers``, and
+``disable_retry_claude_count_token``, and the two are merged at load
+(``models_path_for`` / ``load_models_document`` / ``_load_config_documents``).
+A leftover catalog key still in config.json warns on stderr and is ignored.
 ``parse_upstream`` and ``resolve_api_key`` stay in server.py (request-path
 resolution); the CLI consumes these functions via the re-exports on server.py
 or by importing ``install_template`` /``_load_config_for_validation`` directly.
@@ -12,6 +18,7 @@ or by importing ``install_template`` /``_load_config_for_validation`` directly.
 import json
 import os
 import re
+import sys
 
 from .settings import SETTINGS
 
@@ -38,25 +45,147 @@ EXTRA_FROM_FORBIDDEN = {"authorization", "x-api-key"}
 # Config loading and validation
 # ---------------------------------------------------------------------------
 
-def load_config(path):
-    """Load config.json from path. Returns dict with 'tiers' and 'models' keys.
+MODELS_FILENAME = "models.json"
 
-    Raises ValueError on invalid JSON or missing required structure.
-    Raises FileNotFoundError if path doesn't exist.
+# Top-level keys a config.json document may still carry besides "tiers" —
+# all three are catalog-era leftovers ignored with a warning; their home is
+# the sibling models.json document.
+_LEFTOVER_KEYS = ("models", "extra_request_headers", "disable_retry_claude_count_token")
+
+
+def models_path_for(config_path):
+    """Return the sibling models.json path for a config.json path.
+
+    The abspath is load-bearing: a bare ``config.json`` argument would
+    otherwise yield an empty dirname and silently resolve the sibling
+    against the cwd.
     """
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, dict):
+    return os.path.join(os.path.dirname(os.path.abspath(config_path)),
+                        MODELS_FILENAME)
+
+
+def load_models_document(models_path):
+    """Read and structurally check the models.json catalog document alone.
+
+    Returns a dict with ``models``, plus ``extra_request_headers`` and
+    ``disable_retry_claude_count_token`` when the document carries them.
+
+    Every read or structure failure becomes a ValueError naming models.json
+    and its resolved path — FileNotFoundError, IsADirectoryError,
+    PermissionError, UnicodeDecodeError and json.JSONDecodeError must all be
+    converted, because the server's startup handler catches only
+    (FileNotFoundError, json.JSONDecodeError, ValueError) and anything else
+    escapes as a raw traceback.
+    """
+    try:
+        with open(models_path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except FileNotFoundError as e:
+        raise ValueError("models.json not found: {}".format(models_path)) from e
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            "models.json is not valid JSON: {} ({})".format(models_path, e)) from e
+    except UnicodeDecodeError as e:
+        raise ValueError(
+            "models.json is not valid UTF-8: {} ({})".format(models_path, e)) from e
+    except OSError as e:
+        raise ValueError(
+            "models.json cannot be read: {} ({})".format(models_path, e)) from e
+    if not isinstance(doc, dict):
+        raise ValueError("models.json must be a JSON object: {}".format(models_path))
+    if "models" not in doc:
+        raise ValueError("models.json missing 'models' key: {}".format(models_path))
+    if not isinstance(doc["models"], dict):
+        raise ValueError(
+            "models.json 'models' must be an object: {}".format(models_path))
+    if "extra_request_headers" in doc \
+            and not isinstance(doc["extra_request_headers"], dict):
+        raise ValueError(
+            "models.json 'extra_request_headers' must be an object: {}".format(
+                models_path))
+    if "disable_retry_claude_count_token" in doc \
+            and not isinstance(doc["disable_retry_claude_count_token"], bool):
+        raise ValueError(
+            "models.json 'disable_retry_claude_count_token' must be a boolean: "
+            "{}".format(models_path))
+    out = {"models": doc["models"]}
+    if "extra_request_headers" in doc:
+        out["extra_request_headers"] = doc["extra_request_headers"]
+    if "disable_retry_claude_count_token" in doc:
+        out["disable_retry_claude_count_token"] = \
+            doc["disable_retry_claude_count_token"]
+    return out
+
+
+def _load_config_documents(config_path):
+    """Load the config.json + sibling models.json pair. Returns (merged, warnings).
+
+    Raises FileNotFoundError when config.json is absent — the load_config
+    contract server.py's startup handler keys on. Every other read or
+    structure failure on either document becomes a ValueError naming the
+    file and its path. Reads config.json's ``tiers`` and nothing else: every
+    other key in that document is a catalog-era leftover, collected into
+    ``warnings`` (one line per key, in _LEFTOVER_KEYS order) and excluded
+    from the merged result.
+    """
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            "config is not valid JSON: {} ({})".format(config_path, e)) from e
+    except UnicodeDecodeError as e:
+        raise ValueError(
+            "config is not valid UTF-8: {} ({})".format(config_path, e)) from e
+    except FileNotFoundError:
+        raise
+    except OSError as e:
+        raise ValueError(
+            "config cannot be read: {} ({})".format(config_path, e)) from e
+    if not isinstance(doc, dict):
         raise ValueError("config must be a JSON object")
-    if "tiers" not in data:
+    if "tiers" not in doc:
         raise ValueError("config missing 'tiers' key")
-    if "models" not in data:
-        raise ValueError("config missing 'models' key")
-    if not isinstance(data["tiers"], dict):
+    if not isinstance(doc["tiers"], dict):
         raise ValueError("'tiers' must be an object")
-    if not isinstance(data["models"], dict):
-        raise ValueError("'models' must be an object")
-    return data
+
+    models_path = models_path_for(config_path)
+    models_doc = load_models_document(models_path)
+    warnings = []
+    for key in _LEFTOVER_KEYS:
+        if key not in doc:
+            continue
+        if key in models_doc:
+            warnings.append(
+                "[proxy] WARNING: {} carries a '{}' key; it is ignored — "
+                "config.json holds the tier mapping, and the value is read "
+                "from {}.".format(config_path, key, models_path))
+        else:
+            warnings.append(
+                "[proxy] WARNING: {} carries a '{}' key; it is ignored and "
+                "its value is dropped — {} does not carry '{}'.".format(
+                    config_path, key, models_path, key))
+    merged = {"tiers": doc["tiers"]}
+    merged.update(models_doc)
+    return merged, warnings
+
+
+def load_config(path):
+    """Load the config.json + sibling models.json pair, merged.
+
+    Reads 'tiers' from config.json and the catalog ('models',
+    'extra_request_headers', 'disable_retry_claude_count_token') from the
+    sibling models.json resolved beside it. Leftover catalog keys still in
+    config.json warn on stderr and are ignored.
+
+    Raises ValueError on invalid JSON or missing required structure in
+    either document (naming the file and path).
+    Raises FileNotFoundError only when config.json doesn't exist.
+    """
+    merged, warnings = _load_config_documents(path)
+    for line in warnings:
+        print(line, file=sys.stderr)
+    return merged
 
 
 def _validate_extra_header_spec(provider, spec, errors, seen_headers):
@@ -331,37 +460,64 @@ def write_config(path, config):
 
 
 def install_template(dest_path):
-    """Copy config.json template from src/templates/ to dest_path."""
+    """Provision both config.json and its sibling models.json from the
+    package's templates/ directory.
+
+    dest_path is resolved through os.path.abspath first — a bare
+    --config-path config.json otherwise hands os.path.dirname an empty
+    string, and makedirs("") raises FileNotFoundError, which cmd_start's
+    except OSError reports as a config-creation failure.
+
+    Existence-gated on both sides: any destination that already exists is
+    skipped with a printed 'Preserved existing ...' line — shutil.copy2
+    overwrites unconditionally, and cmd_start triggers this function on
+    either file's absence, so a populated config.json (or a hand-authored
+    catalog) reaches it and an unconditional copy would replace it with the
+    empty template.
+
+    models.json is written first and config.json last: cmd_start re-enters
+    the install branch whenever either file is absent, so config.json's
+    continued absence is the signal that provisioning is unfinished — a
+    failed install leaves that signal in place and the next start retries.
+
+    Returns None. Raises OSError naming the failing destination when a
+    copy fails.
+    """
     import shutil
+    dest_path = os.path.abspath(dest_path)
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    shutil.copy2(SETTINGS.config_template_path, dest_path)
+    destinations = (
+        ("models", SETTINGS.models_template_path, models_path_for(dest_path)),
+        ("config", SETTINGS.config_template_path, dest_path),
+    )
+    for label, template_path, dest in destinations:
+        if os.path.exists(dest):
+            print("Preserved existing {} at: {}".format(
+                os.path.basename(dest), dest))
+            continue
+        try:
+            shutil.copy2(template_path, dest)
+        except OSError as e:
+            raise OSError(
+                "cannot install the {} template at {}: {}".format(
+                    label, dest, e)) from e
+        print("Created {} template at: {}".format(label, dest))
 
 
 def _load_config_for_validation(path=None):
-    """Load and validate config.json. Returns (config, error_msg)."""
+    """Load the config/models document pair for CLI validation.
+
+    Returns (config, error_msg). Retains the path=None fallback to
+    SETTINGS.config_path before any sibling resolution: cmd_status passes
+    state.get("config_path"), which is None for state files written before
+    that field existed, and os.path.abspath(None) would raise TypeError.
+    """
     if path is None:
         path = SETTINGS.config_path
-    if not os.path.exists(path):
-        return None, "config file not found: {}".format(path)
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-    except json.JSONDecodeError as e:
-        return None, "invalid JSON in config: {}".format(e)
-    if not isinstance(config, dict):
-        return None, "config must be a JSON object"
-    if "tiers" not in config:
-        return None, "config missing 'tiers' key"
-    # Validate each tier has non-empty provider and model
-    tiers = config.get("tiers", {})
-    for tier_name in ("haiku", "sonnet", "opus"):
-        if tier_name not in tiers:
-            return None, "missing required tier: {}".format(tier_name)
-        tier = tiers[tier_name]
-        if not isinstance(tier, dict):
-            return None, "tier '{}' must be an object".format(tier_name)
-        if not tier.get("provider"):
-            return None, "tier '{}' has empty provider".format(tier_name)
-        if not tier.get("model"):
-            return None, "tier '{}' has empty model".format(tier_name)
+        config, warnings = _load_config_documents(path)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as e:
+        return None, str(e)
+    for line in warnings:
+        print(line, file=sys.stderr)
     return config, None

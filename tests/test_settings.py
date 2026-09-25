@@ -99,8 +99,9 @@ def _check_str(name, got, expected):
 
 def test_settings_object_shape():
     """srv.SETTINGS is settings.SETTINGS (one object, one binding — the
-    patch-coherence guarantee). All 15 attributes exist with pinned types:
-    six ints, the log_all bool, seven strings, and mode_values."""
+    patch-coherence guarantee). All 15 attributes in the attr_types table
+    exist with pinned types: six ints, one bool (log_all), and eight
+    strings; mode_values is pinned separately below, not in the table."""
     print("\n--- Test: SETTINGS Object Identity and Shape ---")
     if SRV_SETTINGS is settings.SETTINGS:
         pass_("srv.SETTINGS is settings.SETTINGS")
@@ -123,6 +124,7 @@ def test_settings_object_shape():
         "keys_path": str,
         "config_path": str,
         "config_template_path": str,
+        "models_template_path": str,
         "state_file": str,
         "feature_compat_file": str,
         "proxy_dir": str,
@@ -140,6 +142,12 @@ def test_settings_object_shape():
         else:
             fail("SETTINGS.{}: expected {}, got {}".format(
                 attr, typ.__name__, type(got).__name__))
+    if settings.SETTINGS.models_template_path != \
+            settings.SETTINGS.config_template_path:
+        pass_("models_template_path differs from config_template_path")
+    else:
+        fail("SETTINGS.models_template_path equals config_template_path; "
+             "the split templates must be distinct files")
     got_mode = settings.SETTINGS.mode_values
     if got_mode == ("anthropic", "chat", "response"):
         pass_("SETTINGS.mode_values tuple pinned")

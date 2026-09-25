@@ -18,8 +18,10 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>322 test functions across 18 files</strong>, but this number moves whenever
-tests are added. Re-count before quoting it:
+suite has <strong>334 test functions across 19 files</strong>, but this number moves whenever
+tests are added. (That figure was <em>322 across 18</em> before this recount — the page had
+drifted two behind the suite, so the old total disagreed with its own catalog table as well.)
+Re-count before quoting it:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
 such as <code>doc_</code>). The aggregator's own tally is the authoritative figure — the
 recipe only approximates it, so a <code>doc_</code>-prefixed function must be a test case,
@@ -86,13 +88,16 @@ relative size, not as exact current figures.</p>
     <td>Chat-mode SSE synthesis, tool-call deltas, truncation and degradation</td></tr>
 <tr><td><code>test_mode_dispatch.py</code></td><td class="num">28</td>
     <td>Mode dispatch, auth headers, path rewriting</td></tr>
-<tr><td><code>test_admin.py</code></td><td class="num">24</td>
+<tr><td><code>test_admin.py</code></td><td class="num">25</td>
     <td>Admin API endpoints, CSRF origin rules, switch and reload</td></tr>
 <tr><td><code>test_retry_streaming.py</code></td><td class="num">22</td>
     <td>Retry behaviour, streaming, response-size caps</td></tr>
-<tr><td><code>test_config_keys.py</code></td><td class="num">18</td>
+<tr><td><code>test_config_keys.py</code></td><td class="num">17</td>
     <td>Config validation, key decryption, multi-key shapes</td></tr>
-<tr><td><code>test_cli.py</code></td><td class="num">14</td>
+<tr><td><code>test_config_split.py</code></td><td class="num">10</td>
+    <td>The two-document loader: merged load, the required sibling, leftover-key warnings, sibling
+        resolution, and the unreadable-shape conversion</td></tr>
+<tr><td><code>test_cli.py</code></td><td class="num">15</td>
     <td>CLI lifecycle: start, stop, status, reload</td></tr>
 <tr><td><code>test_trace.py</code></td><td class="num">12</td>
     <td>Trace logging and trace analysis</td></tr>
@@ -154,6 +159,20 @@ EOF</code></pre>
 <li><code>test_response_model_rewrite_streaming_non_message_start</code>: First SSE event is not message_start → forwarded unchanged, no rewrite attempted.</li>
 <li><code>test_two_tiers_same_model_same_provider</code>: Two tiers mapping to the same model from the same provider: the server starts, each request routes to the shared model, and JSON + SSE responses are rewritten to the…</li>
 <li><code>test_response_model_rewrite_upstream_model</code>: Upstream returns an arbitrary model name → rewritten to tier name (unconditional rewrite).</li>
+</ul>
+
+<h4><code>tests/test_config_split.py</code> (10 tests) — the two-document config loader</h4>
+<ul>
+<li><code>test_models_path_for_sibling_resolution</code>: <code>models.json</code> resolves as the sibling of the configured config path, not from a default location.</li>
+<li><code>test_merged_load_with_optional_keys</code>: config.json's tiers plus the sibling's models / extra_request_headers / count-tokens flag merge into one dict.</li>
+<li><code>test_missing_models_json_is_value_error_naming_path</code>: A missing catalog raises <code>ValueError</code> naming the resolved path — deliberately not <code>FileNotFoundError</code>, which the server would report against the wrong file.</li>
+<li><code>test_models_doc_bad_shapes_collapse_to_value_error</code>: Malformed catalog shapes (invalid JSON, non-object, missing <code>models</code>, non-object <code>models</code>) each raise <code>ValueError</code> naming <code>models.json</code>.</li>
+<li><code>test_config_doc_bad_shapes</code>: config.json's own structural checks — non-object document, missing <code>tiers</code>, non-object <code>tiers</code>.</li>
+<li><code>test_models_json_unreadable_permissions_shape</code>: The unreadable-by-permissions shape; self-verifies the chmod first and reports the shape as inexpressible on Windows rather than asserting it. The directory-in-place shape carries the same OSError → ValueError conversion.</li>
+<li><code>test_leftover_keys_warn_and_lose</code>: A catalog key left behind in config.json warns on stderr and the <code>models.json</code> value wins.</li>
+<li><code>test_leftover_key_dropped_warning</code>: When the catalog does <em>not</em> carry the leftover key, the warning names the drop instead of claiming the value is read elsewhere.</li>
+<li><code>test_leftover_key_no_models_json_still_fails</code>: The warning path is not a bypass — a leftover key with no catalog beside it still fails.</li>
+<li><code>test_load_config_for_validation</code>: The CLI path is exactly as strict as the server path, and retains the <code>path=None</code> fallback to <code>SETTINGS.config_path</code>.</li>
 </ul>
 
 <h4><code>tests/test_config_keys.py</code> (17 tests) — config validation and key handling</h4>
@@ -440,8 +459,10 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> The admin page and its endpoints, including the Origin check and hot-switch behaviour.</p>
 
-<h4><code>tests/test_admin.py</code> (24 tests) — admin page, API, CSRF</h4>
+<h4><code>tests/test_admin.py</code> (25 tests) — admin page, API, CSRF</h4>
 <ul>
+<li><code>test_admin_reload_non_dict_extra_tier</code>: A non-dict extra tier — which startup validation lets through — must not crash the reload gate; the reload still answers and never drops the connection with no response.</li>
+<li><code>test_admin_switch_validates_key_names</code>: Key-selector validation now lives on the switch path: the reload handler's candidate tiers come from in-memory state, so a bad key on disk is never seen by reload.</li>
 <li><code>test_admin_page_served</code>: GET /admin/ returns HTML.</li>
 <li><code>test_admin_api_config</code>: GET /admin/api/config returns current tiers + models.</li>
 <li><code>test_admin_api_switch</code>: POST /admin/api/switch updates tier, subsequent request routes to new provider.</li>
@@ -472,8 +493,9 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> Start, stop, status, and reload as the operator runs them — including the passphrase pipe and readiness probe.</p>
 
-<h4><code>tests/test_cli.py</code> (14 tests) — CLI lifecycle</h4>
+<h4><code>tests/test_cli.py</code> (15 tests) — CLI lifecycle</h4>
 <ul>
+<li><code>test_cli_status_shows_loader_error</code>: A deleted or malformed <code>models.json</code> makes <code>status</code> print the loader diagnostic rather than silently omitting the tier section.</li>
 <li><code>test_stop_cleans_proxy_state</code>: Start proxy, force-kill server, run stop, verify proxy-state.json deleted.</li>
 <li><code>test_stop_trace_with_proxy</code>: Start proxy, run claude-retry-proxy stop; verify stderr shows graceful-stop sequence.</li>
 <li><code>test_stop_cleans_proxy_state_lock</code>: Create proxy-state.json with a dead PID; run stop; verify state file deleted.</li>
@@ -591,7 +613,14 @@ hand-rolling setup. The ones you are most likely to need:</p>
 <table>
 <tr><th>Helper</th><th>Purpose</th></tr>
 <tr><td><code>_create_test_config(temp_dir, tiers, models, extra_request_headers)</code></td>
-    <td>Write a valid <code>config.json</code></td></tr>
+    <td>Write the <code>config.json</code> / <code>models.json</code> <strong>pair</strong> — a
+        tiers-only config plus a sibling catalog — and return the config path. The signature is
+        unchanged from the single-file era, which is what made the call-site migration a no-op
+        for every caller that already passed <code>--config-path &lt;tempdir&gt;/config.json</code>;
+        the keyword values now land in the sibling document instead of the config body.</td></tr>
+<tr><td><code>_create_test_config_with_flag(temp_dir, tiers, flag_value, extra_request_headers)</code></td>
+    <td>As above, with <code>disable_retry_claude_count_token</code> set in the
+        <code>models.json</code> half (<code>flag_value=None</code> omits the key)</td></tr>
 <tr><td><code>_create_test_keys(temp_dir, vendors, passphrase)</code></td>
     <td>Write an <em>encrypted</em> keys file</td></tr>
 <tr><td><code>_create_test_keys_plain(temp_dir, vendors)</code></td>

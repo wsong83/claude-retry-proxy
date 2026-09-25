@@ -48,8 +48,9 @@ class ProxySettings:
 
         # Config paths
         self.config_path = os.path.join(os.path.expanduser("~"), ".claude", "proxy", "config.json")
-        _src_root = os.path.dirname(os.path.dirname(__file__))
+        _src_root = os.path.dirname(__file__)
         self.config_template_path = os.path.join(_src_root, "templates", "config.json")
+        self.models_template_path = os.path.join(_src_root, "templates", "models.json")
         _default_keys = os.path.join(os.path.expanduser("~"), ".claude", "keys-index.json")
         self.keys_path = _env_str("PROXY_KEYS_PATH", _default_keys)
 

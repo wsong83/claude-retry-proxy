@@ -42,8 +42,8 @@
             </div>
             <div id="tiers-container"></div>
             <div style="margin-top: 1.5rem;">
-                <button onclick="saveConfig()">Apply</button>
-                <button class="secondary" onclick="reloadConfig()">Reload</button>
+                <button onclick="saveConfig()">Apply Config</button>
+                <button class="secondary" onclick="reloadConfig()">Reload Providers</button>
             </div>
             <div id="status" class="status"></div>
         </div>
@@ -230,12 +230,12 @@
                 if (resp.ok) {
                     config = result.config;
                     renderTiers();
-                    showStatus('success', 'Configuration reloaded from disk');
+                    showStatus('success', 'Providers reloaded from models.json');
                 } else {
                     showStatus('error', 'Error: ' + (result.error || 'Unknown error'));
                 }
             } catch (e) {
-                showStatus('error', 'Failed to reload: ' + e.message);
+                showStatus('error', 'Failed to reload providers: ' + e.message);
             }
         }
 

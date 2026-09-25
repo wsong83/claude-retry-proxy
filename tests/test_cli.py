@@ -23,7 +23,6 @@ from _harness import (
     _create_test_config,
     _create_test_keys,
     _create_test_keys_plain,
-    _derive_models_from_tiers,
     _restore_proxy_state,
     _send_proxy_request,
     _start_mock_upstream,
@@ -500,12 +499,15 @@ def test_cli_reload():
                 fail("Proxy did not become ready on port")
                 return
 
-            # Modify config.json on disk: sonnet → model-b
+            # Reload no longer adopts config.json hand-edits: write a
+            # disk-only tier edit AND a catalog edit to models.json.
             tiers_b = dict(tiers_a)
             tiers_b["sonnet"] = {"provider": "p", "model": "model-b"}
             with open(config_path, "w") as f:
-                # Reload re-validates: provider "p" needs >=1 model in config.models
-                json.dump({"tiers": tiers_b, "models": _derive_models_from_tiers(tiers_b)}, f)
+                json.dump({"tiers": tiers_b}, f)
+            with open(os.path.join(temp_dir, "models.json"), "w") as f:
+                json.dump({"models": {"p": ["claude-haiku-4-5", "claude-opus-5",
+                                            "model-a", "model-b"]}}, f)
 
             # Run claude-retry-proxy reload (no --port; reads from proxy-state.json)
             result = subprocess.run(CLAUDE_PROXY + ["reload"],
@@ -514,17 +516,30 @@ def test_cli_reload():
                 fail(f"reload exited {result.returncode}: {result.stdout} {result.stderr}")
                 return
             pass_("claude-retry-proxy reload exited 0")
+            if "Providers reloaded successfully" in result.stdout:
+                pass_("reload headline names the provider refresh")
+            else:
+                fail("reload headline missing 'Providers reloaded successfully': "
+                     "{!r}".format(result.stdout[:300]))
+            # Tier lines survive the headline replacement (pinned; if the
+            # implementation drops them, that is the defect)
+            if "model-a" in result.stdout:
+                pass_("reload prints tier lines from the merged response config")
+            else:
+                fail("reload stdout dropped the tier lines: {!r}".format(
+                    result.stdout[:300]))
 
-            # Verify reload took effect: sonnet routes to model-b
+            # Verify: routing keeps model-a (tiers do NOT follow the disk edit)
             status, resp_body = _send_proxy_request(port, body=json.dumps({
                 "model": "sonnet", "messages": [{"role": "user", "content": "hi"}]}))
             if status != 200:
                 fail(f"Post-reload request returned {status}")
                 return
-            if req_list and b"model-b" in req_list[-1]["body"]:
-                pass_("Post-reload sonnet request routed to model-b")
+            if req_list and b"model-a" in req_list[-1]["body"]:
+                pass_("Post-reload sonnet request still routes to model-a "
+                      "(tiers not re-read from disk)")
             else:
-                fail(f"Post-reload sonnet request did not route to model-b. last: {req_list[-1] if req_list else 'none'}")
+                fail(f"Post-reload routing changed unexpectedly: {req_list[-1] if req_list else 'none'}")
 
             # Clean up the proxy
             stop_result = subprocess.run(CLAUDE_PROXY + ["stop"],
@@ -752,7 +767,7 @@ def test_cli_start_template_flow():
     try:
         temp_dir = tempfile.mkdtemp(prefix="proxy_template_flow_")
 
-        # Branch A: template present → copied
+        # Branch A: template present → both templates copied
         SETTINGS.config_template_path = real_template
         try:
             os.remove(os.path.join(temp_dir, "config.json"))
@@ -764,14 +779,68 @@ def test_cli_start_template_flow():
             pass_("template-present branch exits 1")
         else:
             fail("expected exit 1 in the template-present branch, got {}".format(rc))
-        if os.path.exists(config_path):
-            pass_("template copied to the config path")
+        models_path = os.path.join(temp_dir, "models.json")
+        if os.path.exists(config_path) and os.path.exists(models_path):
+            pass_("both templates copied to the config path (config and models)")
+        elif not os.path.exists(config_path):
+            fail("config template NOT copied in the present branch")
         else:
-            fail("template NOT copied in the present branch")
+            fail("models template NOT copied in the present branch")
         if "Created config template at: {}".format(config_path) in out:
             pass_("present branch prints 'Created config template at:' with the path")
         else:
             fail("present branch message wrong: {!r}".format(out[:400]))
+        if "Created models template at: {}".format(models_path) in out:
+            pass_("present branch prints 'Created models template at:' with the path")
+        else:
+            fail("present branch missing the Created models message: {!r}".format(
+                out[:400]))
+
+        # Branch A2: models.json already exists → preserved, not overwritten
+        with open(models_path, "w") as f:
+            json.dump({"models": {"hand-authored": ["m-1"]}}, f)
+        os.remove(config_path)
+        rc, out = run_start(config_path)
+        if rc == 1:
+            pass_("A2 (models present, config absent) exits 1")
+        else:
+            fail("expected exit 1 in the A2 preservation branch, got {}".format(rc))
+        with open(models_path) as f:
+            if json.load(f) == {"models": {"hand-authored": ["m-1"]}}:
+                pass_("pre-existing models.json not overwritten when config.json is absent")
+            else:
+                fail("models.json was overwritten by the install path")
+        if "Preserved existing models.json at: {}".format(models_path) in out \
+                and "Created models template at:" not in out:
+            pass_("A2 prints the Preserved message, not Created")
+        else:
+            fail("A2 preservation message wrong: {!r}".format(out[:400]))
+
+        # Branch A3 (symmetric case the widened trigger creates): populated
+        # config.json present, models.json absent → config NOT overwritten.
+        os.remove(models_path)
+        tuned_tiers = {"haiku": {"provider": "hand-tuned", "model": "m-h"},
+                       "sonnet": {"provider": "hand-tuned", "model": "m-s"},
+                       "opus": {"provider": "hand-tuned", "model": "m-o"}}
+        with open(config_path, "w") as f:
+            json.dump({"tiers": tuned_tiers}, f)
+        rc, out = run_start(config_path)
+        if rc == 1:
+            pass_("A3 (config present, models absent) exits 1")
+        else:
+            fail("expected exit 1 in the A3 preservation branch, got {}".format(rc))
+        with open(config_path) as f:
+            if json.load(f) == {"tiers": tuned_tiers}:
+                pass_("populated config.json byte-identical after the start "
+                      "that provisions the missing models.json")
+            else:
+                fail("config.json was overwritten by the template on the "
+                     "models-missing trigger: {!r}".format(f.read()[:200]))
+        if "Preserved existing config.json at: {}".format(config_path) in out \
+                and "Created config template at:" not in out:
+            pass_("A3 prints the Preserved message, not Created")
+        else:
+            fail("A3 preservation message wrong: {!r}".format(out[:400]))
 
         # Branch B: template absent → both errors, no file created
         missing_template = os.path.join(temp_dir, "no", "template", "config.json")
@@ -800,8 +869,10 @@ def test_cli_start_template_flow():
                  "SETTINGS path: {!r}".format(out[:400]))
 
         # Branch C (truthfulness addition, plan Risks #2): template present but
-        # the copy fails (unwritable destination) → 'ERROR: Cannot create
-        # config at …' instead of a false missing-template claim.
+        # the install fails (unwritable destination) → a truthful ERROR
+        # refusal, never a false missing-template claim. install_template's
+        # OSError names the path that actually failed ("cannot install the
+        # <label> template at <dest>: ...") or the raw makedirs error.
         SETTINGS.config_template_path = real_template
         # The install target's parent chain runs through a plain file, so
         # install_template's makedirs raises OSError (verified: WinError 3
@@ -810,11 +881,14 @@ def test_cli_start_template_flow():
         with open(blocker_file, "w") as f:
             f.write("placeholder-not-a-directory")
         rc, out = run_start(os.path.join(blocker_file, "sub", "config.json"))
-        if rc == 1 and "ERROR: Cannot create config at" in out:
-            pass_("create-failure branch prints the truthful 'Cannot create config' error")
+        if rc == 1 and "ERROR:" in out \
+                and "Template not available at:" not in out \
+                and "ERROR: Config file not found:" not in out:
+            pass_("create-failure branch refuses with a truthful ERROR, no "
+                  "false missing-template claim")
         else:
-            fail("expected 'Cannot create config at' refusal, got rc={} out={!r}".format(
-                rc, out[:400]))
+            fail("expected a truthful ERROR refusal (rc=1, no missing-template "
+                 "claim), got rc={} out={!r}".format(rc, out[:400]))
     finally:
         SETTINGS.config_template_path = original
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -950,6 +1024,59 @@ def test_cli_status_shows_tiers():
         cleanup_lock_files()
         subprocess.run(CLAUDE_PROXY + ["stop"], capture_output=True, text=True, timeout=10)
         _restore_proxy_state(state_backup)
+
+
+def test_cli_status_shows_loader_error():
+    """When the config pair cannot load (catalog unreadable), status prints
+    a diagnostic naming the loader error instead of silently omitting the
+    tier section."""
+    print("\n--- Test: CLI Status Shows Loader Error ---")
+
+    import claude_retry_proxy.cli as cli_mod
+    import claude_retry_proxy.settings as settings_mod
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_cli_status_err_")
+    SETTINGS = settings_mod.SETTINGS
+    orig_state_file = SETTINGS.state_file
+    # PROXY_STATE_FILE is snapshotted from SETTINGS.state_file at cli import,
+    # so patch the module constant (not just the settings attribute).
+    fake_state = os.path.join(temp_dir, "proxy-state.json")
+    orig_cli_state = cli_mod.PROXY_STATE_FILE
+    cli_mod.PROXY_STATE_FILE = fake_state
+    SETTINGS.state_file = fake_state
+    try:
+        tiers = {
+            "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+            "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+            "opus": {"provider": "p", "model": "claude-opus-5"},
+        }
+        config_path = _create_test_config(temp_dir, tiers)
+        # Break the catalog: malformed sibling models.json
+        with open(os.path.join(temp_dir, "models.json"), "w") as f:
+            f.write("{broken json")
+        with open(fake_state, "w") as f:
+            json.dump({"pid": os.getpid(), "port": 8080,
+                       "start_time": "test", "config_path": config_path}, f)
+
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli_mod.cmd_status([])
+        out = buf.getvalue()
+        if rc == 0:
+            pass_("status with a live pid exits 0 despite the loader error")
+        else:
+            fail(f"status exited {rc}: {out[:300]}")
+        if "Config error" in out and "models.json" in out:
+            pass_("status prints a diagnostic naming the loader error")
+        else:
+            fail("status diagnostic missing 'Config error'/'models.json': {!r}".format(
+                out[:400]))
+    finally:
+        cli_mod.PROXY_STATE_FILE = orig_cli_state
+        SETTINGS.state_file = orig_state_file
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def test_start_status_reload_tier_lines_show_key():
@@ -1290,6 +1417,7 @@ ALL_TESTS = [
     ("cli-start-template-flow", test_cli_start_template_flow),
     ("cli-start-invalid-config", test_cli_start_invalid_config),
     ("cli-status-shows-tiers", test_cli_status_shows_tiers),
+    ("cli-status-shows-loader-error", test_cli_status_shows_loader_error),
     ("start-status-reload-tier-lines-show-key", test_start_status_reload_tier_lines_show_key),
     ("cli-stop-cleans-proxy-state-lock", test_stop_cleans_proxy_state_lock),
     ("cli-stop-cleans-proxy-state", test_stop_cleans_proxy_state),

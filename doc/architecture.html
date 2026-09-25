@@ -171,11 +171,12 @@ i.e. 10 retries.</p>
 
 <div class="note">
 <strong>Exception — <code>count_tokens</code>.</strong> When
-<code>disable_retry_claude_count_token</code> is set in <code>config.json</code> and the
-request targets <code>count_tokens</code>, the loop runs exactly once. Most third-party
-providers do not implement this Anthropic-specific endpoint and answer it with
-<code>503</code>; retrying ten times would burn quota for nothing. The shipped template
-enables this.
+<code>disable_retry_claude_count_token</code> is set in <code>models.json</code> and the request
+targets <code>count_tokens</code>, the loop runs exactly once. Most third-party providers do not
+implement this Anthropic-specific endpoint and answer it with <code>503</code>; retrying ten times
+would burn quota for nothing. The shipped template enables this, and because the flag lives in
+<code>models.json</code> it is re-read by <a href="operations.html#admin">Reload Providers</a> — no
+restart needed.
 </div>
 
 <h3 id="delay-ladder">The delay ladder</h3>
@@ -346,6 +347,24 @@ blocked requests proceed with the new snapshot
 
 <p>A request that is in-flight keeps running to completion with its original snapshot; the
 administrator waits for it rather than cancelling it.</p>
+
+<h3 id="split-write">What a config change writes, and what it does not</h3>
+
+<p>A tier hot-switch writes <strong>only the tier mapping</strong>: the document that lands in
+<code>config.json</code> is exactly <code>{"tiers": …}</code>. The provider catalog, the header
+rules, and the count-tokens flag live in the sibling <code>models.json</code> and are never written
+by the proxy. That separation is the point of the split — it is what stops an import of the catalog
+from overwriting a locally-tuned mapping, and equally what stops a tier change from re-creating the
+duplicate catalog the split removed.</p>
+
+<p>In memory the two documents are merged back into one, so every consumer —
+<code>validate_config</code>, <code>_resolve_extra_request_headers</code>, and the
+<code>/admin/api/config</code> response — sees a single object carrying all four keys.</p>
+
+<p><strong>Reload Providers</strong> is the other half: it re-reads <code>models.json</code>,
+refreshes the catalog, never touches tiers, and writes nothing at all. Its guarantee is
+<em>per call</em> — two overlapping reloads are last-completed-wins, and the only way they can
+disagree is an external <code>update-claude-env</code> write landing between their reads.</p>
 
 <div class="warn">
 <strong>The drain can time out, and the swap is then aborted.</strong> The wait is bounded at

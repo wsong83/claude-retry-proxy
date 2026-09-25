@@ -25,7 +25,10 @@ server owns the listening socket and the request path.</p>
     spawns the server, waits for readiness</td></tr>
 <tr><td><code>stop</code></td><td>Reads the state file and terminates the process</td></tr>
 <tr><td><code>status</code></td><td>Reports running / stopped / stale, plus the current tier mapping</td></tr>
-<tr><td><code>reload</code></td><td>Re-reads <code>config.json</code> into the running proxy without restarting it</td></tr>
+<tr><td><code>reload</code></td><td>Refreshes the provider catalog in the running proxy from
+    <code>models.json</code>, without restarting it. It does <em>not</em> re-read the tier mapping
+    — apply tier changes through the admin page. Refuses, naming the tier, if the reloaded catalog
+    has dropped a model a tier is currently using</td></tr>
 </table>
 
 <h3 id="start-options"><code>start</code> options</h3>
@@ -121,9 +124,22 @@ stdin path (the default) whenever a human is present to type it.
 
 <h2 id="admin">Admin page and API</h2>
 
-<p>The admin page is served at <code>http://localhost:&lt;port&gt;/admin/</code> and lets you
-hot-switch tier mappings: change which provider and model a tier points at, and which credential
-it uses, without restarting the proxy.</p>
+<p>The admin page is served at <code>http://localhost:&lt;port&gt;/admin/</code> and has two
+buttons, which do deliberately different things:</p>
+
+<table>
+<tr><th>Button</th><th>Does</th></tr>
+<tr><td><strong>Apply Config</strong></td>
+    <td>Applies the tier mapping shown in the page: which provider and model a tier points at, and
+        which credential it uses — without restarting the proxy. Writes <code>config.json</code>,
+        as <code>{"tiers": …}</code> and <strong>nothing else</strong>, so a key left over from an
+        older layout is dropped here.</td></tr>
+<tr><td><strong>Reload Providers</strong></td>
+    <td>Re-reads <code>models.json</code> and refreshes the catalog the page offers. It does
+        <em>not</em> re-read the tier mapping, and writes no file at all. Refuses with
+        <code>400</code> — naming the tier, provider, and model — when the reloaded catalog has
+        dropped a model a tier is currently using; the previous catalog stays in effect.</td></tr>
+</table>
 
 <table>
 <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
@@ -138,7 +154,10 @@ it uses, without restarting the proxy.</p>
 <tr><td><span class="badge badge-anthropic">POST</span></td><td><code>/admin/api/switch</code></td>
     <td>Update tier mappings</td></tr>
 <tr><td><span class="badge badge-anthropic">POST</span></td><td><code>/admin/api/reload</code></td>
-    <td>Re-read <code>config.json</code> from disk</td></tr>
+    <td>Reload the provider catalog from <code>models.json</code>. Never re-reads the tier mapping
+        and writes nothing. <code>400</code> — naming the tier, provider, and model — when a tier
+        currently in use is missing from the reloaded catalog; the previous catalog stays in
+        effect</td></tr>
 <tr><td><span class="badge badge-anthropic">POST</span></td><td><code>/admin/shutdown</code></td>
     <td>Stop the proxy gracefully</td></tr>
 </table>
@@ -154,7 +173,10 @@ configuration, so what is on disk always matches what is running.</p>
 
 <p>A switch <strong>preserves everything it does not change</strong>: the models catalog,
 <code>disable_retry_claude_count_token</code>, and any <code>extra_request_headers</code> rules all
-survive a hot tier switch. Applying a switch cannot silently discard your header rules.</p>
+survive a hot tier switch. Applying a switch cannot silently discard your header rules — but note
+the asymmetry: those three live in <code>models.json</code>, which the proxy never writes, so they
+survive <em>in memory</em> across a switch while the document written to disk holds only the tier
+mapping. See <a href="architecture.html#split-write">architecture.html#split-write</a>.</p>
 
 <h3 id="csrf">CSRF protection</h3>
 
@@ -212,7 +234,11 @@ swap waits, a shutdown does not wait at all.</p>
 <table>
 <tr><th>Path</th><th>Written by</th><th>Purpose</th></tr>
 <tr><td><code>proxy/config.json</code></td><td>you, and the admin API</td>
-    <td>Tier routing and policy — <span class="ok-inline">safe to share</span></td></tr>
+    <td>Tier routing — <span class="ok-inline">safe to share</span></td></tr>
+<tr><td><code>proxy/models.json</code></td><td><code>update-claude-env</code>, or you by hand —
+    never the proxy</td>
+    <td>The provider catalog, the header rules, and the count-tokens flag —
+        <span class="ok-inline">safe to share</span></td></tr>
 <tr><td><code>keys-index.json</code></td><td>you</td>
     <td>Provider URLs <em>and credentials</em> — <span class="error-inline">never share</span></td></tr>
 <tr><td><code>proxy/proxy-state.json</code></td><td>the heartbeat, every 30 s</td>

@@ -8,21 +8,31 @@
 </head>
 <body>
 
-<h1>Configuration<span class="sub">config.json, keys-index.json, and the environment</span></h1>
+<h1>Configuration<span class="sub">config.json, models.json, keys-index.json, and the environment</span></h1>
 
-<p><strong>Last updated:</strong> 2026-09-12</p>
+<p><strong>Last updated:</strong> 2026-09-24</p>
 
-<p>Two files configure the proxy, and the split between them is the important thing to
-understand: <strong><code>config.json</code> is safe to read, share, and commit;
-<code>keys-index.json</code> is not.</strong></p>
+<p>Three files configure the proxy, and the split between them is the important thing to
+understand: <strong><code>config.json</code> and <code>models.json</code> are safe to read, share,
+and commit; <code>keys-index.json</code> is not.</strong> <code>config.json</code> holds the tier
+mapping and nothing else, because the mapping is the one thing the admin page writes and the one
+thing you tune by hand. The provider catalog changes on a different schedule — it is imported from
+a shared repo rather than edited locally — so it lives apart, where an import cannot overwrite
+your tuning.</p>
 
 <table>
 <tr><th>File</th><th>Holds</th><th>Default location</th></tr>
 <tr>
   <td><code>config.json</code></td>
-  <td>Which tier goes to which provider and model; which credential to select; the model
-      catalog; retry and header policy</td>
+  <td>The tier mapping, and nothing else: which tier goes to which provider and model, and which
+      credential to select</td>
   <td><code>~/.claude/proxy/config.json</code></td>
+</tr>
+<tr>
+  <td><code>models.json</code></td>
+  <td>The provider catalog; the <a href="#extra-headers">extra_request_headers</a> rules; the
+      <a href="#count-tokens-flag">disable_retry_claude_count_token</a> policy flag</td>
+  <td><code>~/.claude/proxy/models.json</code> — beside <code>config.json</code></td>
 </tr>
 <tr>
   <td><code>keys-index.json</code></td>
@@ -32,10 +42,13 @@ understand: <strong><code>config.json</code> is safe to read, share, and commit;
 </table>
 
 <div class="warn">
-<strong>Credentials live in <code>keys-index.json</code>, never in <code>config.json</code>.</strong>
+<strong>Credentials live in <code>keys-index.json</code>, never in <code>config.json</code> or
+<code>models.json</code>.</strong>
 A <code>config.json</code> records <em>which named key</em> to use, not the key itself — so it is
 safe to version-control and to paste into a bug report. Keep that property: if you ever find a
-credential in <code>config.json</code>, something has gone wrong.
+credential in <code>config.json</code>, something has gone wrong. The same applies to
+<code>models.json</code>, whose header rules are copied verbatim into outbound provider requests —
+a literal <code>fallback</code> value there must never carry a secret.
 </div>
 
 <h2 id="config-schema">config.json</h2>
@@ -45,13 +58,14 @@ credential in <code>config.json</code>, something has gone wrong.
     "haiku":  { "provider": "example-provider", "model": "claude-haiku-4-5", "key": "" },
     "sonnet": { "provider": "example-provider", "model": "claude-sonnet-5",  "key": "" },
     "opus":   { "provider": "example-provider", "model": "claude-opus-5",   "key": "" }
-  },
-  "models": {
-    "example-provider": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]
-  },
-  "disable_retry_claude_count_token": true,
-  "extra_request_headers": {}
+  }
 }</code></pre>
+
+<p>That is the whole file — <code>tiers</code> and nothing else. A key belonging to
+<code>models.json</code> appears here only as a leftover from an older layout: it is ignored,
+warned about on load, and dropped the next time the admin page applies a change. Both files must
+exist — a missing <code>models.json</code> stops the proxy from starting rather than degrading
+it.</p>
 
 <h3 id="tiers-field">The <code>tiers</code> object</h3>
 
@@ -74,16 +88,44 @@ may name a <code>key</code>.</p>
 <a href="architecture.html#tier-resolution">reverse lookup</a> — a client asking for a model
 name that an extra tier is pointed at resolves to that tier.</p>
 
+<h2 id="models-schema">models.json</h2>
+
+<pre><code>{
+  "models": {
+    "example-provider": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]
+  },
+  "extra_request_headers": {},
+  "disable_retry_claude_count_token": true
+}</code></pre>
+
+<p>Always the <strong>sibling</strong> of the config file: the <code>models.json</code> in the same
+directory as the resolved <code>config.json</code>, so a
+<code>--config-path /tmp/x/config.json</code> reads <code>/tmp/x/models.json</code>. There is no
+separate path setting for it.</p>
+
+<p><strong>This document is deploy-owned.</strong> <code>update-claude-env</code> replaces it
+wholesale from the shared repo's copy, so a header rule narrowed — or a flag set — only on this
+machine does not survive a deploy; the durable place to change either is the repo's own copy. The
+proxy itself never writes this file, with one exception: provisioning the template on a first
+install, and even then only when the file is absent. See
+<a href="operations.html#artifacts">operations.html#artifacts</a>.</p>
+
 <h3 id="models-field">The <code>models</code> object</h3>
 
 <p>Maps each provider to the list of model names it offers. The admin page uses this to populate
 its model dropdown, which is why every tier's provider needs at least one entry here.</p>
 
 <p>Each entry must be a non-empty list of non-empty strings. Note the validation direction: the
-proxy checks that every provider <em>mentioned in <code>config.json</code></em> exists in
-<code>keys-index.json</code>. Providers in <code>keys-index.json</code> that no tier or catalog
-entry references are silently ignored, so you can keep credentials for providers you are not
-currently routing to.</p>
+proxy checks that every provider <em>mentioned in <code>config.json</code> or this document</em>
+exists in <code>keys-index.json</code>. Providers in <code>keys-index.json</code> that no tier or
+catalog entry references are silently ignored, so you can keep credentials for providers you are
+not currently routing to.</p>
+
+<p><strong>Reload Providers is stricter than startup.</strong> Startup requires only that a tier's
+provider has <em>some</em> catalog entry. A reload additionally requires that the tier's
+<strong>model</strong> appears in that entry, and refuses with a <code>400</code> naming the tier if
+it does not — so a catalog that has dropped a model a tier is still pinned to cannot be loaded
+silently. The previous catalog stays in effect.</p>
 
 <h3 id="count-tokens-flag"><code>disable_retry_claude_count_token</code></h3>
 
@@ -100,11 +142,12 @@ burns the full retry budget against a provider that will never succeed.</p>
 actually implement the endpoint.</p>
 
 <div class="note">
-This flag is preserved across admin hot-switches and re-read from disk on reload. So are the
-models catalog and every rule under <a href="#extra-headers">extra_request_headers</a>: those
-three are carried across a switch by name, so switching a tier cannot silently discard your
-header rules. See <a href="operations.html#admin">operations.html#admin</a>. This flag also
-interacts with the compatibility learner, which excludes <code>count_tokens</code> from its
+This flag now lives in <code>models.json</code> and is re-read from there on <strong>Reload
+Providers</strong> — so an edit to it takes effect on a reload rather than on a restart. The
+catalog and every rule under <a href="#extra-headers">extra_request_headers</a> come from the same
+document and are carried across a tier hot-switch by name, so switching a tier cannot silently
+discard your header rules. See <a href="operations.html#admin">operations.html#admin</a>. The flag
+also interacts with the compatibility learner, which excludes <code>count_tokens</code> from its
 probing — see <a href="compatibility.html">compatibility.html</a>.
 </div>
 
@@ -166,6 +209,17 @@ representable in latin-1, since they are written verbatim into an HTTP header.</
 Resolved values are recorded in the trace log on <em>every</em> request for a provider with
 rules — not only under <code>--all</code>. If a rule forwards a per-conversation identifier,
 that identifier lands in the trace file. See <a href="trace-log.html#exposure">trace-log.html</a>.
+</div>
+
+<div class="note">
+These rules now live in <code>models.json</code>, which is <strong>deploy-owned</strong>: a
+narrowing made only on this machine does not survive an <code>update-claude-env</code> run — set it
+in the repo's copy if you want it to stick. And because a literal <code>fallback</code> value is
+copied into outbound requests, it must never carry a credential: nothing in this file is protected
+the way <code>keys-index.json</code> is. One operational note — a malformed-JSON error on
+<code>models.json</code> during <strong>Reload Providers</strong> can equally mean an
+<code>update-claude-env</code> write landed mid-file, so retry once it completes before concluding
+the catalog is corrupt.
 </div>
 
 <h2 id="keys-schema">keys-index.json</h2>
@@ -322,8 +376,13 @@ after the spawn. The CLI's pre-spawn check prints the same aggregated error list
 
 <table>
 <tr><th>Condition</th></tr>
-<tr><td><code>config.json</code> is missing — the template is copied into place and the
+<tr><td><code>config.json</code> is missing — the template pair is copied into place and the
     instructions printed instead</td></tr>
+<tr><td><code>models.json</code> is missing, unreadable, not an object, missing
+    <code>models</code>, or carries a non-object <code>extra_request_headers</code></td></tr>
+<tr><td><code>config.json</code> carries a key that belongs in <code>models.json</code> — a
+    <em>warning</em>, not a refusal: the value is ignored, <code>models.json</code> wins, and the
+    key is dropped the next time a change is applied</td></tr>
 <tr><td>Any of the three required tiers is absent</td></tr>
 <tr><td>A tier is not an object, or has an empty <code>provider</code> or <code>model</code></td></tr>
 <tr><td>A tier references a provider with no entry in <code>keys-index.json</code></td></tr>

@@ -280,10 +280,14 @@ def _models_for_vendors(tiers, vendors):
 
 
 def _create_test_config(temp_dir, tiers, models=None, extra_request_headers=None):
-    """Create a temp config.json with tier mappings.
+    """Create a temp config.json / models.json pair.
+
+    Writes a tiers-only config.json and a sibling models.json carrying the
+    catalog (plus extra_request_headers when given), so sibling-path
+    resolution via the config path keeps every call site unchanged.
 
     Args:
-        temp_dir: Directory to create config.json in
+        temp_dir: Directory to create the pair in
         tiers: Dict mapping tier names to {provider, model}
         models: Optional dict mapping provider names to model lists. When None,
             a provider-keyed catalog is derived from the tier mappings so the
@@ -298,14 +302,17 @@ def _create_test_config(temp_dir, tiers, models=None, extra_request_headers=None
     if models is None:
         models = _derive_models_from_tiers(tiers)
     config = {
-        "tiers": tiers,
-        "models": models
+        "tiers": tiers
     }
-    if extra_request_headers is not None:
-        config["extra_request_headers"] = extra_request_headers
     path = os.path.join(temp_dir, "config.json")
     with open(path, "w") as f:
         json.dump(config, f)
+    models_doc = {"models": models}
+    if extra_request_headers is not None:
+        models_doc["extra_request_headers"] = extra_request_headers
+    models_path = os.path.join(temp_dir, "models.json")
+    with open(models_path, "w") as f:
+        json.dump(models_doc, f)
     return path
 
 
@@ -719,20 +726,27 @@ def _start_admin_proxy(tiers, vendors, models=None):
 
 def _create_test_config_with_flag(temp_dir, tiers, flag_value=None,
                                   extra_request_headers=None):
-    """Create a config.json with an optional disable_retry_claude_count_token
-    and/or extra_request_headers map.
+    """Create a config.json / models.json pair with an optional
+    disable_retry_claude_count_token and/or extra_request_headers map.
 
     flag_value: True/False to set, or None to omit the key entirely.
     extra_request_headers: provider-keyed map to set, or None to omit.
+    Both the flag and the header map land in the sibling models.json —
+    only the catalog and its riders live there now; config.json carries
+    tiers and nothing else.
     """
-    config = {"tiers": tiers, "models": _derive_models_from_tiers(tiers)}
-    if flag_value is not None:
-        config["disable_retry_claude_count_token"] = flag_value
-    if extra_request_headers is not None:
-        config["extra_request_headers"] = extra_request_headers
+    config = {"tiers": tiers}
     path = os.path.join(temp_dir, "config.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(config, f)
+    models_doc = {"models": _derive_models_from_tiers(tiers)}
+    if flag_value is not None:
+        models_doc["disable_retry_claude_count_token"] = flag_value
+    if extra_request_headers is not None:
+        models_doc["extra_request_headers"] = extra_request_headers
+    models_path = os.path.join(temp_dir, "models.json")
+    with open(models_path, "w", encoding="utf-8") as f:
+        json.dump(models_doc, f)
     return path
 
 

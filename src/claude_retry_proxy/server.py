@@ -29,7 +29,8 @@ import uuid
 from urllib.parse import urlparse
 
 from . import sinks
-from .config import load_config, validate_config, write_config
+from .config import (load_config, load_models_document, models_path_for,
+                     validate_config, write_config)
 from .keys import load_keys_file, read_passphrase_from_stdin, vendor_key_entries, vendor_key_names
 from .sanitize import sanitize_error
 from .compat import (COMPAT_FEATURE, COMPAT_MAX_RETRIES_PER_REQUEST,
@@ -2108,8 +2109,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self._send_response(400, b'{"error":"invalid JSON"}')
                 return
 
+            # A body that is valid JSON but not an object (null, a list, a
+            # string) would otherwise raise AttributeError at
+            # data.get(...) and abort do_POST with no HTTP response at all.
+            if not isinstance(data, dict):
+                self._send_response(400, b'{"error":"invalid JSON body"}')
+                return
+
             # Validate all 3 tiers present
             new_tiers = data.get("tiers", {})
+            if not isinstance(new_tiers, dict):
+                self._send_response(400, b'{"error":"\'tiers\' must be an object"}')
+                return
             required_tiers = {"haiku", "sonnet", "opus"}
             missing = required_tiers - set(new_tiers.keys())
             if missing:
@@ -2194,20 +2205,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             # Phase 3: Perform the swap
             try:
                 with _config_lock:
-                    # Preserve models section, replace tiers
+                    # The provider catalog lives in models.json and this
+                    # process never writes it: the disk document carries the
+                    # tier mapping and nothing else.
+                    disk_config = {"tiers": new_tiers}
+                    # The in-memory document keeps today's merged shape:
+                    # catalog, header rules, and flag carried over from the
+                    # current config.
                     new_config = {
-                        "tiers": new_tiers,
-                        "models": _current_config.get("models", {})
+                        "tiers": disk_config["tiers"],
+                        "models": _current_config.get("models", {}),
                     }
-                    # Preserve known top-level config keys across hot-switches
-                    for _key in ("disable_retry_claude_count_token",
-                                 "extra_request_headers",):
+                    for _key in ("extra_request_headers",
+                                 "disable_retry_claude_count_token",):
                         if _key in _current_config:
                             new_config[_key] = _current_config[_key]
                     if response_status is None:
                         # Write to disk FIRST, then update in-memory
                         try:
-                            write_config(_config_path, new_config)
+                            write_config(_config_path, disk_config)
                             # Only update in-memory after successful disk write
                             _current_config = new_config
                             response_status = 200
@@ -2242,22 +2258,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self._send_response(403, b'{"error":"forbidden: invalid Origin"}')
                 return
 
-            # Reload config from disk
+            # Reload the provider catalog from models.json. Tiers are not
+            # re-read from disk. This happens at handler entry, before the
+            # drain, so a missing or malformed catalog fails fast with an
+            # immediate 400 rather than after a drain that can last up to
+            # 30 seconds.
             try:
-                new_config = load_config(_config_path)
-            except (FileNotFoundError, json.JSONDecodeError, ValueError) as e:
+                models_doc = load_models_document(models_path_for(_config_path))
+            except ValueError as e:
                 self._send_response(400, json.dumps({
-                    "error": "failed to load config: {}".format(e)
-                }).encode("utf-8"))
-                return
-
-            # Validate against providers
-            provider_names = set(_vendors.keys())
-            provider_keys = {name: vendor_key_names(v) for name, v in _vendors.items()}
-            errors = validate_config(new_config, provider_names, provider_keys)
-            if errors:
-                self._send_response(400, json.dumps({
-                    "error": "config validation failed: {}".format("; ".join(errors))
+                    "error": "failed to load models: {}".format(e)
                 }).encode("utf-8"))
                 return
 
@@ -2283,20 +2293,77 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     return
                 time.sleep(0.1)
 
-            # Phase 3: Perform the swap
+            # Phase 3: Assemble the candidate, gate it, validate it, and swap.
+            # Tiers are assembled under the lock so a /admin/api/switch that
+            # completes during the drain is not silently reverted in memory.
             try:
                 with _config_lock:
-                    _current_config = new_config
+                    candidate = {
+                        "tiers": _current_config.get("tiers", {}),
+                        "models": models_doc.get("models", {}),
+                    }
+                    for _key in ("extra_request_headers",
+                                 "disable_retry_claude_count_token",):
+                        if _key in models_doc:
+                            candidate[_key] = models_doc[_key]
+
+                    # Membership gate: every tier must name a provider whose
+                    # reloaded catalog lists its model. The gate is total —
+                    # a tier it cannot judge is refused with its own 400,
+                    # never skipped, and it must run before validate_config
+                    # so the specific error is not pre-empted.
+                    gate_error = None
+                    models_path = models_path_for(_config_path)
+                    for tier_name, tier in candidate["tiers"].items():
+                        if not isinstance(tier, dict):
+                            gate_error = "tier '{}' is not an object".format(tier_name)
+                            break
+                        provider = tier.get("provider")
+                        model = tier.get("model")
+                        if not provider or not model \
+                                or not isinstance(provider, str) \
+                                or not isinstance(model, str):
+                            gate_error = "tier '{}' does not name a provider and a model".format(tier_name)
+                            break
+                        catalog_entry = candidate["models"].get(provider)
+                        if not isinstance(catalog_entry, list) \
+                                or model not in catalog_entry:
+                            gate_error = (
+                                "reload refused: tier '{}' uses model '{}', which is "
+                                "not in the reloaded catalog for provider '{}' "
+                                "({})".format(tier_name, model, provider, models_path))
+                            break
+                    if gate_error is None:
+                        provider_names = set(_vendors.keys())
+                        provider_keys = {name: vendor_key_names(v)
+                                         for name, v in _vendors.items()}
+                        errors = validate_config(candidate, provider_names,
+                                                 provider_keys)
+                        if errors:
+                            gate_error = "config validation failed: {}".format(
+                                "; ".join(errors))
+                    if gate_error is not None:
+                        # Refusal: perform no swap — the previous catalog
+                        # stays in effect.
+                        response_status = 400
+                        response_body = json.dumps({
+                            "error": gate_error
+                        }).encode("utf-8")
+                    else:
+                        _current_config = candidate
+                        response_status = 200
+                        response_body = json.dumps({
+                            "status": "ok",
+                            "config": candidate
+                        }).encode("utf-8")
             finally:
                 # Phase 4: Clear swap flag and signal completion
                 with _config_lock:
                     _config_swapping = False
                     _swap_done.set()
 
-            self._send_response(200, json.dumps({
-                "status": "ok",
-                "config": new_config
-            }).encode("utf-8"))
+            # Send response after releasing lock
+            self._send_response(response_status, response_body)
             return
 
         request_id = str(uuid.uuid4())
