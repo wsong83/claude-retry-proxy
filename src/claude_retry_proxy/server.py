@@ -33,7 +33,8 @@ from .config import (load_config, load_models_document, models_path_for,
                      validate_config, write_config)
 from .keys import load_keys_file, read_passphrase_from_stdin, vendor_key_entries, vendor_key_names
 from .sanitize import sanitize_error
-from .compat import (COMPAT_FEATURE, COMPAT_MAX_RETRIES_PER_REQUEST,
+from .compat import (COMPAT_FEATURE, COMPAT_FEATURES,
+                     COMPAT_MAX_RETRIES_PER_REQUEST,
                      _compat_get, _compat_key, _compat_learn,
                      _compat_merge_retries, _compat_note_suppressed_request,
                      _compat_probe_inconclusive, _compat_probe_rejected,
@@ -42,8 +43,13 @@ from .compat import (COMPAT_FEATURE, COMPAT_MAX_RETRIES_PER_REQUEST,
                      _compat_reset_strip_counter, _compat_retry_lock,
                      _compat_state_lock, _compat_stripped_body,
                      _compat_suppressed, _compat_validate_constants,
-                     _load_compat_state, _compat_normalize_threshold,
-                     _persist_compat_state_locked)
+                     _feature_for_mode, _load_compat_state,
+                     _compat_normalize_threshold, _persist_compat_state_locked,
+                     _reasoning_entry_selection, _reasoning_is_latched,
+                     _reasoning_latch_notice, _reasoning_next_candidate,
+                     _reasoning_note_complaint, _reasoning_note_full_walk,
+                     _reasoning_persist_switch, _reasoning_reset_full_walks,
+                     _reasoning_reset_on_success)
 from .sinks import (log_trace, write_state, increment_total, increment_retried,
                     write_start_marker, write_stop_marker)
 from .transforms_chat import (_anthropic_to_chat, _chat_to_anthropic,
@@ -369,6 +375,64 @@ def _compat_probe_outcome(result, key, request_id, tier, method, path,
     return result
 
 
+def _reasoning_outcome(result, key, selection, request_id, tier, method, path,
+                       headers, body, handler, config, vendors):
+    """Drive the reasoning_field walk for one client request.
+
+    Lock first: the feature's own retry lock is acquired non-blocking before
+    any counter is touched, so a contended walk mutates nothing and returns the
+    upstream error. On a matched complaint the counter advances and each next
+    candidate is tried in-request from the ORIGINAL client body; the client is
+    served by whichever candidate returns 2xx, and a switch persists only if
+    the strike ladder still stands at that moment (delisted when the candidate
+    is "none"). A candidate's outcome never touches the strike ladder; its 2xx
+    does clear the full-walk counter. A non-complaint failure stops the walk.
+    When every candidate complains that is one full walk; two consecutive full
+    walks latch the pair until restart.
+
+    The client receives the ORIGINAL top-level result on every failure exit.
+    """
+    feature = COMPAT_FEATURES["reasoning_field"]
+    if not feature.retry_lock.acquire(blocking=False):
+        return result
+    try:
+        if _reasoning_is_latched(key):
+            # A concurrent request can latch the pair between the dispatch-site
+            # check and this acquire. The latch is terminal — no retries, no
+            # counter mutation — so honour it here, where counters are about to
+            # be touched, and hand the client its original top-level result.
+            return result
+        _reasoning_note_complaint(key, selection)
+        walk_result = result
+        candidate = selection
+        for _step in range(feature.max_retries_per_request):
+            candidate = _reasoning_next_candidate(candidate)
+            walk_result = _forward_request_impl(
+                method, path, headers, body, handler, request_id,
+                config, vendors, suppress_compat=True,
+                reasoning_selection=candidate)
+            walk_status = walk_result[0]
+            if 200 <= walk_status < 300:
+                # A candidate's own 2xx is positive evidence that a selection
+                # works: it clears the full-walk counter (never the ladder).
+                # The switch then persists only if the ladder still stands —
+                # re-read under the state lock inside the persist function.
+                _reasoning_reset_full_walks(key)
+                _reasoning_persist_switch(key, candidate, request_id, tier)
+                return _compat_merge_retries(result, walk_result)
+            if not feature.complaint_match(walk_status, walk_result[2]):
+                # A non-complaint result stops the walk; hand the client its
+                # own original error rather than the walk's.
+                return _compat_merge_retries(walk_result, result)
+        # Budget exhausted with the last candidate still complaining: one full
+        # walk observed. The second consecutive one latches the pair.
+        if _reasoning_note_full_walk(key):
+            _reasoning_latch_notice(key, request_id, tier)
+        return _compat_merge_retries(walk_result, result)
+    finally:
+        feature.retry_lock.release()
+
+
 def _resolve_extra_request_headers(headers, provider_name, config, request_id):
     """Resolve outbound extra request headers for a provider from config rules.
 
@@ -437,13 +501,19 @@ def _resolve_extra_request_headers(headers, provider_name, config, request_id):
 
 
 def _forward_request_impl(method, path, headers, body, handler, request_id,
-                          config, vendors, suppress_compat=False):
+                          config, vendors, suppress_compat=False,
+                          reasoning_selection=None):
     """Internal implementation of forward_request with snapshot config.
 
     suppress_compat=True bypasses the feature-compatibility subsystem
     entirely — compatibility retries call this function with the flag set,
     so recursion is structurally impossible and the retry is a single
     upstream attempt (never re-enters the 429/503 retry loop).
+
+    reasoning_selection is the chat-mode reasoning echo field. None means
+    "unresolved — resolve it from the learned entry at request entry"; every
+    other value (including the literal "none" the walk wraps to) is used
+    as-is, so the walk's explicit candidate is never re-resolved.
     """
     if method not in ALLOWED_METHODS:
         return 400, {}, b'{"error":"Method not allowed"}', 0, 0, 0, "unknown", None, None
@@ -552,6 +622,9 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     rewritten_body = body
     compat_decision = None  # None | ("strip", key) | ("probe", key)
     compat_outbound_present = False
+    active_feature = _feature_for_mode(mode)
+    reasoning_key = None
+    reasoning_active = False
     if body:
         try:
             body_json["model"] = actual_model
@@ -561,7 +634,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
             if (mode == "anthropic" and not _is_count_tokens
                     and not suppress_compat and isinstance(body_json, dict)
                     and COMPAT_FEATURE in body_json):
-                _ck = _compat_key(provider_name, mode, actual_model)
+                _ck = _compat_key(provider_name, mode, actual_model, COMPAT_FEATURE)
                 if _compat_get(_ck) is not None:
                     reached = _compat_record_strip(_ck)
                     if reached and _compat_retry_lock.acquire(blocking=False):
@@ -593,12 +666,26 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                             "feature": COMPAT_FEATURE,
                         })
                         compat_decision = ("strip", _ck)
-            if isinstance(body_json, dict):
-                compat_outbound_present = COMPAT_FEATURE in body_json
+            # The active feature's presence test gates the mode-scoped
+            # dispatch below and the reasoning selection. None-safe: a mode
+            # with no registered feature is inert.
+            compat_outbound_present = (
+                active_feature is not None
+                and active_feature.present(body_json))
             if mode == "chat":
+                if (reasoning_selection is None and active_feature is not None
+                        and not suppress_compat and not _is_count_tokens
+                        and compat_outbound_present):
+                    reasoning_key = _compat_key(
+                        provider_name, mode, actual_model, active_feature.name)
+                    reasoning_selection, reasoning_active = \
+                        _reasoning_entry_selection(reasoning_key)
+                if reasoning_selection is None:
+                    reasoning_selection = "none"
                 rewritten_body = json.dumps(_anthropic_to_chat(
                     body_json, request_id=request_id, mode=mode,
-                    provider=provider_name, tier=tier)).encode("utf-8")
+                    provider=provider_name, tier=tier,
+                    reasoning_selection=reasoning_selection)).encode("utf-8")
             elif mode == "response":
                 rewritten_body = json.dumps(_anthropic_to_response(
                     body_json, request_id=request_id, mode=mode,
@@ -678,17 +765,46 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     if compat_decision is not None:
         return result
 
+    # Reasoning-field reset: this request's OWN forwarding pass ended 2xx, so
+    # the sent selection works — zero both counters. "Own pass" is the whole
+    # top-level chain, so an upstream 429/503 that the retry loop carried to a
+    # 2xx counts (the served response is the evidence the reset captures). A
+    # walk candidate's 2xx is a nested call and never reaches here; it clears
+    # only the full-walk counter, inside _reasoning_outcome.
+    if reasoning_active and 200 <= result[0] < 300:
+        _reasoning_reset_on_success(reasoning_key, reasoning_selection)
+
+    # Mode-scoped dispatch on the active feature. The suppress_compat clause
+    # leads: every compatibility/walk retry calls this function with the flag
+    # set, so re-entry (and any nested walk) is structurally impossible.
+    # compat_outbound_present already folds in the feature's mode scope and
+    # presence test, so it is written once.
+    if suppress_compat or not compat_outbound_present or _is_count_tokens:
+        return result
+
+    if active_feature.name == "reasoning_field":
+        # reasoning_field: a matched complaint walks the candidate cycle.
+        if reasoning_key is None or _reasoning_is_latched(reasoning_key):
+            return result
+        if not active_feature.complaint_match(result[0], result[2]):
+            return result
+        return _reasoning_outcome(
+            result, reasoning_key, reasoning_selection, request_id, tier,
+            method, path, headers, body, handler, config, vendors)
+
+    if active_feature.name != COMPAT_FEATURE:
+        # A registered feature this dispatch does not handle stays inert, so a
+        # future third feature is never mis-routed into the paths below.
+        return result
+
     # Discovery: the request carried the feature with no learned entry at
     # send time. On a recognized exact 400, confirm with one stripped retry
     # (single upstream attempt, same snapshot, suppress_compat=True).
-    if suppress_compat or mode != "anthropic" or _is_count_tokens \
-            or not compat_outbound_present:
-        return result
     if result[0] != 400:
         return result
     if not _compat_rejection_match(result[0], result[2]):
         return result
-    key = _compat_key(provider_name, mode, actual_model)
+    key = _compat_key(provider_name, mode, actual_model, COMPAT_FEATURE)
     log_trace({
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "event": "compatibility_rejection_detected",

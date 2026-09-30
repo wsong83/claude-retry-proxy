@@ -57,6 +57,25 @@ STRUCTURED_400_BODY = json.dumps({
     },
 }).encode()
 
+# Rejected-body corpus shared by the context_management detector scenarios and
+# the reasoning matcher's unit test: (label, status, body_bytes) triples that
+# are NOT complaints for either feature. The two matchers are structurally
+# parallel by design, so one table is what keeps them from drifting apart.
+# Accept-side cases stay separate — they differ by field-name constant.
+REJECTED_BODY_CORPUS = [
+    ("http-500", 500, json.dumps({
+        "type": "error",
+        "error": {"type": "api_error", "message": "upstream exploded"},
+    }).encode()),
+    ("http-2xx-success", 200, json.dumps({
+        "id": "msg_ok", "type": "message", "role": "assistant", "model": "m",
+        "content": [], "usage": {"input_tokens": 1, "output_tokens": 1},
+    }).encode()),
+    ("unparseable-body", 400, b"this is not json at all"),
+    ("empty-body", 400, b""),
+    ("json-array-body", 400, b'["context_management", "reasoning_content"]'),
+]
+
 CM_VALUE = {"edits": [{"type": "clear_tool_uses_20250901"}]}
 CM_MARKER = "clear_tool_uses_20250901"
 ERROR_MARKER = "Extra inputs are not permitted"
@@ -77,9 +96,17 @@ SSE_BODY = (
     b"\n"
 )
 
-ALLOWED_STATE_KEYS = {
+# The persisted schema is per-feature: one shared envelope plus each
+# descriptor's own field set. The reasoning entry adds exactly `selection`;
+# the default ("none") is never persisted — an absent entry means none.
+ENVELOPE_STATE_KEYS = {
     "schema_version", "provider", "mode", "actual_model", "feature",
-    "state", "threshold", "strip_counter", "probation_successes",
+}
+ALLOWED_STATE_KEYS_BY_FEATURE = {
+    "context_management": ENVELOPE_STATE_KEYS | {
+        "state", "threshold", "strip_counter", "probation_successes",
+    },
+    "reasoning_field": ENVELOPE_STATE_KEYS | {"selection"},
 }
 
 
@@ -118,6 +145,143 @@ def _read_state_file(path):
 def _write_state_file(path, obj):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f)
+
+
+# ---------------------------------------------------------------------------
+# reasoning_field (chat mode) helpers
+# ---------------------------------------------------------------------------
+
+# 400 bodies naming a reasoning field, in the content shapes a real gateway
+# uses. All are built from the field-name constants; none carries upstream
+# prose the matcher depends on.
+REASONING_MESSAGE_400 = json.dumps({
+    "type": "error",
+    "error": {
+        "type": "invalid_request_error",
+        "message": "The reasoning_content in the thinking mode must be passed "
+                   "back to the API.",
+    },
+}).encode()
+
+REASONING_SWITCH_THRESHOLD = 3
+
+
+def _reasoning_request(model="sonnet", with_thinking=True, text="hello"):
+    """A chat-mode client request. `with_thinking` appends an assistant turn
+    carrying a thinking block — the presence gate that makes the reasoning
+    feature active for the request."""
+    body = {
+        "model": model,
+        "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": text}]},
+        ],
+    }
+    if with_thinking:
+        body["messages"].append({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "hmm", "signature": "s"},
+                {"type": "text", "text": "ok"},
+            ],
+        })
+    return body
+
+
+def _sent_reasoning_field(info):
+    """The reasoning field the proxy actually sent upstream, or None.
+
+    Read from the mock upstream's recorded request, so it observes the bytes
+    that really left the proxy rather than any internal call record.
+    """
+    try:
+        body = json.loads(info["body"])
+    except Exception:
+        return None
+    for m in body.get("messages", []):
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        for f in ("reasoning_content", "reasoning"):
+            if f in m:
+                return f
+    return None
+
+
+def _chat_ok_response(info):
+    """A minimal OpenAI chat-completions 2xx body."""
+    try:
+        model = json.loads(info["body"]).get("model", "unknown")
+    except Exception:
+        model = "unknown"
+    return 200, "application/json", json.dumps({
+        "id": "chatcmpl-ok", "object": "chat.completion", "created": 1,
+        "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant",
+                                             "content": "hi"},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                  "total_tokens": 2},
+    }).encode()
+
+
+def _reasoning_upstream(policy, log=None):
+    """A chat-mode mock upstream that validates the echoed reasoning field.
+
+    policy["accept"] is a tuple of accepted values: field names, plus the
+    literal "none" for a request that carries no reasoning field at all. A
+    request sending anything outside that tuple gets the message-form 400.
+    policy["accept"] is read per request, so the test can change the upstream's
+    convention mid-conversation. Every request is appended to `log` when given.
+    """
+    def responder(info):
+        if log is not None:
+            log.append(info)
+        sent = _sent_reasoning_field(info) or "none"
+        if sent in policy.get("accept", ()):
+            return _chat_ok_response(info)
+        return 400, "application/json", REASONING_MESSAGE_400
+    return responder
+
+
+def _reasoning_entry(state_path, model="claude-sonnet-5", provider="p"):
+    """The persisted reasoning_field entry for a pair, or None."""
+    state = _read_state_file(state_path)
+    if not state:
+        return None
+    for entry in _entry_values(_entries(state)):
+        if (isinstance(entry, dict)
+                and entry.get("feature") == "reasoning_field"
+                and entry.get("provider") == provider
+                and entry.get("actual_model") == model):
+            return entry
+    return None
+
+
+def _seed_reasoning_state(state_path, selection,
+                          model="claude-sonnet-5", provider="p"):
+    """Write a state file carrying one learned reasoning_field selection."""
+    entry = {
+        "schema_version": 1, "provider": provider, "mode": "chat",
+        "actual_model": model, "feature": "reasoning_field",
+        "selection": selection,
+    }
+    with open(state_path, "w", encoding="utf-8") as f:
+        json.dump({"schema_version": 1,
+                   "entries": {"\x1f".join(
+                       (provider, "chat", model, "reasoning_field")): entry}},
+                  f)
+
+
+def _chat_vendor(port):
+    """A single chat-mode vendor spec pointing at a mock upstream."""
+    return {"url": "http://127.0.0.1:%d" % port, "key": "K", "mode": "chat"}
+
+
+def _start_reasoning_proxy(responders, state_path):
+    """Start a chat-mode proxy backed by one mock upstream, with an isolated
+    compatibility state file."""
+    vendors = {"p": _chat_vendor(find_free_port())}
+    return _start_compat_proxy(responders, state_path, vendors=vendors)
 
 
 def _entries(state):
@@ -381,9 +545,26 @@ def test_compat_state_load_unreadable_fails_open():
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
+# One valid entry body per registered feature: the shape that feature's own
+# validator must accept, expressed in the feature's own vocabulary.
+VALID_ENTRY_BODIES = {
+    "context_management": {
+        "provider": "p", "mode": "anthropic", "actual_model": "m",
+        "feature": "context_management", "state": "unsupported",
+        "threshold": 32, "strip_counter": 0, "probation_successes": 0,
+    },
+    "reasoning_field": {
+        "provider": "p", "mode": "chat", "actual_model": "m",
+        "feature": "reasoning_field", "selection": "reasoning_content",
+    },
+}
+
+
 def test_compat_state_roundtrip():
     """A learned entry persists with plan-pinned schema fields and survives a
-    proxy restart (stripping resumes immediately)."""
+    proxy restart (stripping resumes immediately); every registered feature's
+    entry validates through its own descriptor and an absent entry resolves to
+    that descriptor's default."""
     print("\n--- Test: Compat State Roundtrip ---")
     state_dir, state_path = _bootstrap_learned_state()
     try:
@@ -433,6 +614,64 @@ def test_compat_state_roundtrip():
                      "calls (%d with cm)" % (len(reqs), _cm_count(reqs)))
         finally:
             cleanup()
+
+        # Per-descriptor validation branch: every registered feature's entry
+        # survives the loader under the key derived from its own identity (the
+        # file key it was stored under is never used as a key), and each
+        # descriptor's own field set is preserved.
+        import claude_retry_proxy.server as srv
+        import claude_retry_proxy.compat as compat
+        saved_path = srv.SETTINGS.feature_compat_file
+        try:
+            for feature_name in sorted(compat.COMPAT_FEATURES):
+                body = VALID_ENTRY_BODIES[feature_name]
+                validated = compat._compat_validate_entry(dict(body))
+                if validated is None:
+                    fail("%s entry rejected by its own descriptor"
+                         % feature_name)
+                    return
+                missing = set(body) - set(validated)
+                if missing:
+                    fail("%s entry lost fields in validation: %s"
+                         % (feature_name, sorted(missing)))
+                    return
+                fpath = os.path.join(
+                    state_dir, "roundtrip-%s.json" % feature_name)
+                with open(fpath, "w", encoding="utf-8") as f:
+                    json.dump({"schema_version": 1, "entries": {
+                        "not\x1fa\x1freal\x1fkey": dict(body)}}, f)
+                srv.SETTINGS.feature_compat_file = fpath
+                fresh = compat._CompatState()
+                compat._load_compat_state(state=fresh)
+                expect_key = (body["provider"], body["mode"],
+                              body["actual_model"], body["feature"])
+                if list(fresh.entries) != [expect_key]:
+                    fail("%s entry did not load under its own identity key: "
+                         "%r" % (feature_name, list(fresh.entries)))
+                    return
+                loaded = fresh.entries[expect_key]
+                if set(loaded) != ALLOWED_STATE_KEYS_BY_FEATURE[feature_name]:
+                    fail("%s loaded entry key set is wrong: %s"
+                         % (feature_name, sorted(loaded)))
+                    return
+            pass_("per-descriptor validation: every registered feature "
+                  "round-trips under its own identity with its own field set")
+        finally:
+            srv.SETTINGS.feature_compat_file = saved_path
+
+        # An absent entry resolves to the descriptor's own default.
+        selection, active = compat._reasoning_entry_selection(
+            ("absent-provider", "chat", "absent-model", "reasoning_field"))
+        if selection != "none" or not active:
+            fail("absent reasoning entry must resolve to the 'none' default, "
+                 "got (%r, %r)" % (selection, active))
+            return
+        if compat._compat_get(("absent-provider", "anthropic",
+                               "absent-model",
+                               "context_management")) is not None:
+            fail("absent context_management entry must resolve to no entry")
+            return
+        pass_("absent entries resolve to each descriptor's own default")
     finally:
         shutil.rmtree(state_dir, ignore_errors=True)
 
@@ -737,9 +976,15 @@ def test_compat_state_write_metadata_only():
         for entry in _entry_values(_entries(state)):
             if not isinstance(entry, dict):
                 continue
-            extra = set(entry) - ALLOWED_STATE_KEYS
+            allowed = ALLOWED_STATE_KEYS_BY_FEATURE.get(entry.get("feature"))
+            if allowed is None:
+                fail("persisted entry has an unregistered feature: %r"
+                     % (entry.get("feature"),))
+                return
+            extra = set(entry) - allowed
             if extra:
-                fail("persisted entry has unexpected keys: %s" % sorted(extra))
+                fail("persisted entry for feature %r has unexpected keys: %s"
+                     % (entry.get("feature"), sorted(extra)))
                 return
         pass_("persisted state is metadata-only (schema fields, no content)")
     finally:
@@ -1116,13 +1361,13 @@ def test_compat_field_stripped_trace_accuracy():
 # ---------------------------------------------------------------------------
 
 def _detector_scenario(body, content_type="application/json",
-                       include_cm=True):
+                       include_cm=True, status=400):
     """Run one request against an upstream that always returns the given
-    400. Returns (status, n_upstream_calls, n_with_cm)."""
+    status/body. Returns (status, n_upstream_calls, n_with_cm)."""
     state_dir, state_path = _make_state_dir()
 
     def responder(info):
-        return 400, content_type, body
+        return status, content_type, body
 
     responders = {"p": responder}
     temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
@@ -1232,44 +1477,52 @@ def test_compat_detector_content_type_agnostic():
 
 def test_compat_detector_unrelated_400_rejected():
     """Broad invalid-request, auth, model, quota, and context-limit 400s
-    never trigger a compatibility retry or learning."""
+    never trigger a compatibility retry or learning, and neither does any
+    entry of the shared rejected-body corpus."""
     print("\n--- Test: Compat Detector Unrelated 400 Rejected ---")
     unrelated = [
-        ("broad-invalid-request", {
+        ("broad-invalid-request", 400, {
             "type": "error",
             "error": {"type": "invalid_request_error",
                       "message": "Invalid request payload"},
         }),
-        ("auth-error", {
+        ("auth-error", 400, {
             "type": "error",
             "error": {"type": "authentication_error",
                       "message": "invalid x-api-key"},
         }),
-        ("model-not-found", {
+        ("model-not-found", 400, {
             "type": "error",
             "error": {"type": "not_found_error",
                       "message": "model not found: claude-sonnet-5"},
         }),
-        ("quota", {
+        ("quota", 400, {
             "type": "error",
             "error": {"type": "billing_error",
                       "message": "quota exceeded for this project"},
         }),
-        ("context-limit", {
+        ("context-limit", 400, {
             "type": "error",
             "error": {"type": "invalid_request_error",
                       "message": "prompt is too long: 250000 tokens > "
                                  "200000 maximum"},
         }),
     ]
-    for label, payload in unrelated:
-        status, calls, with_cm = _detector_scenario(
-            json.dumps(payload).encode())
+    corpus = [(label, status, json.dumps(payload).encode())
+              for label, status, payload in unrelated]
+    corpus += REJECTED_BODY_CORPUS
+    for label, resp_status, body in corpus:
+        got, calls, with_cm = _detector_scenario(body, status=resp_status)
         if calls != 1:
-            fail("%s 400 triggered %d upstream calls (expected 1, no "
-                 "compatibility retry)" % (label, calls))
+            fail("%s (status %d) triggered %d upstream calls (expected 1, "
+                 "no compatibility retry)" % (label, resp_status, calls))
             return
-    pass_("all unrelated 400 forms passed through with no retry")
+        if got != resp_status:
+            fail("%s: client saw status %d, expected the upstream's %d"
+                 % (label, got, resp_status))
+            return
+    pass_("all unrelated forms and every shared-corpus reject passed "
+          "through with no retry")
 
 
 def test_compat_detector_presence_required():
@@ -2096,7 +2349,12 @@ def test_compat_probe_counter_semantics():
 
 def test_compat_single_retry_global():
     """Concurrent first-time requests: exactly one compatibility retry
-    occurs globally; losers receive the original 400."""
+    occurs globally; losers receive the original 400.
+
+    The same contention harness covers the reasoning feature, whose retry lock
+    is its own: a walk denied that lock mutates no counter and writes no state,
+    so the three-strike ladder still needs three consecutive complaints from
+    the point of contention onward."""
     print("\n--- Test: Compat Single Retry Global ---")
     state_dir, state_path = _make_state_dir()
 
@@ -2111,9 +2369,28 @@ def test_compat_single_retry_global():
         time.sleep(1.5)  # hold the retry lock wide open for the losers
         return _ok_response(info)
 
-    responders = {"p": responder}
+    def chat_responder(info):
+        # Accepts only the advanced candidate, slowly, so the winning walk
+        # holds the reasoning feature's own retry lock open while the
+        # concurrent losers try to acquire it.
+        if _sent_reasoning_field(info) == "reasoning_content":
+            time.sleep(1.5)
+            return _chat_ok_response(info)
+        return 400, "application/json", REASONING_MESSAGE_400
+
+    tiers = {
+        "haiku": {"provider": "q", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+    }
+    vendors = {
+        "p": {"url": "http://127.0.0.1:%d" % find_free_port(), "key": "K"},
+        "q": _chat_vendor(find_free_port()),
+    }
+    responders = {"p": responder, "q": chat_responder}
     temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
-        _start_compat_proxy(responders, state_path)
+        _start_compat_proxy(responders, state_path, tiers=tiers,
+                            vendors=vendors)
     if proc is None:
         shutil.rmtree(state_dir, ignore_errors=True)
         fail("Failed to set up test")
@@ -2149,6 +2426,55 @@ def test_compat_single_retry_global():
             pass_("leader learned the entry")
         else:
             fail("leader's successful retry did not learn")
+            return
+
+        # --- reasoning feature: the same contention harness ----------------
+        reasoning_results = []
+
+        def reasoning_worker():
+            s, _ = _send(proxy_port, _reasoning_request(model="haiku"))
+            reasoning_results.append(s)
+
+        threads = [threading.Thread(target=reasoning_worker)
+                   for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        if len(reasoning_results) != 5:
+            fail("only %d/5 concurrent reasoning requests completed"
+                 % len(reasoning_results))
+            return
+        n_ok = sum(1 for s in reasoning_results if s == 200)
+        if n_ok != 1:
+            fail("reasoning single-flight broken: %d/5 clients 2xx (expected "
+                 "exactly the lock holder)" % n_ok)
+            return
+        if _reasoning_entry(state_path, model="claude-haiku-4-5",
+                            provider="q") is not None:
+            fail("a contended walk persisted a selection")
+            return
+        pass_("contended walk: only the lock holder served, no state written")
+
+        # The losers mutated no counter, so the ladder stands at the holder's
+        # single complaint: two more consecutive complaints must arrive before
+        # the switch can land.
+        s, _ = _send(proxy_port, _reasoning_request(model="haiku"))
+        if s != 200:
+            fail("post-contention request failed (%s)" % s)
+            return
+        if _reasoning_entry(state_path, model="claude-haiku-4-5",
+                            provider="q") is not None:
+            fail("switch landed early — a contention loser mutated the "
+                 "complaint counter")
+            return
+        _send(proxy_port, _reasoning_request(model="haiku"))
+        if _reasoning_entry(state_path, model="claude-haiku-4-5",
+                            provider="q") is None:
+            fail("third consecutive complaint did not persist the switch")
+            return
+        pass_("contention losers mutated no counter: the switch still needed "
+              "three consecutive complaints")
     finally:
         cleanup()
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -2480,6 +2806,884 @@ def test_compat_trace_metadata_only():
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# G. reasoning_field (chat mode)
+#
+# The counter and the latch live in memory inside the spawned proxy, so every
+# assertion here is on something observable: the status the client received,
+# the bytes the mock upstream actually saw, the trace file, and the persisted
+# selection read back from the (per-test isolated) state file.
+# ---------------------------------------------------------------------------
+
+def test_reasoning_switch_needs_three_consecutive_complaints():
+    """The persisted selection changes only on the third consecutive matched
+    complaint against it; an intervening first-attempt success resets the
+    count; after a persisted switch the count restarts against the new
+    selection; and a thinking-free successful turn never resets at all."""
+    print("\n--- Test: Reasoning Switch Needs Three Consecutive "
+          "Complaints ---")
+    state_dir, state_path = _make_state_dir()
+    policy = {"accept": ("reasoning_content",)}
+    responders = {"p": _reasoning_upstream(policy)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
+        _start_reasoning_proxy(responders, state_path)
+    if proc is None:
+        shutil.rmtree(state_dir, ignore_errors=True)
+        fail("Failed to set up test")
+        return
+    try:
+        def send(model="sonnet", with_thinking=True):
+            return _send(proxy_port, _reasoning_request(
+                model=model, with_thinking=with_thinking))[0]
+
+        # (a) Two consecutive complaints are not enough.
+        for i in (1, 2):
+            if send() != 200:
+                fail("complaint %d: the walk did not serve the client" % i)
+                return
+            if _reasoning_entry(state_path) is not None:
+                fail("switch landed after %d complaint(s); it must need %d"
+                     % (i, REASONING_SWITCH_THRESHOLD))
+                return
+        pass_("two consecutive complaints did not switch")
+
+        # (b) A first-attempt success resets the ladder. The upstream is
+        # relaxed for exactly one request, modelling a turn it has nothing to
+        # complain about.
+        policy["accept"] = ("none", "reasoning_content")
+        if send() != 200:
+            fail("relaxed request did not succeed")
+            return
+        policy["accept"] = ("reasoning_content",)
+        for i in (1, 2):
+            if send() != 200:
+                fail("post-reset complaint %d not served" % i)
+                return
+            if _reasoning_entry(state_path) is not None:
+                fail("the reset did not take: the switch landed only %d "
+                     "complaint(s) after the intervening success" % i)
+                return
+        pass_("an intervening first-attempt success reset the ladder")
+
+        # (c) The third consecutive complaint persists the switch.
+        if send() != 200:
+            fail("third post-reset complaint not served")
+            return
+        entry = _reasoning_entry(state_path)
+        if entry is None or entry.get("selection") != "reasoning_content":
+            fail("third consecutive complaint did not persist the switch: %r"
+                 % (entry,))
+            return
+        pass_("third consecutive complaint persisted the switch")
+
+        # (d) After the switch the count restarts: two further complaints
+        # against the new selection must not advance it again.
+        policy["accept"] = ("reasoning",)
+        for i in (1, 2):
+            if send() != 200:
+                fail("post-switch complaint %d not served" % i)
+                return
+        entry = _reasoning_entry(state_path)
+        if entry is None or entry.get("selection") != "reasoning_content":
+            fail("two post-switch complaints advanced the selection: %r"
+                 % (entry,))
+            return
+        pass_("after the switch the count restarted at 1")
+
+        # (e) A thinking-free successful turn does NOT reset: on a second pair,
+        # complaint / thinking-free 200 / complaint / complaint must still
+        # reach the switch.
+        policy["accept"] = ("reasoning_content",)
+        if send(model="haiku") != 200:
+            fail("thinking-free pair: first complaint not served")
+            return
+        policy["accept"] = ("none", "reasoning_content")
+        if send(model="haiku", with_thinking=False) != 200:
+            fail("thinking-free turn did not succeed")
+            return
+        policy["accept"] = ("reasoning_content",)
+        for i in (1, 2):
+            if send(model="haiku") != 200:
+                fail("thinking-free pair complaint %d not served" % i)
+                return
+        entry = _reasoning_entry(state_path, model="claude-haiku-4-5")
+        if entry is None or entry.get("selection") != "reasoning_content":
+            fail("a thinking-free success reset the ladder (the switch "
+                 "should have landed on the third complaint): %r"
+                 % (entry,))
+            return
+        pass_("a thinking-free successful turn did not reset the ladder")
+    finally:
+        cleanup()
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def test_reasoning_transient_complaint_does_not_switch():
+    """A single matched complaint followed by first-attempt successes leaves
+    the persisted selection unchanged — the pin for the default-never-settles
+    defect."""
+    print("\n--- Test: Reasoning Transient Complaint Does Not Switch ---")
+    state_dir, state_path = _make_state_dir()
+    policy = {"accept": ("reasoning_content",)}
+    responders = {"p": _reasoning_upstream(policy)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
+        _start_reasoning_proxy(responders, state_path)
+    if proc is None:
+        shutil.rmtree(state_dir, ignore_errors=True)
+        fail("Failed to set up test")
+        return
+    try:
+        status, _ = _send(proxy_port, _reasoning_request())
+        if status != 200:
+            fail("the transient complaint was not absorbed by the walk (%s)"
+                 % status)
+            return
+        if _reasoning_entry(state_path) is not None:
+            fail("a single complaint persisted a selection")
+            return
+        policy["accept"] = ("none", "reasoning_content")
+        for i in (1, 2):
+            status, _ = _send(proxy_port, _reasoning_request())
+            if status != 200:
+                fail("follow-up success %d failed (%s)" % (i, status))
+                return
+        if _reasoning_entry(state_path) is not None:
+            fail("the default settled: a lone complaint plus successes "
+                 "persisted a selection")
+            return
+        pass_("a lone transient complaint left the persisted selection "
+              "unchanged")
+    finally:
+        cleanup()
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def test_reasoning_success_serves_client_during_learning():
+    """While the count is below the threshold a complaint is absorbed by an
+    in-request retry and the client still receives a 200, although the
+    persisted selection has not changed.
+
+    The mock upstream is strict about the echoed field, so a walk that re-sent
+    the resolved selection instead of the advanced candidate fails here rather
+    than passing quietly."""
+    print("\n--- Test: Reasoning Success Serves Client During Learning ---")
+    state_dir, state_path = _make_state_dir()
+    policy = {"accept": ("reasoning_content",)}
+    log = []
+    responders = {"p": _reasoning_upstream(policy, log=log)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
+        _start_reasoning_proxy(responders, state_path)
+    if proc is None:
+        shutil.rmtree(state_dir, ignore_errors=True)
+        fail("Failed to set up test")
+        return
+    try:
+        status, _ = _send(proxy_port, _reasoning_request())
+        if status != 200:
+            fail("client did not receive a 200 during learning (%s)" % status)
+            return
+        if _reasoning_entry(state_path) is not None:
+            fail("the persisted selection changed below the threshold")
+            return
+        sent = [_sent_reasoning_field(i) for i in log]
+        if sent != [None, "reasoning_content"]:
+            fail("expected the walk to send no field then the advanced "
+                 "candidate; upstream saw %r" % (sent,))
+            return
+        pass_("client served 200 during learning; the walk sent the advanced "
+              "candidate, not the resolved selection")
+    finally:
+        cleanup()
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def test_reasoning_walk_sends_advanced_candidate():
+    """A walk step from a persisted `reasoning_content` selection sends exactly
+    `reasoning`; from a persisted `reasoning` selection it sends no field at
+    all — the literal "none" candidate.
+
+    The wrap step is the pin for the sentinel collision: a resolver keyed on
+    the parameter's value rather than on None re-resolves there and re-sends
+    the body that just failed."""
+    print("\n--- Test: Reasoning Walk Sends Advanced Candidate ---")
+    for seeded, accepted, expect_sent, label in (
+            ("reasoning_content", "reasoning",
+             ["reasoning_content", "reasoning"],
+             "reasoning_content -> reasoning"),
+            ("reasoning", "none",
+             ["reasoning", None],
+             "reasoning -> none (no field emitted)")):
+        state_dir, state_path = _make_state_dir()
+        _seed_reasoning_state(state_path, seeded)
+        policy = {"accept": (accepted,)}
+        log = []
+        responders = {"p": _reasoning_upstream(policy, log=log)}
+        temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
+            _start_reasoning_proxy(responders, state_path)
+        if proc is None:
+            shutil.rmtree(state_dir, ignore_errors=True)
+            fail("Failed to set up test (%s)" % label)
+            return
+        try:
+            status, _ = _send(proxy_port, _reasoning_request())
+            if status != 200:
+                fail("%s: walk was not served (%s)" % (label, status))
+                return
+            sent = [_sent_reasoning_field(i) for i in log]
+            if sent != expect_sent:
+                fail("%s: expected %r, upstream saw %r — the wrap step "
+                     "re-resolved instead of using the advanced candidate"
+                     % (label, expect_sent, sent))
+                return
+            pass_("walk advanced %s" % label)
+        finally:
+            cleanup()
+            shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def test_reasoning_full_walk_latches():
+    """One full walk does not latch a pair; two consecutive ones do. A
+    feature-active success in between clears the full-walk counter, so two
+    non-consecutive walks never latch. Latching sends no field, issues no
+    retry, spares the persisted selection, and does not survive a restart."""
+    print("\n--- Test: Reasoning Full Walk Latches ---")
+    state_dir, state_path = _make_state_dir()
+    _seed_reasoning_state(state_path, "reasoning_content")
+    policy = {"accept": ()}       # nothing accepted: every candidate 400s
+    responders = {"p": _reasoning_upstream(policy)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
+        _start_reasoning_proxy(responders, state_path)
+    if proc is None:
+        shutil.rmtree(state_dir, ignore_errors=True)
+        fail("Failed to set up test")
+        return
+    try:
+        def send(model="sonnet", with_thinking=True):
+            return _send(proxy_port, _reasoning_request(
+                model=model, with_thinking=with_thinking))[0]
+
+        def latched_events():
+            return _compat_trace_events(trace_file, "compatibility_latched")
+
+        # One request's full walk is one upstream condition examined three
+        # times, not three independent observations.
+        if send() != 400:
+            fail("a fully-complaining walk should return the original 400")
+            return
+        calls = len(mock_servers["p"]["requests"])
+        if calls != 3:
+            fail("expected 3 upstream calls for a full walk (initial + 2 "
+                 "walk steps), got %d" % calls)
+            return
+        if latched_events():
+            fail("a single full walk latched the pair")
+            return
+        pass_("one full walk did not latch")
+
+        if send() != 400:
+            fail("second full walk should return the original 400")
+            return
+        if not latched_events():
+            fail("two consecutive full walks did not latch")
+            return
+        pass_("two consecutive full walks latched the pair")
+
+        # Latched: no field, no retry, persisted selection untouched.
+        before = len(mock_servers["p"]["requests"])
+        if send() != 400:
+            fail("latched request should return the original 400")
+            return
+        if len(mock_servers["p"]["requests"]) - before != 1:
+            fail("a latched pair still issued walk retries")
+            return
+        entry = _reasoning_entry(state_path)
+        if entry is None or entry.get("selection") != "reasoning_content":
+            fail("the latch rewrote the persisted selection: %r" % (entry,))
+            return
+        pass_("latched: no field, no retry, persisted selection untouched")
+
+        # Consecutiveness: a success clears the full-walk counter, so two
+        # non-consecutive walks must not latch.
+        if send(model="haiku") != 400:
+            fail("full walk on the second pair should return 400")
+            return
+        policy["accept"] = ("none",)
+        if send(model="haiku") != 200:
+            fail("the intervening success did not return 200")
+            return
+        policy["accept"] = ()
+        before = len(latched_events())
+        if send(model="haiku") != 400:
+            fail("post-success full walk should return 400")
+            return
+        if len(latched_events()) != before:
+            fail("two non-consecutive full walks latched the pair — the "
+                 "success in between did not clear the counter")
+            return
+        if send(model="haiku") != 400:
+            fail("second consecutive full walk should return 400")
+            return
+        if len(latched_events()) == before:
+            fail("two consecutive full walks after the reset did not latch")
+            return
+        pass_("a feature-active success cleared the full-walk counter")
+    finally:
+        cleanup()
+
+    # The latch is session-scoped: a fresh process starts from the persisted
+    # state, so its first full walk does not latch.
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
+        _start_reasoning_proxy(responders, state_path)
+    if proc is None:
+        shutil.rmtree(state_dir, ignore_errors=True)
+        fail("restart proxy failed to start")
+        return
+    try:
+        if _send(proxy_port, _reasoning_request())[0] != 400:
+            fail("post-restart full walk should return 400")
+            return
+        calls = len(mock_servers["p"]["requests"])
+        if calls != 3:
+            fail("post-restart pair started latched: expected a 3-call full "
+                 "walk, got %d call(s)" % calls)
+            return
+        pass_("the latch did not survive a restart")
+    finally:
+        cleanup()
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def test_reasoning_non_complaint_errors_are_not_counted():
+    """A 401/403/500, an unparseable body, and an unrelated 400 naming no
+    reasoning field never increment the counter, advance the selection, or
+    latch. A non-complaint result inside a walk stops the walk and returns the
+    ORIGINAL top-level result to the client."""
+    print("\n--- Test: Reasoning Non-Complaint Errors Are Not Counted ---")
+    state_dir, state_path = _make_state_dir()
+    runner = {"mode": "500", "n": 0}
+
+    def upstream(info):
+        runner["n"] += 1
+        mode = runner["mode"]
+        if mode == "complaint":
+            if (_sent_reasoning_field(info) or "none") == "reasoning_content":
+                return _chat_ok_response(info)
+            return 400, "application/json", REASONING_MESSAGE_400
+        if mode == "complaint_then_500":
+            if runner["n"] == 1:
+                return 400, "application/json", REASONING_MESSAGE_400
+            return 500, "application/json", b'{"error":"boom"}'
+        if mode == "500":
+            return 500, "application/json", b'{"error":"boom"}'
+        if mode == "401":
+            return 401, "application/json", b'{"error":"unauthorized"}'
+        if mode == "403":
+            return 403, "application/json", b'{"error":"forbidden"}'
+        if mode == "unparseable":
+            return 400, "application/json", b"this is not json at all"
+        if mode == "unrelated_400":
+            return 400, "application/json", json.dumps({
+                "type": "error",
+                "error": {"type": "invalid_request_error",
+                          "message": "Invalid request payload"},
+            }).encode()
+        raise AssertionError("unknown upstream mode %r" % mode)
+
+    def set_mode(mode):
+        runner["mode"] = mode
+        runner["n"] = 0
+
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
+        _start_reasoning_proxy({"p": upstream}, state_path)
+    if proc is None:
+        shutil.rmtree(state_dir, ignore_errors=True)
+        fail("Failed to set up test")
+        return
+    try:
+        def send(model="sonnet"):
+            before = len(mock_servers["p"]["requests"])
+            status, _ = _send(proxy_port, _reasoning_request(model=model))
+            return status, len(mock_servers["p"]["requests"]) - before
+
+        # Every non-complaint shape passes straight through: no walk.
+        for mode, model, expect in (("500", "sonnet", 500),
+                                    ("401", "sonnet", 401),
+                                    ("403", "sonnet", 403),
+                                    ("unparseable", "sonnet", 400),
+                                    ("unrelated_400", "sonnet", 400)):
+            set_mode(mode)
+            status, calls = send()
+            if status != expect:
+                fail("%s: client saw %s, expected %s" % (mode, status, expect))
+                return
+            if calls != 1:
+                fail("%s: expected 1 upstream call (no walk), got %d"
+                     % (mode, calls))
+                return
+        pass_("401/403/500/unparseable/unrelated-400 never started a walk")
+
+        # Two 500s must not count toward the ladder: the switch still needs
+        # three complaints from here.
+        set_mode("500")
+        send()
+        send()
+        if _reasoning_entry(state_path) is not None:
+            fail("a non-complaint error mutated the counter or persisted "
+                 "state")
+            return
+        set_mode("complaint")
+        for i in (1, 2):
+            status, _ = send()
+            if status != 200:
+                fail("complaint %d not served (%s)" % (i, status))
+                return
+        if _reasoning_entry(state_path) is not None:
+            fail("the 500s counted toward the ladder: the switch landed "
+                 "after only two real complaints")
+            return
+        status, _ = send()
+        if status != 200:
+            fail("third complaint not served (%s)" % status)
+            return
+        if _reasoning_entry(state_path) is None:
+            fail("three real complaints did not persist the switch")
+            return
+        pass_("non-complaint errors did not count toward the ladder")
+
+        # A non-complaint result inside a walk stops it and returns the
+        # ORIGINAL top-level result, not the walk's error.
+        set_mode("complaint_then_500")
+        status, calls = send(model="haiku")
+        if status != 400:
+            fail("a stopped walk returned %s to the client; it must return "
+                 "the original 400 it provoked" % status)
+            return
+        if calls != 2:
+            fail("expected the walk to stop after 1 retry (2 calls), got %d"
+                 % calls)
+            return
+        if _reasoning_entry(state_path, model="claude-haiku-4-5") is not None:
+            fail("a stopped walk persisted state")
+            return
+        if _compat_trace_events(trace_file, "compatibility_latched"):
+            fail("a non-complaint error latched the pair")
+            return
+        pass_("a non-complaint walk step stopped the walk and returned the "
+              "original result")
+    finally:
+        cleanup()
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def test_reasoning_matcher_shapes():
+    """The reasoning complaint matcher accepts every shape that names a field
+    and rejects everything else — including the echoed-request traversal — and
+    a body deep enough to make json.loads raise degrades to False for both
+    matchers."""
+    print("\n--- Test: Reasoning Matcher Shapes ---")
+    import claude_retry_proxy.compat as compat
+    match = compat._reasoning_complaint_match
+
+    def envelope(text, **extra):
+        err = {"type": "invalid_request_error", "message": text}
+        err.update(extra)
+        return json.dumps({"type": "error", "error": err}).encode()
+
+    accepted = [
+        ("pass-back form",
+         envelope("The reasoning_content in the thinking mode must be passed "
+                  "back to the API.")),
+        ("both-fields form",
+         envelope("assistant reasoning and reasoning_content cannot both be "
+                  "specified")),
+        ("bare field name", envelope("reasoning_content")),
+        ("sentence-final form", envelope("unknown field reasoning_content.")),
+        ("vllm-style field name", envelope("unknown field reasoning.")),
+        ("structured loc form", json.dumps({"type": "error", "error": {
+            "type": "invalid_request_error",
+            "message": "Extra inputs are not permitted",
+            "code": "extra_forbidden",
+            "loc": ["messages", 0, "reasoning_content"],
+        }}).encode()),
+    ]
+    for label, body in accepted:
+        if not match(400, body):
+            fail("matcher rejected the %s: %r" % (label, body))
+            return
+
+    rejected = [
+        ("dotted nested path as prose", 400,
+         envelope("messages.0.reasoning_content")),
+        ("field only inside an echoed request payload", 400, json.dumps({
+            "type": "error", "error": {
+                "type": "invalid_request_error",
+                "message": "Invalid request payload",
+                "request": {"messages": [
+                    {"role": "assistant", "reasoning_content": "x"}]},
+            }}).encode()),
+        ("structured loc naming another feature's field", 400,
+         json.dumps({"type": "error", "error": {
+             "code": "extra_forbidden", "loc": ["body", "context_management"],
+         }}).encode()),
+    ]
+    rejected += REJECTED_BODY_CORPUS
+    for label, status, body in rejected:
+        if match(status, body):
+            fail("matcher accepted the %s (status %d): %r"
+                 % (label, status, body[:120]))
+            return
+
+    deep = b"[" * 100000 + b"]" * 100000
+    for name, fn in (("reasoning", match),
+                     ("context_management", compat._compat_rejection_match)):
+        try:
+            got = fn(400, deep)
+        except Exception as e:
+            fail("%s matcher raised on deeply nested input: %r" % (name, e))
+            return
+        if got:
+            fail("%s matcher matched deeply nested input" % name)
+            return
+
+    pass_("matcher shapes: %d accepted, %d rejected, deep nesting degrades "
+          "to False for both matchers" % (len(accepted), len(rejected)))
+
+
+def test_reasoning_delist_on_none_success():
+    """A walk whose advanced candidate is the literal "none" and which
+    succeeds removes the entry rather than writing selection: "none", so
+    absence is what the next load resolves the default from."""
+    print("\n--- Test: Reasoning Delist On None Success ---")
+    state_dir, state_path = _make_state_dir()
+    _seed_reasoning_state(state_path, "reasoning")
+    policy = {"accept": ("none",)}
+    responders = {"p": _reasoning_upstream(policy)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
+        _start_reasoning_proxy(responders, state_path)
+    if proc is None:
+        shutil.rmtree(state_dir, ignore_errors=True)
+        fail("Failed to set up test")
+        return
+    try:
+        for i in (1, 2):
+            status, _ = _send(proxy_port, _reasoning_request())
+            if status != 200:
+                fail("complaint %d not served (%s)" % (i, status))
+                return
+            entry = _reasoning_entry(state_path)
+            if entry is None or entry.get("selection") != "reasoning":
+                fail("the selection changed below the threshold: %r"
+                     % (entry,))
+                return
+        status, _ = _send(proxy_port, _reasoning_request())
+        if status != 200:
+            fail("third complaint not served (%s)" % status)
+            return
+        entry = _reasoning_entry(state_path)
+        if entry is not None:
+            fail("the successful 'none' candidate should have delisted the "
+                 "entry, found %r" % (entry,))
+            return
+        events = [e.get("event") for e in _compat_trace_events(trace_file)]
+        if "compatibility_delisted" not in events:
+            fail("no compatibility_delisted event: %r" % (events,))
+            return
+        pass_("the successful 'none' candidate delisted the entry instead of "
+              "writing selection: none")
+    finally:
+        cleanup()
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def test_reasoning_persist_via_second_candidate():
+    """A switch whose successful walk candidate is the SECOND step persists
+    that candidate, not the first.
+
+    Both other persistence tests reach their switch through walk step 1; this
+    pins the step-2 path — step 1 complains, step 2 returns 2xx at or above
+    the threshold — where the persisted selection must be the candidate whose
+    own attempt was served."""
+    print("\n--- Test: Reasoning Persist Via Second Candidate ---")
+    state_dir, state_path = _make_state_dir()
+    policy = {"accept": ("reasoning",)}   # step 1 rejected, step 2 accepted
+    log = []
+    responders = {"p": _reasoning_upstream(policy, log=log)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
+        _start_reasoning_proxy(responders, state_path)
+    if proc is None:
+        shutil.rmtree(state_dir, ignore_errors=True)
+        fail("Failed to set up test")
+        return
+    try:
+        # Two complaints are absorbed by the walk (step 2 serves the client)
+        # but must not persist: the ladder only climbs to 2.
+        for i in (1, 2):
+            status, _ = _send(proxy_port, _reasoning_request())
+            if status != 200:
+                fail("complaint %d not served by the walk (%s)" % (i, status))
+                return
+            entry = _reasoning_entry(state_path)
+            if entry is not None:
+                fail("a switch landed below the threshold (%d complaint(s)): "
+                     "%r" % (i, entry))
+                return
+        pass_("two step-2-served complaints did not switch")
+
+        # The third consecutive complaint reaches the threshold: the walk's
+        # own 2xx persists the candidate it actually tried and served.
+        before = len(log)
+        status, _ = _send(proxy_port, _reasoning_request())
+        if status != 200:
+            fail("third complaint not served by the walk (%s)" % status)
+            return
+        entry = _reasoning_entry(state_path)
+        if entry is None or entry.get("selection") != "reasoning":
+            fail("the step-2 candidate did not persist (persisted via step 1 "
+                 "instead?): %r" % (entry,))
+            return
+        sent = [_sent_reasoning_field(i) for i in log[before:]]
+        if sent != [None, "reasoning_content", "reasoning"]:
+            fail("expected the walk to climb none -> reasoning_content -> "
+                 "reasoning; upstream saw %r" % (sent,))
+            return
+        events = [e.get("event") for e in _compat_trace_events(trace_file)]
+        if "compatibility_learned" not in events:
+            fail("no compatibility_learned event: %r" % (events,))
+            return
+        pass_("the step-2 candidate persisted, not the step-1 candidate")
+    finally:
+        cleanup()
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def test_reasoning_walk_success_clears_full_walks():
+    """A walk candidate's own 2xx clears the full-walk counter, so a full walk
+    before and one after a walk-served request never latch the pair.
+
+    Nested walk calls run with suppress_compat=True, so their success never
+    reaches the request-level reset; absent the walk-level clear, those two
+    full walks would sit on two NON-consecutive requests and still latch."""
+    print("\n--- Test: Reasoning Walk Success Clears Full Walks ---")
+    state_dir, state_path = _make_state_dir()
+    policy = {"accept": ()}       # nothing accepted: every candidate 400s
+    responders = {"p": _reasoning_upstream(policy)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
+        _start_reasoning_proxy(responders, state_path)
+    if proc is None:
+        shutil.rmtree(state_dir, ignore_errors=True)
+        fail("Failed to set up test")
+        return
+    try:
+        def send():
+            before = len(mock_servers["p"]["requests"])
+            status, _ = _send(proxy_port, _reasoning_request())
+            return status, len(mock_servers["p"]["requests"]) - before
+
+        def latched():
+            return _compat_trace_events(trace_file, "compatibility_latched")
+
+        # (a) One full walk: the full-walk counter stands at 1, no latch.
+        status, calls = send()
+        if (status, calls) != (400, 3):
+            fail("full walk (a): status %s, %d call(s) (expected 400, 3)"
+                 % (status, calls))
+            return
+        if latched():
+            fail("the first full walk latched the pair")
+            return
+        pass_("full walk #1 did not latch")
+
+        # (b) A request whose walk candidate succeeds: the client is served and
+        # the full-walk counter is cleared by that candidate's own 2xx.
+        policy["accept"] = ("reasoning",)
+        status, calls = send()
+        if (status, calls) != (200, 3):
+            fail("walk-served request: status %s, %d call(s) (expected 200, 3)"
+                 % (status, calls))
+            return
+        pass_("a walk candidate's 2xx served the client")
+
+        # (c) A full walk after the walk-served request counts from zero: the
+        # two full walks are non-consecutive, so nothing latches.
+        policy["accept"] = ()
+        status, calls = send()
+        if (status, calls) != (400, 3):
+            fail("full walk (c): status %s, %d call(s) (expected 400, 3)"
+                 % (status, calls))
+            return
+        if latched():
+            fail("two NON-consecutive full walks latched the pair — the walk "
+                 "candidate's success did not clear the full-walk counter")
+            return
+        pass_("the walk success cleared the full-walk counter")
+
+        # (d) The next consecutive full walk latches, proving (c) was a genuine
+        # reset rather than a latch that never fires.
+        status, calls = send()
+        if (status, calls) != (400, 3):
+            fail("full walk (d): status %s, %d call(s) (expected 400, 3)"
+                 % (status, calls))
+            return
+        if not latched():
+            fail("two consecutive full walks after the walk-served request "
+                 "did not latch")
+            return
+        pass_("the next consecutive full walk latched the pair")
+
+        # Latched: no retry is issued for the pair.
+        status, calls = send()
+        if (status, calls) != (400, 1):
+            fail("latched pair: status %s, %d call(s) (expected 400, 1 — no "
+                 "walk)" % (status, calls))
+            return
+        pass_("the latched pair issued no retry")
+    finally:
+        cleanup()
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def test_reasoning_threshold_reads_module_binding():
+    """The strike-ladder threshold is read from compat's module binding at the
+    decision point, so monkeypatching compat.COMPAT_REASONING_SWITCH_THRESHOLD
+    — directly, or through the clamp _compat_validate_constants applies —
+    changes the persist outcome.
+
+    A by-value copy of the constant anywhere on that path (a def-time default
+    argument, or a name imported into the server module) would make the
+    monkeypatch inert and fail these assertions."""
+    print("\n--- Test: Reasoning Threshold Reads Module Binding ---")
+    import claude_retry_proxy.server as srv
+    import claude_retry_proxy.compat as compat
+
+    state_dir, state_path = _make_state_dir()
+    saved_path = srv.SETTINGS.feature_compat_file
+    saved_threshold = compat.COMPAT_REASONING_SWITCH_THRESHOLD
+    key = ("threshold-provider", "chat", "threshold-model", "reasoning_field")
+    try:
+        # No by-value copy of the constant may exist on the server side: the
+        # one comparison site must read the module binding the clamp rebinds.
+        if hasattr(srv, "COMPAT_REASONING_SWITCH_THRESHOLD"):
+            fail("server.py holds a by-value copy of "
+                 "COMPAT_REASONING_SWITCH_THRESHOLD; the threshold comparison "
+                 "must read compat's (possibly clamped) module binding")
+            return
+        srv.SETTINGS.feature_compat_file = state_path
+
+        # Shipped threshold (3): a ladder of 2 sits below it — no persist.
+        state = compat._CompatState()
+        state.reasoning_complaints[key] = ("reasoning_content", 2)
+        compat._reasoning_persist_switch(key, "reasoning", "req-w1", "sonnet",
+                                         state=state)
+        if key in state.entries:
+            fail("a ladder of 2 persisted at the shipped threshold 3: %r"
+                 % (state.entries.get(key),))
+            return
+
+        # Monkeypatch the module binding to 2: the same ladder now persists.
+        compat.COMPAT_REASONING_SWITCH_THRESHOLD = 2
+        compat._reasoning_persist_switch(key, "reasoning", "req-w1", "sonnet",
+                                         state=state)
+        entry = state.entries.get(key)
+        if entry is None or entry.get("selection") != "reasoning":
+            fail("monkeypatching COMPAT_REASONING_SWITCH_THRESHOLD did not "
+                 "change the persist outcome — the comparison site does not "
+                 "read the module binding: %r" % (entry,))
+            return
+        if _reasoning_entry(state_path, model="threshold-model",
+                            provider="threshold-provider") is None:
+            fail("the switched entry was not persisted to the state file")
+            return
+        pass_("the module binding drives the persist outcome at the shipped "
+              "threshold")
+
+        # The clamp path: an invalid threshold is clamped to 2 by
+        # _compat_validate_constants, and the outcome follows the clamped value.
+        compat.COMPAT_REASONING_SWITCH_THRESHOLD = 1
+        compat._compat_validate_constants()
+        if compat.COMPAT_REASONING_SWITCH_THRESHOLD != 2:
+            fail("_compat_validate_constants did not clamp the reasoning switch "
+                 "threshold to 2: %r"
+                 % (compat.COMPAT_REASONING_SWITCH_THRESHOLD,))
+            return
+
+        state2 = compat._CompatState()
+        state2.reasoning_complaints[key] = ("reasoning_content", 1)
+        compat._reasoning_persist_switch(key, "reasoning", "req-w1", "sonnet",
+                                         state=state2)
+        if key in state2.entries:
+            fail("a ladder of 1 persisted at the clamped threshold 2")
+            return
+        state2.reasoning_complaints[key] = ("reasoning_content", 2)
+        compat._reasoning_persist_switch(key, "reasoning", "req-w1", "sonnet",
+                                         state=state2)
+        if state2.entries.get(key, {}).get("selection") != "reasoning":
+            fail("a ladder of 2 did not persist at the clamped threshold 2")
+            return
+        pass_("the clamped module value drives the persist outcome")
+    finally:
+        compat.COMPAT_REASONING_SWITCH_THRESHOLD = saved_threshold
+        srv.SETTINGS.feature_compat_file = saved_path
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def test_reasoning_latched_outcome_issues_no_retry():
+    """A latched pair hands the client its original top-level result and
+    issues NO upstream call, even when _reasoning_outcome is entered directly
+    — bypassing the dispatch-site latch check, which is exactly the
+    interleaving this pins.
+
+    A latch re-check is only meaningful after the retry lock is acquired; a
+    lock owner can latch the pair and release between the dispatch-site test
+    and the acquire, and the re-check is what still stops the walk."""
+    print("\n--- Test: Latched Outcome Issues No Retry ---")
+    import claude_retry_proxy.server as srv
+    import claude_retry_proxy.compat as compat
+
+    key = ("latched-provider", "chat", "latched-model", "reasoning_field")
+    feature = compat.COMPAT_FEATURES["reasoning_field"]
+    original = (400, {}, b'{"type":"error"}', None, 0.0, 0, "sonnet", "p",
+                "claude-sonnet-5")
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append(args)
+        # A non-complaint failure: if the latch were bypassed, the walk would
+        # stop here and the recorded call is what fails the test.
+        return (500, {}, b'{"error":"unreached"}', None, 0.0, 0, "sonnet",
+                "p", "claude-sonnet-5")
+
+    # The retry lock must be genuinely free first: a held lock would return
+    # early for a different reason and make the test vacuous.
+    if not feature.retry_lock.acquire(blocking=False):
+        fail("the reasoning retry lock was already held — cannot isolate L1")
+        return
+    feature.retry_lock.release()
+
+    saved_forward = srv._forward_request_impl
+    compat._state.reasoning_latched[key] = True
+    srv._forward_request_impl = spy
+    try:
+        got = srv._reasoning_outcome(
+            original, key, "reasoning_content", "req-l1", "sonnet",
+            "POST", "/v1/messages", {}, b'{"x": 1}', None, None, None)
+        if calls:
+            fail("a latched pair forwarded %d upstream call(s) — "
+                 "_reasoning_outcome did not re-check the latch after "
+                 "acquiring the retry lock" % len(calls))
+            return
+        if got is not original:
+            fail("a latched pair must return the original top-level result "
+                 "unchanged, got %r" % (got,))
+            return
+        pass_("the latched pair returned the original result with no upstream "
+              "call")
+    finally:
+        srv._forward_request_impl = saved_forward
+        compat._state.reasoning_latched.pop(key, None)
+        compat._state.reasoning_complaints.pop(key, None)
+        compat._state.reasoning_full_walks.pop(key, None)
+
+
 ALL_TESTS = [
     # A. Persistence / state
     ("compat-state-load-missing-file", test_compat_state_load_missing_file),
@@ -2531,6 +3735,19 @@ ALL_TESTS = [
     ("compat-retry-stream-interaction", test_compat_retry_stream_interaction),
     # F. Trace privacy
     ("compat-trace-metadata-only", test_compat_trace_metadata_only),
+    # G. reasoning_field (chat mode)
+    ("reasoning-switch-needs-three-consecutive-complaints", test_reasoning_switch_needs_three_consecutive_complaints),
+    ("reasoning-transient-complaint-does-not-switch", test_reasoning_transient_complaint_does_not_switch),
+    ("reasoning-success-serves-client-during-learning", test_reasoning_success_serves_client_during_learning),
+    ("reasoning-walk-sends-advanced-candidate", test_reasoning_walk_sends_advanced_candidate),
+    ("reasoning-full-walk-latches", test_reasoning_full_walk_latches),
+    ("reasoning-non-complaint-errors-are-not-counted", test_reasoning_non_complaint_errors_are_not_counted),
+    ("reasoning-matcher-shapes", test_reasoning_matcher_shapes),
+    ("reasoning-delist-on-none-success", test_reasoning_delist_on_none_success),
+    ("reasoning-persist-via-second-candidate", test_reasoning_persist_via_second_candidate),
+    ("reasoning-walk-success-clears-full-walks", test_reasoning_walk_success_clears_full_walks),
+    ("reasoning-threshold-reads-module-binding", test_reasoning_threshold_reads_module_binding),
+    ("reasoning-latched-outcome-issues-no-retry", test_reasoning_latched_outcome_issues_no_retry),
 ]
 
 

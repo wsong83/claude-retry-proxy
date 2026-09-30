@@ -367,7 +367,8 @@ stripped first to avoid doubling (e.g., `https://api.openai.com/v1` →
 converts the full conversation history including text, tools, tool_use, and
 tool_result items to the Responses API format. Chat-mode
 non-streaming requests correctly transform tool_use/tool_result in both
-directions (thinking blocks converted to reasoning_content, tool_use→tool_calls, tool_result→role:tool).
+directions (thinking blocks echo the learned per-pair `reasoning_field` — nothing by default,
+`reasoning_content` or `reasoning` once learned — tool_use→tool_calls, tool_result→role:tool).
 Chat-mode streaming correctly converts tool-call SSE deltas to Anthropic
 `tool_use` content blocks (per-index state, parallel/interleaved support,
 dict-only JSON validation, conservative degradation on malformed/truncated
@@ -552,7 +553,7 @@ detailed reference, indexed by [doc/content.html](doc/content.html):
 | [doc/provider-modes.html](doc/provider-modes.html) | The `anthropic` / `chat` / `response` modes: auth headers, path rewriting, request and response transforms, SSE, tool-call degradation |
 | [doc/configuration.html](doc/configuration.html) | the `config.json`, `models.json`, and `keys-index.json` documents, environment variables, validation rules |
 | [doc/operations.html](doc/operations.html) | CLI commands, readiness protocol, passphrase handling, admin API and CSRF, shutdown, runtime artifacts |
-| [doc/compatibility.html](doc/compatibility.html) | The `context_management` compatibility learner: states, transitions, suppression, persistence |
+| [doc/compatibility.html](doc/compatibility.html) | The compatibility learner's registry: the `context_management` state machine (states, transitions, suppression) and the `reasoning_field` selection (walk, matcher, latch), plus shared persistence |
 | [doc/trace-log.html](doc/trace-log.html) | Trace entry schema, event inventory, `--all`, file permissions, pruning, analysis |
 | [doc/test-catalog.html](doc/test-catalog.html) | Test suite layout, harness helpers, isolation, patterns, anti-patterns |
 

@@ -15,12 +15,14 @@ __all__ = ["_anthropic_to_chat", "_transform_anthropic_messages_to_chat",
 
 
 def _anthropic_to_chat(body_json, request_id=None, mode=None, provider=None,
-                       tier=None):
+                       tier=None, reasoning_selection="none"):
     """Transform an Anthropic Messages request into OpenAI Chat Completions.
 
     Builds `out` without mutating `body_json`. messages / tools / tool_choice
     are transformed via the _transform_anthropic_*_to_chat helpers; thinking /
     metadata / top_k are Anthropic-specific request config and are dropped.
+    `reasoning_selection` is forwarded to the messages transform to choose the
+    echo field (see _transform_anthropic_messages_to_chat).
     """
     out = {}
     if "model" in body_json:
@@ -29,7 +31,8 @@ def _anthropic_to_chat(body_json, request_id=None, mode=None, provider=None,
     if "messages" in body_json:
         out["messages"] = _transform_anthropic_messages_to_chat(
             body_json.get("messages", []), request_id=request_id, mode=mode,
-            provider=provider, tier=tier, cache_stripped_out=cache_locations)
+            provider=provider, tier=tier, cache_stripped_out=cache_locations,
+            reasoning_selection=reasoning_selection)
 
     system = body_json.get("system")
     system_text = None
@@ -78,15 +81,19 @@ def _anthropic_to_chat(body_json, request_id=None, mode=None, provider=None,
 
 def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
                                           provider=None, tier=None,
-                                          cache_stripped_out=None):
+                                          cache_stripped_out=None,
+                                          reasoning_selection="none"):
     """Convert an Anthropic messages array into OpenAI Chat messages.
 
-    Always returns a new list (never mutates the input). thinking blocks are
-    converted to reasoning_content on the assistant message; redacted_thinking
-    blocks with non-empty data are converted to a placeholder; image / unknown
-    blocks are stripped; tool_use and tool_result are converted to OpenAI
-    tool_calls / role:tool messages; cache_control is stripped from kept
-    blocks. cache_control_stripped is reported to the caller via the optional
+    Always returns a new list (never mutates the input). A thinking block's
+    text is echoed on the assistant message under exactly one field, chosen by
+    `reasoning_selection`: "reasoning_content" or "reasoning" emits that field
+    only; anything else (the default "none", None, or an unrecognized value)
+    emits no reasoning field at all — never both. redacted_thinking blocks with
+    non-empty data are converted to a placeholder; image / unknown blocks are
+    stripped; tool_use and tool_result are converted to OpenAI tool_calls /
+    role:tool messages; cache_control is stripped from kept blocks.
+    cache_control_stripped is reported to the caller via the optional
     cache_stripped_out list rather than logged here, so _anthropic_to_chat can
     coalesce one event per request.
     """
@@ -207,9 +214,9 @@ def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
                 dropped["unknown"] += 1
             def _assistant_msg(content):
                 m = {"role": "assistant", "content": content}
-                if reasoning_text is not None:
-                    m["reasoning_content"] = reasoning_text
-                    m["reasoning"] = reasoning_text
+                if reasoning_text is not None and reasoning_selection in (
+                        "reasoning_content", "reasoning"):
+                    m[reasoning_selection] = reasoning_text
                 return m
 
             if tool_calls and text_parts:

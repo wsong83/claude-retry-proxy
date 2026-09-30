@@ -10,7 +10,7 @@
 
 <h1>Test Catalog<span class="sub">Suite layout, harness isolation, and testing patterns</span></h1>
 
-<p><strong>Last updated:</strong> 2026-09-18</p>
+<p><strong>Last updated:</strong> 2026-09-30</p>
 
 <p>The suite is a set of per-area modules merged by a single aggregator. It runs against
 <em>real</em> proxy processes and <em>real</em> mock upstream servers over loopback sockets —
@@ -18,9 +18,11 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>334 test functions across 19 files</strong>, but this number moves whenever
-tests are added. (That figure was <em>322 across 18</em> before this recount — the page had
-drifted two behind the suite, so the old total disagreed with its own catalog table as well.)
+suite has <strong>347 test functions across 19 files</strong>, but this number moves whenever
+tests are added. (It read <em>345 across 19</em> before this recount, <em>334 across 19</em>
+before that, and <em>322 across 18</em> before an earlier one — the page has drifted behind the
+suite three times, and in each case the stale total disagreed with the page's own catalog table
+as well.)
 Re-count before quoting it:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
 such as <code>doc_</code>). The aggregator's own tally is the authoritative figure — the
@@ -77,10 +79,11 @@ relative size, not as exact current figures.</p>
 
 <table>
 <tr><th>Module</th><th class="num">Tests</th><th>Covers</th></tr>
-<tr><td><code>test_compat.py</code></td><td class="num">44</td>
-    <td>The <code>context_management</code> learner — persistence, detection, state machine,
-        concurrency. See <a href="compatibility.html">compatibility.html</a>.</td></tr>
-<tr><td><code>test_chat_transform.py</code></td><td class="num">41</td>
+<tr><td><code>test_compat.py</code></td><td class="num">56</td>
+    <td>The compatibility learner — both features (<code>context_management</code>,
+        <code>reasoning_field</code>): persistence, detection, state machine, concurrency.
+        See <a href="compatibility.html">compatibility.html</a>.</td></tr>
+<tr><td><code>test_chat_transform.py</code></td><td class="num">42</td>
     <td>Anthropic → Chat Completions request and response transforms</td></tr>
 <tr><td><code>test_response_transform.py</code></td><td class="num">37</td>
     <td>Anthropic → Responses request and response transforms</td></tr>
@@ -272,11 +275,11 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> The Anthropic↔Chat request and response conversions, including tool calls, thinking blocks, and cache control.</p>
 
-<h4><code>tests/test_chat_transform.py</code> (41 tests) — Anthropic → Chat request and response transforms</h4>
+<h4><code>tests/test_chat_transform.py</code> (42 tests) — Anthropic → Chat request and response transforms</h4>
 <ul>
 <li><code>test_anthropic_to_chat_messages_transform</code>: Full message array (thinking/text/tool_use/tool_result) -&gt; valid OpenAI Chat messages.</li>
-<li><code>test_anthropic_to_chat_messages_thinking_stripped</code>: thinking is converted to reasoning_content; redacted_thinking non-empty data -&gt; placeholder.</li>
-<li><code>test_anthropic_to_chat_messages_redacted_thinking_trace</code>: redacted_thinking with non-empty data -&gt; placeholder reasoning_content + passthrough trace event.</li>
+<li><code>test_anthropic_to_chat_messages_thinking_stripped</code>: At the default selection no reasoning field is emitted for a thinking block; the echo is the learned per-pair selection's call, not an always-on conversion.</li>
+<li><code>test_anthropic_to_chat_messages_redacted_thinking_trace</code>: A placeholder reasoning field is emitted only for the <code>reasoning_content</code> / <code>reasoning</code> selections; the redacted_thinking passthrough trace event is unchanged.</li>
 <li><code>test_anthropic_to_chat_messages_tool_use_to_tool_calls</code>: tool_use block converts to tool_calls with JSON-stringified arguments.</li>
 <li><code>test_anthropic_to_chat_messages_tool_result_to_role_tool</code>: tool_result block in a user message becomes a separate role:tool message.</li>
 <li><code>test_anthropic_to_chat_messages_mixed_text_and_tool_use</code>: Assistant with both text and tool_use -&gt; text message first, then content:null + tool_calls.</li>
@@ -303,6 +306,7 @@ EOF</code></pre>
 <li><code>test_anthropic_to_chat_nan_placeholder_with_valid_tool_use</code>: NaN tool_use + valid tool_use coexist -&gt; placeholder as separate assistant message before tool_calls.</li>
 <li><code>test_anthropic_to_chat_tool_result_list_content</code>: tool_result.content as a list of text blocks is joined with newlines.</li>
 <li><code>test_anthropic_to_chat_no_input_mutation</code>: _anthropic_to_chat does not mutate the input dict or its nested structures.</li>
+<li><code>test_chat_transform_emits_only_selected_field</code>: The request-direction selection matrix — no reasoning field for <code>none</code> (default, explicit, <code>None</code>, or an unrecognized value); exactly <code>reasoning_content</code> or exactly <code>reasoning</code> for those selections; never both.</li>
 <li><code>test_chat_to_anthropic_basic</code>: content, model, stop_reason, usage mapped correctly.</li>
 <li><code>test_chat_to_anthropic_reasoning_content_to_thinking</code>: reasoning_content in the chat message becomes a thinking block first in content.</li>
 <li><code>test_chat_to_anthropic_reasoning_field_compat</code>: vLLM &#x27;reasoning&#x27; field is also recognized; reasoning_content wins when both present.</li>
@@ -405,9 +409,9 @@ EOF</code></pre>
 
 <h3 id="cat-7">Category 7 — Compatibility Learner</h3>
 
-<p><strong>Scope:</strong> The <code>context_management</code> probe ladder, probation, suppression, and its persistence file.</p>
+<p><strong>Scope:</strong> Both learner features — the <code>context_management</code> probe ladder, probation, suppression, and its persistence file, and the <code>reasoning_field</code> candidate walk, switch rule, and latch.</p>
 
-<h4><code>tests/test_compat.py</code> (44 tests) — the context_management learner</h4>
+<h4><code>tests/test_compat.py</code> (56 tests) — the compatibility learner</h4>
 <ul>
 <li><code>test_compat_state_load_missing_file</code>: Missing state file means empty state: discovery still works and no startup failure occurs.</li>
 <li><code>test_compat_state_load_corrupt_fails_open</code>: A corrupt (non-JSON) state file warns and fails open with empty state: requests forward unchanged and the proxy does not crash.</li>
@@ -453,6 +457,18 @@ EOF</code></pre>
 <li><code>test_compat_config_swap_during_retry</code>: The compatibility retry uses the entry-time config snapshot: the in-flight request completes against its original provider, and the admin switch (drained afterwards)…</li>
 <li><code>test_compat_retry_stream_interaction</code>: Interaction with streaming and the existing retry loop: learning works from streamed 2xx (status-receipt evidence, no rollback on mid-stream failure), and the 429/503…</li>
 <li><code>test_compat_trace_metadata_only</code>: All compatibility_* trace events are metadata-only: no field values, no prompt text, no raw upstream error text.</li>
+<li><code>test_reasoning_switch_needs_three_consecutive_complaints</code>: The <code>reasoning_field</code> selection advances only on the third consecutive matched complaint against it; an intervening 2xx-ended request resets the ladder, and after a persisted switch two further complaints do not advance it again.</li>
+<li><code>test_reasoning_transient_complaint_does_not_switch</code>: One matched complaint followed by 2xx-ended requests leaves the persisted selection unchanged — the pin for "the default never settles".</li>
+<li><code>test_reasoning_success_serves_client_during_learning</code>: Below the threshold a complaint is absorbed by an in-request walk and the client still receives a 200, with the persisted selection unchanged.</li>
+<li><code>test_reasoning_walk_sends_advanced_candidate</code>: Each walk step sends exactly the advanced candidate's field, including the wrap step whose candidate is the literal <code>"none"</code>.</li>
+<li><code>test_reasoning_full_walk_latches</code>: One full walk does not latch; the immediately consecutive one does; a successful request in between clears the accumulated evidence.</li>
+<li><code>test_reasoning_non_complaint_errors_are_not_counted</code>: A 401/403/500, an unparseable body, and a 400 naming no field neither increment nor latch, and a walk step returning one stops the walk with the original result returned.</li>
+<li><code>test_reasoning_matcher_shapes</code>: The reasoning matcher's accept/reject contract — message form, structured <code>loc</code> form, sentence-final form; rejects the dotted prose path, an echoed request payload, and every non-400.</li>
+<li><code>test_reasoning_delist_on_none_success</code>: A walk whose advanced candidate is <code>"none"</code> and which succeeds removes the entry rather than writing <code>selection: "none"</code>.</li>
+<li><code>test_reasoning_persist_via_second_candidate</code>: The walk's second candidate returning 2xx at or above the threshold persists that candidate — the persist path both earlier persistence tests skip.</li>
+<li><code>test_reasoning_walk_success_clears_full_walks</code>: A walk candidate's own 2xx clears the full-walk counter while leaving the strike ladder untouched, so a full walk before and after a walk-served request does not latch.</li>
+<li><code>test_reasoning_threshold_reads_module_binding</code>: The strike-ladder threshold is read from <code>compat</code>'s module binding at the decision point, so a monkeypatch — or the startup clamp — changes the persist outcome; a by-value copy of the constant anywhere on that path fails the test.</li>
+<li><code>test_reasoning_latched_outcome_issues_no_retry</code>: A latched pair entered directly — bypassing the dispatch-site check, which is the interleaving this pins — returns the original top-level result and issues no upstream call.</li>
 </ul>
 
 <h3 id="cat-8">Category 8 — Admin API</h3>
@@ -699,6 +715,6 @@ whenever a proxy is running.</p>
       that the full suite passes with a live proxy running.</li>
 </ol>
 
-<footer>Last updated: 2026-09-14</footer>
+<footer>Last updated: 2026-09-30</footer>
 </body>
 </html>

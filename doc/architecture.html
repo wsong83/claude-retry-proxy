@@ -32,9 +32,10 @@ where the request should go and what it should look like when it gets there.</p>
       <code>opus</code>), and each tier is independently pointed at a provider and a model.
       Switching a tier's provider is a config change, not a client change.</li>
   <li><strong>Upstream variability is absorbed, not exposed.</strong> Providers differ in
-      which features they accept, which endpoint shape they speak, and how often they return
-      <code>429</code>. The proxy retries, rewrites, and — for one specific Anthropic feature —
-      <em>learns</em> per upstream. See <a href="compatibility.html">compatibility.html</a>.</li>
+      which features they accept, which endpoint shape they speak, how they echo an assistant
+      turn's reasoning, and how often they return <code>429</code>. The proxy retries, rewrites,
+      and — for two known differences — <em>learns</em> per provider-model pair, one policy per
+      endpoint mode. See <a href="compatibility.html">compatibility.html</a>.</li>
 </ul>
 
 <div class="overview-grid">

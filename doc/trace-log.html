@@ -10,7 +10,7 @@
 
 <h1>Trace Log<span class="sub">What the proxy records, and what it deliberately does not</span></h1>
 
-<p><strong>Last updated:</strong> 2026-09-12</p>
+<p><strong>Last updated:</strong> 2026-09-30</p>
 
 <p>The trace log is a JSONL file — one JSON object per line — at
 <code>~/.claude/logs/proxy-trace.jsonl</code> by default, overridable with
@@ -93,9 +93,9 @@ looking for one exact format will fail on the other.</p>
 
 <h2 id="events">Event inventory</h2>
 
-<p>These are the events emitted outside the compatibility learner. The learner's ten events are
-listed in <a href="compatibility.html#events">compatibility.html</a>; together the two lists are
-the complete set the proxy can write.</p>
+<p>These are the events emitted outside the compatibility learner. The learner's twelve events
+are listed in <a href="compatibility.html#events">compatibility.html</a>; together the two lists
+are the complete set the proxy can write.</p>
 
 <table>
 <tr><th>Event</th><th>When</th></tr>
@@ -104,7 +104,7 @@ the complete set the proxy can write.</p>
 <tr><td><code>retry</code></td><td>a retry was scheduled. Carries <code>attempt</code>,
     <code>delay_s</code>, and a <code>reason</code> of <code>"429"</code>, <code>"503"</code>, or
     <code>"connection_error"</code>.</td></tr>
-<tr><td><code>mode_dispatch</code></td><td>a non-anthropic mode handled a request</td></tr>
+<tr><td><code>mode_dispatch</code></td><td>a non-anthropic mode handled a request — emitted once per pass through the forward path, so a learned walk can produce up to three for one client request (see below)</td></tr>
 <tr><td><code>client_disconnect</code></td><td>the client went away before the response was fully sent</td></tr>
 <tr><td><code>response_size_cap_exceeded</code></td><td>a response was truncated at
     <code>PROXY_MAX_RESPONSE_SIZE</code></td></tr>
@@ -125,6 +125,22 @@ the complete set the proxy can write.</p>
 <p>Several of these are <strong>metadata-only by design</strong>. <code>transform_failure</code>,
 <code>chat_sse_tool_degradation</code>, and the learner's events carry counts and identifiers
 but never body content, so a failed transform cannot leak model output into the log.</p>
+
+<div class="note">
+<strong>A learned walk re-emits the chat path's per-request events.</strong> When
+<code>reasoning_field</code> walks candidates, each step is a nested pass through the forward
+path, so <code>mode_dispatch</code> and the chat transform's events above
+(<code>cache_control_stripped</code>, <code>redacted_thinking_passthrough</code>,
+<code>tool_args_parse_failure</code>, <code>content_block_dropped</code>) fire once per step —
+up to three images for a single client request. The multiplicity is bounded by the feature's
+retry budget and occurs only while a pair is actively learning (a thinking block present, a
+complaint matched, not yet latched), so it is self-limiting.
+<p>Note what this does <em>not</em> affect. <code>request</code> entries are emitted once per
+client request, in the request handler, and a walk step never reaches that code — so
+per-request accounting such as <code>scripts/analyze_proxy_trace.py</code>, which counts
+<code>request</code> entries, is unaffected. It is the <code>mode_dispatch</code> and transform
+event counts that multiply, not the request counts.</p>
+</div>
 
 <h2 id="all">The <code>--all</code> flag</h2>
 
@@ -220,6 +236,6 @@ directory means every request loses its entry until the condition is fixed. See
 <a href="architecture.html#sinks">architecture.html</a> for the full policy.</p>
 </div>
 
-<footer>Last updated: 2026-09-12</footer>
+<footer>Last updated: 2026-09-30</footer>
 </body>
 </html>

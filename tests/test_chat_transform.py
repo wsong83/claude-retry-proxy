@@ -38,8 +38,7 @@ def test_anthropic_to_chat_messages_transform():
     ]
     out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
     expected = [
-        {"role": "assistant", "content": "Let me check.",
-         "reasoning_content": "hidden", "reasoning": "hidden"},
+        {"role": "assistant", "content": "Let me check."},
         {"role": "assistant", "content": None, "tool_calls": [
             {"id": "toolu_1", "type": "function",
              "function": {"name": "get_weather", "arguments": '{"city": "SF"}'}}]},
@@ -55,7 +54,7 @@ def test_anthropic_to_chat_messages_transform():
 
 
 def test_anthropic_to_chat_messages_thinking_stripped():
-    """thinking is converted to reasoning_content; redacted_thinking non-empty data -> placeholder."""
+    """thinking is dropped by default (no reasoning echo); redacted_thinking non-empty data is folded into the same default."""
     print("\n--- Test: Anthropic To Chat Messages Thinking Stripped ---")
     fn = _require_server_func("_transform_anthropic_messages_to_chat")
     if fn is None:
@@ -68,21 +67,22 @@ def test_anthropic_to_chat_messages_thinking_stripped():
         ]},
     ]
     out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
-    expected = [{"role": "assistant", "content": "visible",
-                 "reasoning_content": "hidden", "reasoning": "hidden"}]
+    expected = [{"role": "assistant", "content": "visible"}]
     if out != expected:
-        fail("thinking should convert to reasoning_content (real thinking wins over redacted placeholder), got {!r}".format(out))
+        fail("default selection must emit no reasoning field (real thinking still wins over the redacted placeholder), got {!r}".format(out))
     else:
-        pass_("thinking converted to reasoning_content; redacted_thinking placeholder suppressed by real thinking")
+        pass_("default emits no reasoning field; redacted_thinking placeholder suppressed by real thinking")
 
 
 
 
 def test_anthropic_to_chat_messages_redacted_thinking_trace():
-    """redacted_thinking with non-empty data -> placeholder reasoning_content + passthrough trace event.
+    """redacted_thinking with non-empty data -> placeholder reasoning text + passthrough trace event.
 
-    Real thinking text wins over the placeholder. Empty data is stripped and
-    counted in dropped.redacted_thinking, not passed through.
+    The placeholder rides the same selection-dependent echo path as real
+    thinking, so at the default selection no field is emitted at all. Real
+    thinking text wins over the placeholder. Empty data is stripped and counted
+    in dropped.redacted_thinking, not passed through.
     """
     print("\n--- Test: Anthropic To Chat Messages Redacted Thinking Trace ---")
     fn = _require_server_func("_transform_anthropic_messages_to_chat")
@@ -96,11 +96,9 @@ def test_anthropic_to_chat_messages_redacted_thinking_trace():
         ]},
     ]
     out = fn(messages, request_id=rid, mode="chat", provider="p", tier="sonnet")
-    expected = [{"role": "assistant", "content": "visible",
-                 "reasoning_content": "[redacted_thinking: data not available]",
-                 "reasoning": "[redacted_thinking: data not available]"}]
+    expected = [{"role": "assistant", "content": "visible"}]
     if out != expected:
-        fail("redacted_thinking non-empty data should set placeholder reasoning_content, got {!r}".format(out))
+        fail("default selection must emit no reasoning field for a redacted placeholder, got {!r}".format(out))
         return
     evs = [e for e in _trace_events_for_request(rid) if e.get("event") == "redacted_thinking_passthrough"]
     if len(evs) != 1:
@@ -123,8 +121,7 @@ def test_anthropic_to_chat_messages_redacted_thinking_trace():
         ]},
     ]
     out2 = fn(messages2, request_id=rid2, mode="chat", provider="p", tier="sonnet")
-    if out2 != [{"role": "assistant", "content": "",
-                 "reasoning_content": "real", "reasoning": "real"}]:
+    if out2 != [{"role": "assistant", "content": ""}]:
         fail("real thinking should win over redacted placeholder, got {!r}".format(out2))
         return
     evs2 = [e for e in _trace_events_for_request(rid2) if e.get("event") == "redacted_thinking_passthrough"]
@@ -287,8 +284,7 @@ def test_anthropic_to_chat_messages_interleaved_thinking_tool_use():
     out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
     expected = [
         {"role": "assistant",
-         "content": "Let me look up the weather for San Francisco.\nI found the forecast.",
-         "reasoning_content": "reasoning...", "reasoning": "reasoning..."},
+         "content": "Let me look up the weather for San Francisco.\nI found the forecast."},
         {"role": "assistant", "content": None, "tool_calls": [
             {"id": "toolu_weather", "type": "function",
              "function": {"name": "get_weather", "arguments": '{"city": "San Francisco"}'}}]},
@@ -297,9 +293,71 @@ def test_anthropic_to_chat_messages_interleaved_thinking_tool_use():
     if out != expected:
         fail("interleaved pattern mismatch, got {!r}".format(out))
     else:
-        pass_("interleaved thinking/text/tool_use pattern transformed with reasoning_content on text message")
+        pass_("interleaved thinking/text/tool_use pattern transformed with no reasoning echo at the default")
 
 
+
+
+# Sentinel for "the caller omitted reasoning_selection entirely".
+_OMIT = object()
+
+
+def test_chat_transform_emits_only_selected_field():
+    """The request-direction reasoning echo is selection-driven: only the two
+    field-name strings emit a field, everything else (including the omitted
+    argument, None, and unrecognized values) emits none — and never both."""
+    print("\n--- Test: Chat Transform Emits Only Selected Field ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "hmm", "signature": "s"},
+            {"type": "text", "text": "visible"},
+        ]},
+    ]
+
+    def emit(selection):
+        kwargs = {}
+        if selection is not _OMIT:
+            kwargs["reasoning_selection"] = selection
+        out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8],
+                 mode="chat", provider="p", tier="sonnet", **kwargs)
+        return out[0] if out else None
+
+    base = {"role": "assistant", "content": "visible"}
+    no_echo = [
+        ("omitted-argument", _OMIT),
+        ("none-string", "none"),
+        ("None-value", None),
+        ("unrecognized-value", "both"),
+        ("case-variant", "Reasoning_Content"),
+        ("empty-string", ""),
+    ]
+    for label, selection in no_echo:
+        got = emit(selection)
+        if got != base:
+            fail("%s must emit no reasoning field, got {!r}".format(
+                label, got))
+            return
+
+    for field in ("reasoning_content", "reasoning"):
+        got = emit(field)
+        expected = dict(base)
+        expected[field] = "hmm"
+        if got != expected:
+            fail("selection {!r} must emit that field only, got {!r}".format(
+                field, got))
+            return
+        other = ("reasoning" if field == "reasoning_content"
+                 else "reasoning_content")
+        if other in got:
+            fail("selection {!r} must never emit the other field, got "
+                 "{!r}".format(field, got))
+            return
+
+    pass_("selection matrix: only the two field names emit, never both, "
+          "everything else (including omission) emits none")
 
 
 def test_anthropic_to_chat_messages_string_content_passthrough():
@@ -622,8 +680,7 @@ def test_anthropic_to_chat_integration():
     expected_messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "What's the weather in SF?"},
-        {"role": "assistant", "content": "Let me look it up.",
-         "reasoning_content": "hidden", "reasoning": "hidden"},
+        {"role": "assistant", "content": "Let me look it up."},
         {"role": "assistant", "content": None, "tool_calls": [
             {"id": "toolu_1", "type": "function",
              "function": {"name": "get_weather", "arguments": '{"city": "SF"}'}}]},
@@ -1354,6 +1411,7 @@ ALL_TESTS = [
     ("anthropic-to-chat-messages-mixed-text-and-tool-use", test_anthropic_to_chat_messages_mixed_text_and_tool_use),
     ("anthropic-to-chat-messages-mixed-text-and-tool-result", test_anthropic_to_chat_messages_mixed_text_and_tool_result),
     ("anthropic-to-chat-messages-interleaved-thinking-tool-use", test_anthropic_to_chat_messages_interleaved_thinking_tool_use),
+    ("chat-transform-emits-only-selected-field", test_chat_transform_emits_only_selected_field),
     ("anthropic-to-chat-messages-string-content-passthrough", test_anthropic_to_chat_messages_string_content_passthrough),
     ("anthropic-to-chat-messages-cache-control-stripped", test_anthropic_to_chat_messages_cache_control_stripped),
     ("anthropic-to-chat-messages-non-list-guarded", test_anthropic_to_chat_messages_non_list_guarded),

@@ -127,8 +127,8 @@ records a <code>transform_failure</code> event — so a transform bug degrades t
 
 <table>
 <tr><th>Anthropic input</th><th>Becomes</th></tr>
-<tr><td><code>thinking</code> blocks</td><td><code>reasoning_content</code> on the assistant message</td></tr>
-<tr><td><code>redacted_thinking</code> with non-empty <code>data</code></td><td>a placeholder <code>reasoning_content</code>, plus a <code>redacted_thinking_passthrough</code> event</td></tr>
+<tr><td><code>thinking</code> blocks</td><td><strong>nothing, by default.</strong> The echo is the learned per-pair <code>reasoning_field</code> selection — no field, <code>reasoning_content</code>, or <code>reasoning</code>. See <a href="compatibility.html#reasoning-field">compatibility.html</a></td></tr>
+<tr><td><code>redacted_thinking</code> with non-empty <code>data</code></td><td>the same learned selection decides whether a placeholder field is emitted at all; the <code>redacted_thinking_passthrough</code> event is unchanged</td></tr>
 <tr><td><code>image</code> and unknown blocks</td><td><strong>stripped</strong></td></tr>
 <tr><td><code>tool_use</code></td><td><code>tool_calls</code>, with the input dict-validated</td></tr>
 <tr><td><code>tool_result</code></td><td>a <code>role: "tool"</code> message, paired by <code>tool_use_id</code></td></tr>
@@ -396,26 +396,41 @@ dropped response.</p>
 
 <h2 id="compat-retry">Compatibility retry</h2>
 
-<p>Anthropic mode has one extra behaviour layered over the retry loop. A single learnable
-feature (<code>context_management</code>) can be stripped from a request after an upstream
-rejects it, and the result learned per <code>(provider, mode, model)</code> so later requests
-strip it pre-emptively.</p>
+<p>A behaviour layered over the retry loop: the learner can change what the proxy sends, and
+learn per <code>(provider, mode, model)</code> so that later requests act pre-emptively. Two
+features are registered, each scoped to one endpoint mode — so each runs in the mode whose
+transform it belongs to, and neither runs in response mode:</p>
+
+<ul>
+  <li><code>context_management</code> (<strong>anthropic</strong> mode) — stripped from a request
+      after an upstream rejects it, then re-tested periodically to see whether support arrived.</li>
+  <li><code>reasoning_field</code> (<strong>chat</strong> mode) — the reasoning-echo field
+      (<code>reasoning_content</code>, <code>reasoning</code>, or none) learned from upstream
+      complaints, defaulting to none.</li>
+</ul>
 
 <p>For this page, the relevant properties are:</p>
 
 <ul>
-  <li>It applies to <code>anthropic</code> mode only. Chat and response modes never run it.</li>
+  <li>A feature runs only in <strong>its own</strong> mode — the mode is a per-descriptor
+      property, not a property of the learner.</li>
   <li><code>count_tokens</code> is excluded.</li>
-  <li>The compatibility retry is a <strong>single</strong> upstream attempt. The stripped variant
-      is derived from the original client body with the feature field removed, and is re-sent
-      through the normal forward path — one upstream attempt, but a fresh transform pass.</li>
-  <li>It runs under a single proxy-wide lock that allows at most one probe at a time; a request
-      that cannot take the lock strips rather than probes.</li>
+  <li>Each feature declares its own retry budget, so the attempt count is not one global figure:
+      <code>context_management</code> retries a <strong>single</strong> time, with the stripped
+      variant derived from the original client body and re-sent through the normal forward path
+      — one upstream attempt, but a fresh transform pass. <code>reasoning_field</code> may walk
+      up to <strong>two</strong> further candidates, because reaching a third candidate is what
+      makes the full-walk outcome observable.</li>
+  <li>Each feature holds its <strong>own</strong> retry lock, acquired non-blockingly, so one
+      feature's in-flight retry cannot deny another's. Under <code>context_management</code> at
+      most one probe runs proxy-wide, and a request that cannot take that lock strips rather than
+      probes.</li>
 </ul>
 
 <p>The state machine, the probe ladder, and the suppression rules are documented in
-<a href="compatibility.html">compatibility.html</a>.</p>
+<a href="compatibility.html">compatibility.html</a>, as is the
+<a href="compatibility.html#reasoning-field">reasoning-field selection</a>.</p>
 
-<footer>Last updated: 2026-09-12</footer>
+<footer>Last updated: 2026-09-30</footer>
 </body>
 </html>

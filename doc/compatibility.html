@@ -8,25 +8,38 @@
 </head>
 <body>
 
-<h1>Compatibility Learner<span class="sub">How the proxy learns which upstream rejects <code>context_management</code></span></h1>
+<h1>Compatibility Learner<span class="sub">How the proxy learns, per provider-model pair, what an upstream will accept</span></h1>
 
-<p><strong>Last updated:</strong> 2026-09-12</p>
+<p><strong>Last updated:</strong> 2026-09-30</p>
 
 <p>Third-party providers that speak the Anthropic wire format do not always implement every
-field. One field is common enough to be worth handling automatically:
-<code>context_management</code>. Rather than requiring you to configure a per-provider
-workaround, the proxy <em>discovers</em> which upstreams reject it, strips it from subsequent
-requests, and periodically re-tests whether the upstream has started supporting it.</p>
+field, and they disagree about how to echo an assistant turn's reasoning. Neither fact can be
+known in advance, and neither failure is visible to you — the request simply fails. So the
+proxy <em>learns</em> both, per provider-model pair, and adapts.</p>
 
-<p>This page documents that state machine. It is the most behaviourally intricate part of the
-proxy, and it is the one place where the proxy's behaviour changes over time without
-configuration.</p>
+<p>The learner is a registry of <strong>features</strong>, each naming a policy the proxy runs
+for a request that carries the thing it cares about. Two are registered:</p>
+
+<table>
+<tr><th>Feature</th><th>Mode</th><th>Learns</th></tr>
+<tr><td><code>context_management</code></td><td><code>anthropic</code></td>
+    <td>Which upstreams reject the field — strips it, and re-tests whether support has arrived</td></tr>
+<tr><td><code>reasoning_field</code></td><td><code>chat</code></td>
+    <td>Which reasoning-echo field a chat upstream wants — <code>reasoning_content</code>,
+        <code>reasoning</code>, or none at all</td></tr>
+</table>
+
+<p>A feature's <em>mode</em> is the endpoint mode it runs in, so the two policies never see the
+same request. This page documents both: the <a href="#scope-and-state">first</a> is a state
+machine that changes behaviour over time, the <a href="#reasoning-field">second</a> a
+three-value selection learned from upstream complaints.</p>
 
 <div class="note">
-<strong>Scope.</strong> The learner applies to <code>anthropic</code>-mode providers only.
-Chat and response modes never run it. <code>count_tokens</code> requests are excluded, and so
-are compatibility retries themselves. See
-<a href="provider-modes.html#compat-retry">provider-modes.html</a>.
+<strong>Scope.</strong> Each feature declares the endpoint mode it runs in and runs in no
+other: <code>context_management</code> is <code>anthropic</code>-mode only,
+<code>reasoning_field</code> is <code>chat</code>-mode only, and response mode runs neither.
+<code>count_tokens</code> requests are excluded, and so are compatibility retries themselves.
+See <a href="provider-modes.html#compat-retry">provider-modes.html</a>.
 </div>
 
 <h2 id="constants">Policy constants</h2>
@@ -47,22 +60,35 @@ top of the compatibility learner module, <code>src/claude_retry_proxy/compat.py<
 <tr><td><code>COMPAT_DELISTING_SUCCESSES</code></td><td class="num">2</td>
     <td>Consecutive probe successes required to delist</td></tr>
 <tr><td><code>COMPAT_MAX_RETRIES_PER_REQUEST</code></td><td class="num">1</td>
-    <td>Compatibility retries per client request</td></tr>
+    <td>Compatibility retries per client request for <code>context_management</code>. The budget
+        is per-feature: <code>reasoning_field</code> declares 2, because its walk may need to
+        reach a third candidate</td></tr>
 <tr><td><code>COMPAT_FAILED_CONFIRMATION_SUPPRESSION</code></td><td class="num">3</td>
     <td>Failed confirmations before the key is suppressed</td></tr>
+<tr><td><code>COMPAT_REASONING_SWITCH_THRESHOLD</code></td><td class="num">3</td>
+    <td>Consecutive complaints before <code>reasoning_field</code> moves to the next candidate</td></tr>
 </table>
 
 <p>Startup validates the relationships between these rather than trusting them. Each violation
 prints a warning on stderr and <strong>clamps</strong> the value — it does not refuse to start:
 <code>COMPAT_BACKOFF_MULTIPLIER</code> is raised to at least 2,
-<code>COMPAT_DELISTING_SUCCESSES</code> to at least 2, and
+<code>COMPAT_DELISTING_SUCCESSES</code> to at least 2,
 <code>COMPAT_INITIAL_THRESHOLD</code> is lowered to <code>COMPAT_MAX_THRESHOLD</code> if it
-exceeds it.</p>
+exceeds it, and <code>COMPAT_REASONING_SWITCH_THRESHOLD</code> is raised to at least 2 (a value
+of 0 or 1 would collapse the three-strike rule to a single strike).</p>
 
-<p>Three further constants describe the feature and the persisted schema:
-<code>COMPAT_FEATURE</code> is <code>"context_management"</code>,
-<code>COMPAT_FEATURE_MODE</code> is <code>"anthropic"</code>, and
-<code>COMPAT_SCHEMA_VERSION</code> is <code>1</code>.</p>
+<p>That last clamp is worth a note, because it was the one clamped constant whose consumption
+crossed a module boundary. The threshold is compared inside the learner module — at the persist
+site, under the state lock — but an earlier arrangement imported the constant <em>by value</em>
+into <code>server.py</code> and compared it there. The clamp rebinding the learner's global then
+had no effect on the decision, so the warning printed and the un-clamped value was used anyway.
+The comparison now reads the learner's own binding, which is what makes the guard a guard.</p>
+
+<p>The registry itself is <code>COMPAT_FEATURES</code>, a name → descriptor mapping; each
+descriptor carries its mode, its presence test, its complaint matcher, its learning policy, its
+entry field set, its retry budget and its own retry lock. <code>COMPAT_FEATURE</code> remains as
+the <code>"context_management"</code> name constant, and <code>COMPAT_SCHEMA_VERSION</code> is
+<code>1</code>.</p>
 
 <h2 id="scope-and-state">Scope and states</h2>
 
@@ -75,13 +101,18 @@ different capabilities.</p>
 (<code>_state</code> in <code>compat.py</code>): its <code>entries</code> dict holds the keyed
 entries and its <code>lock</code> serializes access and persistence. The learner functions take
 the state by default parameter (<code>state=_state</code>), so tests can inject a fresh
-instance; the single proxy-wide probe/retry lock is the object's <code>retry_lock</code>, and
-<code>server.py</code>'s forward path keeps referencing it through the module-level aliases
-<code>_compat_state_lock</code> / <code>_compat_retry_lock</code>. The retry lock's
-acquire/release discipline belongs to its caller (the forward path in <code>server.py</code>),
-which holds it across the unstripped probe's upstream HTTP call.</p>
+instance. Each feature owns its <strong>own</strong> retry lock — a descriptor property rather
+than a module-global — so one feature's slow retry can never deny another feature its retry.
+For <code>context_management</code> the forward path in <code>server.py</code> reaches that lock
+through the module-level aliases <code>_compat_state_lock</code> / <code>_compat_retry_lock</code>,
+which remain importable for the tests that assert the alias identity. The retry lock's
+acquire/release discipline belongs to its caller, which holds it across the unstripped probe's
+upstream HTTP call.</p>
 
-<p>There are exactly <strong>two</strong> states:</p>
+<h3 id="context-management-states">The <code>context_management</code> states</h3>
+
+<p>This feature has exactly <strong>two</strong> states. The vocabulary is per-descriptor, so it
+says nothing about <a href="#reasoning-field">the other feature's</a>:</p>
 
 <table>
 <tr><th>State</th><th>Meaning</th></tr>
@@ -201,6 +232,143 @@ probed.</p>
 probing, then quietly re-examined after enough traffic has passed. The 32-request reset is
 counted per key, so a rarely-used model re-enters discovery very slowly.</p>
 
+<h2 id="reasoning-field">The <code>reasoning_field</code> feature</h2>
+
+<p>Chat upstreams disagree about how an assistant turn's reasoning is echoed back. OpenAI's
+chat-completions shape has no such field, so each vendor invented one: DeepSeek and GLM read
+<code>reasoning_content</code>, vLLM reads <code>reasoning</code>, and some accept neither.
+Until this feature existed the proxy hedged by writing <strong>both</strong> — which gateways
+that are strict about unknown pairs reject outright with a hard <code>400</code>, and which
+always serialized the reasoning text twice.</p>
+
+<p>The proxy no longer guesses. It sends one field, learns which one a pair wants from the
+upstream's own complaints, and defaults to sending <strong>nothing</strong>.</p>
+
+<h3 id="reasoning-model">Three pieces of state, one rule</h3>
+
+<table>
+<tr><th>State</th><th>Where</th><th>Meaning</th></tr>
+<tr><td><code>selection</code></td><td>persisted</td>
+    <td><code>reasoning_content</code> or <code>reasoning</code>. An <em>absent</em> entry means
+        <code>none</code> — the default is never written, because it requires no entry</td></tr>
+<tr><td><code>complaints</code></td><td>in memory</td>
+    <td>The pair <code>(for_selection, count)</code> — consecutive matched complaints counted
+        against that one selection</td></tr>
+<tr><td><code>latched</code></td><td>in memory</td>
+    <td>Set once the full-walk outcome has been seen on two consecutive requests</td></tr>
+</table>
+
+<p>The rule in one paragraph: <strong>send the selection; on a complaint, count it and try the
+next candidate inside the same request so the client is still served; persist a switch only once
+the count reaches three; and if all three candidates complain within one request — a
+<em>full walk</em> — on two consecutive requests, latch the pair to <code>none</code> until the
+process restarts.</strong></p>
+
+<p>Four details are load-bearing:</p>
+
+<ul>
+<li><strong>The counter belongs to a selection.</strong> It is the pair <code>(for_selection,
+    count)</code>, compared against the selection the request actually sent — never against the
+    entry's current value. That is what makes a persisted switch reset the count implicitly (the
+    next complaint carries a different selection, so it is the first complaint against the new
+    one), and what keeps a complaint attached to the selection it was aimed at when a switch
+    lands concurrently.</li>
+<li><strong>The reset is the request's own outcome.</strong> A request whose forwarding pass ends
+    2xx sets the count to zero — an upstream <code>429</code>/<code>503</code> that the retry
+    loop carried to a 2xx counts, because it was served. A walk candidate's own success neither
+    resets nor increments the strike count.</li>
+<li><strong>A request with no thinking block is inert.</strong> It neither exercises the
+    selection nor proves anything about it, so it mutates nothing. Letting such a request reset
+    the ladder would make the threshold unreachable for any pair that interleaves ordinary chat
+    with thinking-bearing turns.</li>
+<li><strong>Absent means <code>none</code>.</strong> The default needs no entry, so there is
+    nothing to settle on a plain success — and the same one rule protects a settled
+    <code>reasoning_content</code>, a settled <code>reasoning</code>, and the default alike.</li>
+</ul>
+
+<h3 id="reasoning-walk">The in-request walk</h3>
+
+<p>A complaint is answered inside the same client request: the proxy advances to the next
+candidate in the cycle <code>none → reasoning_content → reasoning → none</code> and re-sends it,
+up to the feature's budget of <strong>2</strong> extra attempts. The client is therefore served
+transparently while a pair is learning, and the third candidate is reachable within one request.
+Each step re-enters the forward path with the <em>original</em> client body and
+<code>suppress_compat</code> set, so the chat transform re-runs with the new candidate.</p>
+
+<table>
+<tr><th>Walk step result</th><th>Effect</th></tr>
+<tr><td><strong>2xx</strong></td>
+    <td>The client is served. A switch is persisted <em>only</em> if the count has reached the
+        threshold, and the persisted candidate is the one that just succeeded — or, when that
+        candidate is <code>none</code>, the entry is <em>removed</em> (absent means none).</td></tr>
+<tr><td><strong>matching complaint</strong></td><td>Advance to the next candidate.</td></tr>
+<tr><td><strong>anything else</strong></td>
+    <td>Stop the walk, change nothing, and return the client its <em>original</em> error rather
+        than the walk's. A <code>401</code>, a <code>500</code>, a connection error or a
+        <code>429</code>/<code>503</code> is no evidence about the field, so nothing is counted
+        and nothing latches.</td></tr>
+</table>
+
+<p>Only one walk runs at a time per feature, under the feature's own retry lock, acquired
+non-blockingly. When it is contended the request issues no retry, mutates no counter, and the
+upstream error reaches the client unchanged. Because the lock is per-feature rather than
+module-global, a chat-mode walk can never deny an <code>anthropic</code>-mode probe its retry.
+The cost is real but bounded: a walk is up to three upstream attempts, so a stuck chat upstream
+can hold one worker thread — and delay a concurrent admin switch's drain — for several minutes.</p>
+
+<h3 id="reasoning-complaint">What counts as a complaint</h3>
+
+<p>Status <code>400</code>, plus one of two content shapes, both built from the proxy's own
+field-name constants and nothing else:</p>
+
+<ul>
+<li><strong>Message form</strong> — a <code>message</code> value in the parsed body names a field.
+    The traversal reads parsed <code>message</code> values only: never bare keys, never the raw
+    body. A gateway that echoes the offending request back as nested JSON therefore cannot hand
+    the matcher its own request text.</li>
+<li><strong>Structured form</strong> — a validation node carrying <code>extra_forbidden</code>
+    whose <code>loc</code>/<code>location</code> list <em>ends</em> with a field name. This is how
+    a gateway reports a rejected field when no message string names it; without it, such a pair
+    would never register a complaint at all.</li>
+</ul>
+
+<p>There is deliberately <strong>no phrase matching</strong>: the prose is upstream-authored and
+will drift, while an upstream complaining about the reasoning field must name it. The trigger is
+therefore keyword-grade rather than field-reference-grade — the bare English noun
+<code>reasoning</code> matches unrelated prose such as "max_tokens must be greater than the
+reasoning budget". That is the accepted cost of a deliberate bias toward recall: a
+<em>missed</em> complaint means the pair never learns, which is the pre-existing behaviour, while
+a false positive costs one increment and needs two more consecutive ones before anything moves.
+A field name buried in a message string that merely echoes the request would also match; that
+hole is recorded rather than closed, because closing it would mean matching on prose again.</p>
+
+<div class="warn">
+<strong>A 400 that names no field is not a complaint.</strong> A <code>401</code>/<code>403</code>
+(account disabled), a <code>500</code> (gateway blip), an unparseable body, or a
+<code>400</code> naming no field in either shape is <em>not</em> counted: nothing advances,
+nothing latches, and the error passes through untouched. The same is true of any status other
+than <code>400</code> — a gateway reporting the condition as a <code>422</code> produces no
+complaint, so such a pair silently stays at <code>none</code>. That is a known limitation of the
+design, not an oversight.
+</div>
+
+<h3 id="reasoning-latch">Latching</h3>
+
+<p>A <em>full walk</em> — all three candidates complaining within one request — is one
+observation, not three: the same upstream condition, examined three times with only the field
+differing. A uniform <code>400</code> unrelated to the field repeats identically across all
+three, so one such request must not latch a pair for the process lifetime. The latch is earned
+the way a switch is, by repetition: <strong>the full walk must recur on two consecutive
+requests</strong>, where consecutive means any intervening feature-active success clears the
+evidence — a walk candidate's own 2xx included, since a working candidate is exactly the evidence
+that "no candidate works" is false.</p>
+
+<p>A latched pair sends <code>none</code>, issues no retries, mutates no counters, and leaves the
+<strong>persisted selection untouched</strong>: the latch is a decision about this process, not a
+rewrite of what was learned, so the next run starts from the last known-good state. It emits a
+<code>compatibility_latched</code> trace event and a stderr warning, both metadata-only, and a
+restart is its only reset.</p>
+
 <h2 id="persistence">Persistence</h2>
 
 <p>Learned state is written to <code>~/.claude/proxy/feature-compatibility.json</code>
@@ -212,13 +380,23 @@ file.</p>
 <tr><th>Field</th><th>Meaning</th></tr>
 <tr><td><code>schema_version</code></td><td>Currently <code>1</code></td></tr>
 <tr><td><code>provider</code>, <code>mode</code>, <code>actual_model</code>, <code>feature</code></td>
-    <td>The key, serialised with a <code>\x1f</code> (unit separator) delimiter so a value
-        containing an ordinary separator cannot forge a collision</td></tr>
-<tr><td><code>state</code></td><td><code>unsupported</code> or <code>probation</code></td></tr>
-<tr><td><code>threshold</code></td><td>The entry's current strip threshold</td></tr>
-<tr><td><code>strip_counter</code>, <code>probation_successes</code></td>
-    <td>Progress counters</td></tr>
+    <td>The shared envelope and the key, serialised with a <code>\x1f</code> (unit separator)
+        delimiter so a value containing an ordinary separator cannot forge a collision. The
+        in-memory key is derived from the entry's <em>own</em> envelope, so a file whose key
+        disagrees with its body cannot be loaded under the wrong one</td></tr>
+<tr><td><code>state</code>, <code>threshold</code>, <code>strip_counter</code>, <code>probation_successes</code></td>
+    <td><strong><code>context_management</code> only.</strong> Its state vocabulary
+        (<code>unsupported</code> or <code>probation</code>), the current strip threshold, and
+        its progress counters</td></tr>
+<tr><td><code>selection</code></td>
+    <td><strong><code>reasoning_field</code> only.</strong> The learned echo field —
+        <code>reasoning_content</code> or <code>reasoning</code>. An <em>absent</em> entry means
+        <code>none</code>: the default is never written</td></tr>
 </table>
+
+<p>The field set is per-descriptor. Each descriptor validates its own values on load, so a value
+outside its vocabulary — an unknown <code>selection</code>, say — rejects the entry rather than
+loading it, and a descriptor returns nothing for anything it cannot validate instead of raising.</p>
 
 <p>On load, the threshold is <em>snapped</em> onto the doubling ladder rather than trusted, so a
 hand-edited or corrupted value cannot produce an off-ladder threshold. Entries that fail
@@ -237,16 +415,20 @@ state and a warning. It does not refuse to start.</p>
 
 <h2 id="events">Trace events</h2>
 
-<p>All ten events below are emitted by the learner. They are metadata-only: none carries request
-or response content.</p>
+<p>All twelve events below are emitted by the learner. They are metadata-only: none carries
+request or response content. The strip, probe and suppression events belong to
+<code>context_management</code> alone; the switch and latch events belong to
+<code>reasoning_field</code>.</p>
 
 <table>
 <tr><th>Event</th><th>Fires when</th></tr>
-<tr><td><code>compatibility_learned</code></td><td>a new entry is created</td></tr>
+<tr><td><code>compatibility_learned</code></td><td>a new entry is created — for either feature (the <code>reasoning_field</code> shape carries the learned <code>selection</code>)</td></tr>
 <tr><td><code>compatibility_field_stripped</code></td><td>the feature was removed from an outbound request</td></tr>
 <tr><td><code>compatibility_probe_started</code></td><td>a probe was scheduled and the lock acquired</td></tr>
 <tr><td><code>compatibility_probe_succeeded</code></td><td>a probe returned 2xx; carries <code>probation_successes</code></td></tr>
-<tr><td><code>compatibility_delisted</code></td><td>the final required success was reached and the entry was removed</td></tr>
+<tr><td><code>compatibility_delisted</code></td><td>an entry was removed — the final required probe success, or a <code>reasoning_field</code> walk whose <code>none</code> candidate succeeded</td></tr>
+<tr><td><code>compatibility_switched</code></td><td><code>reasoning_field</code> changed an existing entry's <code>selection</code></td></tr>
+<tr><td><code>compatibility_latched</code></td><td>two consecutive full walks latched a pair — no candidate works, so no retries until restart</td></tr>
 <tr><td><code>compatibility_probe_rejected</code></td><td>a probe was rejected; carries the doubled <code>threshold</code></td></tr>
 <tr><td><code>compatibility_probe_inconclusive</code></td><td>a probe returned neither 2xx nor a matching 400</td></tr>
 <tr><td><code>compatibility_rejection_detected</code></td><td>a recognised 400 was seen in the normal (non-probe) path</td></tr>
@@ -257,6 +439,6 @@ or response content.</p>
 <p>The full trace schema, including the fields common to every entry, is in
 <a href="trace-log.html">trace-log.html</a>.</p>
 
-<footer>Last updated: 2026-09-23</footer>
+<footer>Last updated: 2026-09-30</footer>
 </body>
 </html>
