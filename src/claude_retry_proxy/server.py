@@ -2716,8 +2716,15 @@ def main():
     _compat_validate_constants()
     _load_compat_state()
 
-    # Check if another proxy is already running on this port
+    # Check if another proxy is already running on this port.
+    # SO_REUSEADDR keeps this probe from being stricter than the bind it guards:
+    # the server socket below is a ThreadingHTTPServer, which sets
+    # allow_reuse_address, so the server itself tolerates a port left in
+    # TIME_WAIT by a proxy that exited moments ago — without this the probe
+    # aborts startup on that residue instead. A live listener is still refused:
+    # SO_REUSEADDR permits reuse of TIME_WAIT, not of a second LISTEN.
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind(("127.0.0.1", SETTINGS.port))
     except OSError:
