@@ -4,14 +4,26 @@ tool-call delta conversion, degradation paths, and streamed e2e.
 Part of the claude-retry-proxy suite; runnable standalone.
 """
 
+import http.client
+import http.server
 import json
+import os
+import shutil
+import socket
+import subprocess
+import tempfile
+import threading
+import time
 
 from _harness import (
     _assert_degradation_metadata_only,
     _cc,
     _chat_sse_fetch_frames,
+    _create_test_config,
+    _create_test_keys_plain,
     _degraded_trace_events,
     _mode_tiers,
+    _models_for_vendors,
     _parse_sse_frames,
     _send_proxy_request_stream,
     _sse_content_block_starts,
@@ -23,6 +35,7 @@ from _harness import (
     _sse_types,
     _start_chat_sse_proxy,
     _start_mode_proxy,
+    _start_proxy_server_directly,
     errors,
     fail,
     find_free_port,
@@ -30,6 +43,145 @@ from _harness import (
     pass_,
     run_cli,
 )
+
+# A post-finish drain that has not terminated by this point is a failure: the
+# drain is bounded by MAX_DRAIN_SECONDS (5s) and must leave ample headroom under
+# the 30s drain-and-swap timeout a config switch waits on.
+DRAIN_BOUND_TEST_SECONDS = 20
+
+
+
+def _start_hanging_chat_proxy(pre_body, hold_s):
+    """Chat-mode proxy whose mock upstream streams `pre_body` over an unterminated
+    response (HTTP/1.0, no Content-Length) and then holds the socket open.
+
+    The harness responder always sets Content-Length and closes, so the proxy's
+    read loop sees EOF immediately and the stall path is never exercised. This
+    mirror of _start_chat_sse_proxy exists solely to reach it.
+
+    Returns (proxy_port, trace_file, cleanup), or (None, None, None) on failure.
+    """
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port),
+                     "key": "K", "mode": "chat"}}
+
+    class HangHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def do_POST(self):
+            content_len = int(self.headers.get("Content-Length", 0))
+            if content_len > 0:
+                self.rfile.read(content_len)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(pre_body)
+            self.wfile.flush()
+            time.sleep(hold_s)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), HangHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    time.sleep(0.1)
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_drain_")
+    proxy_port = find_free_port()
+    config_path = _create_test_config(
+        temp_dir, tiers, models=_models_for_vendors(tiers, vendors))
+    keys_path = _create_test_keys_plain(temp_dir, vendors)
+    trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
+    os.close(trace_fd)
+    proc, probe_ok = _start_proxy_server_directly(
+        proxy_port, config_path=config_path, keys_path=keys_path,
+        passphrase=None, trace_file=trace_file)
+
+    if not probe_ok:
+        server.shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return None, None, None
+
+    def cleanup():
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        server.shutdown()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return proxy_port, trace_file, cleanup
+
+
+
+def _read_sse_until_stop(port, deadline_s, body=None):
+    """POST a streaming chat request, reading until message_stop or `deadline_s`.
+
+    Returns (raw_bytes, saw_message_stop, elapsed_seconds). Returns early on
+    message_stop so a promptly-terminating drain is not charged the full budget.
+    """
+    if body is None:
+        body = {"model": "sonnet", "messages": [{"role": "user", "content": "hi"}],
+                "stream": True}
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=deadline_s + 5)
+    start = time.time()
+    conn.request("POST", "/v1/messages", body=json.dumps(body),
+                 headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    chunks = []
+    saw_stop = False
+    try:
+        while True:
+            # read1 (not read): read(n) blocks until exactly n bytes or EOF, so a
+            # streaming response that emits 501 bytes and then stalls would read
+            # as zero bytes and hide the terminal event this helper looks for.
+            # read1 returns whatever has actually arrived.
+            chunk = resp.read1(4096) if hasattr(resp, "read1") else resp.read(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if b"message_stop" in b"".join(chunks):
+                saw_stop = True
+                break
+            if time.time() - start > deadline_s:
+                break
+    except (socket.timeout, OSError):
+        pass
+    finally:
+        elapsed = time.time() - start
+        conn.close()
+    return b"".join(chunks), saw_stop, elapsed
+
+
+
+def _trace_events_named(trace_file, event_name):
+    """Return every trace event in `trace_file` whose "event" is `event_name`."""
+    out = []
+    if not trace_file or not os.path.exists(trace_file):
+        return out
+    with open(trace_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("event") == event_name:
+                out.append(ev)
+    return out
+
+
+
+def _message_delta_usage(frames):
+    """Return the usage dict on the first message_delta frame, or None."""
+    deltas = _sse_frames_with_type(frames, "message_delta")
+    if not deltas:
+        return None
+    return deltas[0].get("usage")
 
 
 
@@ -804,7 +956,13 @@ def test_chat_sse_tool_call_eof_without_finish():
 
 
 def test_chat_sse_non_tool_calls_finish_with_tool_blocks():
-    """A length/stop finish while tool blocks are open closes them and maps normally."""
+    """A length/stop finish while tool blocks are open closes them and maps.
+
+    A non-"stop" reason still maps verbatim (length -> max_tokens). "stop"
+    alongside emitted tool calls is upgraded to tool_use: the client must wait
+    for tool results rather than stopping for user input. That is the same
+    upgrade the post-finish drain applies, reached here with no drain at all.
+    """
     print("\n--- Test: Chat SSE Non Tool Calls Finish With Tool Blocks ---")
     base = [
         _cc({"role": "assistant"}),
@@ -841,12 +999,12 @@ def test_chat_sse_non_tool_calls_finish_with_tool_blocks():
         if len(blocks2) != 1 or not blocks2[0]["closed"]:
             fail("stop finish with open tool blocks must close them, got {!r}".format(blocks2))
             return
-        if _sse_stop_reason(frames2) != "end_turn":
-            fail("stop finish should map to end_turn (never tool_use), got {!r}".format(_sse_stop_reason(frames2)))
+        if _sse_stop_reason(frames2) != "tool_use":
+            fail("stop finish with emitted tool blocks must upgrade to tool_use, got {!r}".format(_sse_stop_reason(frames2)))
             return
     finally:
         cleanup2()
-    pass_("non-tool_calls finish with open tool blocks: close blocks, map finish normally, log event")
+    pass_("non-tool_calls finish with open tool blocks: close blocks, map/upgrade finish, log event")
 
 
 
@@ -964,7 +1122,12 @@ def test_chat_sse_no_deltas_tool_calls_finish():
 
 
 def test_chat_sse_unparseable_arguments_at_close():
-    """Valid metadata + tool_calls finish but unparseable args degrade the stop reason."""
+    """Valid metadata + tool_calls finish: the emitted block claims tool_use.
+
+    D4-revised (2026-10-03): the stop reason follows block emission, not argument
+    parseability. A tool_use block reached the client, so the finish reason is
+    tool_use; unparseable_arg_count stays a diagnostic only.
+    """
     print("\n--- Test: Chat SSE Unparseable Arguments At Close ---")
     chunks = [
         _cc({"role": "assistant"}),
@@ -982,14 +1145,14 @@ def test_chat_sse_unparseable_arguments_at_close():
         if len(blocks) != 1 or not blocks[0]["closed"]:
             fail("unparseable-args tool block should still be emitted and closed, got {!r}".format(blocks))
             return
-        if _sse_stop_reason(frames) is not None:
-            fail("unparseable accumulated arguments must degrade stop_reason to null, got {!r}".format(_sse_stop_reason(frames)))
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("emitted tool block must claim tool_use even with unparseable args, got {!r}".format(_sse_stop_reason(frames)))
             return
         events = _degraded_trace_events(trace_file)
         if len(events) != 1 or events[0].get("unparseable_arg_count") != 1:
             fail("expected one event with unparseable_arg_count 1, got {!r}".format(events))
             return
-        pass_("unparseable accumulated arguments degrade stop_reason to null")
+        pass_("unparseable accumulated arguments: block emitted, stop_reason tool_use, count diagnostic")
     finally:
         cleanup()
 
@@ -1054,7 +1217,12 @@ def test_chat_sse_conflicting_metadata():
 
 
 def test_chat_sse_fragments_missing_index():
-    """Non-empty fragments without an index are dropped, counted, and block tool_use."""
+    """Non-empty fragments without an index are dropped and counted; the block still claims tool_use.
+
+    D4-revised (2026-10-03): a dropped fragment no longer forces the stop reason
+    to null — the started block was emitted, so tool_use is claimed. The drop is
+    still diagnosed via dropped_fragment_count.
+    """
     print("\n--- Test: Chat SSE Fragments Missing Index ---")
     chunks = [
         _cc({"role": "assistant"}),
@@ -1073,14 +1241,14 @@ def test_chat_sse_fragments_missing_index():
         if len(blocks) != 1 or blocks[0]["input"] != {"a": 1}:
             fail("index-less fragment must not contaminate the started block, got {!r}".format(blocks))
             return
-        if _sse_stop_reason(frames) is not None:
-            fail("dropped fragments must prevent tool_use claim, got {!r}".format(_sse_stop_reason(frames)))
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("emitted block must claim tool_use despite the dropped fragment, got {!r}".format(_sse_stop_reason(frames)))
             return
         events = _degraded_trace_events(trace_file)
         if len(events) != 1 or events[0].get("dropped_fragment_count") != 1:
             fail("expected one event with dropped_fragment_count 1, got {!r}".format(events))
             return
-        pass_("index-less fragments dropped, counted, and tool_use not claimed")
+        pass_("index-less fragments dropped and counted; emitted block still claims tool_use")
     finally:
         cleanup()
 
@@ -1163,7 +1331,11 @@ def test_chat_sse_pending_buffer_cap_exceeded():
 
 
 def test_chat_sse_too_many_parallel_tools():
-    """More than 32 tracked tool indexes overflow into the coalesced diagnostic."""
+    """More than 32 tracked tool indexes overflow into the coalesced diagnostic.
+
+    D4-revised (2026-10-03): the 32 blocks emitted before the 33rd overflowed
+    claim tool_use; overflow_tool_count remains a diagnostic only.
+    """
     print("\n--- Test: Chat SSE Too Many Parallel Tools ---")
     chunks = [_cc({"role": "assistant"})]
     for i in range(33):
@@ -1185,14 +1357,14 @@ def test_chat_sse_too_many_parallel_tools():
         if [s[0] for s in starts] != list(range(32)):
             fail("tool starts must use contiguous indices 0..31, got {!r}".format([s[0] for s in starts]))
             return
-        if _sse_stop_reason(frames) is not None:
-            fail("tool-index overflow must degrade stop_reason to null, got {!r}".format(_sse_stop_reason(frames)))
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("emitted parallel blocks must claim tool_use despite the overflow, got {!r}".format(_sse_stop_reason(frames)))
             return
         events = _degraded_trace_events(trace_file)
         if len(events) != 1 or events[0].get("overflow_tool_count") != 1:
             fail("expected overflow_tool_count 1 in one event, got {!r}".format(events))
             return
-        pass_("33 parallel tool indexes: 32 started contiguously, overflow diagnosed, stop null")
+        pass_("33 parallel tool indexes: 32 started contiguously, overflow diagnosed, stop tool_use")
     finally:
         cleanup()
 
@@ -1238,12 +1410,11 @@ def test_chat_sse_eof_empty_tool_calls_sentinel():
 
 
 def test_chat_sse_mixed_parseable_unparseable_finish():
-    """One unparseable parallel tool degrades the whole stream to a null stop reason.
+    """One unparseable parallel tool no longer degrades the stream to a null stop reason.
 
-    R2 review remediation: the finish claim condition includes
-    unparseable_arg_count == 0, so a stream with a valid tool and a second tool
-    whose accumulated arguments fail json.loads never claims tool_use, even
-    though both blocks start and close.
+    D4-revised (2026-10-03): both parallel blocks are emitted, so the finish
+    claims tool_use; unparseable_arg_count (== 1) stays a diagnostic. The
+    earlier rule gated the stop reason on unparseable_arg_count == 0.
     """
     print("\n--- Test: Chat SSE Mixed Parseable Unparseable Finish ---")
     chunks = [
@@ -1269,8 +1440,8 @@ def test_chat_sse_mixed_parseable_unparseable_finish():
         if _sse_types(frames).count("content_block_start") != 2 or _sse_types(frames).count("content_block_stop") != 2:
             fail("expected exactly 2 starts and 2 stops, got {}".format(_sse_types(frames)))
             return
-        if _sse_stop_reason(frames) is not None:
-            fail("mixed parseable+unparseable finish must degrade to null, got {!r}".format(_sse_stop_reason(frames)))
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("emitted parallel blocks must claim tool_use (one unparseable), got {!r}".format(_sse_stop_reason(frames)))
             return
         events = _degraded_trace_events(trace_file)
         if len(events) != 1:
@@ -1286,7 +1457,7 @@ def test_chat_sse_mixed_parseable_unparseable_finish():
             if marker in blob:
                 fail("degradation event leaked tool marker {!r}: {}".format(marker, blob))
                 return
-        pass_("mixed parseable+unparseable parallel finish -> null, unparseable_arg_count 1, metadata-only event")
+        pass_("mixed parseable+unparseable parallel finish -> tool_use, unparseable_arg_count 1, metadata-only event")
     finally:
         cleanup()
 
@@ -1294,11 +1465,11 @@ def test_chat_sse_mixed_parseable_unparseable_finish():
 
 
 def test_chat_sse_non_dict_arguments_at_close():
-    """Arguments that parse but not as a dict (e.g. \"123\") are counted unparseable.
+    """Arguments that parse but not as a dict (e.g. \"123\") still claim tool_use.
 
-    R3 review remediation: close-time json.loads must produce a dict to count a
-    tool as valid; a number/string/bool/null parse result increments
-    unparseable_arg_count, so this stream degrades to a null stop reason.
+    The block is still emitted (input reconstructed as the non-dict parse), so
+    D4-revised (2026-10-03) claims tool_use; unparseable_arg_count stays a
+    diagnostic. The earlier rule required a dict parse to claim tool_use.
     """
     print("\n--- Test: Chat SSE Non Dict Arguments At Close ---")
     chunks = [
@@ -1320,8 +1491,8 @@ def test_chat_sse_non_dict_arguments_at_close():
         if blocks[0]["input"] != 123:
             fail("block input should reconstruct the non-dict parse 123, got {!r}".format(blocks[0]["input"]))
             return
-        if _sse_stop_reason(frames) is not None:
-            fail("non-dict arguments at close must not claim tool_use, got {!r}".format(_sse_stop_reason(frames)))
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("emitted block must claim tool_use despite non-dict args, got {!r}".format(_sse_stop_reason(frames)))
             return
         events = _degraded_trace_events(trace_file)
         if len(events) != 1 or events[0].get("unparseable_arg_count") != 1:
@@ -1334,7 +1505,7 @@ def test_chat_sse_non_dict_arguments_at_close():
             if marker in blob:
                 fail("degradation event leaked tool marker {!r}: {}".format(marker, blob))
                 return
-        pass_("non-dict arguments at close -> null stop_reason, unparseable_arg_count 1, metadata-only event")
+        pass_("non-dict arguments at close -> tool_use, unparseable_arg_count 1, metadata-only event")
     finally:
         cleanup()
 
@@ -1342,12 +1513,11 @@ def test_chat_sse_non_dict_arguments_at_close():
 
 
 def test_chat_sse_frame_dropped_guard():
-    """A mid-stream oversized no-delimiter frame blocks the tool_use claim.
+    """A mid-stream oversized no-delimiter frame is counted; the emitted block still claims tool_use.
 
-    R5 review remediation: when an oversized (>64 KB) no-delimiter frame is
-    dropped after a tool block was emitted, frame_dropped blocks the finish
-    claim via `not (frame_dropped and emitted_tool_use)`, so the stream
-    degrades to null and the trace event reports frame_dropped: 1.
+    D4-revised (2026-10-03): frame_dropped no longer blocks the finish claim —
+    the tool block was emitted before the drop, so tool_use is claimed. The
+    drop is still diagnosed via frame_dropped: 1.
     """
     print("\n--- Test: Chat SSE Frame Dropped Guard ---")
     upstream_port = find_free_port()
@@ -1377,8 +1547,8 @@ def test_chat_sse_frame_dropped_guard():
         if blocks[0]["input"] != {"a": 1}:
             fail("tool input wrong after frame drop: {!r}".format(blocks[0]))
             return
-        if _sse_stop_reason(frames) is not None:
-            fail("frame drop with emitted tool use must degrade to null, got {!r}".format(_sse_stop_reason(frames)))
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("emitted block must claim tool_use despite the dropped frame, got {!r}".format(_sse_stop_reason(frames)))
             return
         events = _degraded_trace_events(trace_file)
         if len(events) != 1:
@@ -1394,7 +1564,7 @@ def test_chat_sse_frame_dropped_guard():
             if marker in blob:
                 fail("degradation event leaked tool marker {!r}: {}".format(marker, blob))
                 return
-        pass_("oversized no-delimiter frame mid-tool-stream -> null stop_reason, frame_dropped 1")
+        pass_("oversized no-delimiter frame mid-tool-stream: emitted block claims tool_use, frame_dropped 1")
     finally:
         cleanup()
 
@@ -1633,6 +1803,611 @@ def test_chat_sse_reasoning_then_text_transition():
         cleanup()
 
 
+def test_chat_sse_usage_after_finish_reason():
+    """The usage chunk that follows finish_reason is read during the drain and
+    reported on message_delta, instead of being dropped for a zero-filled one."""
+    print("\n--- Test: Chat SSE Usage After Finish Reason ---")
+    chunks = [
+        _cc({"role": "assistant", "content": "hi"}),
+        _cc({}, finish="stop"),
+        # OpenAI's documented ordering: include_usage puts this AFTER finish.
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1,
+         "model": "gpt-4o", "choices": [],
+         "usage": {"prompt_tokens": 111, "completion_tokens": 222}},
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("stop finish should still map to end_turn, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        usage = _message_delta_usage(frames)
+        if not usage:
+            fail("no usage on message_delta")
+            return
+        if usage.get("input_tokens") != 111 or usage.get("output_tokens") != 222:
+            fail("trailing usage not reported on message_delta; got {!r} "
+                 "(expected input_tokens=111, output_tokens=222)".format(usage))
+            return
+        pass_("trailing usage chunk read during drain -> message_delta usage")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_tool_calls_after_finish_reason():
+    """A provider that sends finish_reason before its tool_call frames: the drain
+    captures them and the stream ends tool_use, not end_turn."""
+    print("\n--- Test: Chat SSE Tool Calls After Finish Reason ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({}, finish="stop"),
+        _cc({"tool_calls": [{"index": 0, "id": "call_1",
+                             "function": {"name": "get_weather",
+                                          "arguments": "{\"city\":\"NY\"}"}}]}),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1:
+            fail("tool_call arriving after finish_reason must be captured, got {!r}".format(blocks))
+            return
+        if blocks[0]["name"] != "get_weather" or blocks[0]["input"] != {"city": "NY"}:
+            fail("drained tool block wrong: {!r}".format(blocks[0]))
+            return
+        if not blocks[0]["closed"]:
+            fail("drained tool block must be closed by the terminal sequence, got {!r}".format(blocks[0]))
+            return
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("drained tool call must upgrade stop to tool_use, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        types = _sse_types(frames)
+        if types.count("message_delta") != 1 or types.count("message_stop") != 1:
+            fail("expected exactly one terminal sequence, got {}".format(types))
+            return
+        pass_("tool_calls after finish_reason captured; stop_reason tool_use")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_usage_and_tool_calls_after_finish_reason():
+    """Both trailing frame classes are captured in one drain: the tool call
+    drives stop_reason, the usage chunk drives message_delta usage."""
+    print("\n--- Test: Chat SSE Usage And Tool Calls After Finish Reason ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({}, finish="stop"),
+        _cc({"tool_calls": [{"index": 0, "id": "call_9",
+                             "function": {"name": "ls", "arguments": "{\"p\":\"/tmp\"}"}}]}),
+        {"id": "c1", "object": "chat.completion.chunk", "created": 1,
+         "model": "gpt-4o", "choices": [],
+         "usage": {"prompt_tokens": 7, "completion_tokens": 9}},
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1 or blocks[0]["input"] != {"p": "/tmp"}:
+            fail("tool call after finish must survive alongside usage, got {!r}".format(blocks))
+            return
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("stop_reason should be tool_use, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        usage = _message_delta_usage(frames)
+        if not usage or usage.get("input_tokens") != 7 or usage.get("output_tokens") != 9:
+            fail("trailing usage not reported when tool calls are also drained; got {!r}".format(usage))
+            return
+        pass_("drain captures both trailing tool_calls and usage")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_finish_reason_last_chunk_no_drain():
+    """A stream whose finish_reason is genuinely last is unchanged: one terminal
+    sequence with the mapped stop reason and no extra frames."""
+    print("\n--- Test: Chat SSE Finish Reason Last Chunk No Drain ---")
+    chunks = [
+        _cc({"role": "assistant", "content": "Hel"}),
+        _cc({"content": "lo"}),
+        _cc({}, finish="stop"),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        types = _sse_types(frames)
+        required = ("message_start", "content_block_start", "content_block_delta",
+                    "content_block_stop", "message_delta", "message_stop")
+        missing = [t for t in required if t not in types]
+        if missing:
+            fail("missing SSE events {}; got {}".format(missing, types))
+            return
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("final stop chunk should still map to end_turn, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        starts = _sse_content_block_starts(frames)
+        if len(starts) != 1:
+            fail("no-drain stream must emit exactly one content block, got {!r}".format(starts))
+            return
+        if types.count("message_delta") != 1 or types.count("message_stop") != 1:
+            fail("expected exactly one terminal sequence, got {}".format(types))
+            return
+        deltas = _sse_frames_with_type(frames, "content_block_delta")
+        texts = [d["delta"].get("text") for d in deltas if isinstance(d.get("delta"), dict)]
+        if texts != ["Hel", "lo"]:
+            fail("text deltas should be unchanged, got {!r}".format(texts))
+            return
+        pass_("finish_reason as last chunk: behavior unchanged")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_truncation_still_works():
+    """EOF with no finish_reason still takes the truncation path: chat_sse_truncated
+    fires and a terminal sequence is synthesized."""
+    print("\n--- Test: Chat SSE Truncation Still Works ---")
+    chunks = [_cc({"role": "assistant", "content": "half a th"})]
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    sse_body = _sse_stream_chunks(chunks)  # no finish_reason, no [DONE]
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        types = _sse_types(frames)
+        missing = [t for t in ("content_block_stop", "message_delta", "message_stop") if t not in types]
+        if missing:
+            fail("truncation must still synthesize terminal events; missing {}".format(missing))
+            return
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("truncated text stream should synthesize end_turn, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        events = _trace_events_named(trace_file, "chat_sse_truncated")
+        if len(events) != 1:
+            fail("expected exactly one chat_sse_truncated event, got {}".format(len(events)))
+            return
+        suppressed = _trace_events_named(trace_file, "chat_sse_post_finish_suppressed")
+        if suppressed:
+            fail("a never-finished stream must not report post-finish suppression")
+            return
+        pass_("truncation path unchanged: chat_sse_truncated + synthesized terminal")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_drain_time_deadline():
+    """A provider that sends finish_reason and then goes silent must not hold the
+    request open past the drain bound."""
+    print("\n--- Test: Chat SSE Drain Time Deadline ---")
+    pre = _sse_stream_chunks([_cc({"role": "assistant", "content": "hi"}),
+                              _cc({}, finish="stop")])
+    proxy_port, trace_file, cleanup = _start_hanging_chat_proxy(
+        pre, DRAIN_BOUND_TEST_SECONDS * 3)
+    if proxy_port is None:
+        return
+    try:
+        raw, saw_stop, elapsed = _read_sse_until_stop(proxy_port, DRAIN_BOUND_TEST_SECONDS)
+        if not saw_stop:
+            fail("silent provider after finish_reason: no message_stop within {}s "
+                 "(got {} bytes)".format(DRAIN_BOUND_TEST_SECONDS, len(raw)))
+            return
+        if elapsed > DRAIN_BOUND_TEST_SECONDS:
+            fail("drain took {:.1f}s, exceeding the {}s bound".format(elapsed, DRAIN_BOUND_TEST_SECONDS))
+            return
+        frames = _parse_sse_frames(raw)
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("drain must still emit the mapped stop reason, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        pass_("silent provider: drain bounded, terminal emitted in {:.1f}s".format(elapsed))
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_done_terminates_drain():
+    """[DONE] ends the drain promptly even when the provider keeps the socket open,
+    so the client is not made to wait out the full bound."""
+    print("\n--- Test: Chat SSE Done Terminates Drain ---")
+    pre = _sse_stream_chunks([_cc({"role": "assistant", "content": "hi"}),
+                              _cc({}, finish="stop"),
+                              {"id": "c1", "object": "chat.completion.chunk",
+                               "created": 1, "model": "gpt-4o", "choices": [],
+                               "usage": {"prompt_tokens": 3, "completion_tokens": 4}}])
+    pre += b"data: [DONE]\n\n"
+    proxy_port, trace_file, cleanup = _start_hanging_chat_proxy(
+        pre, DRAIN_BOUND_TEST_SECONDS * 3)
+    if proxy_port is None:
+        return
+    try:
+        raw, saw_stop, elapsed = _read_sse_until_stop(proxy_port, DRAIN_BOUND_TEST_SECONDS)
+        if not saw_stop:
+            fail("no message_stop within {}s after [DONE]".format(DRAIN_BOUND_TEST_SECONDS))
+            return
+        frames = _parse_sse_frames(raw)
+        usage = _message_delta_usage(frames)
+        if not usage or usage.get("output_tokens") != 4:
+            fail("usage frame before [DONE] must be captured, got {!r}".format(usage))
+            return
+        if b"[DONE]" in raw:
+            fail("[DONE] sentinel leaked into client stream")
+            return
+        if elapsed > DRAIN_BOUND_TEST_SECONDS:
+            fail("[DONE] should end the drain promptly, took {:.1f}s".format(elapsed))
+            return
+        pass_("[DONE] terminates drain in {:.1f}s with usage captured".format(elapsed))
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_text_after_finish_suppressed():
+    """Text and reasoning deltas arriving after finish_reason are dropped by
+    policy — terminal() runs after the drain, so nothing is closed while it
+    runs — and counted in the trace."""
+    print("\n--- Test: Chat SSE Text After Finish Suppressed ---")
+    chunks = [
+        _cc({"role": "assistant", "content": "keep"}),
+        _cc({}, finish="stop"),
+        _cc({"content": "trailing text that must not reach the client"}),
+        _cc({"reasoning_content": "late thought"}),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        deltas = _sse_frames_with_type(frames, "content_block_delta")
+        texts = [d["delta"].get("text") for d in deltas
+                 if isinstance(d.get("delta"), dict) and d["delta"].get("type") == "text_delta"]
+        thinking = [d["delta"].get("thinking") for d in deltas
+                    if isinstance(d.get("delta"), dict) and d["delta"].get("type") == "thinking_delta"]
+        if texts != ["keep"]:
+            fail("only pre-finish text may be emitted, got {!r}".format(texts))
+            return
+        if thinking:
+            fail("late reasoning must be suppressed, got {!r}".format(thinking))
+            return
+        if len(_sse_content_block_starts(frames)) != 1:
+            fail("suppressed deltas must not open new blocks, got {!r}".format(_sse_content_block_starts(frames)))
+            return
+        # Order guard: every content_block_delta must precede its block's stop.
+        types = _sse_types(frames)
+        if types.index("content_block_delta") > types.index("content_block_stop"):
+            fail("no delta may follow content_block_stop; got {}".format(types))
+            return
+        events = _trace_events_named(trace_file, "chat_sse_post_finish_suppressed")
+        if len(events) != 1:
+            fail("expected exactly one chat_sse_post_finish_suppressed event, got {}".format(len(events)))
+            return
+        if events[0].get("count") != 2:
+            fail("both suppressed deltas should be counted, got {!r}".format(events[0].get("count")))
+            return
+        pass_("post-finish text/reasoning suppressed and counted")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_stream_options_include_usage():
+    """A streaming chat-mode request asks the provider for the trailing usage
+    frame; a non-streaming request must not carry stream_options at all."""
+    print("\n--- Test: Chat SSE Stream Options Include Usage ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    sse_body = _sse_stream_chunks([_cc({"role": "assistant", "content": "hi"}),
+                                   _cc({}, finish="stop")]) + b"data: [DONE]\n\n"
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}],
+                              "stream": True})
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        reqs = mock_servers["p"]["requests"]
+        if not reqs:
+            fail("upstream received no request")
+            return
+        try:
+            sent = json.loads(reqs[0]["body"])
+        except Exception as e:
+            fail("upstream body not JSON: {}".format(e))
+            return
+        so = sent.get("stream_options")
+        if so != {"include_usage": True}:
+            fail("streaming chat request must send stream_options include_usage, got {!r}".format(so))
+            return
+
+        # Non-streaming: OpenAI rejects stream_options on a buffered request.
+        status2, content_type2, raw2 = _send_proxy_request_stream(
+            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        if status2 != 200:
+            fail("non-streaming request expected 200, got {}".format(status2))
+            return
+        reqs2 = mock_servers["p"]["requests"]
+        if len(reqs2) < 2:
+            fail("expected a second upstream request, got {}".format(len(reqs2)))
+            return
+        try:
+            sent2 = json.loads(reqs2[1]["body"])
+        except Exception as e:
+            fail("non-streaming upstream body not JSON: {}".format(e))
+            return
+        if sent2.get("stream") is True:
+            fail("second request should not be streaming: {!r}".format(sent2.get("stream")))
+            return
+        if "stream_options" in sent2:
+            fail("non-streaming chat request must omit stream_options, got {!r}".format(sent2["stream_options"]))
+            return
+        pass_("streaming request sends include_usage; non-streaming omits stream_options")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_drain_byte_budget():
+    """A drain cut by MAX_DRAIN_BYTES mid-tool-call still claims tool_use.
+
+    The provider sends finish_reason, then a tool frame that opens the block,
+    then argument fragments that push the drain past the 64 KB budget with no
+    [DONE]. The budget is checked per chunk, so the crossing chunk is discarded
+    unparsed and the argument stream ends mid-fragment. Resolved Decision D4:
+    the partially filled block still closes and the stop reason is tool_use (the
+    client can surface the parse failure), never null.
+    """
+    print("\n--- Test: Chat SSE Drain Byte Budget ---")
+    tail = [_cc({"tool_calls": [{"index": 0, "id": "call_big",
+                                 "function": {"name": "big_tool", "arguments": ""}}]})]
+    # ~24 frames x 4000 argument bytes = ~96 KB, comfortably past MAX_DRAIN_BYTES.
+    for _ in range(24):
+        tail.append(_cc({"tool_calls": [{"index": 0, "function": {"arguments": "x" * 4000}}]}))
+    chunks = [_cc({"role": "assistant", "content": "hi"}),
+              _cc({}, finish="stop")] + tail
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks, add_done=False)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        types = _sse_types(frames)
+        if types.count("message_delta") != 1 or types.count("message_stop") != 1:
+            fail("expected exactly one terminal sequence, got {}".format(types))
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1 or not blocks[0]["closed"]:
+            fail("the opened tool block must survive the budget cut and close, got {!r}".format(blocks))
+            return
+        if blocks[0]["name"] != "big_tool":
+            fail("drained tool block wrong: {!r}".format(blocks[0]))
+            return
+        if not isinstance(blocks[0]["input"], str):
+            fail("the budget is checked per chunk, so the argument stream must be "
+                 "cut mid-fragment and stay unparseable; got {!r}".format(blocks[0]["input"]))
+            return
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("byte-budget cut mid-tool-call must still claim tool_use (D4), "
+                 "got {!r}".format(_sse_stop_reason(frames)))
+            return
+        pass_("drain cut at MAX_DRAIN_BYTES: partial tool block closes, stop_reason tool_use")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_first_frame_finish():
+    """A stream whose first data frame carries finish_reason still produces a
+    well-formed message_start -> terminal sequence with no content block.
+
+    The first frame is the only chance to open the message; the post-drain logic
+    must guarantee message_start precedes the terminal events so the client
+    never sees a delta/stop without an opening message.
+    """
+    print("\n--- Test: Chat SSE First Frame Finish ---")
+    chunks = [_cc({}, finish="stop")]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        types = _sse_types(frames)
+        if not types or types[0] != "message_start":
+            fail("message_start must open the stream, got {}".format(types[:3]))
+            return
+        missing = [t for t in ("message_start", "message_delta", "message_stop")
+                   if t not in types]
+        if missing:
+            fail("finish-only stream missing terminal events {}".format(missing))
+            return
+        if _sse_content_block_starts(frames):
+            fail("a finish-only stream must open no content block, got {!r}".format(
+                _sse_content_block_starts(frames)))
+            return
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("stop finish on the first frame should map to end_turn, got {!r}".format(
+                _sse_stop_reason(frames)))
+            return
+        if types.count("message_delta") != 1 or types.count("message_stop") != 1:
+            fail("expected exactly one terminal sequence, got {}".format(types))
+            return
+        pass_("finish on the first frame: start_message precedes a single terminal sequence")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_empty_finish_reason_no_change():
+    """An empty finish_reason is a finish, not an absence: the is-not-None
+    discipline records it, the stop reason follows the mapping (null), and the
+    EOF truncation path — which would synthesize end_turn and log
+    chat_sse_truncated — must not run. A truthiness regression on
+    finish_reason_seen would flip both signals.
+    """
+    print("\n--- Test: Chat SSE Empty Finish Reason ---")
+    chunks = [_cc({"role": "assistant", "content": "hi"}), _cc({}, finish="")]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        types = _sse_types(frames)
+        if types.count("message_delta") != 1 or types.count("message_stop") != 1:
+            fail("expected exactly one terminal sequence, got {}".format(types))
+            return
+        if _sse_stop_reason(frames) is not None:
+            fail("an empty finish_reason must map to a null stop_reason, got {!r}".format(
+                _sse_stop_reason(frames)))
+            return
+        if _trace_events_named(trace_file, "chat_sse_truncated"):
+            fail("a recorded (empty) finish_reason must not take the truncation path")
+            return
+        pass_("empty finish_reason recorded; stop_reason null; no truncation event")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_unmapped_finish_with_tools():
+    """An empty (unmapped) finish_reason during drain plus captured tool calls
+    reports stop_reason null — the None mapping is NOT upgraded by the presence
+    of tool blocks (Resolved Decision D3). The block still closes so the client
+    can read the tool call.
+    """
+    print("\n--- Test: Chat SSE Unmapped Finish With Tools ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({}, finish=""),
+        _cc({"tool_calls": [{"index": 0, "id": "call_u",
+                             "function": {"name": "u_tool", "arguments": "{\"a\":1}"}}]}),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1 or not blocks[0]["closed"] or blocks[0]["input"] != {"a": 1}:
+            fail("the drained tool call must be captured and closed, got {!r}".format(blocks))
+            return
+        types = _sse_types(frames)
+        if types.count("message_delta") != 1 or types.count("message_stop") != 1:
+            fail("expected exactly one terminal sequence, got {}".format(types))
+            return
+        if _sse_stop_reason(frames) is not None:
+            fail("an unmapped finish reason must stay null even with tool blocks "
+                 "(D3), got {!r}".format(_sse_stop_reason(frames)))
+            return
+        pass_("unmapped finish + drained tool blocks: block closed, stop_reason null")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_empty_revision_does_not_downgrade():
+    """A trailing empty-string finish_reason is the absence of an answer, not a
+    correction. The drain's revision path exists to honour a provider correcting
+    itself ("stop" -> "tool_calls"), so a falsy revised value is refused: an
+    already-resolved "tool_calls" survives it, the emitted block still claims
+    tool_use, and no spurious chat_sse_tool_degradation event is logged. A
+    truthiness regression on the revision guard would overwrite the resolved
+    reason with "" and fall into the emitted_tool_use branch, whose force_log
+    reports the downgrade as a degradation.
+    """
+    print("\n--- Test: Chat SSE Empty Revision Does Not Downgrade ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_r",
+                             "function": {"name": "r_tool", "arguments": "{\"k\":1}"}}]}),
+        _cc({}, finish="tool_calls"),
+        # A later frame revises the reason to "" — the falsy revision must be
+        # refused, leaving the resolved "tool_calls" in place.
+        _cc({}, finish=""),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1 or not blocks[0]["closed"] or blocks[0]["input"] != {"k": 1}:
+            fail("the emitted tool block must survive the empty revision, got {!r}".format(blocks))
+            return
+        types = _sse_types(frames)
+        if types.count("message_delta") != 1 or types.count("message_stop") != 1:
+            fail("expected exactly one terminal sequence, got {}".format(types))
+            return
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("an empty revision must not downgrade tool_use, got {!r}".format(
+                _sse_stop_reason(frames)))
+            return
+        degraded = _degraded_trace_events(trace_file)
+        if degraded:
+            fail("a resolved tool_calls stream must log no degradation event, got {!r}".format(degraded))
+            return
+        if _trace_events_named(trace_file, "chat_sse_truncated"):
+            fail("a recorded finish_reason must not take the truncation path")
+            return
+        pass_("empty revision refused; stop_reason tool_use; no degradation event")
+    finally:
+        cleanup()
+
+
+
+
 ALL_TESTS = [
     ("chat-sse-basic-streaming", test_chat_sse_basic_streaming),
     ("chat-sse-finish-reason-mapping", test_chat_sse_finish_reason_mapping),
@@ -1667,6 +2442,20 @@ ALL_TESTS = [
     ("chat-sse-reasoning-delta-to-thinking-delta", test_chat_sse_reasoning_delta_to_thinking_delta),
     ("chat-sse-reasoning-delta-no-content", test_chat_sse_reasoning_delta_no_content),
     ("chat-sse-reasoning-then-text-transition", test_chat_sse_reasoning_then_text_transition),
+    ("chat-sse-usage-after-finish-reason", test_chat_sse_usage_after_finish_reason),
+    ("chat-sse-tool-calls-after-finish-reason", test_chat_sse_tool_calls_after_finish_reason),
+    ("chat-sse-usage-and-tool-calls-after-finish", test_chat_sse_usage_and_tool_calls_after_finish_reason),
+    ("chat-sse-finish-reason-last-chunk", test_chat_sse_finish_reason_last_chunk_no_drain),
+    ("chat-sse-truncation-still-works", test_chat_sse_truncation_still_works),
+    ("chat-sse-drain-time-deadline", test_chat_sse_drain_time_deadline),
+    ("chat-sse-done-terminates-drain", test_chat_sse_done_terminates_drain),
+    ("chat-sse-text-after-finish-suppressed", test_chat_sse_text_after_finish_suppressed),
+    ("chat-sse-stream-options-include-usage", test_chat_sse_stream_options_include_usage),
+    ("chat-sse-drain-byte-budget", test_chat_sse_drain_byte_budget),
+    ("chat-sse-first-frame-finish", test_chat_sse_first_frame_finish),
+    ("chat-sse-empty-finish-reason", test_chat_sse_empty_finish_reason_no_change),
+    ("chat-sse-unmapped-finish-with-tools", test_chat_sse_unmapped_finish_with_tools),
+    ("chat-sse-empty-revision-no-downgrade", test_chat_sse_empty_revision_does_not_downgrade),
 ]
 
 

@@ -371,9 +371,11 @@ directions (thinking blocks echo the learned per-pair `reasoning_field` — noth
 `reasoning_content` or `reasoning` once learned — tool_use→tool_calls, tool_result→role:tool).
 Chat-mode streaming correctly converts tool-call SSE deltas to Anthropic
 `tool_use` content blocks (per-index state, parallel/interleaved support,
-dict-only JSON validation, conservative degradation on malformed/truncated
-streams). Image content blocks are not mapped between Anthropic and OpenAI
-formats. In chat and response modes, error responses (non-2xx) pass through
+argument fragments forwarded verbatim, count-only diagnostics on malformed
+frames), and reads on past `finish_reason` so a trailing usage chunk or a
+late tool call is not lost; a provider that then goes silent is bounded by a
+5-second drain rather than held to the upstream socket timeout. Image
+content blocks are not mapped between Anthropic and OpenAI formats. In chat and response modes, error responses (non-2xx) pass through
 untransformed in the upstream format.
 
 ### Admin page (`http://localhost:8080/admin/`)

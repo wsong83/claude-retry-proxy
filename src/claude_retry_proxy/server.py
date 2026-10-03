@@ -1196,6 +1196,11 @@ MAX_CHAT_TOOL_PENDING_BYTES = 64 * 1024
 MAX_CHAT_TRACKED_TOOL_INDEXES = 32
 MAX_CHAT_OPEN_TOOL_BLOCKS = 32
 
+# Post-finish drain bounds: after a finish_reason chunk the read loop keeps
+# reading briefly to capture trailing usage / tool_call frames.
+MAX_DRAIN_BYTES = 64 * 1024
+MAX_DRAIN_SECONDS = 5
+
 
 def _rewrite_sse_first_event(event_bytes, tier, request_id):
     """Rewrite model in first SSE event if it's a message_start event.
@@ -1515,9 +1520,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         (reasoning_content/reasoning deltas open a thinking block at index 0,
         content deltas a text block). Deltas become content_block_delta, and
         terminal events (content_block_stop, message_delta, message_stop) are
-        emitted exactly once — on the finish_reason chunk, or synthesized at
-        EOF/truncation so the Anthropic client never hangs. [DONE] and
-        non-data frames are skipped.
+        emitted exactly once — after the post-finish drain, or synthesized at
+        EOF/truncation so the Anthropic client never hangs.
+
+        A finish_reason chunk does not end the read: the loop drains trailing
+        frames until EOF, [DONE], or the MAX_DRAIN_BYTES / MAX_DRAIN_SECONDS
+        bound, then emits the terminal sequence. The time bound is enforced by
+        a socket read timeout that tracks the remaining budget, so a silent
+        provider cannot hold the worker thread past it. The drain captures the
+        usage chunk and tool_calls (each tool call opening its own content
+        block); content and reasoning deltas arriving after the finish signal
+        are dropped by policy and counted. [DONE] ends the drain and is
+        otherwise skipped, as are non-data frames.
 
         OpenAI delta.tool_calls are converted into Anthropic tool_use content
         blocks: per-upstream-index state buffers argument fragments until valid
@@ -1525,8 +1539,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         shared monotonic allocator (incremented only on content_block_start,
         never on close, so indices stay contiguous). A normal "tool_calls"
         finish closes open tool blocks in ascending index order and claims
-        stop_reason "tool_use" only when a parseable tool block was emitted; all
-        malformed/dropped variants degrade to a null stop reason that are
+        stop_reason "tool_use" iff a tool_use block was emitted (whatever its
+        arguments); the malformed/dropped variants are still counted and
         reported via one bounded metadata-only trace event per stream.
         """
         MAX_EVENT_BUFFER = 64 * 1024
@@ -1552,6 +1566,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         scalar_after_tools_dropped = 0
         frame_dropped = False
         degradation_logged = False
+        finish_reason_seen = None
+        drain_bytes = 0
+        drain_done = False
+        finish_seen_at = None
+        post_finish_suppressed = 0
+        _orig_timeout = None
+        _timeout_saved = False
 
         def write(payload):
             nonlocal bytes_streamed, first_byte_ms
@@ -1822,6 +1843,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         def handle_frame(frame):
             nonlocal chat_id, usage, first_frame, tool_calls_seen, scalar_after_tools_dropped, malformed_tool_count
+            nonlocal finish_reason_seen, post_finish_suppressed
             text = frame.decode("utf-8", errors="replace")
             data_lines = [ln[5:].strip() for ln in text.splitlines()
                           if ln.startswith("data:")]
@@ -1855,6 +1877,31 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if isinstance(cid, str) and cid:
                     chat_id = cid
                 start_message()
+            if finish_reason_seen is not None:
+                # Drain mode: only tool_calls, usage and a revised
+                # finish_reason are still meaningful. Content / reasoning
+                # deltas arriving after the finish signal are dropped by
+                # policy, not by protocol — terminal() runs after the drain,
+                # so nothing is closed yet. Tool calls arrive as their own block.
+                # A revision is accepted only for a truthy reason: this path
+                # exists to honour a provider correcting itself ("stop" to
+                # "tool_calls"), and an empty string is the absence of an
+                # answer, not a correction. The `is not None` form would let a
+                # trailing "" overwrite a resolved reason; null on every
+                # non-final chunk is already excluded by this same guard.
+                revised = choice.get("finish_reason")
+                if revised:
+                    finish_reason_seen = revised
+                if isinstance(delta, dict):
+                    if delta.get("tool_calls") is not None:
+                        tool_calls_seen = True
+                        process_tool_calls(delta["tool_calls"])
+                    # Suppress content and reasoning deltas
+                    if (isinstance(delta.get("content"), str) and delta.get("content")) or \
+                            (isinstance(delta.get("reasoning_content"), str) and delta.get("reasoning_content")) or \
+                            (isinstance(delta.get("reasoning"), str) and delta.get("reasoning")):
+                        post_finish_suppressed += 1
+                return None
             if isinstance(delta, dict):
                 if delta.get("tool_calls"):
                     tool_calls_seen = True
@@ -1906,6 +1953,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     break
                 if not chunk:
                     break
+                if finish_reason_seen is not None:
+                    drain_bytes += len(chunk)
+                    if drain_bytes > MAX_DRAIN_BYTES:
+                        break
+                    remaining = MAX_DRAIN_SECONDS - (time.time() - finish_seen_at)
+                    if remaining <= 0:
+                        break
+                    if _timeout_saved:
+                        try:
+                            resp.fp.raw._sock.settimeout(max(1, remaining))
+                        except (AttributeError, OSError):
+                            _timeout_saved = False
                 if first_byte_ms is None:
                     first_byte_ms = (time.time() - first_byte_start) * 1000
                 # Degraded mode (first-frame cap exceeded): forward raw bytes
@@ -1927,26 +1986,28 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     del buf[:idx + 2]
                     result = handle_frame(frame)
                     if result == "done":
+                        if finish_reason_seen is not None:
+                            drain_done = True
+                            break
                         continue
                     if isinstance(result, tuple) and result[0] == "finish":
-                        finish_reason = result[1]
-                        if finish_reason == "tool_calls":
-                            valid = close_open_tool_blocks(validate=True)
-                            if (valid > 0 and dropped_fragment_count == 0
-                                    and overflow_tool_count == 0
-                                    and unparseable_arg_count == 0
-                                    and not (frame_dropped and emitted_tool_use)):
-                                sr = "tool_use"
-                            else:
-                                sr = None
-                            terminal(sr)
-                        elif emitted_tool_use:
-                            close_open_tool_blocks(validate=False)
-                            terminal(_map_chat_finish_reason(finish_reason),
-                                     force_log=True)
-                        else:
-                            terminal(_map_chat_finish_reason(finish_reason))
-                        return first_byte_ms
+                        finish_reason_seen = result[1]
+                        finish_seen_at = time.time()
+                        # Bound the drain at the point of blocking: without
+                        # this, a provider that goes silent after finish_reason
+                        # pins resp.read1() for the full upstream socket
+                        # timeout (300 s). The value tracks the REMAINING drain
+                        # budget (recomputed per chunk) and is restored after
+                        # the drain.
+                        try:
+                            _orig_timeout = resp.fp.raw._sock.gettimeout()
+                            resp.fp.raw._sock.settimeout(max(1, MAX_DRAIN_SECONDS))
+                            _timeout_saved = True
+                        except (AttributeError, OSError):
+                            _timeout_saved = False
+                        continue  # enter drain mode
+                if drain_done:
+                    break
                 # Memory guards for frames without a delimiter
                 if len(buf) > MAX_EVENT_BUFFER:
                     if not message_started:
@@ -1980,6 +2041,45 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     break
         except _DISCONNECT_ERRORS:
             raise
+        # Restore the upstream socket timeout captured when the drain began.
+        # The _timeout_saved flag — not a `_orig_timeout is not None` test —
+        # gates it: a captured timeout of None (blocking mode) is a legitimate
+        # value that must be restored as-is.
+        if finish_reason_seen is not None and _timeout_saved:
+            try:
+                resp.fp.raw._sock.settimeout(_orig_timeout)
+            except (OSError, AttributeError):
+                pass
+        # finish_reason was seen: the drain above ran to EOF, [DONE], or a
+        # bound. Emit the terminal sequence now, so trailing usage and tool_call
+        # frames captured during the drain are accounted for.
+        if finish_reason_seen is not None:
+            if not message_started:
+                start_message()
+            if finish_reason_seen == "tool_calls":
+                # Diagnostic only: validate still counts unparseable arguments for
+                # the coalesced chat_sse_tool_degradation event, but the counts no
+                # longer gate the stop reason (Resolved Decision D4).
+                close_open_tool_blocks(validate=True)
+                sr = "tool_use" if emitted_tool_use else None
+                terminal(sr)
+            elif emitted_tool_use:
+                close_open_tool_blocks(validate=False)
+                mapped = _map_chat_finish_reason(finish_reason_seen)
+                # Provider signalled finish before the tool_call frames: claim
+                # tool_use rather than letting the client stop for user input.
+                sr = "tool_use" if mapped == "end_turn" else mapped
+                terminal(sr, force_log=True)
+            else:
+                terminal(_map_chat_finish_reason(finish_reason_seen))
+            if post_finish_suppressed:
+                log_trace({
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "event": "chat_sse_post_finish_suppressed",
+                    "request_id": request_id,
+                    "count": post_finish_suppressed,
+                })
+            return first_byte_ms
         # EOF reached without a finish_reason chunk: synthesize a clean
         # terminal sequence so the client stream never hangs.
         if not message_started:

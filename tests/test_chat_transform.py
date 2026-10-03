@@ -1402,6 +1402,75 @@ def test_chat_to_anthropic_malformed_tool_args_mixed():
     pass_("mixed valid + malformed tool calls: valid tool_use kept, malformed degrades")
 
 
+def test_chat_anthropic_to_chat_zero_arg_tool():
+    """A zero-argument tool call (arguments "{}") emits a real tool_use block with input {}.
+
+    Step 11 (plan 2026-10-02-drain-after-finish-reason): the buffered chat
+    transform's `or parsed_args == {}` over-check previously replaced a
+    legitimate zero-argument call with the "[Tool call failed: ...]" text
+    placeholder. Dropping it emits `input: {}` and fires no
+    tool_args_parse_failure event. Response mode already accepted {}; this
+    aligns chat mode with it. Genuinely unparseable arguments still degrade to
+    the placeholder (companion assertion below).
+    """
+    print("\n--- Test: Chat To Anthropic Zero Arg Tool ---")
+    fn = _require_server_func("_chat_to_anthropic")
+    if fn is None:
+        return
+    # Zero-argument call: arguments "{}" is valid JSON and a valid tool_use input.
+    chat = {"id": "x",
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": "",
+                                     "tool_calls": [
+                                         {"id": "call_zero", "type": "function",
+                                          "function": {"name": "zero_arg", "arguments": "{}"}}]},
+                         "finish_reason": "tool_calls"}]}
+    out = fn(chat, "sonnet", request_id="R0z", mode="chat", provider="p")
+    content = out.get("content") if isinstance(out.get("content"), list) else []
+    tools = [b for b in content if b.get("type") == "tool_use"]
+    if len(tools) != 1:
+        fail("zero-arg tool call must emit exactly one tool_use block, got {!r}".format(content))
+        return
+    if tools[0].get("name") != "zero_arg" or tools[0].get("input") != {}:
+        fail("zero-arg tool block must carry input {{}}, got {!r}".format(tools[0]))
+        return
+    text_blocks = [b for b in content if b.get("type") == "text"]
+    if text_blocks:
+        fail("zero-arg tool call must not emit a placeholder text block, got {!r}".format(text_blocks))
+        return
+    if out.get("stop_reason") != "tool_use":
+        fail("zero-arg tool call should claim tool_use, got {!r}".format(out.get("stop_reason")))
+        return
+    if any(ev.get("event") == "tool_args_parse_failure" for ev in _trace_events_for_request("R0z")):
+        fail("zero-arg tool call must not fire tool_args_parse_failure")
+        return
+    # Companion: a genuinely unparseable arguments string still degrades.
+    chat_bad = {"id": "x",
+                "choices": [{"index": 0,
+                             "message": {"role": "assistant", "content": "",
+                                         "tool_calls": [
+                                             {"id": "call_bad", "type": "function",
+                                              "function": {"name": "bad_arg", "arguments": "{not json"}}]},
+                             "finish_reason": "tool_calls"}]}
+    out_bad = fn(chat_bad, "sonnet", request_id="R0b", mode="chat", provider="p")
+    content_bad = out_bad.get("content") if isinstance(out_bad.get("content"), list) else []
+    if any(b.get("type") == "tool_use" for b in content_bad):
+        fail("unparseable arguments must NOT emit a tool_use block, got {!r}".format(content_bad))
+        return
+    if not any(b.get("type") == "text" and "bad_arg" in (b.get("text") or "") for b in content_bad):
+        fail("unparseable arguments must emit the placeholder text block, got {!r}".format(content_bad))
+        return
+    if out_bad.get("stop_reason") is not None:
+        fail("all-malformed tool calls should force stop_reason None, got {!r}".format(out_bad.get("stop_reason")))
+        return
+    if not any(ev.get("event") == "tool_args_parse_failure" for ev in _trace_events_for_request("R0b")):
+        fail("unparseable arguments must fire tool_args_parse_failure")
+        return
+    pass_("zero-arg tool call emits input {} with no failure event; unparseable still placeholders")
+
+
+
+
 ALL_TESTS = [
     ("anthropic-to-chat-messages-transform", test_anthropic_to_chat_messages_transform),
     ("anthropic-to-chat-messages-thinking-stripped", test_anthropic_to_chat_messages_thinking_stripped),
@@ -1445,6 +1514,7 @@ ALL_TESTS = [
     ("chat-to-anthropic-content-array", test_chat_to_anthropic_content_array),
     ("chat-to-anthropic-malformed-tool-args-text-block", test_chat_to_anthropic_malformed_tool_args_text_block),
     ("chat-to-anthropic-malformed-tool-args-mixed", test_chat_to_anthropic_malformed_tool_args_mixed),
+    ("chat-zero-arg-tool", test_chat_anthropic_to_chat_zero_arg_tool),
 ]
 
 

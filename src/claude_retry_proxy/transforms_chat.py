@@ -76,6 +76,11 @@ def _anthropic_to_chat(body_json, request_id=None, mode=None, provider=None,
             out[field] = body_json[field]
     if "stop_sequences" in body_json:
         out["stop"] = body_json["stop_sequences"]
+    # OpenAI emits the usage frame as the last data frame of a stream, after
+    # finish_reason, and only when asked for it. Non-streaming requests reject
+    # stream_options outright, so it is set only when streaming.
+    if body_json.get("stream"):
+        out["stream_options"] = {"include_usage": True}
     return out
 
 
@@ -460,7 +465,7 @@ def _chat_to_anthropic(chat_body, tier, request_id=None, mode=None, provider=Non
                         parsed_args = None
                 else:
                     parsed_args = None
-                if parsed_args is None or parsed_args == {}:
+                if parsed_args is None:
                     log_trace({
                         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "event": "tool_args_parse_failure",

@@ -10,7 +10,7 @@
 
 <h1>Test Catalog<span class="sub">Suite layout, harness isolation, and testing patterns</span></h1>
 
-<p><strong>Last updated:</strong> 2026-09-30</p>
+<p><strong>Last updated:</strong> 2026-10-03</p>
 
 <p>The suite is a set of per-area modules merged by a single aggregator. It runs against
 <em>real</em> proxy processes and <em>real</em> mock upstream servers over loopback sockets —
@@ -18,10 +18,11 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>347 test functions across 19 files</strong>, but this number moves whenever
-tests are added. (It read <em>345 across 19</em> before this recount, <em>334 across 19</em>
-before that, and <em>322 across 18</em> before an earlier one — the page has drifted behind the
-suite three times, and in each case the stale total disagreed with the page's own catalog table
+suite has <strong>362 test functions across 19 files</strong>, but this number moves whenever
+tests are added. (It read <em>361 across 19</em> before this recount, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
+before that, <em>334 across 19</em> before that, and <em>322 across 18</em> before an earlier
+one — the page has drifted behind the
+suite four times, and in each case the stale total disagreed with the page's own catalog table
 as well.)
 Re-count before quoting it:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
@@ -83,12 +84,12 @@ relative size, not as exact current figures.</p>
     <td>The compatibility learner — both features (<code>context_management</code>,
         <code>reasoning_field</code>): persistence, detection, state machine, concurrency.
         See <a href="compatibility.html">compatibility.html</a>.</td></tr>
-<tr><td><code>test_chat_transform.py</code></td><td class="num">42</td>
+<tr><td><code>test_chat_transform.py</code></td><td class="num">43</td>
     <td>Anthropic → Chat Completions request and response transforms</td></tr>
 <tr><td><code>test_response_transform.py</code></td><td class="num">37</td>
     <td>Anthropic → Responses request and response transforms</td></tr>
-<tr><td><code>test_chat_sse.py</code></td><td class="num">33</td>
-    <td>Chat-mode SSE synthesis, tool-call deltas, truncation and degradation</td></tr>
+<tr><td><code>test_chat_sse.py</code></td><td class="num">47</td>
+    <td>Chat-mode SSE synthesis, tool-call deltas, post-finish drain, truncation and degradation</td></tr>
 <tr><td><code>test_mode_dispatch.py</code></td><td class="num">28</td>
     <td>Mode dispatch, auth headers, path rewriting</td></tr>
 <tr><td><code>test_admin.py</code></td><td class="num">25</td>
@@ -275,7 +276,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> The Anthropic↔Chat request and response conversions, including tool calls, thinking blocks, and cache control.</p>
 
-<h4><code>tests/test_chat_transform.py</code> (42 tests) — Anthropic → Chat request and response transforms</h4>
+<h4><code>tests/test_chat_transform.py</code> (43 tests) — Anthropic → Chat request and response transforms</h4>
 <ul>
 <li><code>test_anthropic_to_chat_messages_transform</code>: Full message array (thinking/text/tool_use/tool_result) -&gt; valid OpenAI Chat messages.</li>
 <li><code>test_anthropic_to_chat_messages_thinking_stripped</code>: At the default selection no reasoning field is emitted for a thinking block; the echo is the learned per-pair selection's call, not an always-on conversion.</li>
@@ -319,6 +320,7 @@ EOF</code></pre>
 <li><code>test_chat_to_anthropic_content_array</code>: Array content blocks map individually.</li>
 <li><code>test_chat_to_anthropic_malformed_tool_args_text_block</code>: Malformed tool args degrade to a text block, not a tool_use with input {}.</li>
 <li><code>test_chat_to_anthropic_malformed_tool_args_mixed</code>: Mixed valid + malformed tool calls: valid tool_use kept, malformed degrades.</li>
+<li><code>test_chat_anthropic_to_chat_zero_arg_tool</code>: A zero-argument call (<code>arguments: &quot;{}&quot;</code>) is valid, not malformed — it emits a real <code>tool_use</code> block with <code>input: {}</code>, claims <code>tool_use</code>, and fires no <code>tool_args_parse_failure</code>; a genuinely unparseable arguments string still degrades to the placeholder and <code>null</code>.</li>
 </ul>
 
 <h3 id="cat-5">Category 5 — Responses API Transforms</h3>
@@ -370,7 +372,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> Synthesising Anthropic SSE events from a chat provider's stream: framing, tool-call deltas, and every degradation path.</p>
 
-<h4><code>tests/test_chat_sse.py</code> (33 tests) — chat-mode SSE synthesis and framing</h4>
+<h4><code>tests/test_chat_sse.py</code> (47 tests) — chat-mode SSE synthesis, post-finish drain, and framing</h4>
 <ul>
 <li><code>test_chat_sse_basic_streaming</code>: Simulated OpenAI SSE chunks produce valid Anthropic SSE events.</li>
 <li><code>test_chat_sse_finish_reason_mapping</code>: finish_reason maps to stop_reason in the terminal message_delta.</li>
@@ -387,24 +389,38 @@ EOF</code></pre>
 <li><code>test_chat_sse_malformed_tool_call_degrades</code>: Malformed tool-call deltas never emit a tool_use block; one metadata-only trace event.</li>
 <li><code>test_chat_sse_mixed_valid_and_malformed_tool_calls</code>: A valid parallel call survives alongside a malformed entry without contamination.</li>
 <li><code>test_chat_sse_tool_call_eof_without_finish</code>: EOF without finish_reason: valid blocks close and get null; no deltas get end_turn.</li>
-<li><code>test_chat_sse_non_tool_calls_finish_with_tool_blocks</code>: A length/stop finish while tool blocks are open closes them and maps normally.</li>
+<li><code>test_chat_sse_non_tool_calls_finish_with_tool_blocks</code>: A length/stop finish while tool blocks are open closes them; a <code>stop</code> finish then upgrades to <code>tool_use</code> (changed 2026-10-03 by the post-finish drain plan — it previously asserted <code>end_turn</code>), while a <code>length</code> finish stays <code>max_tokens</code>.</li>
 <li><code>test_chat_sse_scalar_delta_after_tool_blocks</code>: Scalar deltas after the first tool block are dropped with a counted diagnostic.</li>
 <li><code>test_chat_sse_final_fragment_in_finish_frame</code>: The last argument fragment sharing the finish frame is emitted before close.</li>
 <li><code>test_chat_sse_no_deltas_tool_calls_finish</code>: finish_reason tool_calls with zero tool-call deltas degrades to null (never tool_use).</li>
-<li><code>test_chat_sse_unparseable_arguments_at_close</code>: Valid metadata + tool_calls finish but unparseable args degrade the stop reason.</li>
+<li><code>test_chat_sse_unparseable_arguments_at_close</code>: Valid metadata + tool_calls finish with unparseable arguments; the emitted tool block still claims <code>tool_use</code> and the failure is counted only (changed 2026-10-03 — previously asserted a <code>null</code> stop reason).</li>
 <li><code>test_chat_sse_conflicting_metadata</code>: A later valid-but-different id/name on an existing index is treated as malformed.</li>
-<li><code>test_chat_sse_fragments_missing_index</code>: Non-empty fragments without an index are dropped, counted, and block tool_use.</li>
+<li><code>test_chat_sse_fragments_missing_index</code>: Non-empty fragments without an index are dropped and counted; the block that did start still claims <code>tool_use</code> (changed 2026-10-03 — previously asserted a <code>null</code> stop reason).</li>
 <li><code>test_chat_sse_malformed_delta_shapes</code>: Malformed delta shapes are skipped without crashing; the stream still terminates.</li>
 <li><code>test_chat_sse_pending_buffer_cap_exceeded</code>: Pending argument fragments exceeding the per-tool cap never emit a tool_use.</li>
-<li><code>test_chat_sse_too_many_parallel_tools</code>: More than 32 tracked tool indexes overflow into the coalesced diagnostic.</li>
+<li><code>test_chat_sse_too_many_parallel_tools</code>: More than 32 tracked tool indexes overflow into the coalesced diagnostic; the blocks emitted before the overflow still claim <code>tool_use</code> (changed 2026-10-03 — previously asserted a <code>null</code> stop reason).</li>
 <li><code>test_chat_sse_eof_empty_tool_calls_sentinel</code>: An empty tool_calls: [] sentinel frame must not mark tool deltas seen at EOF.</li>
-<li><code>test_chat_sse_mixed_parseable_unparseable_finish</code>: One unparseable parallel tool degrades the whole stream to a null stop reason.</li>
-<li><code>test_chat_sse_non_dict_arguments_at_close</code>: Arguments that parse but not as a dict (e.g. &quot;123&quot;) are counted unparseable.</li>
-<li><code>test_chat_sse_frame_dropped_guard</code>: A mid-stream oversized no-delimiter frame blocks the tool_use claim.</li>
+<li><code>test_chat_sse_mixed_parseable_unparseable_finish</code>: One unparseable parallel tool no longer degrades the stream — both emitted blocks claim <code>tool_use</code>, with the unparseable one counted (changed 2026-10-03 — previously asserted a <code>null</code> stop reason).</li>
+<li><code>test_chat_sse_non_dict_arguments_at_close</code>: Arguments that parse but not as a dict (e.g. &quot;123&quot;) are counted unparseable; the block is still emitted and still claims <code>tool_use</code> (changed 2026-10-03 — previously asserted a <code>null</code> stop reason).</li>
+<li><code>test_chat_sse_frame_dropped_guard</code>: A mid-stream oversized no-delimiter frame is dropped and counted; the tool block already emitted still claims <code>tool_use</code> (changed 2026-10-03 — previously asserted a <code>null</code> stop reason).</li>
 <li><code>test_chat_mode_streamed_tool_command_e2e</code>: State-wide: a streamed Bash tool call becomes a runnable Anthropic tool_use turn.</li>
 <li><code>test_chat_sse_reasoning_delta_to_thinking_delta</code>: reasoning_content delta -&gt; thinking block at index 0, then text block at index 1.</li>
 <li><code>test_chat_sse_reasoning_delta_no_content</code>: A stream with only reasoning deltas still emits valid thinking blocks and terminal events.</li>
 <li><code>test_chat_sse_reasoning_then_text_transition</code>: thinking content_block_stop(index 0) precedes text content_block_start(index 1).</li>
+<li><code>test_chat_sse_usage_after_finish_reason</code>: A usage chunk arriving after finish_reason (OpenAI's documented <code>include_usage</code> ordering) is captured, so message_delta carries real counts instead of zeros.</li>
+<li><code>test_chat_sse_tool_calls_after_finish_reason</code>: Tool-call frames arriving after a <code>stop</code> finish are captured and the stream ends with <code>stop_reason: tool_use</code>, not <code>end_turn</code>.</li>
+<li><code>test_chat_sse_usage_and_tool_calls_after_finish_reason</code>: A late tool call and a late usage chunk in the same stream are both captured.</li>
+<li><code>test_chat_sse_finish_reason_last_chunk_no_drain</code>: finish_reason as the genuine last chunk keeps the previous behavior — correct stop reason, no extra frames.</li>
+<li><code>test_chat_sse_truncation_still_works</code>: EOF with no finish_reason still takes the truncation path (chat_sse_truncated event, terminal synthesized).</li>
+<li><code>test_chat_sse_drain_time_deadline</code>: A provider that goes silent after finish_reason is bounded by the socket read timeout at 5&nbsp;s, not by the 300&nbsp;s upstream socket timeout.</li>
+<li><code>test_chat_sse_done_terminates_drain</code>: <code>[DONE]</code> ends the drain promptly, its usage frame is captured, and the sentinel never leaks into the client stream.</li>
+<li><code>test_chat_sse_text_after_finish_suppressed</code>: Text and reasoning deltas after finish are suppressed (no delta follows content_block_stop) and counted in one chat_sse_post_finish_suppressed event.</li>
+<li><code>test_chat_sse_stream_options_include_usage</code>: The streaming chat request carries <code>stream_options: {include_usage: true}</code>; a non-streaming request omits the key.</li>
+<li><code>test_chat_sse_drain_byte_budget</code>: A drain cut at MAX_DRAIN_BYTES mid-tool-call closes the partial block and still claims tool_use (Resolved Decision D4).</li>
+<li><code>test_chat_sse_first_frame_finish</code>: finish_reason on the first data frame still yields message_start followed by a single terminal sequence, with no content block.</li>
+<li><code>test_chat_sse_empty_finish_reason_no_change</code>: An empty finish_reason is recorded (the <code>is not None</code> discipline), maps to a null stop reason, and does not take the truncation path.</li>
+<li><code>test_chat_sse_unmapped_finish_with_tools</code>: An unmapped/empty finish_reason with captured tool blocks still reports <code>stop_reason: null</code> (Resolved Decision D3).</li>
+<li><code>test_chat_sse_empty_revision_does_not_downgrade</code>: A trailing <code>finish_reason: &quot;&quot;</code> is refused as a revision, so a resolved <code>tool_calls</code> survives — <code>stop_reason</code> stays <code>tool_use</code>, the emitted block is intact and closed, one terminal sequence is emitted, and no degradation or truncation event is logged. The companion to <code>empty_finish_reason_no_change</code>: an empty reason is recorded when it is the provider's <em>first</em> answer, but may not overwrite a resolved one.</li>
 </ul>
 
 <h3 id="cat-7">Category 7 — Compatibility Learner</h3>
@@ -501,7 +517,6 @@ EOF</code></pre>
 <li><code>test_admin_switch_unknown_key_rejected</code>: An unknown key name in a switch payload is rejected with a 400 naming tier and provider; config is unchanged and the proxy stays live.</li>
 <li><code>test_admin_switch_invalid_key_type_rejected</code>: Non-string key values (false/0/[]) in a switch payload are rejected with 400 &#x27;invalid key name&#x27;; config on disk is unchanged.</li>
 <li><code>test_admin_switch_missing_key_defaults</code>: A switch body without key selectors succeeds and the persisted config gains the provider&#x27;s first key name (canonical config on disk).</li>
-<li><code>test_admin_reload_validates_key_names</code>: Reload re-validates per-tier key names against the in-memory vendors: an unknown key on disk refuses the reload (400); a fixed name reloads.</li>
 <li><code>test_admin_html_key_column</code>: admin.html gains a per-tier key &lt;select&gt;, a disabled-select style, a static column header row (Provider/Model/Key) above #tiers-container, and a populateKeys wired in…</li>
 </ul>
 
@@ -715,6 +730,6 @@ whenever a proxy is running.</p>
       that the full suite passes with a live proxy running.</li>
 </ol>
 
-<footer>Last updated: 2026-09-30</footer>
+<footer>Last updated: 2026-10-03</footer>
 </body>
 </html>

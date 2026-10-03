@@ -10,7 +10,7 @@
 
 <h1>Trace Log<span class="sub">What the proxy records, and what it deliberately does not</span></h1>
 
-<p><strong>Last updated:</strong> 2026-09-30</p>
+<p><strong>Last updated:</strong> 2026-10-03</p>
 
 <p>The trace log is a JSONL file — one JSON object per line — at
 <code>~/.claude/logs/proxy-trace.jsonl</code> by default, overridable with
@@ -117,6 +117,9 @@ are the complete set the proxy can write.</p>
 <tr><td><code>chat_sse_truncated</code>, <code>chat_sse_malformed_json</code>,
     <code>chat_sse_frame_cap_exceeded</code>, <code>chat_sse_buffer_cap_exceeded</code></td>
     <td>chat-mode SSE framing problems</td></tr>
+<tr><td><code>chat_sse_post_finish_suppressed</code></td>
+    <td>post-finish drain suppressed <code>content</code>/<code>reasoning</code> deltas
+    (carries <code>count</code>)</td></tr>
 <tr><td><code>sse_buffer_cap_exceeded</code>, <code>sse_rewrite_malformed_json</code></td>
     <td>anthropic-mode SSE buffering and rewrite problems</td></tr>
 <tr><td><code>response_sse_unexpected</code></td><td>a response-mode provider streamed despite <code>stream: false</code></td></tr>
@@ -236,6 +239,6 @@ directory means every request loses its entry until the condition is fixed. See
 <a href="architecture.html#sinks">architecture.html</a> for the full policy.</p>
 </div>
 
-<footer>Last updated: 2026-09-30</footer>
+<footer>Last updated: 2026-10-03</footer>
 </body>
 </html>

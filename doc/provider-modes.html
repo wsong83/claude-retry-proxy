@@ -10,7 +10,7 @@
 
 <h1>Provider Modes<span class="sub">anthropic, chat, and response — and what each one rewrites</span></h1>
 
-<p><strong>Last updated:</strong> 2026-09-12</p>
+<p><strong>Last updated:</strong> 2026-10-03</p>
 
 <p>The proxy speaks Anthropic Messages to its clients. What it speaks <em>upstream</em> is
 configurable per provider, because not every provider implements the Anthropic API. A
@@ -227,15 +227,35 @@ upstream's original body.
 <code>thinking</code> content block with an empty <code>signature</code>, inserted
 <strong>first</strong> in the content array, ahead of any text or tool-use blocks.</p>
 
-<p><code>finish_reason</code> maps to <code>stop_reason</code>:</p>
+<p><code>finish_reason</code> maps to <code>stop_reason</code>. Both chat paths share this
+mapping; exactly one row behaves differently between them, and it is called out below.</p>
 
 <table>
 <tr><th>OpenAI <code>finish_reason</code></th><th>Anthropic <code>stop_reason</code></th></tr>
-<tr><td><code>stop</code></td><td><code>end_turn</code></td></tr>
+<tr><td><code>stop</code></td><td><code>end_turn</code> in the buffered path;
+    <code>tool_use</code> in the streaming path <em>when a tool block was emitted</em>,
+    otherwise <code>end_turn</code> (see below)</td></tr>
 <tr><td><code>length</code></td><td><code>max_tokens</code></td></tr>
 <tr><td><code>tool_calls</code></td><td><code>tool_use</code></td></tr>
 <tr><td>anything else</td><td><code>null</code></td></tr>
 </table>
+
+<p><strong>The <code>stop</code> row is where the two paths diverge.</strong> In the
+<em>streaming</em> path, a <code>stop</code> finish with tool blocks emitted is upgraded to
+<code>tool_use</code>: a provider that sends <code>finish_reason: "stop"</code> alongside tool
+calls is asking for those tools to run, and reporting <code>end_turn</code> would leave the
+client waiting for user input. The upgrade applies whether the tool calls arrived before the
+finish frame or during the post-finish drain, and it fires only on the <code>stop</code>
+mapping — a <code>length</code> finish stays <code>max_tokens</code>, and a finish reason that
+maps to <code>null</code> stays <code>null</code> even with tool blocks present.</p>
+
+<p>In the <em>buffered</em> path there is no upgrade: <code>stop</code> is mapped plainly, so a
+buffered response carrying tool blocks alongside <code>finish_reason: "stop"</code> reports
+<code>end_turn</code>, where the same turn streamed reports <code>tool_use</code>. The
+divergence is narrow in practice because <code>tool_calls</code> is what providers normally send
+alongside tool calls, and that row agrees on both paths; the <code>stop</code>-with-tools
+combination is the streaming path's repair for providers that send the wrong reason. Be aware of
+it if you switch a provider between streaming and non-streaming.</p>
 
 <h3 id="response-mode-response">Response mode — response details</h3>
 
@@ -286,8 +306,8 @@ tool blocks would leave the client waiting for a result that can never arrive.</
 <h3 id="chat-sse">Chat mode SSE synthesis</h3>
 
 <p>The converter assembles upstream frames on the <code>\n\n</code> delimiter (CRLF-normalised)
-and never splits mid-frame. <code>[DONE]</code> sentinels and non-<code>data</code> frames are
-skipped.</p>
+and never splits mid-frame. Non-<code>data</code> frames are skipped. A <code>[DONE]</code>
+sentinel outside the drain is skipped; during the drain it <em>terminates</em> it.</p>
 
 <p>Two details shape the output:</p>
 
@@ -296,11 +316,67 @@ skipped.</p>
       delta's type is known. A <code>reasoning_content</code> / <code>reasoning</code> delta
       opens a thinking block at index 0; a content delta opens a text block. Opening the block
       eagerly would mean guessing, and guessing wrong would mis-number every later block.</li>
-  <li><strong>Terminal events are emitted exactly once</strong> — on the
-      <code>finish_reason</code> chunk, or synthesised at EOF or on truncation. An Anthropic
-      client that never receives <code>message_stop</code> hangs, so the synthesis is
-      unconditional.</li>
+  <li><strong>Terminal events are emitted exactly once</strong> — after the post-finish drain, or
+      synthesised at EOF or on truncation. An Anthropic client that never receives
+      <code>message_stop</code> hangs, so the synthesis is unconditional.</li>
 </ul>
+
+<h4 id="chat-sse-drain">The post-finish drain</h4>
+
+<p>A <code>finish_reason</code> chunk does <strong>not</strong> end the read. OpenAI emits the
+usage frame as the final data frame of a stream, <em>after</em> the chunk carrying
+<code>finish_reason</code>, and some providers send tool-call frames after a
+<code>finish_reason: "stop"</code>. Returning at the finish frame dropped both, so every stream
+now drains trailing frames first and emits the terminal sequence afterwards.</p>
+
+<p>During the drain:</p>
+
+<ul>
+  <li><strong><code>tool_calls</code> deltas are still processed</strong>, each opening its own
+      content block. A tool call opens a <em>new</em> block, so it composes with the terminal
+      sequence rather than conflicting with it.</li>
+  <li><strong><code>usage</code> is still captured</strong>, which is what makes the trailing
+      usage frame reach <code>message_delta</code>.</li>
+  <li><strong><code>content</code> and <code>reasoning</code> deltas are suppressed.</strong> This
+      is a <em>policy</em> choice, not a protocol constraint: the terminal sequence is emitted
+      after the drain, so no block is closed while the drain runs and a trailing delta would in
+      fact be legal on the wire. It is suppressed because the model has already signalled that it
+      finished — trailing text and reasoning are not part of the completed message, and the drain
+      exists to collect <code>usage</code> and tool calls, not to lengthen the visible turn. The
+      two cases differ because a tool call is a request for the client to <em>act</em>, while
+      trailing prose is only noise after a finished turn. Suppressed deltas are counted in a
+      <code>chat_sse_post_finish_suppressed</code> trace event so the choice stays
+      observable.</li>
+  <li><strong>A later <code>finish_reason</code> updates the recorded one</strong> — the last
+      non-empty value wins, so a provider that revises <code>"stop"</code> to
+      <code>"tool_calls"</code> is honoured, while the <code>finish_reason: null</code> that
+      OpenAI-compatible providers put on every non-final chunk is ignored rather than treated as
+      a revision. An empty string is refused the same way: this path exists to honour a provider
+      <em>correcting itself</em>, and an empty reason is the absence of an answer rather than a
+      correction — accepting it would let a trailing <code>""</code> overwrite a resolved
+      <code>"tool_calls"</code> and report <code>null</code> for a stream whose tool block had
+      already reached the client. A genuinely empty reason is still recorded when it is the
+      provider's <em>first</em> answer; the rule above governs only what may overwrite an
+      already-resolved value.</li>
+</ul>
+
+<p>The drain ends at EOF, at <code>[DONE]</code>, at a <strong>64&nbsp;KB byte budget</strong>
+(the crossing chunk is discarded unparsed), or at a <strong>5&nbsp;s time budget</strong>. The
+time budget is enforced <em>at the point of blocking</em>: the drain sets a socket read timeout to
+the remaining budget before each read and restores the original timeout afterwards. Without that,
+a provider that goes silent after <code>finish_reason</code> would pin the worker thread for the
+upstream socket timeout — 300&nbsp;s — instead of 5&nbsp;s, which would also outlast the 30&nbsp;s
+drain-and-swap timeout.</p>
+
+<p>Truncation is unaffected: a stream that ends with <em>no</em> <code>finish_reason</code> at all
+still takes the EOF path and reports <code>chat_sse_truncated</code>.</p>
+
+<h4 id="chat-sse-stream-options">Requesting usage</h4>
+
+<p>The proxy asks for the usage frame explicitly: a streaming chat request carries
+<code>stream_options: {include_usage: true}</code>. The key is set only when the request is
+streaming — chat-completions rejects <code>stream_options</code> outright on a non-streaming
+request, where the field is an unknown parameter.</p>
 
 <p>Anthropic block indices come from a single monotonic allocator that is incremented only on
 <code>content_block_start</code> and never on close, which keeps indices contiguous even when
@@ -332,8 +408,14 @@ into the trace log.</p>
 
 <h3 id="malformed-args">Malformed arguments</h3>
 
+<p>This section describes <strong>chat mode</strong> — the mode with two independent paths
+through the same problem. Response mode's equivalent rule is stated under
+<a href="#response-mode-response">Response mode — response details</a>: a call whose arguments
+do not parse degrades to a placeholder, and the stop reason is <code>"tool_use"</code> only if
+at least one usable call survived.</p>
+
 <p>When tool-call arguments cannot be parsed as a JSON dict — a parse error, a non-dict result,
-an empty dict, a non-dict <code>function</code> value, or a non-dict tool-call entry — the proxy
+a non-dict <code>function</code> value, or a non-dict tool-call entry — the buffered transform
 does <strong>not</strong> emit a <code>tool_use</code> block with empty input. Silently
 substituting <code>{}</code> would make a broken call look like a deliberate zero-argument call
 and could execute the wrong operation.</p>
@@ -345,12 +427,37 @@ legible in the transcript rather than invisible:</p>
 
 <p>A <code>tool_args_parse_failure</code> trace event is recorded alongside it.</p>
 
+<p><strong><code>{}</code> is not malformed.</strong> An <code>arguments</code> string of
+<code>"{}"</code> is valid JSON and parses to a dict, so it produces a real
+<code>tool_use</code> block carrying <code>input: {}</code> and fires no failure event. Response
+mode has always accepted a zero-argument call this way; chat mode agrees.</p>
+
 <div class="error">
-<strong>When every tool call in a response is malformed, <code>stop_reason</code> is forced to
-<code>null</code>.</strong> This is the same hazard as the Responses-mode all-degraded case: a
-client seeing <code>stop_reason: "tool_use"</code> with zero <code>tool_use</code> blocks waits
-for a tool result that will never come, and hangs until it times out. Forcing
-<code>null</code> lets the client stop waiting and surface the placeholder text instead.
+<strong><code>stop_reason</code> follows the blocks that were actually emitted, not the
+parseability of their arguments.</strong> Precisely: when the provider <em>presented</em> tool
+calls, zero emitted <code>tool_use</code> blocks means <code>stop_reason</code> is
+<code>null</code>. The hazard is the Responses-mode all-degraded case — a client seeing
+<code>stop_reason: "tool_use"</code> with zero <code>tool_use</code> blocks waits for a tool
+result that will never come, and hangs until it times out. <code>null</code> lets it stop
+waiting and surface the placeholder text instead.
+<p><strong>Zero blocks is not by itself a reason for <code>null</code>.</strong> A response that
+presented no tool calls at all keeps its ordinary mapping — <code>end_turn</code> for a
+<code>stop</code> finish, <code>max_tokens</code> for a <code>length</code> finish, and
+<code>null</code> only for a finish reason that maps to nothing. The rule above is scoped to the
+case where calls were presented and none survived.</p>
+<p>The two paths reach that case differently. The <em>buffered</em> path replaces each call it
+cannot parse with the placeholder block above, so a response in which every presented call was
+malformed emits no tool block and reports <code>null</code>. The <em>streaming</em> path
+forwards argument fragments verbatim as they arrive, so once a block has been opened it
+<em>is</em> emitted even when its arguments turn out to be truncated or unparseable — the stop
+reason then claims <code>tool_use</code>, and the client sees the malformed call itself rather
+than a proxy-authored verdict on it. Argument parseability therefore never <em>by itself</em>
+reduces a stream to <code>null</code>.</p>
+<p>Two further cases produce <code>null</code> and are not about the arguments either, so do not
+read the rule above as "an emitted block always means <code>tool_use</code>": a finish reason
+that maps to nothing stays <code>null</code> even with tool blocks present, and a stream that
+ends without any <code>finish_reason</code> reports <code>null</code> when tool-call deltas were
+seen rather than <code>end_turn</code>.</p>
 </div>
 
 <p>The <em>request</em> direction has the same problem in reverse: an
@@ -374,6 +481,7 @@ message carrying the <code>tool_calls</code>, so the ordering the upstream expec
 <tr><td><code>content_block_dropped</code></td><td>an unrepresentable content block was removed</td></tr>
 <tr><td><code>tool_args_parse_failure</code></td><td>tool arguments could not be parsed or serialised</td></tr>
 <tr><td><code>chat_sse_tool_degradation</code></td><td>one or more streaming tool calls degraded (metadata only, once per stream)</td></tr>
+<tr><td><code>chat_sse_post_finish_suppressed</code></td><td>the post-finish drain suppressed <code>content</code>/<code>reasoning</code> deltas (carries <code>count</code>, once per stream)</td></tr>
 <tr><td><code>response_sse_unexpected</code></td><td>a response-mode provider streamed despite <code>stream: false</code></td></tr>
 <tr><td><code>chat_sse_truncated</code>, <code>chat_sse_malformed_json</code>, <code>chat_sse_frame_cap_exceeded</code>, <code>chat_sse_buffer_cap_exceeded</code>, <code>sse_buffer_cap_exceeded</code>, <code>sse_rewrite_malformed_json</code></td><td>an SSE frame was truncated, malformed, or exceeded a buffer bound</td></tr>
 </table>
@@ -431,6 +539,6 @@ transform it belongs to, and neither runs in response mode:</p>
 <a href="compatibility.html">compatibility.html</a>, as is the
 <a href="compatibility.html#reasoning-field">reasoning-field selection</a>.</p>
 
-<footer>Last updated: 2026-09-30</footer>
+<footer>Last updated: 2026-10-03</footer>
 </body>
 </html>
