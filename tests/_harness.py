@@ -42,8 +42,17 @@ os.environ["PROXY_TRACE_FILE"] = os.path.join(
 # any CLI subprocess or server module is spawned, so the dummy proxies the
 # tests launch read/write an isolated state file and can never stop or touch
 # the live proxy's ~/.claude/proxy/proxy-state.json.
+#
+# The path carries a PER-PROCESS discriminator (this runner's pid), never a
+# fixed machine-global name. A fixed name let a dead proxy's PID survive
+# across runs; Windows recycles PID numbers, so cli.py's is_pid_alive() gate
+# could report an unrelated live process as "Proxy already running" and fail
+# test_start_rejects_uncatalogued_model_selector_at_cli. The discriminator is
+# per-PROCESS, not per-test: the harness, every spawned CLI subprocess, and
+# every spawned server must agree on one path within a run, and they inherit
+# it through os.environ.copy().
 os.environ["PROXY_STATE_FILE"] = os.path.join(
-    tempfile.gettempdir(), "claude-retry-proxy-test-state.json")
+    tempfile.gettempdir(), "claude-retry-proxy-test-state-%d.json" % os.getpid())
 
 
 
@@ -68,6 +77,36 @@ PROXY_DIR = os.path.join(os.path.expanduser("~"), ".claude", "proxy")
 # Isolated test state path (set above); must match what cli.py/server.py read
 # from PROXY_STATE_FILE so CLI subprocesses and the tests' own checks agree.
 PROXY_STATE_FILE = os.environ["PROXY_STATE_FILE"]
+
+
+def _remove_test_state_file():
+    """Best-effort removal of this run's per-process state file.
+
+    The file lives in %TEMP%, not in a test's temp_dir, so rmtree never
+    reaches it; and a hard-killed server runs no Python cleanup — TerminateProcess
+    on Windows, SIGKILL on POSIX — so the server's own finally: os.remove(...)
+    never fires either. Called from every layer that leaks it: harness import
+    (clean slate), the three wrapper cleanup() closures (wrapper tests), and
+    run_cli's per-test loop (the chokepoint every module passes through —
+    the only point that covers direct _start_proxy_server_directly spawns).
+    Never raises: cleanup must stay best-effort.
+    """
+    try:
+        os.remove(PROXY_STATE_FILE)
+    except OSError:
+        pass
+
+
+# Start every run from a clean slate. The per-process path above normally cannot
+# collide across runs, but a crashed or killed run can still leave this
+# process's own name behind (Windows reuses pids), and _backup_proxy_state() /
+# _restore_proxy_state() would then propagate that stale entry through every CLI
+# test in the run. The removal is best-effort; the flag below captures whether
+# anything survived it, and test_state_file_path_is_per_run_isolated asserts the
+# flag is False — so a failed removal surfaces as a named test failure instead
+# of being silently inherited.
+_remove_test_state_file()
+_STATE_FILE_PRESENT_AFTER_IMPORT = os.path.exists(PROXY_STATE_FILE)
 
 
 URL_LOCK_FILE = os.path.join(PROXY_DIR, "base-url.lock")
@@ -621,6 +660,10 @@ def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-pas
         for ms in mock_servers.values():
             ms["server"].shutdown()
         shutil.rmtree(temp_dir, ignore_errors=True)
+        # Shared removal for the %TEMP% state file — see
+        # _remove_test_state_file for why rmtree and the child's own cleanup
+        # cannot be relied on here.
+        _remove_test_state_file()
 
     return temp_dir, proxy_port, proc, mock_servers, cleanup
 
@@ -714,6 +757,10 @@ def _start_admin_proxy(tiers, vendors, models=None):
         for ms in mock_servers.values():
             ms["server"].shutdown()
         shutil.rmtree(temp_dir, ignore_errors=True)
+        # Shared removal for the %TEMP% state file — see
+        # _remove_test_state_file for why rmtree and the child's own cleanup
+        # cannot be relied on here.
+        _remove_test_state_file()
 
     return proxy_port, proc, mock_servers, temp_dir, cleanup
 
@@ -950,6 +997,10 @@ def _start_mode_proxy(tiers, vendors, responders=None, extra_env=None,
         for ms in mock_servers.values():
             ms["server"].shutdown()
         shutil.rmtree(temp_dir, ignore_errors=True)
+        # Shared removal for the %TEMP% state file — see
+        # _remove_test_state_file for why rmtree and the child's own cleanup
+        # cannot be relied on here.
+        _remove_test_state_file()
 
     return temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup
 
@@ -1282,6 +1333,16 @@ def run_cli(all_tests, description):
             fail(f"Test crashed: {e}")
             import traceback
             traceback.print_exc()
+
+        # Chokepoint for the per-run state file (plan
+        # 2026-10-03-stale-test-state-file-pid-reuse): direct spawns bypass the
+        # wrapper cleanup() closures (TerminateProcess runs no Python cleanup),
+        # and %TEMP% is out of rmtree(temp_dir)'s reach, so a direct-spawned
+        # server's state file survives the test body. Removing it here — after
+        # func() returns, before the tally — is the one point every module's
+        # test passes through, and runs strictly after the server is dead, so
+        # there is no race with the child's own write.
+        _remove_test_state_file()
 
         if errors:
             failed += 1

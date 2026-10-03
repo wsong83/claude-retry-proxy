@@ -18,11 +18,11 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>362 test functions across 19 files</strong>, but this number moves whenever
-tests are added. (It read <em>361 across 19</em> before this recount, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
+suite has <strong>364 test functions across 19 files</strong>, but this number moves whenever
+tests are added. (It read <em>362 across 19</em> before this recount, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
 before that, <em>334 across 19</em> before that, and <em>322 across 18</em> before an earlier
 one — the page has drifted behind the
-suite four times, and in each case the stale total disagreed with the page's own catalog table
+suite five times, and in each case the stale total disagreed with the page's own catalog table
 as well.)
 Re-count before quoting it:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
@@ -45,8 +45,9 @@ needs no edit unless you add a whole new module.</p>
 
 <div class="note">
 <strong>The suite is safe to run alongside a live proxy.</strong> This was not always true. The
-harness redirects the state, compatibility, and trace paths into a session temp directory at
-import time, so a test run cannot touch a running proxy's files. See
+harness redirects the state, compatibility, and trace paths into isolated temp files at
+import time — the state path per-run, the other two session-scoped — so a test run cannot
+touch a running proxy's files. See
 <a href="#isolation">Isolation</a>.
 </div>
 
@@ -59,9 +60,36 @@ imported, because those modules read their paths at import time.</p>
 <table>
 <tr><th>Variable</th><th>Redirected to</th></tr>
 <tr><td><code>PROXY_TRACE_FILE</code></td><td>a session temp file</td></tr>
-<tr><td><code>PROXY_STATE_FILE</code></td><td>a session temp file</td></tr>
+<tr><td><code>PROXY_STATE_FILE</code></td><td>a per-run temp file (see below)</td></tr>
 <tr><td><code>PROXY_FEATURE_COMPAT_FILE</code></td><td>a session temp file</td></tr>
 </table>
+
+<p><code>PROXY_STATE_FILE</code> is the one path that needs more than a redirect. It is set to
+<code>%TEMP%\claude-retry-proxy-test-state-&lt;runner-pid&gt;.json</code> — keyed to the
+<em>runner process</em>, not a fixed machine-global name — and the harness removes any file at
+that path at import. That closes the failure mode a fixed name created: a dead proxy's PID
+survived across runs, and because Windows recycles PID numbers aggressively, <code>start</code>'s
+<code>is_pid_alive()</code> gate could report an unrelated live process as
+<code>Proxy already running</code> and refuse to start. The path stays identical for the whole
+run — the harness, every spawned CLI subprocess and every spawned server inherit it through
+<code>os.environ.copy()</code> — and <code>run_cli</code>'s per-test loop removes the file after
+every test, so no test inherits one left by an earlier test (neither the wrapper
+<code>cleanup()</code> closures nor a direct <code>_start_proxy_server_directly</code> spawn is
+relied on for this; a direct spawn's file is written by the server child, and on Windows
+<code>terminate()</code> is <code>TerminateProcess</code>, which runs no Python cleanup).
+A <em>completed</em> run therefore leaves nothing behind; a run that is hard-killed can still
+orphan its own file, since no cleanup can run. Those orphans are inert — the next run uses a new
+PID-keyed name and clears it at import — but they are never collected automatically, so
+<code>claude-retry-proxy-test-state-*.json</code> files may be deleted from <code>%TEMP%</code>
+by hand at any time.</p>
+
+<p><strong>Known limitation (accepted by user decision, 2026-10-03).</strong> The product side is
+deliberately unchanged: a proxy killed outside <code>claude-retry-proxy stop</code> (Task Manager,
+<code>taskkill /F</code>, crash, power loss) can leave <code>~/.claude/proxy/proxy-state.json</code>
+holding a dead PID, and a later <code>start</code> can be refused with
+<code>Proxy already running</code> once Windows recycles that PID. Recovery is to delete the stale
+file. Hardening options (an advisory port probe, recording OS process creation time) were
+presented and declined.</p>
 
 <p>The ordering matters and is load-bearing: <code>settings.py</code> binds
 these paths at import and both <code>cli.py</code> and <code>server.py</code> import it,
@@ -101,7 +129,7 @@ relative size, not as exact current figures.</p>
 <tr><td><code>test_config_split.py</code></td><td class="num">10</td>
     <td>The two-document loader: merged load, the required sibling, leftover-key warnings, sibling
         resolution, and the unreadable-shape conversion</td></tr>
-<tr><td><code>test_cli.py</code></td><td class="num">15</td>
+<tr><td><code>test_cli.py</code></td><td class="num">17</td>
     <td>CLI lifecycle: start, stop, status, reload</td></tr>
 <tr><td><code>test_trace.py</code></td><td class="num">12</td>
     <td>Trace logging and trace analysis</td></tr>
@@ -524,7 +552,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> Start, stop, status, and reload as the operator runs them — including the passphrase pipe and readiness probe.</p>
 
-<h4><code>tests/test_cli.py</code> (15 tests) — CLI lifecycle</h4>
+<h4><code>tests/test_cli.py</code> (17 tests) — CLI lifecycle</h4>
 <ul>
 <li><code>test_cli_status_shows_loader_error</code>: A deleted or malformed <code>models.json</code> makes <code>status</code> print the loader diagnostic rather than silently omitting the tier section.</li>
 <li><code>test_stop_cleans_proxy_state</code>: Start proxy, force-kill server, run stop, verify proxy-state.json deleted.</li>
@@ -541,6 +569,8 @@ EOF</code></pre>
 <li><code>test_startup_aborts_on_unwritable_state_path</code>: An unwritable state path aborts startup before READY.</li>
 <li><code>test_relative_state_path_starts_and_writes</code>: A bare relative PROXY_STATE_FILE must not abort startup.</li>
 <li><code>test_startup_abort_exits_one_with_failing_stderr</code>: An unwritable trace path still aborts with exit 1 when stderr is broken.</li>
+<li><code>test_state_file_path_is_per_run_isolated</code>: The harness state path is keyed to the runner PID (<code>claude-retry-proxy-test-state-&lt;pid&gt;.json</code>), is distinct from the legacy fixed name, and the harness constant agrees with <code>os.environ[&#x27;PROXY_STATE_FILE&#x27;]</code> within the run — the regression guard against a revert to a fixed machine-global path whose dead PID could be recycled and trip <code>start</code>&#x27;s liveness gate.</li>
+<li><code>test_run_cli_loop_clears_direct_spawn_state_file</code>: A child <code>run_cli</code> drives a direct <code>_start_proxy_server_directly</code> spawn that hard-kills its server leaving the state file behind; a sentinel test then asserts the loop removed it between tests. Guards the chokepoint that closes the leak for spawn paths bypassing the wrapper <code>cleanup()</code> closures.</li>
 </ul>
 
 <h3 id="cat-10">Category 10 — Trace Log and Sinks</h3>

@@ -258,10 +258,18 @@ startup on failure).
 
 - **Test suite is safe alongside a live proxy.** The suite sets
   `PROXY_TRACE_FILE`, `PROXY_STATE_FILE`, and `PROXY_FEATURE_COMPAT_FILE` to
-  session temp paths at module load, *before* importing `cli.py` or `server.py`
+  session temp paths at module load — the state path per-run (see below) —
+  *before* importing `cli.py` or `server.py`
   (`settings.py` binds those env vars at import — both modules import it). A test proxy
   therefore cannot touch the live proxy's files, and the old docstring warning
   about not running tests alongside a live proxy is obsolete.
+  `PROXY_STATE_FILE` goes further: it is a **per-run** path keyed to the runner
+  PID (`…-test-state-<pid>.json`), cleared at harness import and again after every
+  test in `run_cli`'s loop. The fixed machine-global name it replaced let a dead
+  proxy's PID survive across runs, and Windows recycles PID numbers, so
+  `start`'s `is_pid_alive()` gate could report an unrelated live process as
+  `Proxy already running`. A hard-killed run can still orphan its own file (no
+  cleanup can run); those are inert and may be deleted from `%TEMP%` by hand.
   [doc/test-catalog.html#isolation](doc/test-catalog.html#isolation)
 
 ### Moved out of this section
@@ -344,16 +352,29 @@ No other supplementary docs.
 {"issue_id": "proxy-stderr-append-stale-tail", "title": "proxy-stderr.log is append-only across runs, so read_tail failure diagnostics can surface lines from previous sessions instead of the current attempt", "target_repo": null, "report": "./tmp/reports/defer-issue-proxy-stderr-append-stale-tail.json", "deferred": "2026-09-18", "date_source": "creation"},
 {"issue_id": "client-body-recursionerror-no-response", "title": "A deeply nested client body raises RecursionError out of the request path: the parse guards omit it (RecursionError is not a ValueError) and neither forward_request nor do_POST fences the call, so the request aborts with no HTTP response", "target_repo": null, "report": "./tmp/reports/defer-issue-client-body-recursionerror-no-response.json", "deferred": "2026-09-30", "date_source": "creation"},
 {"issue_id": "httpx2-native-sse-transport", "title": "Adopt httpx2 for upstream transport and native SSE parsing: client.sse() replaces the hand-rolled SSE frame scanner and obsoletes httpx-sse", "target_repo": null, "report": "./tmp/reports/defer-issue-httpx2-native-sse-transport.json", "deferred": "2026-09-27", "date_source": "creation"},
-{"issue_id": "stale-test-state-file-pid-reuse", "title": "The test suite's fixed machine-global PROXY_STATE_FILE survives each run, so a dead proxy PID from a previous run can be recycled by Windows and false-positive cli.py's 'Proxy already running' gate", "target_repo": null, "report": "./tmp/reports/defer-issue-stale-test-state-file-pid-reuse.json", "deferred": "2026-10-03", "date_source": "creation"}
+{"issue_id": "cli-pre-existing-remove-idiom-copies", "title": "tests/test_cli.py still hand-rolls the guarded state-file removal at 8 test-body sites, one file over from the shared _remove_test_state_file() helper that Step 5 introduced to eliminate exactly that hazard", "target_repo": null, "report": "./tmp/reports/defer-issue-cli-pre-existing-remove-idiom-copies.json", "deferred": "2026-10-04", "date_source": "creation"},
+{"issue_id": "posix-sigterm-shutdown-deadlock", "title": "server.py's SIGTERM handler calls server.shutdown() on the serve_forever thread, which socketserver documents as a guaranteed deadlock: on POSIX one SIGTERM permanently wedges the proxy while claude-retry-proxy stop reports success", "target_repo": null, "report": "./tmp/reports/defer-issue-posix-sigterm-shutdown-deadlock.json", "deferred": "2026-10-04", "date_source": "creation"},
+{"issue_id": "operate-round-ends-turn-before-waiting", "title": "Unattended --operate rounds frequently end their turn while a background full-suite run is still in flight, killing the run and leaving the round with no session report", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-operate-round-ends-turn-before-waiting.json", "deferred": "2026-10-04", "date_source": "creation"}
 ]```
 
 ## Future Work — TODO
 
-Six deferred issues remain (see above); the sixth,
+Ten deferred issues remain (see above); the three newest were filed on
+2026-10-04 by plan 2026-10-03-stale-test-state-file-pid-reuse's closeout — the
+POSIX-only deadlock in the server's SIGTERM handler (it calls
+`server.shutdown()` on the `serve_forever` thread, which `socketserver`
+documents as a guaranteed hang), the residual hand-rolled state-file removals in
+`tests/test_cli.py` that could now call the shared helper, and, against
+`claude-config`, the unattended-round launcher ending its turn while a
+background suite is still in flight. The previous newest,
 `client-body-recursionerror-no-response`, was filed on 2026-09-30 by plan
 2026-09-29-chat-reasoning-field-learner's code review — the client-body parse
 was left unhardened while the plan's own upstream-body helper was made total
 against the same failure class. Plan
+2026-10-03-stale-test-state-file-pid-reuse resolved the test-isolation defect
+where a fixed machine-global `PROXY_STATE_FILE` survived each run: the path is
+now keyed to the runner PID, cleared at harness import and after every test in
+`run_cli`'s loop. Plan
 2026-09-23-drop-dead-failed-confirmations-field resolved the compatibility
 entry's dead `failed_confirmations` field — the persisted schema no longer
 carries it, and the in-memory suppression counter it shadowed is unchanged.

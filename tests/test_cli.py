@@ -18,6 +18,7 @@ from _harness import (
     CLAUDE_PROXY,
     PROXY_DIR,
     PROXY_STATE_FILE,
+    _STATE_FILE_PRESENT_AFTER_IMPORT,
     _backup_proxy_state,
     _cli_start_with_plain_keys,
     _create_test_config,
@@ -1411,6 +1412,162 @@ def test_startup_abort_exits_one_with_failing_stderr():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def test_state_file_path_is_per_run_isolated():
+    """The suite's state path is keyed to the runner pid, not a fixed name.
+
+    Regression guard for the stale-state-file defect. A fixed machine-global
+    path let a dead proxy's PID survive across runs; Windows recycles PID
+    numbers, so cli.py's is_pid_alive() gate could report an unrelated live
+    process as "Proxy already running" and fail the clean-config sanity start
+    in test_start_rejects_uncatalogued_model_selector_at_cli.
+    """
+    print("\n--- Test: State File Path Is Per-Run Isolated ---")
+
+    legacy = os.path.join(tempfile.gettempdir(), "claude-retry-proxy-test-state.json")
+    expected = "claude-retry-proxy-test-state-{}.json".format(os.getpid())
+
+    actual = os.path.basename(PROXY_STATE_FILE)
+    if actual == expected:
+        pass_("state path carries this runner's pid: {}".format(actual))
+    else:
+        fail("state path basename is {!r}, expected {!r}".format(actual, expected))
+
+    if actual != os.path.basename(legacy):
+        pass_("state path is distinct from the legacy fixed name")
+    else:
+        fail("state path reverted to the fixed machine-global name {!r}".format(
+            os.path.basename(legacy)))
+
+    # Stable WITHIN a run: the harness, CLI subprocesses, and spawned servers
+    # all inherit the path through os.environ.copy(), so they must agree.
+    if PROXY_STATE_FILE == os.environ.get("PROXY_STATE_FILE"):
+        pass_("harness and environment agree on the state path within this run")
+    else:
+        fail("harness PROXY_STATE_FILE {!r} disagrees with the environment "
+             "{!r}".format(PROXY_STATE_FILE, os.environ.get("PROXY_STATE_FILE")))
+
+    # Import-time guard: the harness removes any leftover at this path when it
+    # loads and captures whether anything survived into
+    # _STATE_FILE_PRESENT_AFTER_IMPORT. A failed removal (locked/permission)
+    # would otherwise be silently inherited through _backup_proxy_state() /
+    # _restore_proxy_state() and resurface as the original PID-gate refusal.
+    if not _STATE_FILE_PRESENT_AFTER_IMPORT:
+        pass_("no file survived the harness's import-time removal at the state path")
+    else:
+        fail("a file remained at {!r} after the harness's import-time removal — "
+             "a stale entry would be inherited by this run".format(PROXY_STATE_FILE))
+
+
+def test_run_cli_loop_clears_direct_spawn_state_file():
+    """run_cli's per-test loop removes the state file a direct spawn leaves.
+
+    Regression guard for the run_cli-loop chokepoint of plan
+    2026-10-03-stale-test-state-file-pid-reuse. A direct
+    _start_proxy_server_directly spawn writes PROXY_STATE_FILE from the server
+    child process; the wrapper cleanup() closures never see a direct spawn,
+    and a hard kill runs no Python cleanup, so the file survives the test
+    body — only run_cli's post-func removal can clear it. Without this guard a
+    future revert of that removal would go unnoticed and a per-run state file
+    would bleed from one module into the next (the original defect).
+
+    Drives two tests through a child run_cli: the first spawns a server
+    directly, confirms the file exists, and hard-kills the server leaving it
+    behind; the second asserts the file is gone. If the loop removal is
+    reverted, the second test fails and the child exits non-zero.
+    """
+    print("\n--- Test: run_cli Loop Clears Direct-Spawn State File ---")
+
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    child = r'''
+import shutil, sys, tempfile, time, os
+
+sys.path.insert(0, sys.argv[1])
+import _harness
+
+
+def leak_test():
+    temp_dir = tempfile.mkdtemp(prefix="proxy_chokepoint_")
+    try:
+        tiers = {"haiku": {"provider": "p", "model": "m1"},
+                 "sonnet": {"provider": "p", "model": "m2"},
+                 "opus": {"provider": "p", "model": "m3"}}
+        vendors = {"p": {"url": "http://127.0.0.1:9", "key": "k"}}
+        config_path = _harness._create_test_config(
+            temp_dir, tiers, models=_harness._models_for_vendors(tiers, vendors))
+        keys_path = _harness._create_test_keys_plain(temp_dir, vendors)
+        trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
+        os.close(trace_fd)
+        port = _harness.find_free_port()
+        proc, probe_ok = _harness._start_proxy_server_directly(
+            port, config_path=config_path, keys_path=keys_path,
+            passphrase=None, trace_file=trace_file)
+        try:
+            if not probe_ok:
+                raise RuntimeError("direct spawn port probe failed")
+            # The server writes the state file before its READY marker, so the
+            # file must exist once the probe succeeded; poll briefly anyway.
+            deadline = time.time() + 5
+            while time.time() < deadline and not os.path.exists(_harness.PROXY_STATE_FILE):
+                time.sleep(0.1)
+            if not os.path.exists(_harness.PROXY_STATE_FILE):
+                raise RuntimeError("state file never appeared after direct spawn")
+        finally:
+            # Hard kill (TerminateProcess / SIGKILL), not terminate(): the
+            # premise below — no Python cleanup runs in the child, so the
+            # state file survives — must hold on POSIX too, where
+            # terminate() would deliver SIGTERM and the server's handler
+            # would remove the file itself.
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        # The hard kill must leave the file behind — this is exactly the leak
+        # run_cli's loop has to close.
+        if not os.path.exists(_harness.PROXY_STATE_FILE):
+            _harness.fail("state file vanished with the child — unexpected cleanup ran")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def sentinel_test():
+    # Runs after leak_test, so the loop's removal has happened between them.
+    if os.path.exists(_harness.PROXY_STATE_FILE):
+        _harness.fail("state file survived the run_cli loop — leak not closed")
+
+
+saved_argv = sys.argv
+sys.argv = ["_harness-chokepoint-guard"]
+try:
+    rc = 0
+    try:
+        _harness.run_cli([("leak", leak_test), ("sentinel", sentinel_test)],
+                         "chokepoint guard")
+    except SystemExit as e:
+        rc = e.code if isinstance(e.code, int) else 1
+finally:
+    sys.argv = saved_argv
+print("CHOKEPOINT rc={} file_gone={}".format(
+    rc, not os.path.exists(_harness.PROXY_STATE_FILE)))
+'''
+    proc = subprocess.run([sys.executable, "-c", child, tests_dir],
+                          capture_output=True, text=True)
+    line = [l for l in proc.stdout.splitlines() if l.startswith("CHOKEPOINT ")]
+    if not line:
+        fail("child produced no CHOKEPOINT result (rc={}): stdout={!r} "
+             "stderr={!r}".format(proc.returncode, proc.stdout[-500:],
+                                  proc.stderr[-500:]))
+        return
+    fields = dict(kv.split("=", 1) for kv in line[-1].split()[1:])
+    if fields.get("rc") == "0" and fields.get("file_gone") == "True":
+        pass_("direct-spawn state file removed by the run_cli loop "
+              "(child rc=0, file gone after run)")
+    else:
+        fail("run_cli loop chokepoint broken: {} (child rc={}); "
+             "child output tail: {!r}".format(line[-1], proc.returncode,
+                                              proc.stdout[-500:]))
+
+
 ALL_TESTS = [
     ("cli-reload", test_cli_reload),
     ("start-rejects-uncatalogued-model-selector-at-cli", test_start_rejects_uncatalogued_model_selector_at_cli),
@@ -1427,6 +1584,8 @@ ALL_TESTS = [
     ("startup-aborts-on-unwritable-state-path", test_startup_aborts_on_unwritable_state_path),
     ("relative-state-path-starts-and-writes", test_relative_state_path_starts_and_writes),
     ("startup-abort-exits-one-with-failing-stderr", test_startup_abort_exits_one_with_failing_stderr),
+    ("state-file-path-is-per-run-isolated", test_state_file_path_is_per_run_isolated),
+    ("run-cli-loop-clears-direct-spawn-state-file", test_run_cli_loop_clears_direct_spawn_state_file),
 ]
 
 
