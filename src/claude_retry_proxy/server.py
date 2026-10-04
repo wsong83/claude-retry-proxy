@@ -613,6 +613,11 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
             body_json = json.loads(body)
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
             body_json = None
+    # Whether the client declared tools: the denominator that makes
+    # chat_sse_drain.emitted_tool_use interpretable, and the input the
+    # unfinished-turn detector evaluates at its own decision point.
+    _tools = body_json.get("tools") if isinstance(body_json, dict) else None
+    tools_declared = isinstance(_tools, list) and bool(_tools)
 
     # Build request body once before the retry loop (never re-transformed per
     # attempt). Anthropic mode does a model-only rewrite (plus learned
@@ -748,7 +753,8 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
             result = _forward_core(
                 method, path, handler, request_id, config, rewritten_body,
                 fwd_headers, upstream_path, host, port, use_ssl, tier,
-                provider_name, actual_model, mode, _is_count_tokens)
+                provider_name, actual_model, mode, _is_count_tokens,
+                tools_declared=tools_declared, key_name=key_name)
             return _compat_probe_outcome(
                 result, compat_decision[1], request_id, tier, method, path,
                 headers, body, handler, config, vendors)
@@ -759,6 +765,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
         method, path, handler, request_id, config, rewritten_body,
         fwd_headers, upstream_path, host, port, use_ssl, tier,
         provider_name, actual_model, mode, _is_count_tokens,
+        tools_declared=tools_declared, key_name=key_name,
         max_attempts=1 if suppress_compat else None)
 
     # Stripped request: upstream already saw the stripped body — return as-is.
@@ -865,7 +872,8 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
 def _forward_core(method, path, handler, request_id, config,
                   rewritten_body, fwd_headers, upstream_path,
                   host, port, use_ssl, tier, provider_name, actual_model,
-                  mode, is_count_tokens, max_attempts=None):
+                  mode, is_count_tokens, tools_declared=False, key_name=None,
+                  max_attempts=None):
     """Forwarding pass: 429/503/connection retry loop and response handling.
 
     max_attempts=None derives the attempt count from config (SETTINGS.max_retries,
@@ -946,7 +954,8 @@ def _forward_core(method, path, handler, request_id, config,
                     # SSE: stream with mode-appropriate rewriting/transform
                     first_byte_ms = handler._stream_upstream_response(
                         resp, resp.status, resp_headers, request_id, retries,
-                        tier=tier, mode=mode)
+                        tier=tier, mode=mode, tools_declared=tools_declared,
+                        provider=provider_name, key=key_name)
                     conn.close()
                     return (resp.status, resp_headers, b"",
                             first_byte_ms, time.time() - total_start, retries, tier, provider_name, actual_model)
@@ -1038,7 +1047,8 @@ def _forward_core(method, path, handler, request_id, config,
                     else:
                         first_byte_ms = handler._stream_upstream_response(
                             resp, resp.status, resp_headers, request_id, retries,
-                            tier=tier, mode=mode)
+                            tier=tier, mode=mode, tools_declared=tools_declared,
+                            provider=provider_name, key=key_name)
                         conn.close()
                         return (resp.status, resp_headers, b"",
                                 first_byte_ms, time.time() - total_start, retries, tier, provider_name, actual_model)
@@ -1335,7 +1345,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body_bytes)
 
     def _stream_upstream_response(self, resp, status, resp_headers, request_id, retries,
-                                   tier=None, mode=None):
+                                   tier=None, mode=None, tools_declared=False,
+                                   provider=None, key=None):
         """Stream an upstream 2xx response body to the client as it arrives.
 
         For SSE (text/event-stream):
@@ -1375,7 +1386,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if is_sse and tier:
                 if mode == "chat":
                     return self._stream_chat_sse_to_anthropic(
-                        resp, request_id, tier, first_byte_start)
+                        resp, request_id, tier, first_byte_start,
+                        tools_declared=tools_declared, provider=provider, key=key)
                 if mode == "response":
                     return self._stream_response_sse_fallback(
                         resp, request_id, tier, first_byte_start)
@@ -1511,7 +1523,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         return ("event: " + etype + "\n"
                 "data: " + json.dumps(payload) + "\n\n").encode("utf-8")
 
-    def _stream_chat_sse_to_anthropic(self, resp, request_id, tier, first_byte_start):
+    def _stream_chat_sse_to_anthropic(self, resp, request_id, tier, first_byte_start,
+                                      tools_declared=False, provider=None, key=None):
         """Transform an OpenAI chat-completions SSE stream into Anthropic Messages SSE.
 
         Frames are assembled on the \\n\\n delimiter (CRLF-normalized) — never
@@ -1520,8 +1533,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         (reasoning_content/reasoning deltas open a thinking block at index 0,
         content deltas a text block). Deltas become content_block_delta, and
         terminal events (content_block_stop, message_delta, message_stop) are
-        emitted exactly once — after the post-finish drain, or synthesized at
-        EOF/truncation so the Anthropic client never hangs.
+        emitted exactly once — after the post-finish drain, or at EOF for a
+        stream that ended without a finish_reason but received the [DONE]
+        sentinel (protocol-complete: the provider simply never said why it
+        stopped). A stream cut before [DONE] closes instead with an SSE error
+        event (error.type: api_error) and no message_delta/message_stop, so
+        the client knows the response was cut short and can retry rather than
+        recording a completed turn. The two dispositions are discriminated by
+        the [DONE] sentinel, recorded as `saw_done` on chat_sse_truncated.
 
         A finish_reason chunk does not end the read: the loop drains trailing
         frames until EOF, [DONE], or the MAX_DRAIN_BYTES / MAX_DRAIN_SECONDS
@@ -1548,6 +1567,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         usage = {}
         chat_id = None
         message_started = False
+        saw_done = False
+        text_emitted = False
+        text_tail = ""
         first_frame = True
         tool_calls_seen = False
         emitted_tool_use = False
@@ -1568,6 +1590,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         degradation_logged = False
         finish_reason_seen = None
         drain_bytes = 0
+        drain_exit = None
+        drain_ended_at = None
+        frames_seen = 0
+        late_frames = 0
+        first_late_ms = None
+        last_late_ms = None
+        late_tool_call_ms = None
+        _off = None
         drain_done = False
         finish_seen_at = None
         post_finish_suppressed = 0
@@ -1813,18 +1843,33 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         state["pending"].append(args)
                         state["pending_bytes"] += len(args.encode("utf-8"))
 
-        def terminal(stop_reason, force_log=False):
-            nonlocal malformed_tool_count
+        def close_all_blocks():
+            """Close every open content block — scalar and tool — exactly once."""
             while open_blocks:
                 idx = open_blocks.pop()
                 write({"type": "content_block_stop", "index": idx})
             close_open_tool_blocks(validate=False)
-            # Any tracked tool whose metadata never produced a start is
-            # incomplete — count it so the coalesced diagnostic fires.
+
+        def log_degradation_if_needed(force_log=False):
+            """Finalize tool bookkeeping, then emit the coalesced degradation
+            summary when any counter is set.
+
+            The unstarted-tool pre-pass lives here rather than in terminal() so
+            every terminal path — including the cut-stream error path, which no
+            longer calls terminal() — finalizes identically.
+            """
+            nonlocal malformed_tool_count
             for st in tool_states.values():
                 if not st["started"] and not st["dropped"]:
                     malformed_tool_count += 1
                     st["dropped"] = True
+            if force_log or malformed_tool_count or overflow_tool_count \
+                    or dropped_fragment_count or unparseable_arg_count \
+                    or scalar_after_tools_dropped or frame_dropped:
+                log_tool_degradation_summary()
+
+        def terminal(stop_reason, force_log=False):
+            close_all_blocks()
             delta_usage = {"input_tokens": 0, "output_tokens": 0}
             if usage.get("prompt_tokens") is not None:
                 delta_usage["input_tokens"] = usage.get("prompt_tokens")
@@ -1836,14 +1881,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "usage": delta_usage,
             })
             write({"type": "message_stop"})
-            if force_log or malformed_tool_count or overflow_tool_count \
-                    or dropped_fragment_count or unparseable_arg_count \
-                    or scalar_after_tools_dropped or frame_dropped:
-                log_tool_degradation_summary()
+            log_degradation_if_needed(force_log)
 
         def handle_frame(frame):
             nonlocal chat_id, usage, first_frame, tool_calls_seen, scalar_after_tools_dropped, malformed_tool_count
             nonlocal finish_reason_seen, post_finish_suppressed
+            nonlocal text_emitted, text_tail
             text = frame.decode("utf-8", errors="replace")
             data_lines = [ln[5:].strip() for ln in text.splitlines()
                           if ln.startswith("data:")]
@@ -1931,6 +1974,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             "index": current_block_index,
                             "delta": {"type": "text_delta", "text": content},
                         })
+                        text_emitted = True
+                        text_tail = (text_tail + content)[-200:]
                 tool_calls = delta.get("tool_calls")
                 if tool_calls is not None:
                     process_tool_calls(tool_calls)
@@ -1948,18 +1993,28 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             while True:
                 try:
                     chunk = resp.read1(8192)
+                except socket.timeout:
+                    drain_exit = "time_budget"
+                    break
                 except (http.client.IncompleteRead, http.client.RemoteDisconnected,
                         socket.error, OSError):
+                    drain_exit = "read_error"
                     break
                 if not chunk:
+                    drain_exit = "eof"
                     break
                 if finish_reason_seen is not None:
                     drain_bytes += len(chunk)
                     if drain_bytes > MAX_DRAIN_BYTES:
+                        drain_exit = "byte_budget"
                         break
                     remaining = MAX_DRAIN_SECONDS - (time.time() - finish_seen_at)
                     if remaining <= 0:
+                        drain_exit = "time_budget"
                         break
+                    _off = (time.time() - finish_seen_at) * 1000
+                    _frames_before = frames_seen
+                    _tools_before = tool_calls_seen
                     if _timeout_saved:
                         try:
                             resp.fp.raw._sock.settimeout(max(1, remaining))
@@ -1971,6 +2026,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if buf is None:
                     bytes_streamed += len(chunk)
                     if bytes_streamed > SETTINGS.max_response_size:
+                        drain_exit = "response_cap"
                         self._log_response_cap_exceeded(request_id, bytes_streamed)
                         break
                     self.wfile.write(chunk)
@@ -1985,10 +2041,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     frame = bytes(buf[:idx])
                     del buf[:idx + 2]
                     result = handle_frame(frame)
+                    frames_seen += 1
                     if result == "done":
                         if finish_reason_seen is not None:
                             drain_done = True
+                            drain_exit = "done"
                             break
+                        saw_done = True
                         continue
                     if isinstance(result, tuple) and result[0] == "finish":
                         finish_reason_seen = result[1]
@@ -2006,6 +2065,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         except (AttributeError, OSError):
                             _timeout_saved = False
                         continue  # enter drain mode
+                # Late-frame offsets: how far past finish_reason this chunk's
+                # frames arrived — the evidence for whether the 5 s drain
+                # budget is generous or binding.
+                if _off is not None:
+                    if frames_seen > _frames_before:
+                        if first_late_ms is None:
+                            first_late_ms = _off
+                        last_late_ms = _off
+                        late_frames += 1
+                    if tool_calls_seen and not _tools_before:
+                        late_tool_call_ms = _off
                 if drain_done:
                     break
                 # Memory guards for frames without a delimiter
@@ -2037,10 +2107,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         frame_dropped = True
                         buf.clear()
                 if bytes_streamed > SETTINGS.max_response_size:
+                    drain_exit = "response_cap"
                     self._log_response_cap_exceeded(request_id, bytes_streamed)
                     break
         except _DISCONNECT_ERRORS:
             raise
+        drain_ended_at = time.time()
         # Restore the upstream socket timeout captured when the drain began.
         # The _timeout_saved flag — not a `_orig_timeout is not None` test —
         # gates it: a captured timeout of None (blocking mode) is a legitimate
@@ -2056,6 +2128,26 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if finish_reason_seen is not None:
             if not message_started:
                 start_message()
+            # Shadow detector: log-only, no effect on the response. It measures
+            # the predicate's precision on real traffic before any behaviour
+            # depends on it (the client-retry nudge is a staged follow-on).
+            if (tools_declared and not emitted_tool_use
+                    and finish_reason_seen == "stop"
+                    and text_emitted and text_tail.rstrip().endswith(":")):
+                log_trace({
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "event": "chat_sse_unfinished_turn",
+                    "request_id": request_id,
+                    "tier": tier,
+                    "provider": provider,
+                    "key": key,
+                    "finish_reason": finish_reason_seen,
+                    "tool_calls_seen": 1 if tool_calls_seen else 0,
+                    "emitted_tool_use": 1 if emitted_tool_use else 0,
+                    "tools_declared": 1 if tools_declared else 0,
+                    "text_tail_len": len(text_tail),
+                    "rule": "colon_after_prose",
+                })
             if finish_reason_seen == "tool_calls":
                 # Diagnostic only: validate still counts unparseable arguments for
                 # the coalesced chat_sse_tool_degradation event, but the counts no
@@ -2072,6 +2164,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 terminal(sr, force_log=True)
             else:
                 terminal(_map_chat_finish_reason(finish_reason_seen))
+            _fr = finish_reason_seen if isinstance(finish_reason_seen, str) else "<non-string>"
+            log_trace({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "event": "chat_sse_drain",
+                "request_id": request_id,
+                "finish_reason": _fr[:64],
+                "drain_exit": drain_exit,
+                "drain_bytes": drain_bytes,
+                "drain_ms": int((drain_ended_at - finish_seen_at) * 1000) if drain_ended_at else 0,
+                "tool_calls_seen": 1 if tool_calls_seen else 0,
+                "emitted_tool_use": 1 if emitted_tool_use else 0,
+                "tools_declared": 1 if tools_declared else 0,
+                "late_frames": late_frames,
+                "first_late_ms": int(first_late_ms) if first_late_ms is not None else None,
+                "last_late_ms": int(last_late_ms) if last_late_ms is not None else None,
+                "late_tool_call_ms": int(late_tool_call_ms) if late_tool_call_ms is not None else None,
+            })
             if post_finish_suppressed:
                 log_trace({
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -2080,8 +2189,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     "count": post_finish_suppressed,
                 })
             return first_byte_ms
-        # EOF reached without a finish_reason chunk: synthesize a clean
-        # terminal sequence so the client stream never hangs.
+        # EOF reached without a finish_reason chunk. Two dispositions: with
+        # [DONE] the stream is protocol-complete and just never said why it
+        # stopped; without it the connection was cut mid-response.
         if not message_started:
             start_message()
         log_trace({
@@ -2089,11 +2199,34 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "event": "chat_sse_truncated",
             "request_id": request_id,
             "pending_bytes": len(buf) if isinstance(buf, bytearray) else 0,
+            "saw_done": 1 if saw_done else 0,
         })
-        sr = "end_turn"
-        if tool_calls_seen:
-            sr = None
-        terminal(sr)
+        if saw_done:
+            # The provider closed the stream properly, it just never said why:
+            # protocol-complete, so close it with a terminal sequence.
+            sr = "end_turn"
+            if tool_calls_seen:
+                sr = None
+            terminal(sr)
+            return first_byte_ms
+        # No [DONE] ever arrived: the connection was cut mid-response and the
+        # response is incomplete. Close it with an SSE error event, not a
+        # synthesized terminal — a synthesized end_turn is indistinguishable, on
+        # the wire, from a turn the model actually finished, so the client
+        # records a completed message, reports no error and never retries.
+        # `api_error` is the retryable 500-equivalent, so the client re-issues
+        # the request. Close open blocks first so the partial turn is a
+        # well-formed stream up to the error, and finalize the degradation
+        # diagnostics — terminal() would have done both.
+        close_all_blocks()
+        log_degradation_if_needed()
+        write({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": "upstream stream ended without a finish_reason",
+            },
+        })
         return first_byte_ms
 
     def _stream_response_sse_fallback(self, resp, request_id, tier, first_byte_start):

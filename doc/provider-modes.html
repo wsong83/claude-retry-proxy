@@ -10,7 +10,7 @@
 
 <h1>Provider Modes<span class="sub">anthropic, chat, and response — and what each one rewrites</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-03</p>
+<p><strong>Last updated:</strong> 2026-10-04</p>
 
 <p>The proxy speaks Anthropic Messages to its clients. What it speaks <em>upstream</em> is
 configurable per provider, because not every provider implements the Anthropic API. A
@@ -228,7 +228,12 @@ upstream's original body.
 <strong>first</strong> in the content array, ahead of any text or tool-use blocks.</p>
 
 <p><code>finish_reason</code> maps to <code>stop_reason</code>. Both chat paths share this
-mapping; exactly one row behaves differently between them, and it is called out below.</p>
+mapping; exactly one row behaves differently between them, and it is called out below. The table
+covers streams that delivered a <code>finish_reason</code>. A stream that delivered none is not
+mapped at all but <em>dispositioned</em>, so it has no row here: it is closed with a synthesised
+terminal sequence when <code>[DONE]</code> arrived, and with an <code>error</code> frame carrying
+no stop reason at all when the connection was cut. See
+<a href="#chat-sse">Chat mode SSE synthesis</a>.</p>
 
 <table>
 <tr><th>OpenAI <code>finish_reason</code></th><th>Anthropic <code>stop_reason</code></th></tr>
@@ -317,8 +322,13 @@ sentinel outside the drain is skipped; during the drain it <em>terminates</em> i
       opens a thinking block at index 0; a content delta opens a text block. Opening the block
       eagerly would mean guessing, and guessing wrong would mis-number every later block.</li>
   <li><strong>Terminal events are emitted exactly once</strong> — after the post-finish drain, or
-      synthesised at EOF or on truncation. An Anthropic client that never receives
-      <code>message_stop</code> hangs, so the synthesis is unconditional.</li>
+      synthesised at EOF. A stream that ends with no <code>finish_reason</code> takes one of two
+      dispositions, decided by whether <code>[DONE]</code> arrived: with it the stream is
+      protocol-complete and is closed with a synthesised terminal sequence, without it the
+      connection was cut mid-response and the stream is closed with an SSE <code>error</code>
+      event (<code>error.type: "api_error"</code>). An Anthropic client that never receives
+      <code>message_stop</code> hangs, so every path terminates the stream — the anti-hang
+      property now rests on the <code>error</code> event as much as on the synthesis.</li>
 </ul>
 
 <h4 id="chat-sse-drain">The post-finish drain</h4>
@@ -368,8 +378,70 @@ a provider that goes silent after <code>finish_reason</code> would pin the worke
 upstream socket timeout — 300&nbsp;s — instead of 5&nbsp;s, which would also outlast the 30&nbsp;s
 drain-and-swap timeout.</p>
 
-<p>Truncation is unaffected: a stream that ends with <em>no</em> <code>finish_reason</code> at all
-still takes the EOF path and reports <code>chat_sse_truncated</code>.</p>
+<p>A stream that ends with <em>no</em> <code>finish_reason</code> at all never reaches the drain.
+It takes the EOF path and reports <code>chat_sse_truncated</code>, whose <code>saw_done</code>
+field carries the discriminator:</p>
+
+<ul>
+  <li><strong><code>saw_done: 1</code></strong> — the provider closed the stream properly and
+      simply never said why it stopped. The stream is protocol-complete, so it is closed with a
+      synthesised terminal sequence: <code>end_turn</code>, or a null <code>stop_reason</code>
+      when tool-call deltas were seen. Treating <code>[DONE]</code> as proof of completeness is
+      what keeps a provider that omits <code>finish_reason</code> but terminates correctly from
+      being turned into a retry storm.</li>
+  <li><strong><code>saw_done: 0</code></strong> — no <code>[DONE]</code> ever arrived, so the
+      connection was cut mid-response and the turn is incomplete. The open content blocks are
+      closed, the degradation diagnostics are finalised, and the stream is then closed by an SSE
+      <code>error</code> frame (<code>error.type: "api_error"</code>, documented as retryable)
+      with no <code>message_delta</code> and no <code>message_stop</code>. A synthesised
+      <code>end_turn</code> would be indistinguishable, on the wire, from a turn the model
+      actually finished: the client would record a completed message, report no error and never
+      re-issue the request.</li>
+</ul>
+
+<p>Every stream that <em>did</em> reach a <code>finish_reason</code> emits exactly one
+<code>chat_sse_drain</code> trace event when its drain ends. It records how the drain exited
+(<code>drain_exit</code>: <code>"done"</code>, <code>"eof"</code>, <code>"byte_budget"</code>,
+<code>"time_budget"</code>, <code>"read_error"</code>, <code>"response_cap"</code>), how much it
+read (<code>drain_bytes</code>) and how long it waited (<code>drain_ms</code>), what the stream
+contained (<code>finish_reason</code>, <code>tool_calls_seen</code>,
+<code>emitted_tool_use</code>, <code>tools_declared</code>), and when the trailing frames actually
+arrived (<code>late_frames</code>, <code>first_late_ms</code>, <code>last_late_ms</code>,
+<code>late_tool_call_ms</code> — the offset from the finish signal, which is what answers whether
+the 5&nbsp;s budget is generous or binding). Between them, <code>chat_sse_drain</code> and
+<code>chat_sse_truncated</code> are exhaustive: every chat-mode stream that returned 200 and
+started ends with exactly one of the two, unless the request aborts with an exception — a client
+disconnect, or an upstream frame shape the parser cannot read. Field-by-field reference:
+<a href="trace-log.html#events">trace-log.html</a>.</p>
+
+<h4 id="chat-sse-unfinished-turn">A turn that ends without its tool call</h4>
+
+<p>Not every incomplete-looking turn is a relay fault, and this one is worth recognizing on
+sight. A chat-mode model occasionally ends an agentic turn by narrating the action it is about to
+take and then reporting <code>finish_reason: "stop"</code> without emitting a single tool-call
+frame. The proxy relays exactly what it received: the turn arrives with <code>end_turn</code>, a
+thinking block and a text block, and no <code>tool_use</code> block, so the client stops and waits
+for the user to ask it to continue. Re-issuing produces the tool call normally.</p>
+
+<p>It is an upstream behavior rather than a relay defect, and the trace can show which it is. Such
+a turn reports real, non-zero <code>usage</code>, and it logs <strong>no</strong>
+<code>chat_sse_truncated</code>, <strong>no</strong> <code>chat_sse_tool_degradation</code>, and a
+<code>chat_sse_drain</code> with <code>tool_calls_seen: 0</code>. The absence of the degradation
+event is the load-bearing part: every path that fails to start or drops a tool block increments a
+counter that fires it, so its absence means no delta ever carried a tool call the transform could
+read. A stream that had been cut would instead have logged <code>chat_sse_truncated</code>, and a
+stream that was still draining would have been held open rather than closed with
+<code>end_turn</code>.</p>
+
+<p>The remedy is routing rather than repair — the proxy cannot invent a tool call the model never
+emitted — so measure the rate per provider and move traffic away from a provider that does it
+often. The measurement is <code>tools_declared</code> joined to <code>emitted_tool_use</code> on
+<code>chat_sse_drain</code> (per provider), which turns "a tool-bearing turn that emitted no
+<code>tool_use</code>" into a countable rate; neither field expresses it alone.
+<code>chat_sse_unfinished_turn</code> is the same condition detected live and written to the trace
+without acting on it — a shadow-mode measurement of the detector's precision on real traffic,
+which is why it is evaluated only after the drain has ended, so that a tool call arriving late is
+never counted as one that never came.</p>
 
 <h4 id="chat-sse-stream-options">Requesting usage</h4>
 
@@ -457,7 +529,9 @@ reduces a stream to <code>null</code>.</p>
 read the rule above as "an emitted block always means <code>tool_use</code>": a finish reason
 that maps to nothing stays <code>null</code> even with tool blocks present, and a stream that
 ends without any <code>finish_reason</code> reports <code>null</code> when tool-call deltas were
-seen rather than <code>end_turn</code>.</p>
+seen rather than <code>end_turn</code> — but only when <code>[DONE]</code> arrived. A stream cut
+before <code>[DONE]</code> closes with an <code>error</code> frame and reports no stop reason at
+all, so this rule is about the protocol-complete case only.</p>
 </div>
 
 <p>The <em>request</em> direction has the same problem in reverse: an
@@ -483,7 +557,10 @@ message carrying the <code>tool_calls</code>, so the ordering the upstream expec
 <tr><td><code>chat_sse_tool_degradation</code></td><td>one or more streaming tool calls degraded (metadata only, once per stream)</td></tr>
 <tr><td><code>chat_sse_post_finish_suppressed</code></td><td>the post-finish drain suppressed <code>content</code>/<code>reasoning</code> deltas (carries <code>count</code>, once per stream)</td></tr>
 <tr><td><code>response_sse_unexpected</code></td><td>a response-mode provider streamed despite <code>stream: false</code></td></tr>
-<tr><td><code>chat_sse_truncated</code>, <code>chat_sse_malformed_json</code>, <code>chat_sse_frame_cap_exceeded</code>, <code>chat_sse_buffer_cap_exceeded</code>, <code>sse_buffer_cap_exceeded</code>, <code>sse_rewrite_malformed_json</code></td><td>an SSE frame was truncated, malformed, or exceeded a buffer bound</td></tr>
+<tr><td><code>chat_sse_truncated</code></td><td>a chat-mode stream ended with no <code>finish_reason</code> at all (a whole-stream disposition, not a framing fault); carries <code>pending_bytes</code> and <code>saw_done</code>, which discriminates a protocol-complete stream (<code>1</code>) from one cut mid-response (<code>0</code>, closed with an <code>error</code> frame)</td></tr>
+<tr><td><code>chat_sse_drain</code></td><td>the post-finish drain of a chat-mode stream ended (once per stream that reached a <code>finish_reason</code>); carries <code>drain_exit</code>, <code>drain_bytes</code>, <code>drain_ms</code>, the tool-call flags and the late-frame offsets</td></tr>
+<tr><td><code>chat_sse_unfinished_turn</code></td><td>the shadow-mode detector saw a turn that ends with no tool call (tools were declared and <code>finish_reason</code> was <code>stop</code>); <strong>log only — it changes no response</strong></td></tr>
+<tr><td><code>chat_sse_malformed_json</code>, <code>chat_sse_frame_cap_exceeded</code>, <code>chat_sse_buffer_cap_exceeded</code>, <code>sse_buffer_cap_exceeded</code>, <code>sse_rewrite_malformed_json</code></td><td>an SSE frame was malformed or exceeded a buffer bound</td></tr>
 </table>
 
 <p>Full field lists and the complete event inventory live in
@@ -539,6 +616,6 @@ transform it belongs to, and neither runs in response mode:</p>
 <a href="compatibility.html">compatibility.html</a>, as is the
 <a href="compatibility.html#reasoning-field">reasoning-field selection</a>.</p>
 
-<footer>Last updated: 2026-10-03</footer>
+<footer>Last updated: 2026-10-04</footer>
 </body>
 </html>

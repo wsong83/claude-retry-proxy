@@ -10,6 +10,11 @@ Calculates per-model metrics including:
 - Geometric mean TTFT (Time To First Token)
 - Geometric mean latency
 
+Also reports chat-mode drain diagnostics:
+- chat_sse_unfinished_turn count per provider (log-only detector)
+- late-frame offset distributions (late_tool_call_ms, last_late_ms)
+- share of drained streams that exited on drain_exit == "time_budget"
+
 Filters:
 - Latency > 30 minutes (outliers)
 - Max retries (10) + failure status (complete upstream outage)
@@ -96,6 +101,13 @@ def main():
     MAX_LATENCY_SEC = 30 * 60  # 30 minutes
     MAX_RETRIES_THRESHOLD = 10
 
+    # Chat-mode drain diagnostics (chat_sse_drain / chat_sse_unfinished_turn)
+    unfinished_by_provider = defaultdict(int)
+    late_tool_call_ms_values = []
+    last_late_ms_values = []
+    drain_total = 0
+    drain_time_budget = 0
+
     total_entries = 0
     entries_in_range = 0
     filtered_latency = 0
@@ -108,10 +120,12 @@ def main():
             except json.JSONDecodeError:
                 continue
 
-            if entry.get("event") != "request":
+            _ev = entry.get("event")
+            if _ev not in ("request", "chat_sse_drain", "chat_sse_unfinished_turn"):
                 continue
 
-            total_entries += 1
+            if _ev == "request":
+                total_entries += 1
 
             # Parse timestamp
             timestamp_str = entry.get("timestamp")
@@ -129,6 +143,21 @@ def main():
                 if dt < cutoff_time:
                     continue
             except Exception:
+                continue
+
+            # Drain diagnostics collected under the same window as the table.
+            if _ev != "request":
+                if _ev == "chat_sse_unfinished_turn":
+                    unfinished_by_provider[entry.get("provider") or "?"] += 1
+                    continue
+                drain_total += 1
+                if entry.get("drain_exit") == "time_budget":
+                    drain_time_budget += 1
+                for _field, _sink in (("late_tool_call_ms", late_tool_call_ms_values),
+                                      ("last_late_ms", last_late_ms_values)):
+                    _v = entry.get(_field)
+                    if isinstance(_v, (int, float)) and not isinstance(_v, bool):
+                        _sink.append(float(_v))
                 continue
 
             entries_in_range += 1
@@ -235,6 +264,38 @@ def main():
         print(f"{'TOTAL':<20} {total_requests:>10} {overall_avg_retries:>12.4f} {overall_query_success:>14.2f}% {overall_attempt_success:>16.2f}% {overall_geo_ttft:>11.2f}s {overall_geo_latency:>11.2f}s")
 
     print()
+    # Chat-mode drain diagnostics: the unfinished-turn detector, the late-frame
+    # offsets, and the share of drains that hit the time budget.
+    def _dist(values):
+        if not values:
+            return "n/a"
+        s = sorted(values)
+        n = len(s)
+        median = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+        p90 = s[min(n - 1, max(0, math.ceil(0.9 * n) - 1))]
+        return f"min={s[0]:.0f} median={median:.0f} p90={p90:.0f} max={s[-1]:.0f}"
+
+    print()
+    print("=" * 130)
+    print("Chat-mode drain diagnostics")
+    print("=" * 130)
+    print(f"Drained streams (chat_sse_drain): {drain_total}")
+    if drain_total:
+        share = drain_time_budget / drain_total * 100
+        print(f"  Exited on drain_exit == \"time_budget\": {drain_time_budget} ({share:.1f}%)")
+    else:
+        print("  Exited on drain_exit == \"time_budget\": 0")
+    if unfinished_by_provider:
+        print("chat_sse_unfinished_turn by provider:")
+        for prov in sorted(unfinished_by_provider,
+                           key=lambda p: unfinished_by_provider[p], reverse=True):
+            print(f"  {prov}: {unfinished_by_provider[prov]}")
+    else:
+        print("chat_sse_unfinished_turn: none in window")
+    print(f"late_tool_call_ms: {_dist(late_tool_call_ms_values)}")
+    print(f"last_late_ms: {_dist(last_late_ms_values)}")
+    print()
+
     print("Notes:")
     print("  - Query Success%: % of queries that eventually succeeded (retries counted as part of same query)")
     print("  - Attempt Success%: % of all attempts that succeeded (each retry counted separately)")

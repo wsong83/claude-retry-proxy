@@ -51,13 +51,18 @@ DRAIN_BOUND_TEST_SECONDS = 20
 
 
 
-def _start_hanging_chat_proxy(pre_body, hold_s):
+def _start_hanging_chat_proxy(pre_body, hold_s, post_body=None, gap_s=0.0):
     """Chat-mode proxy whose mock upstream streams `pre_body` over an unterminated
     response (HTTP/1.0, no Content-Length) and then holds the socket open.
 
     The harness responder always sets Content-Length and closes, so the proxy's
     read loop sees EOF immediately and the stall path is never exercised. This
     mirror of _start_chat_sse_proxy exists solely to reach it.
+
+    With `post_body` and `gap_s` the upstream writes `post_body` after a delay,
+    which lands it in a later read chunk than `pre_body` — the shape that makes
+    a post-finish frame count as *late* (the per-chunk offset is taken at chunk
+    receipt, before the frames are parsed).
 
     Returns (proxy_port, trace_file, cleanup), or (None, None, None) on failure.
     """
@@ -78,6 +83,10 @@ def _start_hanging_chat_proxy(pre_body, hold_s):
             self.end_headers()
             self.wfile.write(pre_body)
             self.wfile.flush()
+            if post_body is not None:
+                time.sleep(gap_s)
+                self.wfile.write(post_body)
+                self.wfile.flush()
             time.sleep(hold_s)
 
         def log_message(self, format, *args):
@@ -173,6 +182,24 @@ def _trace_events_named(trace_file, event_name):
             if ev.get("event") == event_name:
                 out.append(ev)
     return out
+
+
+
+def _wait_for_trace_events(trace_file, event_name, timeout_s=3.0):
+    """Poll trace_file until at least one `event_name` event appears.
+
+    A client that returns at message_stop can outrun the proxy's trace write:
+    the terminal frames are flushed to the wire before chat_sse_drain (or the
+    detector events) reach the sink, so a single immediate read races the
+    proxy process. Returns the events found, or [] if none landed within
+    `timeout_s` seconds.
+    """
+    deadline = time.time() + timeout_s
+    while True:
+        out = _trace_events_named(trace_file, event_name)
+        if out or time.time() >= deadline:
+            return out
+        time.sleep(0.05)
 
 
 
@@ -362,7 +389,15 @@ def test_chat_sse_empty_choices_usage_chunk():
 
 
 def test_chat_sse_eof_without_finish_reason():
-    """Terminal events are synthesized when the stream ends without finish_reason."""
+    """A cut stream (no finish_reason, no [DONE]) closes with a retryable SSE
+    error event instead of a synthesized terminal, and chat_sse_truncated
+    records saw_done: 0.
+
+    The synthesized end_turn was indistinguishable on the wire from a turn the
+    model actually finished, so the client recorded a completed message and
+    never retried. Open blocks are still closed first so the partial turn is a
+    well-formed stream up to the error; no message_delta/message_stop follows.
+    """
     print("\n--- Test: Chat SSE EOF Without Finish Reason ---")
     upstream_port = find_free_port()
     tiers = _mode_tiers()
@@ -385,11 +420,78 @@ def test_chat_sse_eof_without_finish_reason():
             return
         frames = _parse_sse_frames(raw)
         types = _sse_types(frames)
+        if "content_block_stop" not in types:
+            fail("cut stream must close its open content blocks before the error; got {}".format(types))
+            return
+        present = [t for t in ("message_delta", "message_stop") if t in types]
+        if present:
+            fail("cut stream must not synthesize {}; got {}".format(present, types))
+            return
+        errs = _sse_frames_with_type(frames, "error")
+        if len(errs) != 1:
+            fail("cut stream must close with exactly one error frame, got {} ({})".format(len(errs), types))
+            return
+        if (errs[0].get("error") or {}).get("type") != "api_error":
+            fail("cut-stream error must be api_error (retryable), got {!r}".format(errs[0].get("error")))
+            return
+        if types.index("content_block_stop") > types.index("error"):
+            fail("content_block_stop must precede the error frame; got {}".format(types))
+            return
+        events = _trace_events_named(trace_file, "chat_sse_truncated")
+        if len(events) != 1:
+            fail("expected exactly one chat_sse_truncated event, got {}".format(len(events)))
+            return
+        if events[0].get("saw_done") != 0:
+            fail("chat_sse_truncated must record saw_done: 0 on a cut stream, got {!r}".format(events[0].get("saw_done")))
+            return
+        if _trace_events_named(trace_file, "chat_sse_drain"):
+            fail("a stream that never reached finish_reason must not log chat_sse_drain")
+            return
+        pass_("cut stream: blocks closed, api_error closes, saw_done 0, no synthesized terminal")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_done_without_finish_reason_is_terminal():
+    """[DONE] without ever a finish_reason is protocol-complete: the stream
+    closes with the synthesized terminal sequence — never an error frame — and
+    chat_sse_truncated records saw_done: 1.
+
+    A provider that always omits finish_reason but terminates properly would
+    otherwise be turned into a retry storm against a retryable error, replacing
+    a working integration with an outage. This test pins that contract.
+    """
+    print("\n--- Test: Chat SSE Done Without Finish Reason Is Terminal ---")
+    chunks = [_cc({"role": "assistant", "content": "hello"})]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)  # appends [DONE]
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        types = _sse_types(frames)
         missing = [t for t in ("content_block_stop", "message_delta", "message_stop") if t not in types]
         if missing:
-            fail("EOF without finish_reason should synthesize terminal events; missing {}".format(missing))
-        else:
-            pass_("terminal events synthesized on EOF")
+            fail("[DONE]-terminated stream must close with the terminal sequence; missing {} ({})".format(missing, types))
+            return
+        errs = _sse_frames_with_type(frames, "error")
+        if errs:
+            fail("[DONE]-terminated stream must not emit an error frame, got {!r}".format(errs))
+            return
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("protocol-complete finish-less stream should synthesize end_turn, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        events = _trace_events_named(trace_file, "chat_sse_truncated")
+        if len(events) != 1:
+            fail("expected exactly one chat_sse_truncated event, got {}".format(len(events)))
+            return
+        if events[0].get("saw_done") != 1:
+            fail("chat_sse_truncated must record saw_done: 1 for a [DONE]-terminated stream, got {!r}".format(events[0].get("saw_done")))
+            return
+        pass_("[DONE] without finish_reason: terminal sequence, no error frame, saw_done 1")
     finally:
         cleanup()
 
@@ -1966,8 +2068,12 @@ def test_chat_sse_finish_reason_last_chunk_no_drain():
 
 
 def test_chat_sse_truncation_still_works():
-    """EOF with no finish_reason still takes the truncation path: chat_sse_truncated
-    fires and a terminal sequence is synthesized."""
+    """EOF with no finish_reason still takes the truncation path — but its
+    disposition changed (2026-10-04): chat_sse_truncated fires with
+    saw_done: 0 and the stream closes with a retryable SSE error event, not a
+    synthesized terminal. No chat_sse_drain event accompanies it: the drain
+    only runs for streams that reached a finish_reason.
+    """
     print("\n--- Test: Chat SSE Truncation Still Works ---")
     chunks = [_cc({"role": "assistant", "content": "half a th"})]
     upstream_port = find_free_port()
@@ -1984,22 +2090,153 @@ def test_chat_sse_truncation_still_works():
         if frames is None:
             return
         types = _sse_types(frames)
-        missing = [t for t in ("content_block_stop", "message_delta", "message_stop") if t not in types]
-        if missing:
-            fail("truncation must still synthesize terminal events; missing {}".format(missing))
+        if "content_block_stop" not in types:
+            fail("truncation must still close open blocks; missing content_block_stop in {}".format(types))
             return
-        if _sse_stop_reason(frames) != "end_turn":
-            fail("truncated text stream should synthesize end_turn, got {!r}".format(_sse_stop_reason(frames)))
+        present = [t for t in ("message_delta", "message_stop") if t in types]
+        if present:
+            fail("truncation must not synthesize {}; got {}".format(present, types))
+            return
+        errs = _sse_frames_with_type(frames, "error")
+        if len(errs) != 1:
+            fail("truncation must close with exactly one error frame, got {} ({})".format(len(errs), types))
+            return
+        if (errs[0].get("error") or {}).get("type") != "api_error":
+            fail("truncation error must be api_error (retryable), got {!r}".format(errs[0].get("error")))
             return
         events = _trace_events_named(trace_file, "chat_sse_truncated")
         if len(events) != 1:
             fail("expected exactly one chat_sse_truncated event, got {}".format(len(events)))
             return
+        if events[0].get("saw_done") != 0:
+            fail("chat_sse_truncated must record saw_done: 0 on a cut stream, got {!r}".format(events[0].get("saw_done")))
+            return
+        if _trace_events_named(trace_file, "chat_sse_drain"):
+            fail("a cut stream never reaches the drain; no chat_sse_drain expected")
+            return
         suppressed = _trace_events_named(trace_file, "chat_sse_post_finish_suppressed")
         if suppressed:
             fail("a never-finished stream must not report post-finish suppression")
             return
-        pass_("truncation path unchanged: chat_sse_truncated + synthesized terminal")
+        pass_("truncation path: chat_sse_truncated (saw_done 0) + api_error close, no chat_sse_drain")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_truncation_with_tool_block_emits_error_event():
+    """A cut stream (no finish_reason, no [DONE]) that had opened a tool block
+    closes the block first, then terminates with a retryable api_error — and
+    never a message_delta/message_stop.
+
+    Not a duplicate of test_chat_sse_tool_call_eof_without_finish case (a):
+    that fixture carries [DONE] and takes the protocol-complete branch, so the
+    cut-with-tool-block shape is otherwise uncovered.
+    """
+    print("\n--- Test: Chat SSE Truncation With Tool Block Emits Error Event ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_cut",
+                             "function": {"name": "cut_tool", "arguments": "{\"a\":1}"}}]}),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks, add_done=False)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        blocks = _sse_tool_use_blocks(frames)
+        if len(blocks) != 1 or not blocks[0]["closed"]:
+            fail("the emitted tool block must be closed before the error frame, got {!r}".format(blocks))
+            return
+        if blocks[0]["input"] != {"a": 1}:
+            fail("tool block input wrong: {!r}".format(blocks[0]))
+            return
+        types = _sse_types(frames)
+        present = [t for t in ("message_delta", "message_stop") if t in types]
+        if present:
+            fail("cut stream with a tool block must not synthesize {}; got {}".format(present, types))
+            return
+        errs = _sse_frames_with_type(frames, "error")
+        if len(errs) != 1:
+            fail("cut stream with a tool block must close with exactly one error frame, got {} ({})".format(len(errs), types))
+            return
+        if (errs[0].get("error") or {}).get("type") != "api_error":
+            fail("error frame must be api_error (retryable), got {!r}".format(errs[0].get("error")))
+            return
+        if types.index("content_block_stop") > types.index("error"):
+            fail("content_block_stop must precede the error frame; got {}".format(types))
+            return
+        events = _trace_events_named(trace_file, "chat_sse_truncated")
+        if len(events) != 1 or events[0].get("saw_done") != 0:
+            fail("expected one chat_sse_truncated with saw_done 0, got {!r}".format(events))
+            return
+        pass_("cut stream with tool block: block closed, api_error closes, no terminal")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_tool_degradation_on_cut_stream():
+    """A cut stream whose only defect is a tracked-but-unstarted tool call
+    still fires the coalesced degradation event.
+
+    The unstarted-tool counting loop lives in log_degradation_if_needed() rather
+    than terminal(), precisely so that the cut path — which no longer calls
+    terminal() — finalizes identically. Every [DONE]-bearing fixture reaches
+    that loop through terminal() and would stay green if the loop were moved
+    back; only a cut fixture pins the refactor.
+
+    No polling here, unlike the _wait_for_trace_events tests: both trace writes
+    precede the client-visible error frame (log_degradation_if_needed runs
+    before chat_sse_truncated's block and before the error write on the cut
+    path), so reading the client stream to EOF via _chat_sse_fetch_frames
+    cannot outrun them. Do not "fix" this into a poll.
+    """
+    print("\n--- Test: Chat SSE Tool Degradation On Cut Stream ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_incomplete"}]}),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks, add_done=False)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        events = _degraded_trace_events(trace_file)
+        if len(events) != 1:
+            fail("cut stream with an unstarted tool must fire exactly one degradation "
+                 "event (the counting loop now lives in log_degradation_if_needed), "
+                 "got {}".format(len(events)))
+            return
+        if _sse_content_block_starts(frames):
+            fail("an id with no function.name must never open a tool block on the "
+                 "cut path, got {!r}".format(_sse_content_block_starts(frames)))
+            return
+        types = _sse_types(frames)
+        present = [t for t in ("message_delta", "message_stop") if t in types]
+        if present:
+            fail("cut stream must not synthesize {}; got {}".format(present, types))
+            return
+        errs = _sse_frames_with_type(frames, "error")
+        if len(errs) != 1:
+            fail("cut stream must close with exactly one error frame, got {} ({})".format(
+                len(errs), types))
+            return
+        if (errs[0].get("error") or {}).get("type") != "api_error":
+            fail("error frame must be api_error (retryable), got {!r}".format(errs[0].get("error")))
+            return
+        trunc = _trace_events_named(trace_file, "chat_sse_truncated")
+        if len(trunc) != 1 or trunc[0].get("saw_done") != 0:
+            fail("expected one chat_sse_truncated with saw_done 0, got {!r}".format(trunc))
+            return
+        pass_("cut stream with unstarted tool: degradation event fires, no tool_use, "
+              "api_error closes, saw_done 0")
     finally:
         cleanup()
 
@@ -2028,6 +2265,21 @@ def test_chat_sse_drain_time_deadline():
         frames = _parse_sse_frames(raw)
         if _sse_stop_reason(frames) != "end_turn":
             fail("drain must still emit the mapped stop reason, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        # The fixture goes silent after finish_reason, so the drain exits on
+        # the socket timeout (the except socket.timeout clause). If that clause
+        # were dead code — e.g. ordered after the OSError tuple, which
+        # socket.timeout subclasses — this would report "read_error".
+        # Poll: _read_sse_until_stop returns at message_stop, which the proxy
+        # writes before it logs the drain event, so an immediate read races
+        # the sink write.
+        drain_events = _wait_for_trace_events(trace_file, "chat_sse_drain")
+        if len(drain_events) != 1:
+            fail("expected exactly one chat_sse_drain event, got {}".format(len(drain_events)))
+            return
+        if drain_events[0].get("drain_exit") != "time_budget":
+            fail("silent provider must exit the drain on its own deadline "
+                 "(socket.timeout -> time_budget), got {!r}".format(drain_events[0].get("drain_exit")))
             return
         pass_("silent provider: drain bounded, terminal emitted in {:.1f}s".format(elapsed))
     finally:
@@ -2231,7 +2483,288 @@ def test_chat_sse_drain_byte_budget():
             fail("byte-budget cut mid-tool-call must still claim tool_use (D4), "
                  "got {!r}".format(_sse_stop_reason(frames)))
             return
+        drain_events = _trace_events_named(trace_file, "chat_sse_drain")
+        if len(drain_events) != 1:
+            fail("expected exactly one chat_sse_drain event, got {}".format(len(drain_events)))
+            return
+        if drain_events[0].get("drain_exit") != "byte_budget":
+            fail("a drain cut by MAX_DRAIN_BYTES must report drain_exit "
+                 "\"byte_budget\", got {!r}".format(drain_events[0].get("drain_exit")))
+            return
         pass_("drain cut at MAX_DRAIN_BYTES: partial tool block closes, stop_reason tool_use")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_drain_event_on_done():
+    """A normal stream (finish_reason then [DONE]) logs exactly one
+    chat_sse_drain event describing the drain: the finish_reason, why it ended
+    (drain_exit "done"), byte/time counters, tool flags, and tools_declared 0
+    for a request that declared no tools."""
+    print("\n--- Test: Chat SSE Drain Event On Done ---")
+    chunks = [_cc({"role": "assistant", "content": "hi"}),
+              _cc({}, finish="stop")]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)  # appends [DONE]
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("normal stop stream must map to end_turn, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        events = _trace_events_named(trace_file, "chat_sse_drain")
+        if len(events) != 1:
+            fail("expected exactly one chat_sse_drain event, got {}".format(len(events)))
+            return
+        ev = events[0]
+        if ev.get("finish_reason") != "stop":
+            fail("chat_sse_drain.finish_reason must be the upstream value, got {!r}".format(ev.get("finish_reason")))
+            return
+        if ev.get("drain_exit") != "done":
+            fail("drain ended by [DONE] must report drain_exit \"done\", got {!r}".format(ev.get("drain_exit")))
+            return
+        for field in ("drain_bytes", "drain_ms"):
+            v = ev.get(field)
+            if not isinstance(v, int) or v < 0:
+                fail("chat_sse_drain.{} must be a non-negative int, got {!r}".format(field, v))
+                return
+        if ev.get("tool_calls_seen") != 0 or ev.get("emitted_tool_use") != 0:
+            fail("tool flags must be 0 on a text-only stream, got {!r}/{!r}".format(
+                ev.get("tool_calls_seen"), ev.get("emitted_tool_use")))
+            return
+        if ev.get("tools_declared") != 0:
+            fail("a request with no tools must log tools_declared 0, got {!r}".format(ev.get("tools_declared")))
+            return
+        pass_("chat_sse_drain on [DONE]: finish_reason stop, drain_exit done, tools_declared 0")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_drain_event_trailing_tool_calls():
+    """A stream whose finish_reason precedes its tool_call frames reports
+    tool_calls_seen 1 and emitted_tool_use 1 on chat_sse_drain — the evidence
+    channel that turns a missing trailing tool call from an inference into a
+    readable field."""
+    print("\n--- Test: Chat SSE Drain Event Trailing Tool Calls ---")
+    chunks = [
+        _cc({"role": "assistant"}),
+        _cc({}, finish="stop"),
+        _cc({"tool_calls": [{"index": 0, "id": "call_late",
+                             "function": {"name": "late_tool", "arguments": "{\"k\":1}"}}]}),
+    ]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)  # appends [DONE]
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("trailing tool call must upgrade the stop to tool_use, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        events = _trace_events_named(trace_file, "chat_sse_drain")
+        if len(events) != 1:
+            fail("expected exactly one chat_sse_drain event, got {}".format(len(events)))
+            return
+        ev = events[0]
+        if ev.get("tool_calls_seen") != 1:
+            fail("chat_sse_drain.tool_calls_seen must be 1, got {!r}".format(ev.get("tool_calls_seen")))
+            return
+        if ev.get("emitted_tool_use") != 1:
+            fail("chat_sse_drain.emitted_tool_use must be 1, got {!r}".format(ev.get("emitted_tool_use")))
+            return
+        pass_("chat_sse_drain: tool_calls_seen 1, emitted_tool_use 1 on trailing tool frames")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_drain_event_eof_exit():
+    """A drain that runs to upstream EOF (finish_reason arrived, connection
+    closed, no [DONE]) reports drain_exit "eof" on chat_sse_drain.
+
+    The guidance for this plan asked for this assertion inside the migrated
+    truncation test, but a cut stream never reaches the drain and logs no
+    chat_sse_drain at all — the field is only observable on a finish-bearing
+    stream, which is this fixture."""
+    print("\n--- Test: Chat SSE Drain Event EOF Exit ---")
+    chunks = [_cc({"role": "assistant", "content": "hi"}),
+              _cc({}, finish="stop")]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks, add_done=False)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("eof-drained stop stream must map to end_turn, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        events = _trace_events_named(trace_file, "chat_sse_drain")
+        if len(events) != 1:
+            fail("expected exactly one chat_sse_drain event, got {}".format(len(events)))
+            return
+        if events[0].get("drain_exit") != "eof":
+            fail("a drain that ends at upstream EOF must report drain_exit \"eof\", "
+                 "got {!r}".format(events[0].get("drain_exit")))
+            return
+        pass_("chat_sse_drain: drain_exit eof on a finish stream without [DONE]")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_unfinished_turn_shadow_logged():
+    """The unfinished-turn detector fires in shadow mode: a tools-declaring
+    request whose prose ends in ':' after finish_reason "stop", with no tool
+    block, logs exactly one chat_sse_unfinished_turn — and changes nothing
+    about the response. The same stream without tools logs none (tools_declared
+    gate), and the chat_sse_drain event carries tools_declared 1/0 to match."""
+    print("\n--- Test: Chat SSE Unfinished Turn Shadow Logged ---")
+    chunks = [_cc({"role": "assistant", "content": "Running the check: "}),
+              _cc({}, finish="stop")]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)  # appends [DONE]
+    if proxy_port is None:
+        return
+    try:
+        tool = {"name": "lookup", "description": "look things up",
+                "input_schema": {"type": "object", "properties": {}}}
+        body_with_tools = {"model": "sonnet",
+                           "messages": [{"role": "user", "content": "go"}],
+                           "stream": True, "tools": [tool]}
+        frames = _chat_sse_fetch_frames(proxy_port, body=body_with_tools)
+        if frames is None:
+            return
+        # Shadow mode must be structurally incapable of acting: the terminal
+        # sequence is exactly what the detector-less path emits.
+        types = _sse_types(frames)
+        missing = [t for t in ("message_delta", "message_stop") if t not in types]
+        if missing:
+            fail("the detector must not alter the response; missing {} ({})".format(missing, types))
+            return
+        if _sse_frames_with_type(frames, "error"):
+            fail("the detector must not emit an error frame, got {!r}".format(_sse_frames_with_type(frames, "error")))
+            return
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("detector stream must still stop with end_turn, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        events = _trace_events_named(trace_file, "chat_sse_unfinished_turn")
+        if len(events) != 1:
+            fail("expected exactly one chat_sse_unfinished_turn event, got {}".format(len(events)))
+            return
+        ev = events[0]
+        if ev.get("rule") != "colon_after_prose":
+            fail("unfinished-turn rule must be colon_after_prose, got {!r}".format(ev.get("rule")))
+            return
+        if ev.get("finish_reason") != "stop":
+            fail("unfinished-turn finish_reason must be stop, got {!r}".format(ev.get("finish_reason")))
+            return
+        if ev.get("tools_declared") != 1:
+            fail("tools-declaring request must log tools_declared 1, got {!r}".format(ev.get("tools_declared")))
+            return
+        if ev.get("tool_calls_seen") != 0 or ev.get("emitted_tool_use") != 0:
+            fail("detector predicates on no tool frames: got tool_calls_seen {!r}, "
+                 "emitted_tool_use {!r}".format(ev.get("tool_calls_seen"), ev.get("emitted_tool_use")))
+            return
+        if not isinstance(ev.get("text_tail_len"), int) or ev.get("text_tail_len") <= 0:
+            fail("text_tail_len must be a positive int (the tail itself is never logged), "
+                 "got {!r}".format(ev.get("text_tail_len")))
+            return
+        if "provider" not in ev or "key" not in ev:
+            fail("unfinished-turn event must carry provider and key, got keys {}".format(sorted(ev)))
+            return
+        drain_events = _trace_events_named(trace_file, "chat_sse_drain")
+        if len(drain_events) != 1 or drain_events[0].get("tools_declared") != 1:
+            fail("chat_sse_drain must carry tools_declared 1 for this request, got {!r}".format(drain_events))
+            return
+        # Negative: the same upstream stream on a request with no tools must
+        # not fire the detector (tools_declared gate), and logs tools_declared 0.
+        body_no_tools = {"model": "sonnet",
+                         "messages": [{"role": "user", "content": "go"}],
+                         "stream": True}
+        frames2 = _chat_sse_fetch_frames(proxy_port, body=body_no_tools)
+        if frames2 is None:
+            return
+        events2 = _trace_events_named(trace_file, "chat_sse_unfinished_turn")
+        if len(events2) != 1:
+            fail("a request without tools must not fire the detector; got {} events".format(len(events2)))
+            return
+        drain_events2 = _trace_events_named(trace_file, "chat_sse_drain")
+        if len(drain_events2) != 2 or drain_events2[1].get("tools_declared") != 0:
+            fail("chat_sse_drain must carry tools_declared 0 on the no-tools request, "
+                 "got {!r}".format(drain_events2))
+            return
+        pass_("shadow detector: fires once with tools (response unchanged), silent without")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_drain_late_tool_call_time_budget():
+    """A tool call that arrives after finish_reason on a drain that ends by
+    the time budget reports a non-null late_tool_call_ms — the arrival latency
+    of a tool call the drain would otherwise have lost, and the number that
+    answers whether the 5 s budget is generous or binding.
+
+    Uses a two-phase hanging upstream: the finish stream lands first, the tool
+    frame 0.3 s later (a distinct read chunk, so it counts as late), then the
+    socket goes silent until the drain's socket timeout fires — the same
+    except-socket.timeout exit test_chat_sse_drain_time_deadline pins."""
+    print("\n--- Test: Chat SSE Drain Late Tool Call Time Budget ---")
+    pre = _sse_stream_chunks([_cc({"role": "assistant", "content": "hi"}),
+                              _cc({}, finish="stop")])
+    post = _sse_stream_chunks([_cc({"tool_calls": [{"index": 0, "id": "call_really_late",
+                                                    "function": {"name": "late_tool",
+                                                                 "arguments": "{\"q\":1}"}}]})])
+    proxy_port, trace_file, cleanup = _start_hanging_chat_proxy(
+        pre, DRAIN_BOUND_TEST_SECONDS * 3, post_body=post, gap_s=0.3)
+    if proxy_port is None:
+        return
+    try:
+        raw, saw_stop, elapsed = _read_sse_until_stop(proxy_port, DRAIN_BOUND_TEST_SECONDS)
+        if not saw_stop:
+            fail("no message_stop within {}s (got {} bytes)".format(DRAIN_BOUND_TEST_SECONDS, len(raw)))
+            return
+        frames = _parse_sse_frames(raw)
+        if _sse_stop_reason(frames) != "tool_use":
+            fail("late tool call must upgrade the stop to tool_use, got {!r}".format(_sse_stop_reason(frames)))
+            return
+        # Poll: the client returns at message_stop, which the proxy writes
+        # before it logs the drain event — an immediate read can outrun the
+        # sink write (observed 2-of-3 runs failing without the wait).
+        events = _wait_for_trace_events(trace_file, "chat_sse_drain")
+        if len(events) != 1:
+            fail("expected exactly one chat_sse_drain event, got {}".format(len(events)))
+            return
+        ev = events[0]
+        if ev.get("drain_exit") != "time_budget":
+            fail("drain must end on its own deadline, got {!r}".format(ev.get("drain_exit")))
+            return
+        if ev.get("late_tool_call_ms") is None:
+            fail("a tool call arriving after finish_reason must record late_tool_call_ms, "
+                 "got {!r}".format(ev.get("late_tool_call_ms")))
+            return
+        if ev.get("late_tool_call_ms") < 0:
+            fail("late_tool_call_ms must be non-negative, got {!r}".format(ev.get("late_tool_call_ms")))
+            return
+        if not ev.get("late_frames"):
+            fail("late_frames must count the post-finish chunk, got {!r}".format(ev.get("late_frames")))
+            return
+        if ev.get("tool_calls_seen") != 1 or ev.get("emitted_tool_use") != 1:
+            fail("tool flags must both be 1, got {!r}/{!r}".format(
+                ev.get("tool_calls_seen"), ev.get("emitted_tool_use")))
+            return
+        pass_("time_budget drain: late_tool_call_ms {} (late_frames {})".format(
+            ev.get("late_tool_call_ms"), ev.get("late_frames")))
     finally:
         cleanup()
 
@@ -2456,6 +2989,14 @@ ALL_TESTS = [
     ("chat-sse-empty-finish-reason", test_chat_sse_empty_finish_reason_no_change),
     ("chat-sse-unmapped-finish-with-tools", test_chat_sse_unmapped_finish_with_tools),
     ("chat-sse-empty-revision-no-downgrade", test_chat_sse_empty_revision_does_not_downgrade),
+    ("chat-sse-done-without-finish-reason-is-terminal", test_chat_sse_done_without_finish_reason_is_terminal),
+    ("chat-sse-truncation-with-tool-block-emits-error", test_chat_sse_truncation_with_tool_block_emits_error_event),
+    ("chat-sse-drain-event-on-done", test_chat_sse_drain_event_on_done),
+    ("chat-sse-drain-event-trailing-tool-calls", test_chat_sse_drain_event_trailing_tool_calls),
+    ("chat-sse-drain-event-eof-exit", test_chat_sse_drain_event_eof_exit),
+    ("chat-sse-unfinished-turn-shadow-logged", test_chat_sse_unfinished_turn_shadow_logged),
+    ("chat-sse-drain-late-tool-call-time-budget", test_chat_sse_drain_late_tool_call_time_budget),
+    ("chat-sse-tool-degradation-on-cut-stream", test_chat_sse_tool_degradation_on_cut_stream),
 ]
 
 

@@ -10,7 +10,7 @@
 
 <h1>Test Catalog<span class="sub">Suite layout, harness isolation, and testing patterns</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-03</p>
+<p><strong>Last updated:</strong> 2026-10-04</p>
 
 <p>The suite is a set of per-area modules merged by a single aggregator. It runs against
 <em>real</em> proxy processes and <em>real</em> mock upstream servers over loopback sockets —
@@ -18,11 +18,11 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>364 test functions across 19 files</strong>, but this number moves whenever
-tests are added. (It read <em>362 across 19</em> before this recount, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
+suite has <strong>372 test functions across 19 files</strong>, but this number moves whenever
+tests are added. (It read <em>371 across 19</em> before this recount, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
 before that, <em>334 across 19</em> before that, and <em>322 across 18</em> before an earlier
 one — the page has drifted behind the
-suite five times, and in each case the stale total disagreed with the page's own catalog table
+suite seven times, and in each case the stale total disagreed with the page's own catalog table
 as well.)
 Re-count before quoting it:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
@@ -116,8 +116,8 @@ relative size, not as exact current figures.</p>
     <td>Anthropic → Chat Completions request and response transforms</td></tr>
 <tr><td><code>test_response_transform.py</code></td><td class="num">37</td>
     <td>Anthropic → Responses request and response transforms</td></tr>
-<tr><td><code>test_chat_sse.py</code></td><td class="num">47</td>
-    <td>Chat-mode SSE synthesis, tool-call deltas, post-finish drain, truncation and degradation</td></tr>
+<tr><td><code>test_chat_sse.py</code></td><td class="num">55</td>
+    <td>Chat-mode SSE synthesis, tool-call deltas, post-finish drain, drain telemetry, truncation and degradation</td></tr>
 <tr><td><code>test_mode_dispatch.py</code></td><td class="num">28</td>
     <td>Mode dispatch, auth headers, path rewriting</td></tr>
 <tr><td><code>test_admin.py</code></td><td class="num">25</td>
@@ -400,13 +400,13 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> Synthesising Anthropic SSE events from a chat provider's stream: framing, tool-call deltas, and every degradation path.</p>
 
-<h4><code>tests/test_chat_sse.py</code> (47 tests) — chat-mode SSE synthesis, post-finish drain, and framing</h4>
+<h4><code>tests/test_chat_sse.py</code> (55 tests) — chat-mode SSE synthesis, post-finish drain, drain telemetry, and framing</h4>
 <ul>
 <li><code>test_chat_sse_basic_streaming</code>: Simulated OpenAI SSE chunks produce valid Anthropic SSE events.</li>
 <li><code>test_chat_sse_finish_reason_mapping</code>: finish_reason maps to stop_reason in the terminal message_delta.</li>
 <li><code>test_chat_sse_no_content_delta</code>: Chunks without content delta produce no content_block_delta events.</li>
 <li><code>test_chat_sse_empty_choices_usage_chunk</code>: An empty-choices usage chunk does not crash and its usage is accumulated.</li>
-<li><code>test_chat_sse_eof_without_finish_reason</code>: Terminal events are synthesized when the stream ends without finish_reason.</li>
+<li><code>test_chat_sse_eof_without_finish_reason</code>: A stream cut before <code>[DONE]</code> closes with an SSE <code>error</code> frame (<code>api_error</code>) and no <code>message_delta</code>/<code>message_stop</code>, open blocks closed first, and logs <code>chat_sse_truncated</code> with <code>saw_done: 0</code> (changed 2026-10-04 by the truncation-error plan — it previously asserted a synthesised terminal sequence).</li>
 <li><code>test_chat_sse_first_event_has_content</code>: A first chunk that carries real content emits a content_block_delta.</li>
 <li><code>test_chat_sse_injection_prevented</code>: Provider-controlled newline/event/data text cannot inject extra SSE events.</li>
 <li><code>test_chat_sse_event_line_present</code>: Every data-bearing SSE frame has an event: line matching the JSON type field.</li>
@@ -439,7 +439,7 @@ EOF</code></pre>
 <li><code>test_chat_sse_tool_calls_after_finish_reason</code>: Tool-call frames arriving after a <code>stop</code> finish are captured and the stream ends with <code>stop_reason: tool_use</code>, not <code>end_turn</code>.</li>
 <li><code>test_chat_sse_usage_and_tool_calls_after_finish_reason</code>: A late tool call and a late usage chunk in the same stream are both captured.</li>
 <li><code>test_chat_sse_finish_reason_last_chunk_no_drain</code>: finish_reason as the genuine last chunk keeps the previous behavior — correct stop reason, no extra frames.</li>
-<li><code>test_chat_sse_truncation_still_works</code>: EOF with no finish_reason still takes the truncation path (chat_sse_truncated event, terminal synthesized).</li>
+<li><code>test_chat_sse_truncation_still_works</code>: EOF with no finish_reason still takes the truncation path — <code>chat_sse_truncated</code> with <code>saw_done: 0</code>, no <code>chat_sse_drain</code>, and an <code>error</code> frame rather than a terminal sequence (changed 2026-10-04 by the truncation-error plan — it previously asserted a synthesised terminal sequence).</li>
 <li><code>test_chat_sse_drain_time_deadline</code>: A provider that goes silent after finish_reason is bounded by the socket read timeout at 5&nbsp;s, not by the 300&nbsp;s upstream socket timeout.</li>
 <li><code>test_chat_sse_done_terminates_drain</code>: <code>[DONE]</code> ends the drain promptly, its usage frame is captured, and the sentinel never leaks into the client stream.</li>
 <li><code>test_chat_sse_text_after_finish_suppressed</code>: Text and reasoning deltas after finish are suppressed (no delta follows content_block_stop) and counted in one chat_sse_post_finish_suppressed event.</li>
@@ -449,6 +449,14 @@ EOF</code></pre>
 <li><code>test_chat_sse_empty_finish_reason_no_change</code>: An empty finish_reason is recorded (the <code>is not None</code> discipline), maps to a null stop reason, and does not take the truncation path.</li>
 <li><code>test_chat_sse_unmapped_finish_with_tools</code>: An unmapped/empty finish_reason with captured tool blocks still reports <code>stop_reason: null</code> (Resolved Decision D3).</li>
 <li><code>test_chat_sse_empty_revision_does_not_downgrade</code>: A trailing <code>finish_reason: &quot;&quot;</code> is refused as a revision, so a resolved <code>tool_calls</code> survives — <code>stop_reason</code> stays <code>tool_use</code>, the emitted block is intact and closed, one terminal sequence is emitted, and no degradation or truncation event is logged. The companion to <code>empty_finish_reason_no_change</code>: an empty reason is recorded when it is the provider's <em>first</em> answer, but may not overwrite a resolved one.</li>
+<li><code>test_chat_sse_done_without_finish_reason_is_terminal</code>: A stream that delivers content, then <code>[DONE]</code>, and never a <code>finish_reason</code> is protocol-complete — it closes with <code>content_block_stop</code> + <code>message_delta</code> + <code>message_stop</code>, carries no <code>error</code> frame, and logs <code>chat_sse_truncated</code> with <code>saw_done: 1</code>. This pins the branch that keeps a provider which omits <code>finish_reason</code> but terminates properly from becoming a retry storm.</li>
+<li><code>test_chat_sse_truncation_with_tool_block_emits_error_event</code>: A tool_call delta followed by EOF with no <code>[DONE]</code> and no <code>finish_reason</code> closes with an <code>error</code> frame (<code>api_error</code>), no <code>message_delta</code>/<code>message_stop</code>, and the emitted tool block still closed by <code>content_block_stop</code>.</li>
+<li><code>test_chat_sse_drain_event_on_done</code>: A normal stream ending <code>finish_reason</code> → <code>[DONE]</code> logs exactly one <code>chat_sse_drain</code> carrying <code>finish_reason</code>, <code>drain_exit: &quot;done&quot;</code>, <code>drain_bytes</code>, <code>drain_ms</code>, <code>tool_calls_seen</code> and <code>emitted_tool_use</code>.</li>
+<li><code>test_chat_sse_drain_event_trailing_tool_calls</code>: A stream whose <code>finish_reason</code> precedes the tool_call frames reports <code>tool_calls_seen: 1</code> and <code>emitted_tool_use: 1</code> on <code>chat_sse_drain</code> — the evidence channel for a tool call the drain rescued.</li>
+<li><code>test_chat_sse_drain_event_eof_exit</code>: A drain that ends at EOF reports <code>drain_exit: &quot;eof&quot;</code>; the <code>&quot;eof&quot;</code> exit is reachable only on a stream that <em>did</em> deliver a <code>finish_reason</code>, since a cut stream never reaches the drain and logs no <code>chat_sse_drain</code> at all.</li>
+<li><code>test_chat_sse_drain_late_tool_call_time_budget</code>: A tool call arriving after <code>finish_reason</code> on the socket-timeout path records <code>late_frames</code> and <code>late_tool_call_ms</code> — the arrival offset that answers whether the 5&nbsp;s drain budget is generous or binding.</li>
+<li><code>test_chat_sse_unfinished_turn_shadow_logged</code>: A completed turn that declared tools, emitted no <code>tool_use</code> and ended on <code>finish_reason: &quot;stop&quot;</code> logs the log-only <code>chat_sse_unfinished_turn</code> event (with <code>tools_declared: 1</code> and <code>emitted_tool_use: 0</code>) and changes no response.</li>
+<li><code>test_chat_sse_tool_degradation_on_cut_stream</code>: A cut stream (no <code>[DONE]</code>) whose tool-call delta never opens a block still fires exactly one coalesced <code>chat_sse_tool_degradation</code>, with no block started, an <code>error</code> frame and no terminal sequence, and <code>saw_done: 0</code> on <code>chat_sse_truncated</code>. This is the only committed test that reaches the unstarted-tool counting loop on the cut path — the loop's relocation into <code>log_degradation_if_needed()</code> is what the cut path depends on, and this test is what keeps that relocation from being silently undone.</li>
 </ul>
 
 <h3 id="cat-7">Category 7 — Compatibility Learner</h3>
@@ -760,6 +768,6 @@ whenever a proxy is running.</p>
       that the full suite passes with a live proxy running.</li>
 </ol>
 
-<footer>Last updated: 2026-10-03</footer>
+<footer>Last updated: 2026-10-04</footer>
 </body>
 </html>

@@ -374,7 +374,11 @@ Chat-mode streaming correctly converts tool-call SSE deltas to Anthropic
 argument fragments forwarded verbatim, count-only diagnostics on malformed
 frames), and reads on past `finish_reason` so a trailing usage chunk or a
 late tool call is not lost; a provider that then goes silent is bounded by a
-5-second drain rather than held to the upstream socket timeout. Image
+5-second drain rather than held to the upstream socket timeout. A stream that
+ends with no `finish_reason` at all is closed with a synthesised ending if the
+provider sent its `[DONE]` sentinel, and with a retryable `api_error` event if
+the connection was cut before it did — a truncated turn is never reported to
+the client as a turn the model finished. Image
 content blocks are not mapped between Anthropic and OpenAI formats. In chat and response modes, error responses (non-2xx) pass through
 untransformed in the upstream format.
 

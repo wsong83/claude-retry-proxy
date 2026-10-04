@@ -10,7 +10,7 @@
 
 <h1>Trace Log<span class="sub">What the proxy records, and what it deliberately does not</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-03</p>
+<p><strong>Last updated:</strong> 2026-10-04</p>
 
 <p>The trace log is a JSONL file — one JSON object per line — at
 <code>~/.claude/logs/proxy-trace.jsonl</code> by default, overridable with
@@ -114,7 +114,21 @@ are the complete set the proxy can write.</p>
 <tr><td><code>content_block_dropped</code></td><td>an unrepresentable content block was removed</td></tr>
 <tr><td><code>tool_args_parse_failure</code></td><td>tool arguments could not be parsed or serialised</td></tr>
 <tr><td><code>chat_sse_tool_degradation</code></td><td>one or more streaming tool calls degraded (once per stream)</td></tr>
-<tr><td><code>chat_sse_truncated</code>, <code>chat_sse_malformed_json</code>,
+<tr><td><code>chat_sse_truncated</code></td>
+    <td>a chat-mode stream ended with <strong>no <code>finish_reason</code> at all</strong> — a
+    whole-stream disposition, not a framing fault. Carries <code>saw_done</code>: with
+    <code>1</code> the stream was protocol-complete and is closed with a synthesised terminal
+    sequence; with <code>0</code> it was cut mid-response and is closed by an <code>error</code>
+    frame, reporting no stop reason (see below)</td></tr>
+<tr><td><code>chat_sse_drain</code></td>
+    <td>the post-finish drain ended — <strong>once per stream that reached a
+    <code>finish_reason</code></strong>. Carries the exit reason, the drain's byte and time cost,
+    the tool-call flags, and the late-frame offsets (see below)</td></tr>
+<tr><td><code>chat_sse_unfinished_turn</code></td>
+    <td>a completed turn declared tools and emitted none, with <code>finish_reason: "stop"</code>
+    — a <strong>log-only</strong> shadow-mode diagnostic that changes no response (see
+    below)</td></tr>
+<tr><td><code>chat_sse_malformed_json</code>,
     <code>chat_sse_frame_cap_exceeded</code>, <code>chat_sse_buffer_cap_exceeded</code></td>
     <td>chat-mode SSE framing problems</td></tr>
 <tr><td><code>chat_sse_post_finish_suppressed</code></td>
@@ -128,6 +142,54 @@ are the complete set the proxy can write.</p>
 <p>Several of these are <strong>metadata-only by design</strong>. <code>transform_failure</code>,
 <code>chat_sse_tool_degradation</code>, and the learner's events carry counts and identifiers
 but never body content, so a failed transform cannot leak model output into the log.</p>
+
+<h3 id="chat-sse-events">The chat-mode SSE events</h3>
+
+<p>Two of the events above partition the chat-mode SSE lifecycle. Every chat-mode stream that
+returned 200 and started ends with <strong>exactly one</strong> of <code>chat_sse_drain</code> or
+<code>chat_sse_truncated</code>, unless the request aborts with an exception — a client disconnect,
+or an upstream frame shape the parser cannot read. A stream that delivered a
+<code>finish_reason</code> emits <code>chat_sse_drain</code> when its drain ends; a stream that
+never delivered one emits <code>chat_sse_truncated</code> at EOF. Because the two are exhaustive,
+an absent pair is itself a finding: that stream did not complete.</p>
+
+<p><code>chat_sse_drain</code> carries <code>drain_exit</code>, the reason the drain ended —
+<code>"done"</code> (<code>[DONE]</code>), <code>"eof"</code>, <code>"byte_budget"</code> (the
+64&nbsp;KB budget), <code>"time_budget"</code> (the 5&nbsp;s budget), <code>"read_error"</code>
+(the connection died), or <code>"response_cap"</code> (the response size cap was hit). Alongside
+it: <code>drain_bytes</code> and <code>drain_ms</code> for the cost, <code>finish_reason</code>
+for what the provider claimed, and three flags — <code>tool_calls_seen</code> (a tool-call delta
+reached the transform), <code>emitted_tool_use</code> (a <code>tool_use</code> block actually
+reached the client), and <code>tools_declared</code> (the client declared tools at all).</p>
+
+<p>The late-frame fields answer a different question: how long the drain actually had to wait.
+<code>late_frames</code> counts the drain <em>reads</em> that carried frames arriving after the
+finish signal — one per chunk, not per frame within a chunk — <code>first_late_ms</code> and
+<code>last_late_ms</code> bracket the offsets of the first and last such read, and
+<code>late_tool_call_ms</code> is the offset at which a tool call arrived <em>late</em> — the one
+number that says whether the 5&nbsp;s budget is generous or binding, since it measures a tool call
+that would have been lost without the drain. All four are null or zero for a stream that ended at
+the finish frame; the wait costs latency only when a provider goes silent after
+<code>finish_reason</code>.</p>
+
+<p><strong>The join that makes this a measurement.</strong> <code>tools_declared</code> together
+with <code>emitted_tool_use</code> gives, per provider, the rate of tool-bearing turns that emitted
+no <code>tool_use</code> — neither field expresses it alone, since <code>emitted_tool_use: 0</code>
+is unremarkable on a turn that never declared tools. Join the pair to the <code>request</code>
+entry by <code>request_id</code> for the provider name.</p>
+
+<p><code>chat_sse_unfinished_turn</code> is the same condition detected live: tools declared, no
+<code>tool_use</code> emitted, <code>finish_reason: "stop"</code>, and text ending in a colon. It
+carries <code>request_id</code>, <code>tier</code>, <code>provider</code>, <code>key</code>,
+<code>finish_reason</code>, <code>tool_calls_seen</code>, <code>emitted_tool_use</code>,
+<code>tools_declared</code>, <code>text_tail_len</code>, and <code>rule</code>. It is
+<strong>log only</strong>: it changes no response, and it exists to measure the detector's
+precision on real traffic before any behaviour depends on it — the shadow-mode stage of the
+rollout described in
+<a href="provider-modes.html#chat-sse-unfinished-turn">provider-modes.html</a>. It is evaluated
+after the drain has ended, so a tool call that merely arrived late is never counted as one that
+never came. The text tail it matches on is held in memory only; the event records its length, not
+its content.</p>
 
 <div class="note">
 <strong>A learned walk re-emits the chat path's per-request events.</strong> When
@@ -239,6 +301,6 @@ directory means every request loses its entry until the condition is fixed. See
 <a href="architecture.html#sinks">architecture.html</a> for the full policy.</p>
 </div>
 
-<footer>Last updated: 2026-10-03</footer>
+<footer>Last updated: 2026-10-04</footer>
 </body>
 </html>

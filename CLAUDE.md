@@ -282,6 +282,7 @@ what you need in context, and the link has the rest.
 | Provider mode dispatch — `anthropic`/`chat`/`response` differ in auth header, path, and both body transforms | [doc/provider-modes.html](doc/provider-modes.html) |
 | Chat mode never substitutes `input: {}` for tool arguments it could not parse — it degrades them to a visible placeholder block | [doc/provider-modes.html#malformed-args](doc/provider-modes.html#malformed-args) |
 | A chat-mode stream that goes silent after `finish_reason` waits up to 5 s before the terminal event, not the upstream socket timeout | [doc/provider-modes.html#chat-sse-drain](doc/provider-modes.html#chat-sse-drain) |
+| A chat-mode stream that ends with no `finish_reason` closes differently depending on whether `[DONE]` arrived | [doc/provider-modes.html#chat-sse](doc/provider-modes.html#chat-sse) |
 | A vendor carries either `key` (string) or `keys` (name→payload); a tier's `key` selector picks one | [doc/configuration.html#multi-key](doc/configuration.html#multi-key) |
 | The keys file may be plain JSON — convenient, but the keys then sit unencrypted on disk | [doc/configuration.html#encryption](doc/configuration.html#encryption) |
 | Validation flows config→keys, not the reverse, and is strict — single-sourced in `config.py`/`keys.py`, enforced by both the server and CLI `start` | [doc/configuration.html#validation](doc/configuration.html#validation) |
@@ -354,12 +355,23 @@ No other supplementary docs.
 {"issue_id": "httpx2-native-sse-transport", "title": "Adopt httpx2 for upstream transport and native SSE parsing: client.sse() replaces the hand-rolled SSE frame scanner and obsoletes httpx-sse", "target_repo": null, "report": "./tmp/reports/defer-issue-httpx2-native-sse-transport.json", "deferred": "2026-09-27", "date_source": "creation"},
 {"issue_id": "cli-pre-existing-remove-idiom-copies", "title": "tests/test_cli.py still hand-rolls the guarded state-file removal at 8 test-body sites, one file over from the shared _remove_test_state_file() helper that Step 5 introduced to eliminate exactly that hazard", "target_repo": null, "report": "./tmp/reports/defer-issue-cli-pre-existing-remove-idiom-copies.json", "deferred": "2026-10-04", "date_source": "creation"},
 {"issue_id": "posix-sigterm-shutdown-deadlock", "title": "server.py's SIGTERM handler calls server.shutdown() on the serve_forever thread, which socketserver documents as a guaranteed deadlock: on POSIX one SIGTERM permanently wedges the proxy while claude-retry-proxy stop reports success", "target_repo": null, "report": "./tmp/reports/defer-issue-posix-sigterm-shutdown-deadlock.json", "deferred": "2026-10-04", "date_source": "creation"},
-{"issue_id": "operate-round-ends-turn-before-waiting", "title": "Unattended --operate rounds frequently end their turn while a background full-suite run is still in flight, killing the run and leaving the round with no session report", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-operate-round-ends-turn-before-waiting.json", "deferred": "2026-10-04", "date_source": "creation"}
+{"issue_id": "operate-round-ends-turn-before-waiting", "title": "Unattended --operate rounds frequently end their turn while a background full-suite run is still in flight, killing the run and leaving the round with no session report", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-operate-round-ends-turn-before-waiting.json", "deferred": "2026-10-04", "date_source": "creation"},
+{"issue_id": "chat-sse-done-framing-assumption", "title": "A `data: [DONE]` frame without a trailing blank line is never assembled, so saw_done stays 0 and a protocol-complete chat-mode stream is closed with a retryable error instead of a synthesised terminal sequence", "target_repo": null, "report": "./tmp/reports/defer-issue-chat-sse-done-framing-assumption.json", "deferred": "2026-10-04", "date_source": "creation"},
+{"issue_id": "chat-sse-late-frame-offsets-unasserted", "title": "first_late_ms and last_late_ms are gated only by the structural step-2 script and never asserted behaviorally, so the null-vs-set distinction — the one that separates a stream that ended at the finish frame from one that drained — is unpinned by any committed test", "target_repo": null, "report": "./tmp/reports/defer-issue-chat-sse-late-frame-offsets-unasserted.json", "deferred": "2026-10-04", "date_source": "creation"},
+{"issue_id": "unfinished-turn-detector-ignores-degraded-tool", "title": "The chat_sse_unfinished_turn detector's predicate omits `not tool_calls_seen`, so a tool call the proxy saw but could not start a block for is logged as a model that emitted no tool call — a proxy-side degradation counted as an upstream omission", "target_repo": null, "report": "./tmp/reports/defer-issue-unfinished-turn-detector-ignores-degraded-tool.json", "deferred": "2026-10-04", "date_source": "creation"}
 ]```
 
 ## Future Work — TODO
 
-Ten deferred issues remain (see above); the three newest were filed on
+Thirteen deferred issues remain (see above); the three newest were filed on
+2026-10-04 by plan 2026-10-04-truncation-error-and-drain-trace's Phase 6
+review, all in the chat-mode SSE path that plan reworked — a `[DONE]` sentinel
+with no trailing blank line that never assembles (so a protocol-complete stream
+is errored and retried), the two late-frame offset fields asserted only
+structurally and never behaviorally, and a detector predicate that counts a
+proxy-side tool-block degradation as a model omission, which the follow-on
+retry-nudge plan inherits because it biases that plan's precision baseline. The
+previous three were filed on
 2026-10-04 by plan 2026-10-03-stale-test-state-file-pid-reuse's closeout — the
 POSIX-only deadlock in the server's SIGTERM handler (it calls
 `server.shutdown()` on the `serve_forever` thread, which `socketserver`
