@@ -213,6 +213,7 @@ for the rest.
 | `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | Keys file path (encrypted or plain JSON) |
 | `PROXY_STATE_FILE` | `~/.claude/proxy/proxy-state.json` | State file path override (added 2026-08-28). The server heartbeat writes PID/port/start_time to this file; `claude-retry-proxy stop`/`status`/`reload` read it. Override for test isolation. |
 | `PROXY_FEATURE_COMPAT_FILE` | `~/.claude/proxy/feature-compatibility.json` | Compatibility state file path (added 2026-09-02). Stores learned per-provider field incompatibility. Override for test isolation. |
+| `PROXY_CHAT_RETRY_NUDGE` | the `[proxy nudge] …` text | Retry-nudge text (added 2026-10-06), chat mode: appended as a trailing user message to a retry that recovers an errored unfinished tool turn. Unset = default text; empty, whitespace-only, or >4096 chars **disables the feature** (`""` is the kill switch — unlike the numeric vars, blank/oversize is not defaulted). Read at startup. |
 
 [doc/configuration.html#env-vars](doc/configuration.html#env-vars) is the
 authoritative reference and carries the same table with prose.
@@ -257,19 +258,21 @@ startup on failure).
   (10 retries, 30s cap) give ~3.8 min worst case.
 
 - **Test suite is safe alongside a live proxy.** The suite sets
-  `PROXY_TRACE_FILE`, `PROXY_STATE_FILE`, and `PROXY_FEATURE_COMPAT_FILE` to
-  session temp paths at module load — the state path per-run (see below) —
+  `PROXY_TRACE_FILE` and `PROXY_FEATURE_COMPAT_FILE` to session temp paths, and
+  `PROXY_STATE_FILE` to a per-run path (see below), at module load —
   *before* importing `cli.py` or `server.py`
   (`settings.py` binds those env vars at import — both modules import it). A test proxy
   therefore cannot touch the live proxy's files, and the old docstring warning
   about not running tests alongside a live proxy is obsolete.
   `PROXY_STATE_FILE` goes further: it is a **per-run** path keyed to the runner
-  PID (`…-test-state-<pid>.json`), cleared at harness import and again after every
+  PID (`~/.claude/proxy/claude-retry-proxy-test-state-<pid>.json` — the live
+  directory, a distinct name), cleared at harness import and again after every
   test in `run_cli`'s loop. The fixed machine-global name it replaced let a dead
   proxy's PID survive across runs, and Windows recycles PID numbers, so
   `start`'s `is_pid_alive()` gate could report an unrelated live process as
   `Proxy already running`. A hard-killed run can still orphan its own file (no
-  cleanup can run); those are inert and may be deleted from `%TEMP%` by hand.
+  cleanup can run); those are inert and may be deleted from `~/.claude/proxy` by
+  hand.
   [doc/test-catalog.html#isolation](doc/test-catalog.html#isolation)
 
 ### Moved out of this section
@@ -283,6 +286,7 @@ what you need in context, and the link has the rest.
 | Chat mode never substitutes `input: {}` for tool arguments it could not parse — it degrades them to a visible placeholder block | [doc/provider-modes.html#malformed-args](doc/provider-modes.html#malformed-args) |
 | A chat-mode stream that goes silent after `finish_reason` waits up to 5 s before the terminal event, not the upstream socket timeout | [doc/provider-modes.html#chat-sse-drain](doc/provider-modes.html#chat-sse-drain) |
 | A chat-mode stream that ends with no `finish_reason` closes differently depending on whether `[DONE]` arrived | [doc/provider-modes.html#chat-sse](doc/provider-modes.html#chat-sse) |
+| A chat-mode turn that declared tools, ends its text in a colon and emitted no tool call is closed with a retryable error and its retry nudged (`PROXY_CHAT_RETRY_NUDGE=""` disables); a repeated stall passes through | [doc/provider-modes.html#chat-sse-unfinished-turn](doc/provider-modes.html#chat-sse-unfinished-turn) |
 | A vendor carries either `key` (string) or `keys` (name→payload); a tier's `key` selector picks one | [doc/configuration.html#multi-key](doc/configuration.html#multi-key) |
 | The keys file may be plain JSON — convenient, but the keys then sit unencrypted on disk | [doc/configuration.html#encryption](doc/configuration.html#encryption) |
 | Validation flows config→keys, not the reverse, and is strict — single-sourced in `config.py`/`keys.py`, enforced by both the server and CLI `start` | [doc/configuration.html#validation](doc/configuration.html#validation) |
@@ -357,20 +361,22 @@ No other supplementary docs.
 {"issue_id": "posix-sigterm-shutdown-deadlock", "title": "server.py's SIGTERM handler calls server.shutdown() on the serve_forever thread, which socketserver documents as a guaranteed deadlock: on POSIX one SIGTERM permanently wedges the proxy while claude-retry-proxy stop reports success", "target_repo": null, "report": "./tmp/reports/defer-issue-posix-sigterm-shutdown-deadlock.json", "deferred": "2026-10-04", "date_source": "creation"},
 {"issue_id": "operate-round-ends-turn-before-waiting", "title": "Unattended --operate rounds frequently end their turn while a background full-suite run is still in flight, killing the run and leaving the round with no session report", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-operate-round-ends-turn-before-waiting.json", "deferred": "2026-10-04", "date_source": "creation"},
 {"issue_id": "chat-sse-done-framing-assumption", "title": "A `data: [DONE]` frame without a trailing blank line is never assembled, so saw_done stays 0 and a protocol-complete chat-mode stream is closed with a retryable error instead of a synthesised terminal sequence", "target_repo": null, "report": "./tmp/reports/defer-issue-chat-sse-done-framing-assumption.json", "deferred": "2026-10-04", "date_source": "creation"},
-{"issue_id": "chat-sse-late-frame-offsets-unasserted", "title": "first_late_ms and last_late_ms are gated only by the structural step-2 script and never asserted behaviorally, so the null-vs-set distinction — the one that separates a stream that ended at the finish frame from one that drained — is unpinned by any committed test", "target_repo": null, "report": "./tmp/reports/defer-issue-chat-sse-late-frame-offsets-unasserted.json", "deferred": "2026-10-04", "date_source": "creation"},
-{"issue_id": "unfinished-turn-detector-ignores-degraded-tool", "title": "The chat_sse_unfinished_turn detector's predicate omits `not tool_calls_seen`, so a tool call the proxy saw but could not start a block for is logged as a model that emitted no tool call — a proxy-side degradation counted as an upstream omission", "target_repo": null, "report": "./tmp/reports/defer-issue-unfinished-turn-detector-ignores-degraded-tool.json", "deferred": "2026-10-04", "date_source": "creation"}
+{"issue_id": "chat-sse-late-frame-offsets-unasserted", "title": "first_late_ms and last_late_ms are gated only by the structural step-2 script and never asserted behaviorally, so the null-vs-set distinction — the one that separates a stream that ended at the finish frame from one that drained — is unpinned by any committed test", "target_repo": null, "report": "./tmp/reports/defer-issue-chat-sse-late-frame-offsets-unasserted.json", "deferred": "2026-10-04", "date_source": "creation"}
 ]```
 
 ## Future Work — TODO
 
-Thirteen deferred issues remain (see above); the three newest were filed on
+Twelve deferred issues remain (see above); the three newest were filed on
 2026-10-04 by plan 2026-10-04-truncation-error-and-drain-trace's Phase 6
 review, all in the chat-mode SSE path that plan reworked — a `[DONE]` sentinel
 with no trailing blank line that never assembles (so a protocol-complete stream
 is errored and retried), the two late-frame offset fields asserted only
-structurally and never behaviorally, and a detector predicate that counts a
-proxy-side tool-block degradation as a model omission, which the follow-on
-retry-nudge plan inherits because it biases that plan's precision baseline. The
+structurally and never behaviorally, and a detector predicate that counted a
+proxy-side tool-block degradation as a model omission, which plan
+2026-10-05-chat-retry-nudge resolved on 2026-10-06 with the
+`not tool_calls_seen` clause (the nudge it ships errors the unarmed turn and
+nudges the recovery — `PROXY_CHAT_RETRY_NUDGE`, kill-switchable; the two
+chat-SSE issues above remain open). The
 previous three were filed on
 2026-10-04 by plan 2026-10-03-stale-test-state-file-pid-reuse's closeout — the
 POSIX-only deadlock in the server's SIGTERM handler (it calls

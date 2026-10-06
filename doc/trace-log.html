@@ -10,7 +10,7 @@
 
 <h1>Trace Log<span class="sub">What the proxy records, and what it deliberately does not</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-04</p>
+<p><strong>Last updated:</strong> 2026-10-06</p>
 
 <p>The trace log is a JSONL file — one JSON object per line — at
 <code>~/.claude/logs/proxy-trace.jsonl</code> by default, overridable with
@@ -125,9 +125,16 @@ are the complete set the proxy can write.</p>
     <code>finish_reason</code></strong>. Carries the exit reason, the drain's byte and time cost,
     the tool-call flags, and the late-frame offsets (see below)</td></tr>
 <tr><td><code>chat_sse_unfinished_turn</code></td>
-    <td>a completed turn declared tools and emitted none, with <code>finish_reason: "stop"</code>
-    — a <strong>log-only</strong> shadow-mode diagnostic that changes no response (see
-    below)</td></tr>
+    <td>a completed turn declared tools, saw no tool call on the wire, and ended with
+    <code>finish_reason: "stop"</code> and a colon-ending text tail; with the retry nudge enabled
+    the turn is then closed with a retryable <code>error</code> instead of a terminal sequence
+    (see below)</td></tr>
+<tr><td><code>chat_retry_nudge</code></td>
+    <td>the nudge text was injected into a retry that matched an armed unfinished-turn marker —
+    logged after the chat transform, so it never claims a nudge the upstream did not see</td></tr>
+<tr><td><code>chat_retry_passthrough</code></td>
+    <td>a recovery request that matched a marker stalled again: the turn passes through to the
+    normal terminal synthesis instead of being errored a second time — the loop guard</td></tr>
 <tr><td><code>chat_sse_malformed_json</code>,
     <code>chat_sse_frame_cap_exceeded</code>, <code>chat_sse_buffer_cap_exceeded</code></td>
     <td>chat-mode SSE framing problems</td></tr>
@@ -179,17 +186,26 @@ is unremarkable on a turn that never declared tools. Join the pair to the <code>
 entry by <code>request_id</code> for the provider name.</p>
 
 <p><code>chat_sse_unfinished_turn</code> is the same condition detected live: tools declared, no
-<code>tool_use</code> emitted, <code>finish_reason: "stop"</code>, and text ending in a colon. It
-carries <code>request_id</code>, <code>tier</code>, <code>provider</code>, <code>key</code>,
-<code>finish_reason</code>, <code>tool_calls_seen</code>, <code>emitted_tool_use</code>,
-<code>tools_declared</code>, <code>text_tail_len</code>, and <code>rule</code>. It is
-<strong>log only</strong>: it changes no response, and it exists to measure the detector's
-precision on real traffic before any behaviour depends on it — the shadow-mode stage of the
-rollout described in
-<a href="provider-modes.html#chat-sse-unfinished-turn">provider-modes.html</a>. It is evaluated
-after the drain has ended, so a tool call that merely arrived late is never counted as one that
-never came. The text tail it matches on is held in memory only; the event records its length, not
-its content.</p>
+tool call seen on the wire <em>and</em> no <code>tool_use</code> emitted, <code>finish_reason:
+"stop"</code>, and text ending in a colon. It carries <code>request_id</code>, <code>tier</code>,
+<code>provider</code>, <code>key</code>, <code>finish_reason</code>, <code>tool_calls_seen</code>,
+<code>emitted_tool_use</code>, <code>tools_declared</code>, <code>text_tail_len</code>, and
+<code>rule</code>. It is evaluated after the drain has ended, so a tool call that merely arrived
+late is never counted as one that never came; the text tail it matches on is held in memory only —
+the event records its length, not its content. The <code>tool_calls_seen</code> test is what keeps
+a proxy-side degradation — a tool call seen on the wire but never started as a block — from being
+counted as a model omission.</p>
+
+<p><strong>It also acts.</strong> With the retry nudge enabled
+(<code>PROXY_CHAT_RETRY_NUDGE</code> non-empty — the default) a fire closes the turn with a
+retryable <code>error</code> instead of a terminal sequence and arms a single-use in-memory
+marker; the next request that recovers the conversation consumes the marker, has the nudge text
+injected into its upstream copy, and logs <code>chat_retry_nudge</code>. A recovery that stalls
+again is not errored a second time: it logs <code>chat_retry_passthrough</code> and is closed with
+the normal terminal synthesis. With the variable set empty the event is a pure measurement again —
+every fired turn passes through, while <code>chat_sse_unfinished_turn</code> keeps being written.
+Behaviour, the store's bounds, and the kill switch:
+<a href="provider-modes.html#chat-sse-unfinished-turn">provider-modes.html</a>.</p>
 
 <div class="note">
 <strong>A learned walk re-emits the chat path's per-request events.</strong> When
@@ -301,6 +317,6 @@ directory means every request loses its entry until the condition is fixed. See
 <a href="architecture.html#sinks">architecture.html</a> for the full policy.</p>
 </div>
 
-<footer>Last updated: 2026-10-04</footer>
+<footer>Last updated: 2026-10-06</footer>
 </body>
 </html>

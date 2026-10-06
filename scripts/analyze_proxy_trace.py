@@ -11,9 +11,12 @@ Calculates per-model metrics including:
 - Geometric mean latency
 
 Also reports chat-mode drain diagnostics:
-- chat_sse_unfinished_turn count per provider (log-only detector)
+- chat_sse_unfinished_turn count per provider
 - late-frame offset distributions (late_tool_call_ms, last_late_ms)
 - share of drained streams that exited on drain_exit == "time_budget"
+- retry recovery: chat_retry_nudge joined to the recovery request's own
+  chat_sse_drain.emitted_tool_use, per provider, with dangling keys
+  (nudged requests with no observed retry drain) accounted separately
 
 Filters:
 - Latency > 30 minutes (outliers)
@@ -108,6 +111,16 @@ def main():
     drain_total = 0
     drain_time_budget = 0
 
+    # Retry-recovery join: each chat_retry_nudge (deduped by request_id —
+    # the guard against multiple armed markers matching one request across
+    # the two passes, the cross-prefix collision, and belt-and-braces for
+    # the once-per-matching-entry consume rule) joins to the recovery
+    # request's own chat_sse_drain.
+    nudge_by_request = {}      # recovery request_id -> its first nudge entry
+    passthrough_ids = set()    # recovery request_ids that logged chat_retry_passthrough
+    passthrough_originals = set()  # errored request_ids whose recovery stalled again
+    drain_emitted_tool = {}    # request_id -> 1/0 emitted_tool_use from chat_sse_drain
+
     total_entries = 0
     entries_in_range = 0
     filtered_latency = 0
@@ -121,7 +134,8 @@ def main():
                 continue
 
             _ev = entry.get("event")
-            if _ev not in ("request", "chat_sse_drain", "chat_sse_unfinished_turn"):
+            if _ev not in ("request", "chat_sse_drain", "chat_sse_unfinished_turn",
+                           "chat_retry_nudge", "chat_retry_passthrough"):
                 continue
 
             if _ev == "request":
@@ -150,6 +164,22 @@ def main():
                 if _ev == "chat_sse_unfinished_turn":
                     unfinished_by_provider[entry.get("provider") or "?"] += 1
                     continue
+                # Explicit branches, each ending in continue: without them the
+                # two retry events would fall through into drain_total and
+                # inflate the drained-stream diagnostics.
+                if _ev == "chat_retry_nudge":
+                    _rid = entry.get("request_id")
+                    if _rid and _rid not in nudge_by_request:
+                        nudge_by_request[_rid] = entry
+                    continue
+                if _ev == "chat_retry_passthrough":
+                    _rid = entry.get("request_id")
+                    if _rid:
+                        passthrough_ids.add(_rid)
+                    _oid = entry.get("original_request_id")
+                    if _oid:
+                        passthrough_originals.add(_oid)
+                    continue
                 drain_total += 1
                 if entry.get("drain_exit") == "time_budget":
                     drain_time_budget += 1
@@ -158,6 +188,9 @@ def main():
                     _v = entry.get(_field)
                     if isinstance(_v, (int, float)) and not isinstance(_v, bool):
                         _sink.append(float(_v))
+                _rid = entry.get("request_id")
+                if _rid:
+                    drain_emitted_tool[_rid] = 1 if entry.get("emitted_tool_use") else 0
                 continue
 
             entries_in_range += 1
@@ -292,6 +325,47 @@ def main():
             print(f"  {prov}: {unfinished_by_provider[prov]}")
     else:
         print("chat_sse_unfinished_turn: none in window")
+
+    # Retry recovery: join each nudged request (deduped by request_id) to its
+    # own chat_sse_drain.emitted_tool_use. A nudge with no observed retry
+    # drain (errored again, disconnected, never re-issued, or outside the
+    # --days window) is counted as dangling and excluded from the success
+    # denominator.
+    retry_success = 0
+    retry_no_tool = 0
+    retry_dangling = 0
+    retry_success_by_provider = defaultdict(int)
+    retry_dangling_by_provider = defaultdict(int)
+    for _rid, _entry in nudge_by_request.items():
+        _prov = _entry.get("provider") or "?"
+        if _rid not in drain_emitted_tool:
+            retry_dangling += 1
+            retry_dangling_by_provider[_prov] += 1
+        elif drain_emitted_tool[_rid]:
+            retry_success += 1
+            retry_success_by_provider[_prov] += 1
+        else:
+            retry_no_tool += 1
+    retry_denominator = retry_success + retry_no_tool
+    print()
+    print("Retry recovery (chat_retry_nudge):")
+    print(f"  Nudged requests (deduped by request_id): {len(nudge_by_request)}")
+    print(f"  Observed retry drain with a tool call: {retry_success}")
+    print(f"  Observed retry drain without a tool call: {retry_no_tool}")
+    print(f"  No observed retry drain (excluded from the success denominator): {retry_dangling}")
+    if retry_denominator:
+        print(f"  Retry success rate: {retry_success / retry_denominator * 100:.1f}% "
+              f"({retry_success}/{retry_denominator})")
+    print(f"  Repeated stall passed through without a second error "
+          f"(chat_retry_passthrough): {len(passthrough_ids)} "
+          f"[distinct errored conversations by original_request_id: "
+          f"{len(passthrough_originals)}]")
+    if nudge_by_request:
+        print("  Retry recovery by provider (success / dangling):")
+        for prov in sorted(set(retry_success_by_provider) | set(retry_dangling_by_provider),
+                           key=lambda p: retry_success_by_provider[p], reverse=True):
+            print(f"    {prov}: {retry_success_by_provider[prov]} / "
+                  f"{retry_dangling_by_provider[prov]}")
     print(f"late_tool_call_ms: {_dist(late_tool_call_ms_values)}")
     print(f"last_late_ms: {_dist(last_late_ms_values)}")
     print()

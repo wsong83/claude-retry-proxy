@@ -10,7 +10,7 @@
 
 <h1>Configuration<span class="sub">config.json, models.json, keys-index.json, and the environment</span></h1>
 
-<p><strong>Last updated:</strong> 2026-09-24</p>
+<p><strong>Last updated:</strong> 2026-10-06</p>
 
 <p>Three files configure the proxy, and the split between them is the important thing to
 understand: <strong><code>config.json</code> and <code>models.json</code> are safe to read, share,
@@ -349,6 +349,17 @@ is absent both processes honor the same variable.</p>
     <td>Heartbeat state file. Override for test isolation.</td></tr>
 <tr><td><code>PROXY_FEATURE_COMPAT_FILE</code></td><td colspan="2"><code>~/.claude/proxy/feature-compatibility.json</code></td>
     <td>Compatibility state file. Override for test isolation.</td></tr>
+<tr><td><code>PROXY_CHAT_RETRY_NUDGE</code></td>
+    <td colspan="2"><code>[proxy nudge] Your previous turn ended without a tool call. If you
+    intended to call a tool, emit that tool call now and continue the task.</code></td>
+    <td>The text injected as a trailing user message into a retry that recovers an errored
+    unfinished turn (chat mode) — see
+    <a href="provider-modes.html#chat-sse-unfinished-turn">provider-modes.html</a>. <strong>Unset</strong>
+    uses the default text; <strong>set to empty, whitespace-only, or longer than 4096
+    characters</strong> disables the feature outright (the detector then only logs), so
+    <code>PROXY_CHAT_RETRY_NUDGE=""</code> is the kill switch. Unlike the numeric variables, a
+    blank or oversize value here is not silently replaced by the default — it turns the feature
+    off. Read at startup, so a restart or relaunch applies it.</td></tr>
 </table>
 
 <div class="note">
@@ -357,6 +368,9 @@ ignored, and the default above is used instead.</strong> Nothing is written to s
 trace, so an out-of-range setting is indistinguishable from an unset one. The one warn-and-clamp
 mechanism in the codebase governs the compatibility learner's internal constants, not these
 variables; see <a href="compatibility.html#constants">compatibility.html</a>.
+<p><code>PROXY_CHAT_RETRY_NUDGE</code> is the one exception to the rule above: its blank and
+oversize forms are not ignored-and-defaulted but are defined to <em>disable</em> the feature,
+because "set but empty" is how its kill switch is spelled.</p>
 <p><code>PROXY_IDLE_TIMEOUT</code> is not in this table because it does not exist: the server
 defines no idle-timeout feature, and setting it has no effect.</p>
 </div>
@@ -407,6 +421,6 @@ common mistake: <strong>config is authoritative</strong>. Every provider named i
 <code>config.json</code> must exist in the keys file. Providers that exist only in the keys file
 are ignored.</p>
 
-<footer>Last updated: 2026-09-12</footer>
+<footer>Last updated: 2026-10-06</footer>
 </body>
 </html>

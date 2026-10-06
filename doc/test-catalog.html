@@ -10,7 +10,7 @@
 
 <h1>Test Catalog<span class="sub">Suite layout, harness isolation, and testing patterns</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-04</p>
+<p><strong>Last updated:</strong> 2026-10-06</p>
 
 <p>The suite is a set of per-area modules merged by a single aggregator. It runs against
 <em>real</em> proxy processes and <em>real</em> mock upstream servers over loopback sockets —
@@ -18,11 +18,11 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>372 test functions across 19 files</strong>, but this number moves whenever
-tests are added. (It read <em>371 across 19</em> before this recount, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
+suite has <strong>379 test functions across 19 files</strong>, but this number moves whenever
+tests are added. (It read <em>372 across 19</em> before this recount, <em>371 across 19</em> before that, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
 before that, <em>334 across 19</em> before that, and <em>322 across 18</em> before an earlier
 one — the page has drifted behind the
-suite seven times, and in each case the stale total disagreed with the page's own catalog table
+suite eight times, and in each case the stale total disagreed with the page's own catalog table
 as well.)
 Re-count before quoting it:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
@@ -65,7 +65,8 @@ imported, because those modules read their paths at import time.</p>
 </table>
 
 <p><code>PROXY_STATE_FILE</code> is the one path that needs more than a redirect. It is set to
-<code>%TEMP%\claude-retry-proxy-test-state-&lt;runner-pid&gt;.json</code> — keyed to the
+<code>~/.claude/proxy/claude-retry-proxy-test-state-&lt;runner-pid&gt;.json</code> — the live
+proxy's own directory, but under a distinct name — keyed to the
 <em>runner process</em>, not a fixed machine-global name — and the harness removes any file at
 that path at import. That closes the failure mode a fixed name created: a dead proxy's PID
 survived across runs, and because Windows recycles PID numbers aggressively, <code>start</code>'s
@@ -80,8 +81,8 @@ relied on for this; a direct spawn's file is written by the server child, and on
 A <em>completed</em> run therefore leaves nothing behind; a run that is hard-killed can still
 orphan its own file, since no cleanup can run. Those orphans are inert — the next run uses a new
 PID-keyed name and clears it at import — but they are never collected automatically, so
-<code>claude-retry-proxy-test-state-*.json</code> files may be deleted from <code>%TEMP%</code>
-by hand at any time.</p>
+<code>~/.claude/proxy/claude-retry-proxy-test-state-*.json</code> files may be deleted by hand at
+any time.</p>
 
 <p><strong>Known limitation (accepted by user decision, 2026-10-03).</strong> The product side is
 deliberately unchanged: a proxy killed outside <code>claude-retry-proxy stop</code> (Task Manager,
@@ -116,8 +117,8 @@ relative size, not as exact current figures.</p>
     <td>Anthropic → Chat Completions request and response transforms</td></tr>
 <tr><td><code>test_response_transform.py</code></td><td class="num">37</td>
     <td>Anthropic → Responses request and response transforms</td></tr>
-<tr><td><code>test_chat_sse.py</code></td><td class="num">55</td>
-    <td>Chat-mode SSE synthesis, tool-call deltas, post-finish drain, drain telemetry, truncation and degradation</td></tr>
+<tr><td><code>test_chat_sse.py</code></td><td class="num">62</td>
+    <td>Chat-mode SSE synthesis, tool-call deltas, post-finish drain, drain telemetry, truncation, degradation, and the unfinished-turn retry nudge</td></tr>
 <tr><td><code>test_mode_dispatch.py</code></td><td class="num">28</td>
     <td>Mode dispatch, auth headers, path rewriting</td></tr>
 <tr><td><code>test_admin.py</code></td><td class="num">25</td>
@@ -400,7 +401,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> Synthesising Anthropic SSE events from a chat provider's stream: framing, tool-call deltas, and every degradation path.</p>
 
-<h4><code>tests/test_chat_sse.py</code> (55 tests) — chat-mode SSE synthesis, post-finish drain, drain telemetry, and framing</h4>
+<h4><code>tests/test_chat_sse.py</code> (62 tests) — chat-mode SSE synthesis, post-finish drain, drain telemetry, and framing</h4>
 <ul>
 <li><code>test_chat_sse_basic_streaming</code>: Simulated OpenAI SSE chunks produce valid Anthropic SSE events.</li>
 <li><code>test_chat_sse_finish_reason_mapping</code>: finish_reason maps to stop_reason in the terminal message_delta.</li>
@@ -455,7 +456,14 @@ EOF</code></pre>
 <li><code>test_chat_sse_drain_event_trailing_tool_calls</code>: A stream whose <code>finish_reason</code> precedes the tool_call frames reports <code>tool_calls_seen: 1</code> and <code>emitted_tool_use: 1</code> on <code>chat_sse_drain</code> — the evidence channel for a tool call the drain rescued.</li>
 <li><code>test_chat_sse_drain_event_eof_exit</code>: A drain that ends at EOF reports <code>drain_exit: &quot;eof&quot;</code>; the <code>&quot;eof&quot;</code> exit is reachable only on a stream that <em>did</em> deliver a <code>finish_reason</code>, since a cut stream never reaches the drain and logs no <code>chat_sse_drain</code> at all.</li>
 <li><code>test_chat_sse_drain_late_tool_call_time_budget</code>: A tool call arriving after <code>finish_reason</code> on the socket-timeout path records <code>late_frames</code> and <code>late_tool_call_ms</code> — the arrival offset that answers whether the 5&nbsp;s drain budget is generous or binding.</li>
-<li><code>test_chat_sse_unfinished_turn_shadow_logged</code>: A completed turn that declared tools, emitted no <code>tool_use</code> and ended on <code>finish_reason: &quot;stop&quot;</code> logs the log-only <code>chat_sse_unfinished_turn</code> event (with <code>tools_declared: 1</code> and <code>emitted_tool_use: 0</code>) and changes no response.</li>
+<li><code>test_chat_sse_unfinished_turn_errors_and_nudges_retry</code>: A tools-declaring turn ending in <code>:</code> with no tool call closes with a retryable <code>api_error</code> (no terminal frames), and the conversation-extending recovery gets the nudge injected upstream with a <code>chat_retry_nudge</code> event naming the errored request; the recovery's own stall passes through with terminal frames. A <em>third</em> extension shows no nudge (the marker is consumed on match — single-use) and errors as a fresh stall; a byte-identical re-POST of that third request then matches the exact-hash branch. Carries the retired <code>test_chat_sse_unfinished_turn_shadow_logged</code>'s field pins and its no-tools negative half (changed 2026-10-06 by the retry-nudge plan — the retired test asserted the log-only, response-unchanged behaviour).</li>
+<li><code>test_chat_sse_retry_passthrough_no_second_error</code>: The recovery of an already-errored turn that stalls <em>again</em> passes through — no second error frame, a normal <code>end_turn</code> terminal, the nudge present in its upstream body, and <code>chat_retry_passthrough</code> carrying the first request's id — the passthrough loop guard.</li>
+<li><code>test_chat_sse_unfinished_turn_predicate_ignores_degraded_tool</code>: (a) A tool call seen on the wire but never started (id, no name) is proxy-side degradation: no error frame, no <code>chat_sse_unfinished_turn</code>, and the existing degradation event still fires — the inherited <code>unfinished-turn-detector-ignores-degraded-tool</code> pin. (b) A late empty <code>tool_calls: []</code> sentinel is not a tool call (the truthiness-based drain seen-test), so a genuine prose-only stall in a sentinel-bearing stream still errors.</li>
+<li><code>test_chat_sse_no_nudge_without_marker</code>: Request B — a different conversation sent after request A stalled and was errored — gets no <code>chat_retry_nudge</code> event, an unchanged upstream body, and a normal terminal: no marker, no nudge.</li>
+<li><code>test_chat_retry_nudge_disabled_by_empty_env</code>: <code>PROXY_CHAT_RETRY_NUDGE=&quot;&quot;</code> is the kill switch: the unfinished-turn stream terminals exactly as before (no error frame), the detector still logs (a pure measurement), and no marker or nudge machinery fires.</li>
+<li><code>test_chat_sse_nudge_reentry_walk_stall_passthrough</code>: A nudge recovery whose first upstream attempt is rejected with a matched reasoning-field complaint is re-entered by the candidate walk, and the <em>served</em> attempt still carries the entry-time marker decision: the served stream has no error frame (the loop guard survives re-entry) and the served upstream body contains the nudge text exactly once as its trailing user message (injection re-runs on the inherited decision). The three-request upstream count pins that a walk step actually happened, so neither assertion can pass vacuously.</li>
+<li><code>test_chat_retry_nudge_sweep_expires_armed_only</code>: Store level: an <em>unarmed</em> entry backdated past the TTL survives another request's sweep — arm still returns True (the TTL is anchored at arm) and the recovery still matches it — while an <em>armed</em> entry backdated past the TTL is expired by the same sweep. Pins the sweep ordering that keeps a generation longer than the TTL from losing its own marker to a concurrent eligible request.</li>
+<li><code>test_chat_retry_nudge_ineligible_request_does_not_consume</code>: The marker check runs only inside the eligibility gate (chat mode <em>and</em> tools declared), so an <em>ineligible</em> request whose body strict-extends an armed entry is served un-nudged with an unchanged upstream body and leaves the single-use marker intact; the following eligible recovery then fires <code>chat_retry_nudge</code> naming the errored request.</li>
 <li><code>test_chat_sse_tool_degradation_on_cut_stream</code>: A cut stream (no <code>[DONE]</code>) whose tool-call delta never opens a block still fires exactly one coalesced <code>chat_sse_tool_degradation</code>, with no block started, an <code>error</code> frame and no terminal sequence, and <code>saw_done: 0</code> on <code>chat_sse_truncated</code>. This is the only committed test that reaches the unstarted-tool counting loop on the cut path — the loop's relocation into <code>log_degradation_if_needed()</code> is what the cut path depends on, and this test is what keeps that relocation from being silently undone.</li>
 </ul>
 
@@ -768,6 +776,6 @@ whenever a proxy is running.</p>
       that the full suite passes with a live proxy running.</li>
 </ol>
 
-<footer>Last updated: 2026-10-04</footer>
+<footer>Last updated: 2026-10-06</footer>
 </body>
 </html>

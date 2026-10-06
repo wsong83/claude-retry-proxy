@@ -378,7 +378,12 @@ late tool call is not lost; a provider that then goes silent is bounded by a
 ends with no `finish_reason` at all is closed with a synthesised ending if the
 provider sent its `[DONE]` sentinel, and with a retryable `api_error` event if
 the connection was cut before it did — a truncated turn is never reported to
-the client as a turn the model finished. Image
+the client as a turn the model finished. A tool-bearing turn whose stream ends
+in a colon with no tool call is closed with a retryable error the same way
+rather than passed off as `end_turn`, and the retry that continues the
+conversation is nudged upstream to emit the tool call it narrated (see
+`PROXY_CHAT_RETRY_NUDGE` below; setting it empty restores the old
+pass-through). Image
 content blocks are not mapped between Anthropic and OpenAI formats. In chat and response modes, error responses (non-2xx) pass through
 untransformed in the upstream format.
 
@@ -407,6 +412,7 @@ greyed out.
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | path | Trace log location |
 | `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | path | Keys file location (encrypted or plain JSON) |
 | `PROXY_STATE_FILE` | `~/.claude/proxy/proxy-state.json` | path | State file path override. The server heartbeat writes PID/port/start_time here; `claude-retry-proxy stop`/`status`/`reload` read it. Override for test isolation. |
+| `PROXY_CHAT_RETRY_NUDGE` | `[proxy nudge] Your previous turn ended without a tool call. If you intended to call a tool, emit that tool call now and continue the task.` | unset = default; empty, blank, or >4096 chars = **disabled** | Chat mode only. Text injected as a trailing user message into the retry that recovers a turn errored as unfinished (nudging the model to emit the tool call it narrated). `PROXY_CHAT_RETRY_NUDGE=""` is the kill switch; a restart or relaunch applies it. |
 
 Backoff is `PROXY_INITIAL_DELAY * 2**attempt`, capped at `PROXY_MAX_DELAY`.
 **429** responses retry using `PROXY_MAX_DELAY` directly (maximal latency);

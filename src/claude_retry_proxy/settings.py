@@ -25,6 +25,14 @@ def _env_str(name, default):
     return val if val else default
 
 
+# Default text injected as a trailing user message when a recovery request
+# matches an armed unfinished-turn marker (PROXY_CHAT_RETRY_NUDGE).
+DEFAULT_CHAT_RETRY_NUDGE = (
+    "[proxy nudge] Your previous turn ended without a tool call. "
+    "If you intended to call a tool, emit that tool call now and continue the task."
+)
+
+
 class ProxySettings:
     """Env-derived settings value bag, constructed once at import.
 
@@ -42,6 +50,17 @@ class ProxySettings:
         self.max_response_size = _env_int("PROXY_MAX_RESPONSE_SIZE", 100 * 1024 * 1024, 1024, 1024 * 1024 * 1024)
 
         self.log_all = _env_str("PROXY_LOG_ALL", "") == "1"
+
+        # Retry-nudge text (chat-mode unfinished-turn recovery). Read with
+        # os.environ.get, not _env_str: the kill switch needs "set but empty"
+        # to be distinguishable from "unset". Empty, whitespace-only, or
+        # >4096-char values disable the feature (empty string); any other
+        # value is used verbatim.
+        _nudge = os.environ.get("PROXY_CHAT_RETRY_NUDGE",
+                                DEFAULT_CHAT_RETRY_NUDGE)
+        if not _nudge.strip() or len(_nudge) > 4096:
+            _nudge = ""
+        self.chat_retry_nudge = _nudge
 
         _default_trace = os.path.join(os.path.expanduser("~"), ".claude", "logs", "proxy-trace.jsonl")
         self.trace_file = _env_str("PROXY_TRACE_FILE", _default_trace)

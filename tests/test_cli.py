@@ -21,6 +21,7 @@ from _harness import (
     _STATE_FILE_PRESENT_AFTER_IMPORT,
     _backup_proxy_state,
     _cli_start_with_plain_keys,
+    _close_child_stdin,
     _create_test_config,
     _create_test_keys,
     _create_test_keys_plain,
@@ -603,10 +604,7 @@ def test_start_rejects_uncatalogued_model_selector_at_cli():
                                    "--keys-path", keys_path],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             stdin=subprocess.PIPE, text=True)
-        try:
-            proc.stdin.close()
-        except OSError:
-            pass
+        _close_child_stdin(proc)
         try:
             stdout, stderr = proc.communicate(timeout=60)
         except subprocess.TimeoutExpired:
@@ -923,10 +921,7 @@ def test_cli_start_invalid_config():
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 stdin=subprocess.PIPE, text=True
             )
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
+            _close_child_stdin(proc)
             stdout, stderr = proc.communicate(timeout=30)
 
             if proc.returncode == 1:

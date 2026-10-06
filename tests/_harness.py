@@ -9,6 +9,7 @@ standalone cluster module.
 
 
 import argparse
+import errno
 import http.server
 import json
 import os
@@ -38,10 +39,25 @@ os.environ["PROXY_TRACE_FILE"] = os.path.join(
 
 # Same isolation for the CLI/state file. cli.py and server.py read
 # PROXY_STATE_FILE from the env (added 2026-08-28 to fix the
-# test-suite-kills-live-proxy hazard). Force it to a session temp path before
-# any CLI subprocess or server module is spawned, so the dummy proxies the
-# tests launch read/write an isolated state file and can never stop or touch
-# the live proxy's ~/.claude/proxy/proxy-state.json.
+# test-suite-kills-live-proxy hazard). Force it to a per-run path before any
+# CLI subprocess or server module is spawned, so the dummy proxies the tests
+# launch read/write an isolated state file and can never stop or touch the
+# live proxy's ~/.claude/proxy/proxy-state.json.
+#
+# The path lives IN ~/.claude/proxy with the distinct PID-keyed filename
+# below that keeps it separate from the live proxy's proxy-state.json. The
+# same-directory placement is now a convention, not a constraint: it was
+# required while cli.py's _write_state created its atomic-write temp with
+# mkstemp(dir=PROXY_DIR) — a temp and destination on different devices fail
+# the rename with OSError EXDEV ("Invalid cross-device link"), which on
+# Linux (home partition vs /tmp) crashed every successful
+# `claude-retry-proxy start` after the proxy had already spawned.
+# _write_state now creates its temp beside the target itself
+# (mkstemp(dir=dirname(PROXY_STATE_FILE))), so EXDEV no longer binds and
+# PROXY_STATE_FILE may name any directory; what still separates the test
+# file from the live proxy's file is the PID-keyed name. (The server's own
+# StateSink wrote its temp beside its destination already, so it was never
+# affected.)
 #
 # The path carries a PER-PROCESS discriminator (this runner's pid), never a
 # fixed machine-global name. A fixed name let a dead proxy's PID survive
@@ -52,7 +68,8 @@ os.environ["PROXY_TRACE_FILE"] = os.path.join(
 # every spawned server must agree on one path within a run, and they inherit
 # it through os.environ.copy().
 os.environ["PROXY_STATE_FILE"] = os.path.join(
-    tempfile.gettempdir(), "claude-retry-proxy-test-state-%d.json" % os.getpid())
+    os.path.expanduser("~"), ".claude", "proxy",
+    "claude-retry-proxy-test-state-%d.json" % os.getpid())
 
 
 
@@ -82,10 +99,12 @@ PROXY_STATE_FILE = os.environ["PROXY_STATE_FILE"]
 def _remove_test_state_file():
     """Best-effort removal of this run's per-process state file.
 
-    The file lives in %TEMP%, not in a test's temp_dir, so rmtree never
-    reaches it; and a hard-killed server runs no Python cleanup — TerminateProcess
-    on Windows, SIGKILL on POSIX — so the server's own finally: os.remove(...)
-    never fires either. Called from every layer that leaks it: harness import
+    The file lives in ~/.claude/proxy (same directory as the CLI's
+    atomic-write temp, so the rename cannot cross devices), not in a test's
+    temp_dir, so rmtree never reaches it; and a hard-killed server runs no
+    Python cleanup — TerminateProcess on Windows, SIGKILL on POSIX — so the
+    server's own finally: os.remove(...) never fires either. Called from
+    every layer that leaks it: harness import
     (clean slate), the three wrapper cleanup() closures (wrapper tests), and
     run_cli's per-test loop (the chokepoint every module passes through —
     the only point that covers direct _start_proxy_server_directly spawns).
@@ -186,6 +205,32 @@ def _restore_proxy_state(backup):
 
 
 
+def _close_child_stdin(proc, line=None):
+    """Close a child's stdin (sending EOF), then drop the parent's handle.
+
+    `line`, when given, is written first — the passphrase-pipe protocol is
+    unchanged: the child still receives its `<passphrase>\\n` followed by EOF.
+
+    Dropping the handle (`proc.stdin = None`) is the close-then-communicate
+    fix: subprocess._communicate flushes `self.stdin` catching only
+    BrokenPipeError, so a closed TextIOWrapper raises ValueError: I/O
+    operation on closed file before any pipe output is read (POSIX; the
+    call sites here all communicate with the child later).
+    """
+    if proc.stdin is None:
+        return
+    try:
+        if line is not None:
+            proc.stdin.write(line)
+    except (BrokenPipeError, OSError):
+        pass
+    try:
+        proc.stdin.close()
+    except OSError:
+        pass
+    proc.stdin = None
+
+
 def _cli_start_with_plain_keys(port, config_path, keys_path, trace_file):
     """Start proxy via CLI with plain keys. Returns (proc, stdout, stderr, returncode)."""
     cmd = CLAUDE_PROXY + [
@@ -197,10 +242,7 @@ def _cli_start_with_plain_keys(port, config_path, keys_path, trace_file):
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             stdin=subprocess.PIPE, text=True)
     # Close stdin — plain keys, no passphrase needed
-    try:
-        proc.stdin.close()
-    except OSError:
-        pass
+    _close_child_stdin(proc)
     try:
         stdout, stderr = proc.communicate(timeout=30)
     except subprocess.TimeoutExpired:
@@ -471,21 +513,14 @@ def _start_proxy_server_directly(port, config_path=None, keys_path=None,
         text=True, cwd=cwd
     )
 
-    # Pipe passphrase to server (or close stdin for plain keys)
+    # Pipe passphrase to server (or close stdin for plain keys); the handle
+    # is dropped after the close so a later proc.communicate() — the refusal
+    # tests drain the child's stderr through it — cannot flush a closed file.
     if passphrase is not None:
-        if proc.stdin:
-            try:
-                proc.stdin.write(passphrase + "\n")
-                proc.stdin.close()
-            except (BrokenPipeError, OSError):
-                pass
+        _close_child_stdin(proc, line=passphrase + "\n")
     else:
         # Plain keys: close stdin so server doesn't block on read
-        if proc.stdin:
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
+        _close_child_stdin(proc)
 
     # Wait for server to be ready
     deadline = time.time() + 10
@@ -629,10 +664,21 @@ def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-pas
             return MockHandler
 
         MockHandler = make_handler(requests_received)
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", port), MockHandler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        time.sleep(0.1)
+        try:
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", port), MockHandler)
+        except OSError as e:
+            # A caller may pre-bind its own listener on the vendor URL's port
+            # before calling this helper (the SSE-rewrite tests bind their SSE
+            # mock first). Linux rejects a second bind with EADDRINUSE; skip
+            # ours and leave `server` None so teardown skips it — the caller's
+            # listener serves the upstream traffic instead.
+            if e.errno != errno.EADDRINUSE:
+                raise
+            server = None
+        if server is not None:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            time.sleep(0.1)
         mock_servers[vendor_name] = {"server": server, "requests": requests_received}
 
     # Start proxy
@@ -646,7 +692,8 @@ def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-pas
 
     if not probe_ok:
         for ms in mock_servers.values():
-            ms["server"].shutdown()
+            if ms["server"] is not None:
+                ms["server"].shutdown()
         proc.kill()
         shutil.rmtree(temp_dir, ignore_errors=True)
         return None, None, None, None, None
@@ -658,9 +705,10 @@ def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-pas
         except subprocess.TimeoutExpired:
             proc.kill()
         for ms in mock_servers.values():
-            ms["server"].shutdown()
+            if ms["server"] is not None:
+                ms["server"].shutdown()
         shutil.rmtree(temp_dir, ignore_errors=True)
-        # Shared removal for the %TEMP% state file — see
+        # Shared removal for the per-run state file — see
         # _remove_test_state_file for why rmtree and the child's own cleanup
         # cannot be relied on here.
         _remove_test_state_file()
@@ -757,7 +805,7 @@ def _start_admin_proxy(tiers, vendors, models=None):
         for ms in mock_servers.values():
             ms["server"].shutdown()
         shutil.rmtree(temp_dir, ignore_errors=True)
-        # Shared removal for the %TEMP% state file — see
+        # Shared removal for the per-run state file — see
         # _remove_test_state_file for why rmtree and the child's own cleanup
         # cannot be relied on here.
         _remove_test_state_file()
@@ -828,11 +876,7 @@ def _start_proxy_with_flag(proxy_port, temp_dir, flag_value, extra_env=None):
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
     if proc.stdin:
-        try:
-            proc.stdin.write("test-passphrase\n")
-            proc.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
+        _close_child_stdin(proc, line="test-passphrase\n")
 
     probe_ok = False
     deadline = time.time() + 10
@@ -997,7 +1041,7 @@ def _start_mode_proxy(tiers, vendors, responders=None, extra_env=None,
         for ms in mock_servers.values():
             ms["server"].shutdown()
         shutil.rmtree(temp_dir, ignore_errors=True)
-        # Shared removal for the %TEMP% state file — see
+        # Shared removal for the per-run state file — see
         # _remove_test_state_file for why rmtree and the child's own cleanup
         # cannot be relied on here.
         _remove_test_state_file()
@@ -1337,8 +1381,9 @@ def run_cli(all_tests, description):
         # Chokepoint for the per-run state file (plan
         # 2026-10-03-stale-test-state-file-pid-reuse): direct spawns bypass the
         # wrapper cleanup() closures (TerminateProcess runs no Python cleanup),
-        # and %TEMP% is out of rmtree(temp_dir)'s reach, so a direct-spawned
-        # server's state file survives the test body. Removing it here — after
+        # and ~/.claude/proxy is out of rmtree(temp_dir)'s reach, so a
+        # direct-spawned server's state file survives the test body. Removing
+        # it here — after
         # func() returns, before the tally — is the one point every module's
         # test passes through, and runs strictly after the server is dead, so
         # there is no race with the child's own write.

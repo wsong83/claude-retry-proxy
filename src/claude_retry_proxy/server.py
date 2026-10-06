@@ -13,6 +13,7 @@ re, urllib.parse, argparse).
 """
 
 import argparse
+import hashlib
 import http.client
 import http.server
 import json
@@ -92,6 +93,179 @@ def _rng():
         r = random.Random()
         _rng_local.rng = r
     return r
+
+
+# ---------------------------------------------------------------------------
+# Retry-nudge marker store (chat-mode unfinished-turn recovery)
+# ---------------------------------------------------------------------------
+#
+# Single-use, in-memory markers: _retry_nudge_remember stores an unarmed
+# entry per chat request at entry; _retry_nudge_arm marks it when the stream
+# closes the turn with the retryable error; _retry_nudge_check recognizes the
+# client's recovery request (exact body re-issue or strict conversation
+# extension) and CONSUMES the entry on match. Only armed entries age-expire,
+# on a TTL anchored at arm (unarmed entries are never age-swept — the cap's
+# oldest-unarmed-first eviction bounds them), so a long generation cannot
+# expire its own marker. Bounded by RETRY_NUDGE_MAX_ENTRIES entries of at
+# most RETRY_NUDGE_MAX_MESSAGES_BYTES of serialized messages each; cleared
+# on restart, never persisted. Helpers never raise: an internal failure
+# returns None/False and mutates nothing (the sinks' discipline).
+RETRY_NUDGE_TTL_SECONDS = 180
+RETRY_NUDGE_MAX_ENTRIES = 32
+RETRY_NUDGE_MAX_MESSAGES_BYTES = 1024 * 1024
+
+# Every read and write of _retry_nudge_entries — including the sweep and the
+# eviction scan — runs under this lock. remember/arm/check each acquire it
+# exactly once; _retry_nudge_sweep is lock-held-internal (its callers hold
+# it), so the non-reentrant Lock is never re-acquired.
+_retry_nudge_lock = threading.Lock()
+_retry_nudge_entries = {}
+
+
+def _retry_nudge_sweep():
+    """Drop armed entries past the recovery-window bound.
+
+    Lock-held-internal: the caller (remember or check) already holds the
+    store lock — never acquire here. Only ARMED entries age-expire: the
+    TTL runs from arm (arm refreshes stored_at), so it measures the
+    post-error recovery window, never the original request's start.
+    Unarmed entries are not age-expired — a generation longer than the
+    TTL must not lose its own marker to a concurrent request's sweep
+    before its arm; the cap's oldest-unarmed-first eviction bounds them.
+    """
+    now = time.time()
+    expired = [rid for rid, entry in _retry_nudge_entries.items()
+               if entry.get("armed")
+               and now - entry.get("stored_at", 0.0) > RETRY_NUDGE_TTL_SECONDS]
+    for rid in expired:
+        del _retry_nudge_entries[rid]
+
+
+def _retry_nudge_remember(request_id, body, body_json):
+    """Store an unarmed marker for this chat request. True iff stored.
+
+    Skips (mutating nothing) when request_id is falsy or already present (a
+    compat/reasoning re-entry of the same request must not clobber an entry
+    armed earlier in its lifecycle), when messages is not a non-empty list
+    of dicts, or when its serialization exceeds
+    RETRY_NUDGE_MAX_MESSAGES_BYTES. At the entry cap, unarmed entries are
+    evicted first (oldest first) and armed only as a last resort — armed
+    entries are the ones with imminent recoveries.
+    """
+    if not request_id:
+        return False
+    messages = body_json.get("messages") if isinstance(body_json, dict) else None
+    if not isinstance(messages, list) or not messages:
+        return False
+    if not all(isinstance(m, dict) for m in messages):
+        return False
+    try:
+        messages_json = json.dumps(messages, separators=(",", ":"))
+        body_hash = hashlib.sha256(body).hexdigest()
+    except (TypeError, ValueError, RecursionError):
+        return False
+    if len(messages_json.encode("utf-8")) > RETRY_NUDGE_MAX_MESSAGES_BYTES:
+        return False
+    with _retry_nudge_lock:
+        if request_id in _retry_nudge_entries:
+            return False
+        _retry_nudge_sweep()
+        _retry_nudge_entries[request_id] = {
+            "hash": body_hash,
+            "messages_json": messages_json,
+            "armed": False,
+            "stored_at": time.time(),
+        }
+        # Enforce the cap: evict unarmed entries first (oldest first), armed
+        # only as a last resort. The entry just stored is never the victim.
+        while len(_retry_nudge_entries) > RETRY_NUDGE_MAX_ENTRIES:
+            victim = None
+            for _armed_pref in (False, True):
+                for rid, entry in _retry_nudge_entries.items():
+                    if rid == request_id or bool(entry.get("armed")) != _armed_pref:
+                        continue
+                    if victim is None or entry["stored_at"] < victim[1]["stored_at"]:
+                        victim = (rid, entry)
+                if victim is not None:
+                    break
+            if victim is None:
+                break
+            del _retry_nudge_entries[victim[0]]
+    return True
+
+
+def _retry_nudge_arm(request_id):
+    """Set the marker's armed flag and re-anchor its TTL at arm.
+
+    Returns True iff an entry was armed, False when none exists (never
+    creates one). The bool is load-bearing: the stream errors the turn only
+    when arming succeeded. No sweep here by design, and no age barrier
+    before arm either — the sweep exempts unarmed entries, so an entry
+    older than the TTL at arm time is still present and armable; arm
+    refreshes stored_at, and the recovery window starts when the error is
+    written, not when the request arrived.
+    """
+    if not request_id:
+        return False
+    with _retry_nudge_lock:
+        entry = _retry_nudge_entries.get(request_id)
+        if entry is None:
+            return False
+        entry["armed"] = True
+        entry["stored_at"] = time.time()
+        return True
+
+
+def _retry_nudge_check(body, body_json):
+    """Find the armed marker this request recovers; consume it on match.
+
+    Two passes over the (swept) armed entries: exact sha256(body) first (a
+    byte-identical re-issue), then the strict-extension prefix (the new
+    messages list starts with the stored list AND is longer — the realistic
+    recovery appends the interrupted turn and its continuation prompt; a
+    byte-identical re-send belongs to the exact-hash branch, and the
+    strictness keeps an equal-length non-identical list from matching).
+    Returns the stored request_id on a match, None otherwise. The entry is
+    consumed (deleted) before returning: the marker is single-use, so later
+    turns of the recovering conversation are neither nudged with now-false
+    "previous turn" text nor routed into the passthrough loop guard — the
+    recovery request's own passthrough decision never re-consults the store
+    (retry_original_id is computed once at request entry). No-raise: an
+    internal failure returns None and mutates nothing.
+    """
+    if not body:
+        return None
+    try:
+        body_hash = hashlib.sha256(body).hexdigest()
+    except (TypeError, ValueError):
+        return None
+    with _retry_nudge_lock:
+        _retry_nudge_sweep()
+        armed = [(rid, entry) for rid, entry in _retry_nudge_entries.items()
+                 if entry.get("armed")]
+        # Pass 1: exact body re-issue wins over any prefix match.
+        for rid, entry in armed:
+            if entry.get("hash") == body_hash:
+                del _retry_nudge_entries[rid]
+                return rid
+        # Pass 2: strict extension of the stored conversation prefix.
+        messages = body_json.get("messages") if isinstance(body_json, dict) else None
+        if not isinstance(messages, list) or not messages:
+            return None
+        if not all(isinstance(m, dict) for m in messages):
+            return None
+        for rid, entry in armed:
+            try:
+                stored = json.loads(entry["messages_json"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(stored, list):
+                continue
+            if len(messages) > len(stored) and messages[:len(stored)] == stored:
+                del _retry_nudge_entries[rid]
+                return rid
+    return None
+
 
 # Admin page and validation
 _admin_html_cache = None
@@ -348,13 +522,16 @@ def forward_request(method, path, headers, body, handler=None, request_id=None):
 
 
 def _compat_probe_outcome(result, key, request_id, tier, method, path,
-                          headers, body, handler, config, vendors):
+                          headers, body, handler, config, vendors,
+                          retry_original_id=None):
     """Process an unstripped probe response under the state machine.
 
     2xx records a probation success (evidence recorded at status receipt;
     mid-stream failures do not roll back). The same exact 400 doubles the
     threshold and returns the stripped retry result. Anything else is
-    inconclusive. The caller owns _compat_retry_lock.
+    inconclusive. The caller owns _compat_retry_lock. retry_original_id is
+    forwarded unchanged to the stripped retry, so the entry-time marker
+    decision (loop guard + nudge) survives the re-entry.
     """
     status = result[0]
     if 200 <= status < 300:
@@ -368,7 +545,8 @@ def _compat_probe_outcome(result, key, request_id, tier, method, path,
         for _attempt in range(COMPAT_MAX_RETRIES_PER_REQUEST):
             retry_result = _forward_request_impl(
                 method, path, headers, stripped_body, handler, request_id,
-                config, vendors, suppress_compat=True)
+                config, vendors, suppress_compat=True,
+                retry_original_id=retry_original_id)
             return _compat_merge_retries(result, retry_result)
         return result
     _compat_probe_inconclusive(key, request_id, tier)
@@ -376,7 +554,8 @@ def _compat_probe_outcome(result, key, request_id, tier, method, path,
 
 
 def _reasoning_outcome(result, key, selection, request_id, tier, method, path,
-                       headers, body, handler, config, vendors):
+                       headers, body, handler, config, vendors,
+                       retry_original_id=None):
     """Drive the reasoning_field walk for one client request.
 
     Lock first: the feature's own retry lock is acquired non-blocking before
@@ -391,6 +570,8 @@ def _reasoning_outcome(result, key, selection, request_id, tier, method, path,
     walks latch the pair until restart.
 
     The client receives the ORIGINAL top-level result on every failure exit.
+    retry_original_id rides along unchanged to each walk forward, so the
+    entry-time marker decision (loop guard + nudge) survives the walk.
     """
     feature = COMPAT_FEATURES["reasoning_field"]
     if not feature.retry_lock.acquire(blocking=False):
@@ -410,7 +591,8 @@ def _reasoning_outcome(result, key, selection, request_id, tier, method, path,
             walk_result = _forward_request_impl(
                 method, path, headers, body, handler, request_id,
                 config, vendors, suppress_compat=True,
-                reasoning_selection=candidate)
+                reasoning_selection=candidate,
+                retry_original_id=retry_original_id)
             walk_status = walk_result[0]
             if 200 <= walk_status < 300:
                 # A candidate's own 2xx is positive evidence that a selection
@@ -502,7 +684,7 @@ def _resolve_extra_request_headers(headers, provider_name, config, request_id):
 
 def _forward_request_impl(method, path, headers, body, handler, request_id,
                           config, vendors, suppress_compat=False,
-                          reasoning_selection=None):
+                          reasoning_selection=None, retry_original_id=None):
     """Internal implementation of forward_request with snapshot config.
 
     suppress_compat=True bypasses the feature-compatibility subsystem
@@ -514,6 +696,13 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     "unresolved — resolve it from the learned entry at request entry"; every
     other value (including the literal "none" the walk wraps to) is used
     as-is, so the walk's explicit candidate is never re-resolved.
+
+    retry_original_id is the marker decision resolved once by the
+    eligibility gate below — the single resolution point, which runs only
+    for eligible requests: a non-None parent value (inherited from a
+    compat/reasoning re-entry) is honored as-is — never re-resolved — so
+    the re-entered forward keeps the loop guard and the nudge; None (a
+    top-level forward_request call) resolves at that gate.
     """
     if method not in ALLOWED_METHODS:
         return 400, {}, b'{"error":"Method not allowed"}', 0, 0, 0, "unknown", None, None
@@ -619,6 +808,24 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     _tools = body_json.get("tools") if isinstance(body_json, dict) else None
     tools_declared = isinstance(_tools, list) and bool(_tools)
 
+    # Retry-nudge markers: remember every eligible chat request first (it
+    # no-ops on an id already stored — a compat/reasoning re-entry — and the
+    # fresh entry is unarmed, so check cannot match this request against
+    # itself). This gate is the single resolution point: the check runs
+    # only here, for eligible requests — an ineligible request (another
+    # mode, no declared tools, or count_tokens, rejected above) never
+    # consumes a marker, and it drops any inherited value. A non-None
+    # value from a re-entered forward is honored as-is — never re-resolved
+    # — so the re-entry keeps the loop guard and the nudge. The id threads
+    # to the stream function, where it gates the unfinished-turn error
+    # (loop guard) and tags the passthrough.
+    if mode == "chat" and tools_declared and SETTINGS.chat_retry_nudge:
+        _retry_nudge_remember(request_id, body, body_json)
+        if retry_original_id is None:
+            retry_original_id = _retry_nudge_check(body, body_json)
+    else:
+        retry_original_id = None
+
     # Build request body once before the retry loop (never re-transformed per
     # attempt). Anthropic mode does a model-only rewrite (plus learned
     # conditional stripping of the compatibility feature); chat/response modes
@@ -687,10 +894,39 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                         _reasoning_entry_selection(reasoning_key)
                 if reasoning_selection is None:
                     reasoning_selection = "none"
+                # Nudge injection: this request matched an armed marker, so
+                # append the config-texted nudge as a trailing user message
+                # to the parsed copy only — the client's bytes are never
+                # modified and the client response never carries the nudge.
+                # The transform stays the single mapping authority (it runs
+                # on the mutated copy below, so the shape is real at the
+                # wire). Guarded on messages being a list; the match itself
+                # guarantees one exists.
+                if (retry_original_id is not None
+                        and isinstance(body_json.get("messages"), list)):
+                    body_json["messages"].append({
+                        "role": "user",
+                        "content": [{"type": "text",
+                                     "text": SETTINGS.chat_retry_nudge}],
+                    })
                 rewritten_body = json.dumps(_anthropic_to_chat(
                     body_json, request_id=request_id, mode=mode,
                     provider=provider_name, tier=tier,
                     reasoning_selection=reasoning_selection)).encode("utf-8")
+                if retry_original_id is not None:
+                    # Post-transform, inside the successful-build branch: a
+                    # transform failure falls back to the client's original
+                    # bytes, and the event must never claim a nudge the
+                    # upstream did not see.
+                    log_trace({
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "event": "chat_retry_nudge",
+                        "request_id": request_id,
+                        "original_request_id": retry_original_id,
+                        "tier": tier,
+                        "provider": provider_name,
+                        "key": key_name,
+                    })
             elif mode == "response":
                 rewritten_body = json.dumps(_anthropic_to_response(
                     body_json, request_id=request_id, mode=mode,
@@ -754,10 +990,12 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                 method, path, handler, request_id, config, rewritten_body,
                 fwd_headers, upstream_path, host, port, use_ssl, tier,
                 provider_name, actual_model, mode, _is_count_tokens,
-                tools_declared=tools_declared, key_name=key_name)
+                tools_declared=tools_declared, key_name=key_name,
+                retry_original_id=retry_original_id)
             return _compat_probe_outcome(
                 result, compat_decision[1], request_id, tier, method, path,
-                headers, body, handler, config, vendors)
+                headers, body, handler, config, vendors,
+                retry_original_id=retry_original_id)
         finally:
             _compat_retry_lock.release()
 
@@ -766,7 +1004,8 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
         fwd_headers, upstream_path, host, port, use_ssl, tier,
         provider_name, actual_model, mode, _is_count_tokens,
         tools_declared=tools_declared, key_name=key_name,
-        max_attempts=1 if suppress_compat else None)
+        max_attempts=1 if suppress_compat else None,
+        retry_original_id=retry_original_id)
 
     # Stripped request: upstream already saw the stripped body — return as-is.
     if compat_decision is not None:
@@ -797,7 +1036,8 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
             return result
         return _reasoning_outcome(
             result, reasoning_key, reasoning_selection, request_id, tier,
-            method, path, headers, body, handler, config, vendors)
+            method, path, headers, body, handler, config, vendors,
+            retry_original_id=retry_original_id)
 
     if active_feature.name != COMPAT_FEATURE:
         # A registered feature this dispatch does not handle stays inert, so a
@@ -844,7 +1084,8 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
             for _attempt in range(COMPAT_MAX_RETRIES_PER_REQUEST):
                 retry_result = _forward_request_impl(
                     method, path, headers, stripped_body, handler,
-                    request_id, config, vendors, suppress_compat=True)
+                    request_id, config, vendors, suppress_compat=True,
+                    retry_original_id=retry_original_id)
                 break
         if retry_result is None:
             return result
@@ -873,7 +1114,7 @@ def _forward_core(method, path, handler, request_id, config,
                   rewritten_body, fwd_headers, upstream_path,
                   host, port, use_ssl, tier, provider_name, actual_model,
                   mode, is_count_tokens, tools_declared=False, key_name=None,
-                  max_attempts=None):
+                  max_attempts=None, retry_original_id=None):
     """Forwarding pass: 429/503/connection retry loop and response handling.
 
     max_attempts=None derives the attempt count from config (SETTINGS.max_retries,
@@ -955,7 +1196,8 @@ def _forward_core(method, path, handler, request_id, config,
                     first_byte_ms = handler._stream_upstream_response(
                         resp, resp.status, resp_headers, request_id, retries,
                         tier=tier, mode=mode, tools_declared=tools_declared,
-                        provider=provider_name, key=key_name)
+                        provider=provider_name, key=key_name,
+                        retry_original_id=retry_original_id)
                     conn.close()
                     return (resp.status, resp_headers, b"",
                             first_byte_ms, time.time() - total_start, retries, tier, provider_name, actual_model)
@@ -1048,7 +1290,8 @@ def _forward_core(method, path, handler, request_id, config,
                         first_byte_ms = handler._stream_upstream_response(
                             resp, resp.status, resp_headers, request_id, retries,
                             tier=tier, mode=mode, tools_declared=tools_declared,
-                            provider=provider_name, key=key_name)
+                            provider=provider_name, key=key_name,
+                            retry_original_id=retry_original_id)
                         conn.close()
                         return (resp.status, resp_headers, b"",
                                 first_byte_ms, time.time() - total_start, retries, tier, provider_name, actual_model)
@@ -1346,7 +1589,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _stream_upstream_response(self, resp, status, resp_headers, request_id, retries,
                                    tier=None, mode=None, tools_declared=False,
-                                   provider=None, key=None):
+                                   provider=None, key=None, retry_original_id=None):
         """Stream an upstream 2xx response body to the client as it arrives.
 
         For SSE (text/event-stream):
@@ -1387,7 +1630,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if mode == "chat":
                     return self._stream_chat_sse_to_anthropic(
                         resp, request_id, tier, first_byte_start,
-                        tools_declared=tools_declared, provider=provider, key=key)
+                        tools_declared=tools_declared, provider=provider, key=key,
+                        retry_original_id=retry_original_id)
                 if mode == "response":
                     return self._stream_response_sse_fallback(
                         resp, request_id, tier, first_byte_start)
@@ -1524,7 +1768,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "data: " + json.dumps(payload) + "\n\n").encode("utf-8")
 
     def _stream_chat_sse_to_anthropic(self, resp, request_id, tier, first_byte_start,
-                                      tools_declared=False, provider=None, key=None):
+                                      tools_declared=False, provider=None, key=None,
+                                      retry_original_id=None):
         """Transform an OpenAI chat-completions SSE stream into Anthropic Messages SSE.
 
         Frames are assembled on the \\n\\n delimiter (CRLF-normalized) — never
@@ -1883,6 +2128,43 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             write({"type": "message_stop"})
             log_degradation_if_needed(force_log)
 
+        def log_drain():
+            """Emit the per-stream drain event.
+
+            Extracted so every disposition that reaches it — the normal
+            terminal path and the unfinished-turn error path — logs it
+            exactly once, from a single literal.
+            """
+            _fr = finish_reason_seen if isinstance(finish_reason_seen, str) else "<non-string>"
+            log_trace({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "event": "chat_sse_drain",
+                "request_id": request_id,
+                "finish_reason": _fr[:64],
+                "drain_exit": drain_exit,
+                "drain_bytes": drain_bytes,
+                "drain_ms": int((drain_ended_at - finish_seen_at) * 1000) if drain_ended_at else 0,
+                "tool_calls_seen": 1 if tool_calls_seen else 0,
+                "emitted_tool_use": 1 if emitted_tool_use else 0,
+                "tools_declared": 1 if tools_declared else 0,
+                "late_frames": late_frames,
+                "first_late_ms": int(first_late_ms) if first_late_ms is not None else None,
+                "last_late_ms": int(last_late_ms) if last_late_ms is not None else None,
+                "late_tool_call_ms": int(late_tool_call_ms) if late_tool_call_ms is not None else None,
+            })
+
+        def log_post_finish_suppressed():
+            """Emit the post-finish suppression count when any delta was
+            dropped — guarded and extracted for the same single-literal,
+            exactly-once discipline as log_drain()."""
+            if post_finish_suppressed:
+                log_trace({
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "event": "chat_sse_post_finish_suppressed",
+                    "request_id": request_id,
+                    "count": post_finish_suppressed,
+                })
+
         def handle_frame(frame):
             nonlocal chat_id, usage, first_frame, tool_calls_seen, scalar_after_tools_dropped, malformed_tool_count
             nonlocal finish_reason_seen, post_finish_suppressed
@@ -1936,7 +2218,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if revised:
                     finish_reason_seen = revised
                 if isinstance(delta, dict):
-                    if delta.get("tool_calls") is not None:
+                    if delta.get("tool_calls"):
                         tool_calls_seen = True
                         process_tool_calls(delta["tool_calls"])
                     # Suppress content and reasoning deltas
@@ -2128,10 +2410,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if finish_reason_seen is not None:
             if not message_started:
                 start_message()
-            # Shadow detector: log-only, no effect on the response. It measures
-            # the predicate's precision on real traffic before any behaviour
-            # depends on it (the client-retry nudge is a staged follow-on).
+            # The detector acts when PROXY_CHAT_RETRY_NUDGE is non-empty: an
+            # unarmed stalled turn is closed with the retryable api_error (the
+            # marker arm gates the error), while an armed one — the recovery
+            # request of an already-errored turn — passes through to the normal
+            # terminal synthesis below. With the value empty the detector is a
+            # pure measurement: every fired turn passes through, unchanged.
+            # `not tool_calls_seen` keeps proxy-side degradation (a tool call
+            # seen on the wire but never started as a block) from counting as
+            # a model omission.
             if (tools_declared and not emitted_tool_use
+                    and not tool_calls_seen
                     and finish_reason_seen == "stop"
                     and text_emitted and text_tail.rstrip().endswith(":")):
                 log_trace({
@@ -2148,6 +2437,39 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     "text_tail_len": len(text_tail),
                     "rule": "colon_after_prose",
                 })
+                if (retry_original_id is None
+                        and SETTINGS.chat_retry_nudge
+                        and _retry_nudge_arm(request_id)):
+                    # Arm-gated error path: same wire shape and write ordering
+                    # as the cut path below — trace writes first, then the
+                    # retryable api_error, and no terminal sequence follows.
+                    # The arm must succeed before the error is written: a turn
+                    # whose marker could never be stored (oversized or
+                    # malformed messages) must pass through, never error, or
+                    # every stall on that conversation becomes a
+                    # repeated-error loop.
+                    log_drain()
+                    log_post_finish_suppressed()
+                    close_all_blocks()
+                    log_degradation_if_needed()
+                    write({
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": "upstream ended the turn without a tool call after tools were declared",
+                        },
+                    })
+                    return first_byte_ms
+                if retry_original_id is not None:
+                    log_trace({
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "event": "chat_retry_passthrough",
+                        "request_id": request_id,
+                        "original_request_id": retry_original_id,
+                        "tier": tier,
+                        "provider": provider,
+                        "key": key,
+                    })
             if finish_reason_seen == "tool_calls":
                 # Diagnostic only: validate still counts unparseable arguments for
                 # the coalesced chat_sse_tool_degradation event, but the counts no
@@ -2164,30 +2486,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 terminal(sr, force_log=True)
             else:
                 terminal(_map_chat_finish_reason(finish_reason_seen))
-            _fr = finish_reason_seen if isinstance(finish_reason_seen, str) else "<non-string>"
-            log_trace({
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "event": "chat_sse_drain",
-                "request_id": request_id,
-                "finish_reason": _fr[:64],
-                "drain_exit": drain_exit,
-                "drain_bytes": drain_bytes,
-                "drain_ms": int((drain_ended_at - finish_seen_at) * 1000) if drain_ended_at else 0,
-                "tool_calls_seen": 1 if tool_calls_seen else 0,
-                "emitted_tool_use": 1 if emitted_tool_use else 0,
-                "tools_declared": 1 if tools_declared else 0,
-                "late_frames": late_frames,
-                "first_late_ms": int(first_late_ms) if first_late_ms is not None else None,
-                "last_late_ms": int(last_late_ms) if last_late_ms is not None else None,
-                "late_tool_call_ms": int(late_tool_call_ms) if late_tool_call_ms is not None else None,
-            })
-            if post_finish_suppressed:
-                log_trace({
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "event": "chat_sse_post_finish_suppressed",
-                    "request_id": request_id,
-                    "count": post_finish_suppressed,
-                })
+            log_drain()
+            log_post_finish_suppressed()
             return first_byte_ms
         # EOF reached without a finish_reason chunk. Two dispositions: with
         # [DONE] the stream is protocol-complete and just never said why it

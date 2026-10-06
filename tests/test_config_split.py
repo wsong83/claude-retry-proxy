@@ -315,6 +315,7 @@ def test_models_json_unreadable_permissions_shape():
     reported as not expressible, not asserted."""
     print("\n--- Test: models.json Unreadable Permissions ---")
     temp_dir = tempfile.mkdtemp(prefix="proxy_split_perm_")
+    mpath = None
     try:
         cpath, mpath = _write_pair(
             temp_dir, models_doc={"models": {"p": ["claude-haiku-4-5"]}})
@@ -325,8 +326,9 @@ def test_models_json_unreadable_permissions_shape():
                 f.read()
         except (OSError, ValueError):
             denied = True
-        finally:
-            os.chmod(mpath, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        # NOTE: deliberately no permission restore here — mode 0000 must
+        # still be in effect when load_config runs below; the restore lives
+        # in the outer finally so it happens only after the assertion.
         if not denied:
             pass_("platform cannot express an unreadable file read "
                   "(chmod near-no-op); shape not asserted here")
@@ -344,6 +346,11 @@ def test_models_json_unreadable_permissions_shape():
         else:
             fail("load succeeded on an unreadable models.json")
     finally:
+        if mpath is not None:
+            try:
+                os.chmod(mpath, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+            except OSError:
+                pass
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 

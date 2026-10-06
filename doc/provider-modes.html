@@ -10,7 +10,7 @@
 
 <h1>Provider Modes<span class="sub">anthropic, chat, and response — and what each one rewrites</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-04</p>
+<p><strong>Last updated:</strong> 2026-10-06</p>
 
 <p>The proxy speaks Anthropic Messages to its clients. What it speaks <em>upstream</em> is
 configurable per provider, because not every provider implements the Anthropic API. A
@@ -239,7 +239,10 @@ no stop reason at all when the connection was cut. See
 <tr><th>OpenAI <code>finish_reason</code></th><th>Anthropic <code>stop_reason</code></th></tr>
 <tr><td><code>stop</code></td><td><code>end_turn</code> in the buffered path;
     <code>tool_use</code> in the streaming path <em>when a tool block was emitted</em>,
-    otherwise <code>end_turn</code> (see below)</td></tr>
+    otherwise <code>end_turn</code> (see below) — with one exception: when the
+    unfinished-turn detector fires and the retry nudge is enabled, the stream is closed
+    with a retryable <code>error</code> frame and <em>no</em> <code>stop_reason</code> at
+    all (<a href="#chat-sse-unfinished-turn">below</a>)</td></tr>
 <tr><td><code>length</code></td><td><code>max_tokens</code></td></tr>
 <tr><td><code>tool_calls</code></td><td><code>tool_use</code></td></tr>
 <tr><td>anything else</td><td><code>null</code></td></tr>
@@ -418,10 +421,11 @@ disconnect, or an upstream frame shape the parser cannot read. Field-by-field re
 
 <p>Not every incomplete-looking turn is a relay fault, and this one is worth recognizing on
 sight. A chat-mode model occasionally ends an agentic turn by narrating the action it is about to
-take and then reporting <code>finish_reason: "stop"</code> without emitting a single tool-call
-frame. The proxy relays exactly what it received: the turn arrives with <code>end_turn</code>, a
-thinking block and a text block, and no <code>tool_use</code> block, so the client stops and waits
-for the user to ask it to continue. Re-issuing produces the tool call normally.</p>
+take — the prose tail ends in a colon, as it would if a tool call followed — and then reports
+<code>finish_reason: "stop"</code> without emitting a single tool-call frame. Relayed as-is, the
+turn arrives with <code>end_turn</code>, a thinking block and a text block, and no
+<code>tool_use</code> block, so the client stops and waits for the user to ask it to continue.
+Re-issuing produces the tool call normally.</p>
 
 <p>It is an upstream behavior rather than a relay defect, and the trace can show which it is. Such
 a turn reports real, non-zero <code>usage</code>, and it logs <strong>no</strong>
@@ -433,15 +437,58 @@ read. A stream that had been cut would instead have logged <code>chat_sse_trunca
 stream that was still draining would have been held open rather than closed with
 <code>end_turn</code>.</p>
 
-<p>The remedy is routing rather than repair — the proxy cannot invent a tool call the model never
-emitted — so measure the rate per provider and move traffic away from a provider that does it
-often. The measurement is <code>tools_declared</code> joined to <code>emitted_tool_use</code> on
-<code>chat_sse_drain</code> (per provider), which turns "a tool-bearing turn that emitted no
-<code>tool_use</code>" into a countable rate; neither field expresses it alone.
-<code>chat_sse_unfinished_turn</code> is the same condition detected live and written to the trace
-without acting on it — a shadow-mode measurement of the detector's precision on real traffic,
-which is why it is evaluated only after the drain has ended, so that a tool call arriving late is
-never counted as one that never came.</p>
+<p><strong>The detector acts on it.</strong> <code>chat_sse_unfinished_turn</code> is that same
+condition detected live, evaluated only after the drain has ended — so a tool call arriving late
+is never counted as one that never came — and it fires when <em>all</em> of these hold: tools
+were declared on the request, no <code>tool_use</code> block was emitted <em>and</em> no tool call
+was seen on the wire, the recorded <code>finish_reason</code> is <code>"stop"</code>, and the
+stream's text tail (whitespace-trimmed) ends with <code>":"</code>. The two tool tests are not
+redundant: a tool call seen on the wire but never started as a block is a proxy-side degradation,
+not a model omission, and it must not be counted as one.</p>
+
+<div class="warn">
+<strong>With the retry nudge enabled (<code>PROXY_CHAT_RETRY_NUDGE</code> non-empty — the
+default), a fired turn is closed with a retryable <code>error</code> instead of a terminal
+sequence.</strong> The proxy arms a single-use marker for the request, closes the open content
+blocks, and writes an SSE <code>error</code> frame (<code>error.type: "api_error"</code>, i.e.
+retryable) with no <code>message_delta</code> and no <code>message_stop</code> — the same
+disposition, on the wire, as a cut stream. A client that would previously have seen a quiet
+<code>end_turn</code> here now sees an error and retries the turn; that retry is where the repair
+happens.
+</div>
+
+<p>The marker is what makes the retry a repair. It remembers the conversation's messages in
+process memory, and the next request that recovers it — a byte-identical re-issue, or the
+conversation extended strictly past the stored messages — consumes it and gets the nudge text
+appended as a trailing user message to the <em>upstream copy only</em>: the client's bytes are
+never modified, the client response never carries the nudge, and the transform remains the single
+mapping authority for the upstream shape. The nudge tells the model its previous turn ended
+without the tool call, prompting the retried generation to emit it. The injection is logged —
+<code>chat_retry_nudge</code>, written post-transform so the event never claims a nudge the
+upstream did not see. A recovery request is itself marked as such, so a turn that stalls
+<em>again</em> is not errored a second time: it is logged as <code>chat_retry_passthrough</code>
+and closed with the normal terminal synthesis, so a model that keeps stalling surfaces as one
+error and one ordinary turn rather than an error loop.</p>
+
+<p>Two boundaries are deliberate. A conversation whose messages could not be stored (malformed, or
+larger than 1&nbsp;MiB) can never be nudged, so it is never errored — "cannot be nudged" implies
+"must not error", or every stall on that conversation would become a repeated-error loop. And the
+marker store is bounded and short-lived: at most 32 conversations, at most 1&nbsp;MiB of messages
+each, retained in process memory for up to 180&nbsp;s from the error (the TTL is anchored at the
+error, not at the request's start, so a long generation cannot expire its own marker). It is
+never persisted, never logged, and never served by any endpoint; a restart between the stall and
+the recovery simply means the recovery proceeds without a nudge — the client already received the
+retryable error.</p>
+
+<p><strong>The kill switch is the environment variable itself.</strong> Set
+<code>PROXY_CHAT_RETRY_NUDGE=""</code> — empty, whitespace-only, or longer than 4096 characters,
+which disable the feature (a restart or relaunch applies it) — and the detector returns to a pure
+measurement: every fired turn passes through to the normal terminal synthesis exactly as before,
+and <code>chat_sse_unfinished_turn</code> keeps being logged. The per-provider rate remains the
+routing signal: join <code>tools_declared</code> to <code>emitted_tool_use</code> on
+<code>chat_sse_drain</code> (per provider) to count "a tool-bearing turn that emitted no
+<code>tool_use</code>" as a rate — neither field expresses it alone — and a provider that stalls
+often is still worth moving traffic away from.</p>
 
 <h4 id="chat-sse-stream-options">Requesting usage</h4>
 
@@ -559,7 +606,9 @@ message carrying the <code>tool_calls</code>, so the ordering the upstream expec
 <tr><td><code>response_sse_unexpected</code></td><td>a response-mode provider streamed despite <code>stream: false</code></td></tr>
 <tr><td><code>chat_sse_truncated</code></td><td>a chat-mode stream ended with no <code>finish_reason</code> at all (a whole-stream disposition, not a framing fault); carries <code>pending_bytes</code> and <code>saw_done</code>, which discriminates a protocol-complete stream (<code>1</code>) from one cut mid-response (<code>0</code>, closed with an <code>error</code> frame)</td></tr>
 <tr><td><code>chat_sse_drain</code></td><td>the post-finish drain of a chat-mode stream ended (once per stream that reached a <code>finish_reason</code>); carries <code>drain_exit</code>, <code>drain_bytes</code>, <code>drain_ms</code>, the tool-call flags and the late-frame offsets</td></tr>
-<tr><td><code>chat_sse_unfinished_turn</code></td><td>the shadow-mode detector saw a turn that ends with no tool call (tools were declared and <code>finish_reason</code> was <code>stop</code>); <strong>log only — it changes no response</strong></td></tr>
+<tr><td><code>chat_sse_unfinished_turn</code></td><td>the detector saw a turn that ends with no tool call and no tool call on the wire (tools were declared, <code>finish_reason</code> was <code>stop</code>, and the text tail ends with <code>":"</code>); with the retry nudge enabled the turn is then closed with a retryable <code>error</code> and its marker armed, instead of a terminal sequence</td></tr>
+<tr><td><code>chat_retry_nudge</code></td><td>the nudge text was injected into a retry that matched an armed unfinished-turn marker (logged after the transform, so it never claims a nudge the upstream did not see)</td></tr>
+<tr><td><code>chat_retry_passthrough</code></td><td>a recovery request stalled again; the turn is closed with the normal terminal synthesis instead of being errored a second time (the loop guard)</td></tr>
 <tr><td><code>chat_sse_malformed_json</code>, <code>chat_sse_frame_cap_exceeded</code>, <code>chat_sse_buffer_cap_exceeded</code>, <code>sse_buffer_cap_exceeded</code>, <code>sse_rewrite_malformed_json</code></td><td>an SSE frame was malformed or exceeded a buffer bound</td></tr>
 </table>
 
@@ -616,6 +665,6 @@ transform it belongs to, and neither runs in response mode:</p>
 <a href="compatibility.html">compatibility.html</a>, as is the
 <a href="compatibility.html#reasoning-field">reasoning-field selection</a>.</p>
 
-<footer>Last updated: 2026-10-04</footer>
+<footer>Last updated: 2026-10-06</footer>
 </body>
 </html>

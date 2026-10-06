@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import time
+import urllib.request
 from datetime import datetime, timezone
 
 from .settings import SETTINGS, resolve_trace_file
@@ -25,6 +26,11 @@ CONFIG_FILE = SETTINGS.config_path
 KEYS_FILE = SETTINGS.keys_path
 
 PRUNE_RETENTION_DAYS = 5
+
+# Localhost admin calls (reload, shutdown) go through a proxy-less opener so
+# an ambient HTTP_PROXY with an empty no_proxy cannot divert 127.0.0.1 admin
+# traffic to an external proxy.
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 # ---------------------------------------------------------------------------
@@ -276,8 +282,12 @@ def _read_state():
 def _write_state(state):
     """Write proxy-state.json atomically."""
     import tempfile
-    os.makedirs(PROXY_DIR, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=PROXY_DIR, suffix=".tmp")
+    # Temp file must live in the TARGET's directory: os.replace is atomic only
+    # within one filesystem, and PROXY_STATE_FILE may be overridden onto another
+    # device (EXDEV otherwise). Mirrors StateSink._emit in sinks.py.
+    target_dir = os.path.dirname(PROXY_STATE_FILE) or "."
+    os.makedirs(target_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=target_dir, suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(state, f)
@@ -638,7 +648,7 @@ def cmd_stop(args):
                 method="POST")
             # Add Origin header for CSRF validation (reviewer-cmd-stop-csrf fix)
             req.add_header("Origin", "http://127.0.0.1:{}".format(port))
-            with urllib.request.urlopen(req, timeout=2) as resp:
+            with _LOCAL_OPENER.open(req, timeout=2) as resp:
                 resp.read()
             shutdown_ok = True
             _trace("cmd_stop: shutdown request accepted")
@@ -756,7 +766,7 @@ def cmd_reload(args):
             headers={"Origin": "http://127.0.0.1:{}".format(port)})
         # The timeout must exceed the server's 30 s drain window; a busy
         # proxy is a reload that subsequently succeeds, not a CLI failure.
-        with urllib.request.urlopen(req, timeout=40) as resp:
+        with _LOCAL_OPENER.open(req, timeout=40) as resp:
             body = resp.read().decode("utf-8")
             data = json.loads(body)
             if data.get("status") == "ok":

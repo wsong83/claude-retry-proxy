@@ -99,8 +99,8 @@ def _check_str(name, got, expected):
 
 def test_settings_object_shape():
     """srv.SETTINGS is settings.SETTINGS (one object, one binding — the
-    patch-coherence guarantee). All 15 attributes in the attr_types table
-    exist with pinned types: six ints, one bool (log_all), and eight
+    patch-coherence guarantee). All 16 attributes in the attr_types table
+    exist with pinned types: six ints, one bool (log_all), and nine
     strings; mode_values is pinned separately below, not in the table."""
     print("\n--- Test: SETTINGS Object Identity and Shape ---")
     if SRV_SETTINGS is settings.SETTINGS:
@@ -128,6 +128,7 @@ def test_settings_object_shape():
         "state_file": str,
         "feature_compat_file": str,
         "proxy_dir": str,
+        "chat_retry_nudge": str,
     }
     for attr, typ in sorted(attr_types.items()):
         if not hasattr(settings.SETTINGS, attr):
