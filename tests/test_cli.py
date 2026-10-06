@@ -25,6 +25,7 @@ from _harness import (
     _create_test_config,
     _create_test_keys,
     _create_test_keys_plain,
+    _remove_test_state_file,
     _restore_proxy_state,
     _send_proxy_request,
     _start_mock_upstream,
@@ -38,6 +39,34 @@ from _harness import (
     run_cli,
     warn,
 )
+
+
+def _wait_port_closed(port, timeout=10):
+    """Poll until nothing accepts a TCP connection on 127.0.0.1:port.
+
+    Returns True once the port is closed, False on timeout. Used to confirm a
+    CLI-started proxy actually stopped: cmd_stop exits 0 on every path, so its
+    return code cannot distinguish a stopped proxy from a leaked one.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(0.5)
+        open_ = False
+        try:
+            sock.connect(("127.0.0.1", port))
+            open_ = True
+        except (socket.error, ConnectionRefusedError):
+            open_ = False
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if not open_:
+            return True
+        time.sleep(0.1)
+    return False
 
 
 
@@ -543,11 +572,15 @@ def test_cli_reload():
             else:
                 fail(f"Post-reload routing changed unexpectedly: {req_list[-1] if req_list else 'none'}")
 
-            # Clean up the proxy
-            stop_result = subprocess.run(CLAUDE_PROXY + ["stop"],
-                                         capture_output=True, text=True, timeout=10)
-            if stop_result.returncode != 0:
-                fail(f"stop failed: {stop_result.stdout} {stop_result.stderr}")
+            # Clean up the proxy. cmd_stop exits 0 on every path, so its
+            # return code cannot confirm the proxy actually stopped — poll the
+            # port closed so this test cannot return with a live proxy behind
+            # it (a leaked proxy's heartbeat re-creates the state file naming
+            # a live PID, defeating the next CLI start with "already running").
+            subprocess.run(CLAUDE_PROXY + ["stop"],
+                           capture_output=True, text=True, timeout=10)
+            if not _wait_port_closed(port, timeout=10):
+                fail("proxy still listening on port {} after stop".format(port))
 
         finally:
             if 'mock_started' in dir():
@@ -615,6 +648,8 @@ def test_start_rejects_uncatalogued_model_selector_at_cli():
 
     try:
         temp_dir = tempfile.mkdtemp(prefix="proxy_cli_canon_gate_")
+        sanity_started = False
+        sanity_port = None
         try:
             keys_path = _create_test_keys_plain(temp_dir, vendors)
 
@@ -712,17 +747,28 @@ def test_start_rejects_uncatalogued_model_selector_at_cli():
                 "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
                 "opus": {"provider": "p", "model": "claude-opus-5"},
             }, models={"p": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]})
+            sanity_port = find_free_port()
             rc, stdout, stderr = try_cli_start(config_ok, keys_path,
-                                               port=find_free_port())
+                                               port=sanity_port)
             if rc == 0:
                 pass_("clean config passes the canonical CLI gate and starts")
-                subprocess.run(CLAUDE_PROXY + ["stop"],
-                               capture_output=True, text=True, timeout=10)
+                sanity_started = True
             else:
                 fail("clean config unexpectedly refused at the CLI gate (rc={}): "
                      "{!r} {!r}".format(rc, stdout[:400], stderr[:400]))
         finally:
+            # Stop the sanity proxy on every path, not only the rc == 0 branch:
+            # a failed assertion must not leak a live proxy whose heartbeat
+            # re-creates the state file naming a live PID. Poll the port closed
+            # because cmd_stop exits 0 even when nothing was killed.
+            if sanity_started:
+                subprocess.run(CLAUDE_PROXY + ["stop"],
+                               capture_output=True, text=True, timeout=10)
+                if not _wait_port_closed(sanity_port, timeout=10):
+                    fail("sanity proxy still listening on port {} after stop".format(
+                        sanity_port))
             shutil.rmtree(temp_dir, ignore_errors=True)
+            _remove_test_state_file()
     finally:
         cleanup_lock_files()
         subprocess.run(CLAUDE_PROXY + ["stop"], capture_output=True, text=True, timeout=10)

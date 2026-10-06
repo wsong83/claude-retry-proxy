@@ -10,7 +10,7 @@
 
 <h1>Architecture<span class="sub">How a request is routed, retried, and rewritten</span></h1>
 
-<p><strong>Last updated:</strong> 2026-09-12</p>
+<p><strong>Last updated:</strong> 2026-10-06</p>
 
 <p>This page describes the path a request takes from the moment it reaches the proxy to the
 moment a response leaves it. It is the reference the other pages link back into — in
@@ -242,6 +242,77 @@ retry onward; on the 429 path the base is the full 30 s, so it de-synchronises i
 permit. Raising <code>PROXY_MAX_RETRIES</code> and <code>PROXY_MAX_DELAY</code> together is
 what produces it.</p>
 
+<h2 id="error-envelope">Error responses</h2>
+
+<p>Every error the proxy <em>itself</em> generates — as opposed to one it forwards from upstream —
+is returned in the <strong>Anthropic error envelope</strong>, so a client that already speaks the
+Anthropic API needs no special case for the proxy's own failures:</p>
+
+<pre>{"type": "error",
+ "error": {"type": &lt;taxonomy&gt;, "code": &lt;proxy discriminator&gt;, "message": …},
+ "request_id": …}</pre>
+
+<p>The top level (<code>type</code> / <code>error</code> / <code>request_id</code>) is the
+Anthropic standard shape. Inside it, <code>error.type</code> is a coarse taxonomy category and
+<code>error.code</code> is a proxy extension carrying the fine detail. The
+<code>request_id</code> key is <em>omitted entirely</em> — never set to <code>null</code> — when
+no per-request id exists.</p>
+
+<p>Bodies are built by one constructor, <code>_error_body</code>, and serialized with
+<code>json.dumps</code> rather than string interpolation: two messages carry client-controlled
+text (<code>unrecognized_model</code> echoes back the model name) and exception text, so both
+must stay JSON-escaped.</p>
+
+<table>
+<tr><th><code>error.code</code></th><th><code>error.type</code></th><th>Status</th><th>Raised when</th></tr>
+<tr><td><code>invalid_json</code></td><td><code>invalid_request_error</code></td><td>400</td>
+    <td>The client body does not parse as JSON</td></tr>
+<tr><td><code>invalid_body_type</code></td><td><code>invalid_request_error</code></td><td>400</td>
+    <td>The body parses but is not a JSON object</td></tr>
+<tr><td><code>unrecognized_model</code></td><td><code>invalid_request_error</code></td><td>400</td>
+    <td>The model name resolves to no tier; the message lists the valid ones</td></tr>
+<tr><td><code>method_not_allowed</code></td><td><code>invalid_request_error</code></td><td>400</td>
+    <td>The method is not one of the accepted methods</td></tr>
+<tr><td><code>path_not_allowed</code></td><td><code>invalid_request_error</code></td><td>400</td>
+    <td>The path matches neither the Messages path nor an admin route</td></tr>
+<tr><td><code>invalid_content_length</code></td><td><code>invalid_request_error</code></td><td>400</td>
+    <td>A <code>Content-Length</code> header is present but unparseable</td></tr>
+<tr><td><code>count_tokens_unsupported</code></td><td><code>invalid_request_error</code></td><td>400</td>
+    <td><code>count_tokens</code> is called on a <code>chat</code> or <code>response</code> provider</td></tr>
+<tr><td><code>payload_too_large</code></td><td><code>request_too_large</code></td><td>413</td>
+    <td>The body exceeds <code>PROXY_MAX_BODY_SIZE</code></td></tr>
+<tr><td><code>invalid_provider_key</code></td><td><code>api_error</code></td><td>500</td>
+    <td>The tier's key selector resolves to no usable key at request time</td></tr>
+<tr><td><code>invalid_provider_mode</code></td><td><code>api_error</code></td><td>500</td>
+    <td>The vendor's configured mode is not an accepted value</td></tr>
+<tr><td><code>invalid_provider_url</code></td><td><code>api_error</code></td><td>500</td>
+    <td>The vendor's upstream URL will not parse — including a bad port, which
+        <code>urlparse</code> raises on rather than returning</td></tr>
+<tr><td><code>upstream_unreachable</code></td><td><code>api_error</code></td><td>502</td>
+    <td>The retry budget is exhausted on connection errors — see
+        <a href="#give-up">Give-up behaviour</a></td></tr>
+<tr><td><code>response_frame_encode_failure</code></td><td><code>api_error</code></td>
+    <td>SSE event</td>
+    <td>A synthesized SSE frame cannot be serialized; sent as an <code>event: error</code> frame
+        inside the stream rather than aborting it — see
+        <a href="provider-modes.html#streaming">provider-modes.html#streaming</a></td></tr>
+<tr><td><code>upstream_body_truncated</code></td><td>varies</td><td>varies</td>
+    <td>A truncated upstream body is being surfaced to the client</td></tr>
+<tr><td><code>not_found</code></td><td><code>not_found_error</code></td><td>404</td>
+    <td>An unmatched <code>GET</code> falls through <code>do_GET</code>'s default branch</td></tr>
+</table>
+
+<p>The <strong>admin surface is deliberately not converted</strong>: its bodies keep their
+original flat shapes, because the admin page is the proxy's own UI rather than an
+Anthropic-compatible endpoint. The one exception is an unmatched admin <code>GET</code>, which
+falls through the shared <code>do_GET</code> default and therefore does return the envelope.</p>
+
+<p>Two client-visible consequences are worth knowing. The give-up status for a lost connection
+changed from a literal <code>0</code> — not a valid HTTP status, and unparseable by most clients
+— to a real <code>502</code>. And the trace log's <code>error</code> field now carries this
+envelope, so <code>sanitize_error</code>'s 200-character cap truncates it; see
+<a href="trace-log.html#entry-schema">trace-log.html</a>.</p>
+
 <h2 id="give-up">Give-up behaviour</h2>
 
 <p>When the retry budget is exhausted the two families of failure behave differently, and the
@@ -257,9 +328,12 @@ difference is visible to the client.</p>
 </tr>
 <tr>
   <td>Connection error</td>
-  <td>A <strong>synthesised</strong> JSON body of type <code>upstream_unreachable</code>,
-      reporting the sanitised error and the retry count, returned with status
-      <code>0</code>. There is no upstream body to preserve.</td>
+  <td>The <strong>error envelope</strong> (<code>error.code</code>
+      <code>upstream_unreachable</code>) described in
+      <a href="#error-envelope">Error responses</a>, reporting the sanitised error and the
+      retry count, returned with status <code>502</code> — a real HTTP status, where this
+      path previously returned the literal <code>0</code>. There is no upstream body to
+      preserve.</td>
 </tr>
 </table>
 
@@ -483,6 +557,6 @@ daemon flag and adding a bounded drain, which changes what <code>stop</code> doe
 client sees — and why the interrupted request's trace entry never lands — is owned by
 <a href="operations.html#shutdown">operations.html#shutdown</a>.</p>
 
-<footer>Last updated: 2026-09-12</footer>
+<footer>Last updated: 2026-10-06</footer>
 </body>
 </html>

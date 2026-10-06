@@ -18,11 +18,11 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>379 test functions across 19 files</strong>, but this number moves whenever
-tests are added. (It read <em>372 across 19</em> before this recount, <em>371 across 19</em> before that, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
+suite has <strong>393 test functions across 19 files</strong>, but this number moves whenever
+tests are added. (It read <em>379 across 19</em> before this recount, <em>372 across 19</em> before that, <em>371 across 19</em> before that, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
 before that, <em>334 across 19</em> before that, and <em>322 across 18</em> before an earlier
 one — the page has drifted behind the
-suite eight times, and in each case the stale total disagreed with the page's own catalog table
+suite nine times, and in each case the stale total disagreed with the page's own catalog table
 as well.)
 Re-count before quoting it:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
@@ -117,15 +117,15 @@ relative size, not as exact current figures.</p>
     <td>Anthropic → Chat Completions request and response transforms</td></tr>
 <tr><td><code>test_response_transform.py</code></td><td class="num">37</td>
     <td>Anthropic → Responses request and response transforms</td></tr>
-<tr><td><code>test_chat_sse.py</code></td><td class="num">62</td>
+<tr><td><code>test_chat_sse.py</code></td><td class="num">66</td>
     <td>Chat-mode SSE synthesis, tool-call deltas, post-finish drain, drain telemetry, truncation, degradation, and the unfinished-turn retry nudge</td></tr>
 <tr><td><code>test_mode_dispatch.py</code></td><td class="num">28</td>
     <td>Mode dispatch, auth headers, path rewriting</td></tr>
 <tr><td><code>test_admin.py</code></td><td class="num">25</td>
     <td>Admin API endpoints, CSRF origin rules, switch and reload</td></tr>
-<tr><td><code>test_retry_streaming.py</code></td><td class="num">22</td>
+<tr><td><code>test_retry_streaming.py</code></td><td class="num">23</td>
     <td>Retry behaviour, streaming, response-size caps</td></tr>
-<tr><td><code>test_config_keys.py</code></td><td class="num">17</td>
+<tr><td><code>test_config_keys.py</code></td><td class="num">18</td>
     <td>Config validation, key decryption, multi-key shapes</td></tr>
 <tr><td><code>test_config_split.py</code></td><td class="num">10</td>
     <td>The two-document loader: merged load, the required sibling, leftover-key warnings, sibling
@@ -134,7 +134,7 @@ relative size, not as exact current figures.</p>
     <td>CLI lifecycle: start, stop, status, reload</td></tr>
 <tr><td><code>test_trace.py</code></td><td class="num">12</td>
     <td>Trace logging and trace analysis</td></tr>
-<tr><td><code>test_tier_routing.py</code></td><td class="num">11</td>
+<tr><td><code>test_tier_routing.py</code></td><td class="num">19</td>
     <td>Tier resolution, model resolution, reverse lookup</td></tr>
 <tr><td><code>test_unit.py</code></td><td class="num">2</td>
     <td>Unit-level helpers: jitter, delay computation, small utilities</td></tr>
@@ -152,7 +152,7 @@ relative size, not as exact current figures.</p>
     <td><strong>Not a test module.</strong> The aggregator and CLI entry point.</td></tr>
 </table>
 
-<!-- BEGIN per-test inventory (generated 2026-09-16) -->
+<!-- BEGIN per-test inventory (generated 2026-09-16; extended 2026-10-06) -->
 <h2 id="per-test">Per-Test Descriptions</h2>
 
 <p>Every test in the suite, grouped by the area it exercises. Use it to find which
@@ -179,7 +179,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> How a request's model name becomes a tier, and how a config is validated against the keys file before the proxy will start.</p>
 
-<h4><code>tests/test_tier_routing.py</code> (11 tests) — tier and model resolution</h4>
+<h4><code>tests/test_tier_routing.py</code> (19 tests) — tier and model resolution</h4>
 <ul>
 <li><code>test_tier_routing_basic</code>: Send request with model &quot;sonnet&quot;, verify correct upstream receives the configured model name and API key.</li>
 <li><code>test_tier_routing_all_tiers</code>: Send haiku/sonnet/opus requests, verify each routes to its configured provider.</li>
@@ -192,6 +192,14 @@ EOF</code></pre>
 <li><code>test_response_model_rewrite_streaming_non_message_start</code>: First SSE event is not message_start → forwarded unchanged, no rewrite attempted.</li>
 <li><code>test_two_tiers_same_model_same_provider</code>: Two tiers mapping to the same model from the same provider: the server starts, each request routes to the shared model, and JSON + SSE responses are rewritten to the…</li>
 <li><code>test_response_model_rewrite_upstream_model</code>: Upstream returns an arbitrary model name → rewritten to tier name (unconditional rewrite).</li>
+<li><code>test_non_object_body_rejected</code>: Every non-object JSON body (<code>null</code>, <code>123</code>, <code>&quot;x&quot;</code>, <code>[1,2]</code>, <code>true</code>, <code>3.14</code>) returns 400 <code>invalid_body_type</code> rather than aborting with zero bytes — previously <code>data.get(...)</code> raised <code>AttributeError</code>.</li>
+<li><code>test_deep_nested_body_invalid_json</code>: A ~20,000-deep body returns 400 <code>invalid_json</code> instead of a dropped connection. <code>RecursionError</code> is not a <code>ValueError</code>, so the pre-plan guard missed it entirely.</li>
+<li><code>test_deep_nested_body_encode_band</code>: A body inside the decode-succeeds/encode-fails band is answered, not dropped. The depth-20,000 test above lies past <em>both</em> ceilings and so exercises only the decode-side fail-safe; this one measures the band on the running interpreter and sits inside it.</li>
+<li><code>test_response_json_encode_band</code>: Pins <code>_rewrite_json_response</code>'s <em>encode</em> side — the re-serialize must sit inside the widened <code>try</code>, not after the <code>except</code> that returns (review-2 finding).</li>
+<li><code>test_sse_first_event_encode_band</code>: Pins <code>_rewrite_sse_first_event</code>'s separate encode guard — round 2 widened only the decode <code>try</code>, leaving <code>json.dumps</code> outside it (review-1 finding, reopened by review 2).</li>
+<li><code>test_error_envelope_shape</code>: <code>path_not_allowed</code> (400), <code>payload_too_large</code> (413) and <code>upstream_unreachable</code> (502, read from the response rather than the trace) each carry top-level <code>type == &quot;error&quot;</code>, an <code>error</code> object with type/code/message, and a non-empty top-level <code>request_id</code>.</li>
+<li><code>test_unrecognized_model_injection_safe</code>: A model name carrying JSON metacharacters cannot break the envelope — the message interpolates the client-supplied name verbatim, so the body must come from <code>json.dumps</code> rather than string interpolation.</li>
+<li><code>test_get_v1_models_404_envelope</code>: <code>do_GET</code>'s default branch answers any non-admin GET, and that response is not an admin surface — so <code>GET /v1/models</code> is an Anthropic-surface 404 carrying the envelope (<code>not_found_error</code> / <code>not_found</code>).</li>
 </ul>
 
 <h4><code>tests/test_config_split.py</code> (10 tests) — the two-document config loader</h4>
@@ -208,7 +216,7 @@ EOF</code></pre>
 <li><code>test_load_config_for_validation</code>: The CLI path is exactly as strict as the server path, and retains the <code>path=None</code> fallback to <code>SETTINGS.config_path</code>.</li>
 </ul>
 
-<h4><code>tests/test_config_keys.py</code> (17 tests) — config validation and key handling</h4>
+<h4><code>tests/test_config_keys.py</code> (18 tests) — config validation and key handling</h4>
 <ul>
 <li><code>test_config_validation_missing_tier</code>: Config with empty provider → server refuses to start.</li>
 <li><code>test_config_validation_unknown_provider</code>: Config references provider not in keys-index.json → server refuses to start.</li>
@@ -227,13 +235,14 @@ EOF</code></pre>
 <li><code>test_validate_config_key_name_checks</code>: validate_config&#x27;s provider_keys mode validates per-tier key selectors for ALL config tiers; the two-arg (legacy) call skips key checks.</li>
 <li><code>test_keys_file_invalid_multikey_shapes_rejected</code>: Every malformed multi-key vendor shape refuses server startup with a per-vendor ValueError — never a silent load-and-route.</li>
 <li><code>test_string_form_empty_key_warns_not_rejects</code>: A string-form empty key still loads (startup warning on stderr) and a request through that provider fails with invalid_provider_key — no empty auth header is forwarded…</li>
+<li><code>test_invalid_provider_url_envelope</code>: A vendor URL that loads but cannot be parsed yields 500 <code>invalid_provider_url</code> in the standard envelope. The keys loader only checks that <code>url</code> is present, so a URL with no usable scheme or host passes startup validation and fails at request time in <code>parse_upstream</code>; nothing else in the suite covers that path.</li>
 </ul>
 
 <h3 id="cat-2">Category 2 — Retry, Streaming, and Size Caps</h3>
 
 <p><strong>Scope:</strong> The retry ladder, the streaming and buffered response paths, and the body/response size limits that cut them short.</p>
 
-<h4><code>tests/test_retry_streaming.py</code> (22 tests) — retry, streaming, size caps</h4>
+<h4><code>tests/test_retry_streaming.py</code> (23 tests) — retry, streaming, size caps</h4>
 <ul>
 <li><code>test_concurrent_requests</code>: 10+ parallel requests complete successfully.</li>
 <li><code>test_retry_logic</code>: Start proxy; mock upstream returns 503 3x then 200; verify exponential backoff.</li>
@@ -257,6 +266,7 @@ EOF</code></pre>
 <li><code>test_retry_stability_extra_header</code>: A 429-retried request to a ruled provider carries the SAME x-opencode-session value on every attempt.</li>
 <li><code>test_trace_write_failure_does_not_duplicate_upstream_request</code>: A trace-write failure inside the retry loop must not be misread as a connection error and re-issue the upstream POST.</li>
 <li><code>test_retry_path_print_failure_does_not_misclassify</code>: A failing print inside the retry loop must not read as a connection error.</li>
+<li><code>test_give_up_truncated_body_envelope</code>: A truncated give-up body carries <code>upstream_body_truncated</code> and the status-appropriate <code>error.type</code>. On retry exhaustion the loop drains the upstream body through <code>_read_capped</code>; when that drain hits <code>PROXY_MAX_BODY_SIZE</code> the proxy substitutes its own body.</li>
 </ul>
 
 <h4><code>tests/test_unit.py</code> (2 tests) — delay and header helpers</h4>
@@ -401,7 +411,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> Synthesising Anthropic SSE events from a chat provider's stream: framing, tool-call deltas, and every degradation path.</p>
 
-<h4><code>tests/test_chat_sse.py</code> (62 tests) — chat-mode SSE synthesis, post-finish drain, drain telemetry, and framing</h4>
+<h4><code>tests/test_chat_sse.py</code> (66 tests) — chat-mode SSE synthesis, post-finish drain, drain telemetry, and framing</h4>
 <ul>
 <li><code>test_chat_sse_basic_streaming</code>: Simulated OpenAI SSE chunks produce valid Anthropic SSE events.</li>
 <li><code>test_chat_sse_finish_reason_mapping</code>: finish_reason maps to stop_reason in the terminal message_delta.</li>
@@ -465,6 +475,10 @@ EOF</code></pre>
 <li><code>test_chat_retry_nudge_sweep_expires_armed_only</code>: Store level: an <em>unarmed</em> entry backdated past the TTL survives another request's sweep — arm still returns True (the TTL is anchored at arm) and the recovery still matches it — while an <em>armed</em> entry backdated past the TTL is expired by the same sweep. Pins the sweep ordering that keeps a generation longer than the TTL from losing its own marker to a concurrent eligible request.</li>
 <li><code>test_chat_retry_nudge_ineligible_request_does_not_consume</code>: The marker check runs only inside the eligibility gate (chat mode <em>and</em> tools declared), so an <em>ineligible</em> request whose body strict-extends an armed entry is served un-nudged with an unchanged upstream body and leaves the single-use marker intact; the following eligible recovery then fires <code>chat_retry_nudge</code> naming the errored request.</li>
 <li><code>test_chat_sse_tool_degradation_on_cut_stream</code>: A cut stream (no <code>[DONE]</code>) whose tool-call delta never opens a block still fires exactly one coalesced <code>chat_sse_tool_degradation</code>, with no block started, an <code>error</code> frame and no terminal sequence, and <code>saw_done: 0</code> on <code>chat_sse_truncated</code>. This is the only committed test that reaches the unstarted-tool counting loop on the cut path — the loop's relocation into <code>log_degradation_if_needed()</code> is what the cut path depends on, and this test is what keeps that relocation from being silently undone.</li>
+<li><code>test_chat_sse_deep_frame_skipped</code>: A chat frame deeper than the decode ceiling is skipped, not fatal. Pins <code>handle_frame</code>'s widened guard (review-2): its <code>json.loads</code> caught only <code>json.JSONDecodeError</code>, and no fence exists between it and <code>do_POST</code>, so a deep frame aborted the request with zero bytes.</li>
+<li><code>test_chat_sse_deep_tool_args_at_close</code>: Deep tool arguments inside a <em>shallow</em> frame degrade at close, not fatal. Pins <code>close_open_tool_blocks</code>' widened guard (review-2): it caught only <code>ValueError</code>, and the deep content rides inside a JSON <em>string</em>, so the frame itself still parses.</li>
+<li><code>test_chat_sse_inband_usage_terminal</code>: An in-band upstream <code>usage</code> value still yields <code>message_delta</code> and <code>message_stop</code>. Pins <code>terminal()</code>'s int-only usage copy (review-3 finding): <code>usage</code> is stored unvalidated from the upstream frame, so without the type check a deep value parses and then fails at encode — leaving a clean EOF that reads as a truncated success.</li>
+<li><code>test_sse_event_unserializable_payload_degrades</code>: A payload <code>_sse_event</code> cannot serialize degrades to an SSE <code>error</code> frame carrying <code>error.code: &quot;response_frame_encode_failure&quot;</code> rather than raising. Pins the encode fence added for the review-3 finding — <code>_sse_event</code>'s <code>json.dumps</code> had been the only request/response-path encode with no enclosing <code>try</code>.</li>
 </ul>
 
 <h3 id="cat-7">Category 7 — Compatibility Learner</h3>

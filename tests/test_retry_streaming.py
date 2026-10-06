@@ -2016,13 +2016,25 @@ def test_disable_retry_count_tokens_conn_error():
         status, resp_body = _send_proxy_request(
             proxy_port, path="/v1/messages/count_tokens?beta=true", body=body)
 
-        if status == 0:
-            pass_("Client received status 0 (connection error path)")
+        if status == 502:
+            try:
+                data = json.loads(resp_body)
+            except Exception as e:
+                fail("conn-error response is not valid JSON: {} ({!r})".format(
+                    e, resp_body[:200]))
+                data = None
+            if data is not None:
+                code = (data.get("error") or {}).get("code")
+                if code == "upstream_unreachable":
+                    pass_("Client received parseable 502 upstream_unreachable")
+                else:
+                    fail("expected error.code upstream_unreachable, got {!r}".format(code))
+        elif status == 0:
+            fail("Client received status 0 — the response is unparseable")
         else:
-            fail(f"Client received {status}, expected 0 (connection error)")
+            fail(f"Client received {status}, expected 502 (upstream unreachable)")
 
-        # Client cannot parse HTTP/1.0 0, so the upstream_unreachable body is
-        # asserted via the trace (mirrors test_exhaust_connection_error_synthesizes_body).
+        # The trace 'error' field carries the same envelope body.
         time.sleep(0.3)
         proc.terminate()
         try:
@@ -2054,6 +2066,64 @@ def test_disable_retry_count_tokens_conn_error():
         except subprocess.TimeoutExpired:
             proc.kill()
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _truncating_429_responder(info):
+    """Upstream answering 429 with a body larger than the drain cap."""
+    return 429, "application/json", json.dumps({
+        "error": {"type": "rate_limit_error", "message": "x" * 4096}
+    }).encode()
+
+
+def test_give_up_truncated_body_envelope():
+    """A truncated give-up body carries upstream_body_truncated and the
+    status-appropriate error.type.
+
+    On retry exhaustion the retry loop drains the upstream body through
+    _read_capped, capped at PROXY_MAX_BODY_SIZE. When the drain hits that cap
+    the proxy substitutes its own body — now the standard envelope with
+    error.code upstream_body_truncated and error.type derived from the
+    upstream status (429 -> rate_limit_error).
+    """
+    print("\n--- Test: Give-Up Truncated Body Envelope ---")
+
+    upstream = find_free_port()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream), "key": "K"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        _mode_tiers(), vendors,
+        responders={"p": _truncating_429_responder},
+        extra_env={"PROXY_MAX_RETRIES": "1", "PROXY_INITIAL_DELAY": "1",
+                   "PROXY_MAX_DELAY": "1", "PROXY_MAX_BODY_SIZE": "1024"})
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, resp_body = _send_proxy_request(proxy_port)
+        if status != 429:
+            fail("expected 429 on exhaustion, got {}".format(status))
+            return
+        try:
+            data = json.loads(resp_body)
+        except Exception as e:
+            fail("truncated-body response is not valid JSON: {} ({!r})".format(
+                e, resp_body[:200]))
+            return
+        err = data.get("error")
+        if not isinstance(err, dict):
+            fail("truncated-body: error is not an object: {!r}".format(err))
+            return
+        if err.get("code") != "upstream_body_truncated":
+            fail("expected code upstream_body_truncated, got {!r}".format(err.get("code")))
+            return
+        if err.get("type") != "rate_limit_error":
+            fail("expected error.type rate_limit_error for a 429, got {!r}".format(err.get("type")))
+            return
+        if data.get("type") != "error" or not data.get("request_id"):
+            fail("truncated-body envelope shape wrong: {!r}".format(data))
+            return
+        pass_("truncated give-up body -> upstream_body_truncated / rate_limit_error")
+    finally:
+        cleanup()
 
 
 
@@ -2837,6 +2907,7 @@ ALL_TESTS = [
     ("empty-body-429-exhaust", test_empty_body_429_exhaust),
     ("disable-retry-count-tokens-503", test_disable_retry_count_tokens_503),
     ("disable-retry-count-tokens-conn-error", test_disable_retry_count_tokens_conn_error),
+    ("give-up-truncated-body-envelope", test_give_up_truncated_body_envelope),
     ("disable-retry-count-tokens-normal-path-unaffected", test_disable_retry_count_tokens_normal_path_unaffected),
     ("disable-retry-count-tokens-false-retries", test_disable_retry_count_tokens_false_retries),
     ("disable-retry-count-tokens-path-anchoring", test_disable_retry_count_tokens_path_anchoring),

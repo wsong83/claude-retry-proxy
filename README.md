@@ -506,7 +506,13 @@ icacls "$env:USERPROFILE\.claude\logs" /inheritance:r /grant:r "$env:USERNAME:(O
   maximal delay; jitter de-synchronizes concurrent sessions.
 - **Error body preservation** — exhausted retries on `429`/`503` return the
   upstream error body to the client; connection-error exhaustion returns a
-  synthesized `upstream_unreachable` body (visible in the trace log).
+  synthesized `upstream_unreachable` body with status `502` (visible in the
+  trace log).
+- **Anthropic error envelope** — every error the proxy generates *itself*,
+  rather than forwards, is returned in the standard Anthropic envelope
+  (`{"type":"error","error":{"type","code","message"},"request_id"}`), so a
+  client that already handles Anthropic errors needs no special case for the
+  proxy's own failures. The admin surface is deliberately excluded.
 - **Graceful disconnect handling** — client disconnects mid-response are
   logged as `client_disconnect` trace events; no tracebacks.
 - **Trace pruning** — `start` removes entries older than 5 days from the

@@ -99,10 +99,20 @@ def test_mode_invalid_rejected():
         status, body = _send_proxy_request(proxy_port)
         if status != 500:
             fail("expected 500 for invalid mode, got {}".format(status))
-        elif b"invalid_provider_mode" not in body:
-            fail("expected invalid_provider_mode in error body, got {}".format(body.decode(errors="replace")))
         else:
-            pass_("invalid mode returns 500 invalid_provider_mode")
+            try:
+                parsed = json.loads(body)
+            except Exception as e:
+                fail("invalid-mode response is not valid JSON: {} ({!r})".format(
+                    e, body.decode(errors="replace")[:200]))
+                parsed = None
+            if parsed is not None:
+                err = parsed.get("error")
+                code = err.get("code") if isinstance(err, dict) else None
+                if code == "invalid_provider_mode":
+                    pass_("invalid mode returns 500 invalid_provider_mode")
+                else:
+                    fail("expected error.code invalid_provider_mode, got {!r}".format(code))
     finally:
         cleanup()
 
@@ -360,10 +370,21 @@ def test_count_tokens_rejected_chat_mode():
             body=json.dumps({"model": "sonnet"}))
         if status != 400:
             fail("chat mode count_tokens: expected 400, got {}".format(status))
-        elif b"count_tokens" not in body:
-            fail("expected count_tokens rejection message, got {}".format(body.decode(errors="replace")))
         else:
-            pass_("chat mode rejects count_tokens with 400")
+            try:
+                parsed = json.loads(body)
+            except Exception as e:
+                fail("chat mode count_tokens: 400 is not valid JSON: {} ({!r})".format(
+                    e, body.decode(errors="replace")[:200]))
+                parsed = None
+            if parsed is not None:
+                err = parsed.get("error")
+                code = err.get("code") if isinstance(err, dict) else None
+                if code == "count_tokens_unsupported":
+                    pass_("chat mode rejects count_tokens with 400 count_tokens_unsupported")
+                else:
+                    fail("chat mode count_tokens: expected error.code "
+                         "count_tokens_unsupported, got {!r}".format(code))
     finally:
         cleanup()
 
@@ -386,10 +407,21 @@ def test_count_tokens_rejected_response_mode():
             body=json.dumps({"model": "sonnet"}))
         if status != 400:
             fail("response mode count_tokens: expected 400, got {}".format(status))
-        elif b"count_tokens" not in body:
-            fail("expected count_tokens rejection message, got {}".format(body.decode(errors="replace")))
         else:
-            pass_("response mode rejects count_tokens with 400")
+            try:
+                parsed = json.loads(body)
+            except Exception as e:
+                fail("response mode count_tokens: 400 is not valid JSON: {} ({!r})".format(
+                    e, body.decode(errors="replace")[:200]))
+                parsed = None
+            if parsed is not None:
+                err = parsed.get("error")
+                code = err.get("code") if isinstance(err, dict) else None
+                if code == "count_tokens_unsupported":
+                    pass_("response mode rejects count_tokens with 400 count_tokens_unsupported")
+                else:
+                    fail("response mode count_tokens: expected error.code "
+                         "count_tokens_unsupported, got {!r}".format(code))
     finally:
         cleanup()
 

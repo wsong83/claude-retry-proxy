@@ -1189,10 +1189,19 @@ def test_string_form_empty_key_warns_not_rejects():
         try:
             status, body = _send_proxy_request(port)
             text = body.decode("utf-8", errors="replace")
-            if status == 500 and "invalid_provider_key" in text:
-                pass_("request through empty-key provider returns 500 invalid_provider_key")
-            else:
-                fail("expected 500 invalid_provider_key, got {} {!r}".format(status, text[:200]))
+            try:
+                parsed = json.loads(body)
+            except Exception as e:
+                fail("empty-key response is not valid JSON: {} ({!r})".format(e, text[:200]))
+                parsed = None
+            if parsed is not None:
+                err = parsed.get("error")
+                code = err.get("code") if isinstance(err, dict) else None
+                if status == 500 and code == "invalid_provider_key":
+                    pass_("request through empty-key provider returns 500 invalid_provider_key")
+                else:
+                    fail("expected 500 error.code invalid_provider_key, got {} {!r}".format(
+                        status, text[:200]))
         finally:
             proc.terminate()
             try:
@@ -1210,6 +1219,85 @@ def test_string_form_empty_key_warns_not_rejects():
                 fail("expected empty-key WARNING on stderr, got {!r}".format(err[:400]))
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_invalid_provider_url_envelope():
+    """A vendor URL that loads but cannot be parsed yields 500 invalid_provider_url
+    in the standard envelope.
+
+    The keys loader only checks that 'url' is present; a URL with no usable
+    scheme/host passes startup validation and fails at request time in
+    parse_upstream. Nothing else in the suite covers this code, and it is
+    asserted from the response body (not the trace).
+
+    parse_upstream defers the port check to attribute access, so a
+    port-bearing malformed URL (out-of-range or non-numeric port) or a
+    malformed IPv6 authority raises before the None return. Every shape here
+    must reach the envelope rather than aborting with zero bytes.
+    """
+    print("\n--- Test: Invalid Provider URL Envelope ---")
+    corpus = [
+        "not-a-url",                 # no scheme/host -> urlparse host is None
+        "http://127.0.0.1:99999",    # port out of range -> parsed.port raises
+        "http://127.0.0.1:abc",      # non-numeric port -> parsed.port raises
+        "http://[::1",               # malformed IPv6 authority -> urlparse raises
+    ]
+    for bad_url in corpus:
+        temp_dir = tempfile.mkdtemp(prefix="proxy_badurl_")
+        try:
+            tiers = {
+                "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+                "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+                "opus": {"provider": "p", "model": "claude-opus-5"},
+            }
+            config_path = _create_test_config(temp_dir, tiers, models={
+                "p": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]})
+            keys_path = _create_test_keys_plain(temp_dir, {
+                "p": {"url": bad_url, "key": "K"}
+            })
+            port = find_free_port()
+            proc, probe_ok = _start_proxy_server_directly(
+                port, config_path=config_path, keys_path=keys_path, passphrase=None)
+            if not probe_ok:
+                fail("server refused to start with URL {!r} (expected load OK)".format(
+                    bad_url))
+                continue
+            try:
+                status, body = _send_proxy_request(port)
+                text = body.decode("utf-8", errors="replace")
+                if status == 0:
+                    fail("URL {!r}: dropped the connection (zero-byte abort)".format(
+                        bad_url))
+                    continue
+                if status != 500:
+                    fail("URL {!r}: expected 500, got {} ({!r})".format(
+                        bad_url, status, text[:200]))
+                    continue
+                try:
+                    parsed = json.loads(body)
+                except Exception as e:
+                    fail("URL {!r}: response is not valid JSON: {} ({!r})".format(
+                        bad_url, e, text[:200]))
+                    continue
+                err = parsed.get("error")
+                code = err.get("code") if isinstance(err, dict) else None
+                if code != "invalid_provider_url":
+                    fail("URL {!r}: expected error.code invalid_provider_url, "
+                         "got {!r}".format(bad_url, code))
+                    continue
+                if parsed.get("type") != "error" or not parsed.get("request_id"):
+                    fail("URL {!r}: invalid-url envelope shape wrong: {!r}".format(
+                        bad_url, parsed))
+                    continue
+                pass_("URL {!r} -> 500 invalid_provider_url envelope".format(bad_url))
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 ALL_TESTS = [
@@ -1230,6 +1318,7 @@ ALL_TESTS = [
     ("validate-config-key-name-checks", test_validate_config_key_name_checks),
     ("keys-file-invalid-multikey-shapes-rejected", test_keys_file_invalid_multikey_shapes_rejected),
     ("string-form-empty-key-warns-not-rejects", test_string_form_empty_key_warns_not_rejects),
+    ("invalid-provider-url-envelope", test_invalid_provider_url_envelope),
 ]
 
 

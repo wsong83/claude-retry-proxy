@@ -293,7 +293,9 @@ what you need in context, and the link has the rest.
 | `disable_retry_claude_count_token` skips retrying `count_tokens` (template default `true`) | [doc/configuration.html#count-tokens-flag](doc/configuration.html#count-tokens-flag) |
 | Trace/state I/O failures degrade the proxy; they never stop it — except at startup, which fails fast | [doc/architecture.html#sinks](doc/architecture.html#sinks) |
 | Responses are truncated at `PROXY_MAX_RESPONSE_SIZE` with a `response_size_cap_exceeded` event | [doc/architecture.html#size-caps](doc/architecture.html#size-caps) |
-| On 429/503 exhaustion the upstream error body is preserved and returned; connection errors get a synthesized body | [doc/architecture.html#give-up](doc/architecture.html#give-up) |
+| On 429/503 exhaustion the upstream error body is preserved and returned; connection errors get a synthesized body, now with status `502` rather than a literal `0` | [doc/architecture.html#give-up](doc/architecture.html#give-up) |
+| Every error the proxy generates itself uses the Anthropic envelope (`error.type` taxonomy + `error.code` discriminator + `request_id`); the admin surface is deliberately excluded | [doc/architecture.html#error-envelope](doc/architecture.html#error-envelope) |
+| The decode and encode ceilings differ (`json.loads` ≈16,920 vs `json.dumps` ≈15,501), so a band of payloads parses and then fails to re-encode — guards are verified by `try`-**enclosure**, never by grepping `except` | [doc/architecture.html#error-envelope](doc/architecture.html#error-envelope) |
 | Integer-second jitter is degenerate for `base ∈ {1, 2}` — zero de-sync; effective from `base ≥ 3` | [doc/architecture.html#jitter](doc/architecture.html#jitter) |
 | Heartbeat state is in-memory; `proxy-state.json` is a projection rewritten every 30 s | [doc/architecture.html#heartbeat](doc/architecture.html#heartbeat) |
 | Shutdown kills in-flight requests — it does not drain them, and the killed request's trace entry never lands | [doc/operations.html#shutdown](doc/operations.html#shutdown) |
@@ -316,8 +318,8 @@ what you need in context, and the link has the rest.
 - **[doc/content.html](doc/content.html) — the human-facing reference.** Start
   here; it indexes the whole tree.
   - [architecture.html](doc/architecture.html) — request path, tier resolution,
-    retry/backoff, give-up, size caps, disconnects, config swap, heartbeat,
-    sinks, shutdown
+    retry/backoff, error responses and the Anthropic envelope, give-up, size
+    caps, disconnects, config swap, heartbeat, sinks, shutdown
   - [provider-modes.html](doc/provider-modes.html) — the three endpoint modes,
     auth, paths, request/response transforms, SSE, tool-call degradation
   - [configuration.html](doc/configuration.html) — `config.json`,

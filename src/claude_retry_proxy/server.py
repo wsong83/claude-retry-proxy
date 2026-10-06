@@ -320,15 +320,22 @@ def parse_upstream(url):
     """Parse upstream URL into (host, port, use_ssl, path_prefix). Returns None on failure."""
     if not url:
         return None
-    parsed = urlparse(url)
-    host = parsed.hostname
-    if not host:
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if not host:
+            return None
+        # urlparse defers the port check to attribute access, so an
+        # out-of-range or non-numeric port raises here rather than at the
+        # urlparse call; a malformed IPv6 authority raises out of urlparse.
+        port = parsed.port
+    except ValueError:
         return None
     if parsed.scheme == "https":
-        port = parsed.port or 443
+        port = port or 443
         use_ssl = True
     elif parsed.scheme == "http":
-        port = parsed.port or 80
+        port = port or 80
         use_ssl = False
     else:
         return None
@@ -421,7 +428,30 @@ def compute_jittered_delay(base):
     return max(0, math.floor(base + jitter + 0.5))
 
 
-def _read_capped(resp, max_bytes):
+def _error_body(error_type, code, message, request_id=None):
+    """Build a client-facing error body in the Anthropic standard envelope.
+
+    Returns bytes for
+    {"type":"error","error":{"type":…,"code":…,"message":…},"request_id":…}.
+    The top-level shape (type/error/request_id) is the Anthropic standard
+    error envelope; error.type is a coarse taxonomy category while
+    error.code is the proxy-discriminator extension carrying the fine
+    detail (the former nested type strings ride there verbatim).
+    The request_id key is omitted entirely (not null) when None.
+    Serialized with json.dumps — never string interpolation — because
+    message carries client-controlled text (unrecognized_model) and
+    exception text (upstream_unreachable); both must stay JSON-escaped.
+    """
+    envelope = {
+        "type": "error",
+        "error": {"type": error_type, "code": code, "message": message},
+    }
+    if request_id is not None:
+        envelope["request_id"] = request_id
+    return json.dumps(envelope).encode("utf-8")
+
+
+def _read_capped(resp, max_bytes, request_id=None):
     """Read up to max_bytes from resp. Truncate past the cap with a marker.
 
     Drains the response body so the connection can be closed cleanly, but
@@ -455,7 +485,16 @@ def _read_capped(resp, max_bytes):
     except OSError:
         pass
     if truncated:
-        return b'{"error":"[proxy: response body truncated]"}'
+        # error.type tracks the status this body is returned under, so a
+        # rate-limit/overload give-up keeps its taxonomy category.
+        if resp.status == 429:
+            err_type = "rate_limit_error"
+        elif resp.status == 503:
+            err_type = "overloaded_error"
+        else:
+            err_type = "api_error"
+        return _error_body(err_type, "upstream_body_truncated",
+                           "[proxy: response body truncated]", request_id)
     return b"".join(chunks)
 
 
@@ -705,27 +744,43 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     top-level forward_request call) resolves at that gate.
     """
     if method not in ALLOWED_METHODS:
-        return 400, {}, b'{"error":"Method not allowed"}', 0, 0, 0, "unknown", None, None
+        return 400, {}, _error_body("invalid_request_error", "method_not_allowed",
+                                    "Method not allowed", request_id), \
+            0, 0, 0, "unknown", None, None
 
     if not ALLOWED_PATH_RE.match(path):
-        return 400, {}, b'{"error":"Path not allowed"}', 0, 0, 0, "unknown", None, None
+        return 400, {}, _error_body("invalid_request_error", "path_not_allowed",
+                                    "Path not allowed", request_id), \
+            0, 0, 0, "unknown", None, None
 
     if body and len(body) > SETTINGS.max_body_size:
-        return 413, {}, b'{"error":"Payload too large"}', 0, 0, 0, "unknown", None, None
+        return 413, {}, _error_body("request_too_large", "payload_too_large",
+                                    "Payload too large", request_id), \
+            0, 0, 0, "unknown", None, None
 
     # Resolve tier from model name
-    model_name = extract_model(body)
+    model_name, body_error = extract_model(body)
+    if body_error is not None:
+        # Body-shape rejection, before tier resolution: the two new codes
+        # Step 3 of the envelope plan adds on a path that had no response.
+        if body_error == "invalid_body_type":
+            message = "Request body must be a JSON object"
+        else:  # "invalid_json"
+            message = "Request body is not valid JSON"
+        return 400, {}, _error_body("invalid_request_error", body_error,
+                                    message, request_id), \
+            0, 0, 0, "unknown", None, None
     tier = resolve_tier(model_name, config)
 
     if tier == "unknown":
         # Unknown model - reject with 400 listing valid tiers
         # List in plan-specified order: haiku, sonnet, opus
         valid_tiers = [t for t in ("haiku", "sonnet", "opus") if t in config.get("tiers", {})]
-        err_msg = json.dumps({
-            "error": "Unrecognized model: {}. Valid tiers: {}".format(
-                model_name, ", ".join(valid_tiers))
-        })
-        return 400, {}, err_msg.encode("utf-8"), 0, 0, 0, "unknown", None, None
+        err_msg = "Unrecognized model: {}. Valid tiers: {}".format(
+            model_name, ", ".join(valid_tiers))
+        return 400, {}, _error_body("invalid_request_error", "unrecognized_model",
+                                    err_msg, request_id), \
+            0, 0, 0, "unknown", None, None
 
     # Look up provider and upstream info
     tier_config = config["tiers"][tier]
@@ -739,26 +794,19 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
         # Degenerate resolution (defense-in-depth behind the load gate — e.g.
         # a string-form "key": "" vendor): fail clearly rather than emitting
         # an empty/x-api-key: None header upstream.
-        err_msg = json.dumps({
-            "error": {
-                "type": "invalid_provider_key",
-                "message": "Provider '{}' has no usable API key configured".format(
-                    provider_name)
-            }
-        })
-        return 500, {}, err_msg.encode("utf-8"), 0, 0, 0, tier, provider_name, actual_model
+        return 500, {}, _error_body(
+            "api_error", "invalid_provider_key",
+            "Provider '{}' has no usable API key configured".format(provider_name),
+            request_id), 0, 0, 0, tier, provider_name, actual_model
 
     # Read endpoint mode (None/''/missing normalize to "anthropic")
     mode = vendor.get("mode") or "anthropic"
     if mode not in SETTINGS.mode_values:
-        err_msg = json.dumps({
-            "error": {
-                "type": "invalid_provider_mode",
-                "message": "Provider '{}' has invalid mode '{}'. Valid modes: {}".format(
-                    provider_name, mode, ", ".join(SETTINGS.mode_values))
-            }
-        })
-        return 500, {}, err_msg.encode("utf-8"), 0, 0, 0, tier, provider_name, actual_model
+        return 500, {}, _error_body(
+            "api_error", "invalid_provider_mode",
+            "Provider '{}' has invalid mode '{}'. Valid modes: {}".format(
+                provider_name, mode, ", ".join(SETTINGS.mode_values)),
+            request_id), 0, 0, 0, tier, provider_name, actual_model
 
     if mode != "anthropic":
         log_trace({
@@ -774,13 +822,10 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     # Parse upstream URL
     parsed = parse_upstream(upstream_url)
     if parsed is None:
-        err_msg = json.dumps({
-            "error": {
-                "type": "invalid_provider_url",
-                "message": "Provider '{}' has invalid URL: {}".format(provider_name, upstream_url)
-            }
-        })
-        return 500, {}, err_msg.encode("utf-8"), 0, 0, 0, tier, provider_name, actual_model
+        return 500, {}, _error_body(
+            "api_error", "invalid_provider_url",
+            "Provider '{}' has invalid URL: {}".format(provider_name, upstream_url),
+            request_id), 0, 0, 0, tier, provider_name, actual_model
 
     host, port, use_ssl, path_prefix = parsed
 
@@ -789,10 +834,10 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     _is_count_tokens = path.split("?", 1)[0].rstrip("/").endswith(
         "/messages/count_tokens")
     if mode != "anthropic" and _is_count_tokens:
-        err_msg = json.dumps({
-            "error": "count_tokens not supported in chat/response mode"
-        })
-        return 400, {}, err_msg.encode("utf-8"), 0, 0, 0, tier, provider_name, actual_model
+        return 400, {}, _error_body(
+            "invalid_request_error", "count_tokens_unsupported",
+            "count_tokens not supported in chat/response mode",
+            request_id), 0, 0, 0, tier, provider_name, actual_model
 
     # Parse the request body once. Unparseable bodies skip compatibility
     # logic entirely (the transform below falls back to the original body).
@@ -800,7 +845,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     if body:
         try:
             body_json = json.loads(body)
-        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
             body_json = None
     # Whether the client declared tools: the denominator that makes
     # chat_sse_drain.emitted_tool_use interpretable, and the input the
@@ -933,8 +978,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                     provider=provider_name, tier=tier)).encode("utf-8")
             else:
                 rewritten_body = json.dumps(body_json).encode("utf-8")
-        except (json.JSONDecodeError, UnicodeDecodeError, TypeError,
-                KeyError, IndexError, AttributeError, ValueError):
+        except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
             if mode != "anthropic":
                 log_trace({
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1177,7 +1221,7 @@ def _forward_core(method, path, handler, request_id, config,
                     conn.close()
                     continue
                 else:
-                    err_body = _read_capped(resp, SETTINGS.max_body_size)
+                    err_body = _read_capped(resp, SETTINGS.max_body_size, request_id)
                     try:
                         conn.close()
                     except OSError:
@@ -1366,17 +1410,18 @@ def _forward_core(method, path, handler, request_id, config,
                 continue
             else:
                 total_elapsed = time.time() - total_start
-                err_body = json.dumps({
-                    "error": {
-                        "type": "upstream_unreachable",
-                        "message": "upstream: {} after {} retries".format(
-                            sanitize_error(str(e)) or "connection failed", retries),
-                    }
-                }).encode("utf-8")
-                return 0, {}, err_body, None, total_elapsed, retries, tier, provider_name, actual_model
+                err_body = _error_body(
+                    "api_error", "upstream_unreachable",
+                    "upstream: {} after {} retries".format(
+                        sanitize_error(str(e)) or "connection failed", retries),
+                    request_id)
+                return 502, {}, err_body, None, total_elapsed, retries, tier, provider_name, actual_model
 
     total_elapsed = time.time() - total_start
-    return last_status or 0, {}, b'', None, total_elapsed, retries, tier, provider_name, actual_model
+    return (last_status or 502), {}, _error_body(
+        "api_error", "upstream_unreachable",
+        "upstream: connection failed after {} retries".format(retries),
+        request_id), None, total_elapsed, retries, tier, provider_name, actual_model
 
 
 # ---------------------------------------------------------------------------
@@ -1386,19 +1431,28 @@ def _forward_core(method, path, handler, request_id, config,
 def extract_model(body_bytes):
     """Extract model name from request body.
 
-    Returns "unknown" if body is empty, not valid JSON, or model is missing/None/non-string.
+    Returns a 2-tuple (model_name, body_error). The contract is total —
+    exactly five outcomes:
+      - empty body: ("unknown", None) — early return, never reaches json.loads
+        (empty bodies continue to surface as unrecognized_model)
+      - object body, usable model: (name, None)
+      - object body, model missing/None/non-string: ("unknown", None)
+      - parses but is not a dict: (None, "invalid_body_type")
+      - does not parse: (None, "invalid_json")
     """
     if not body_bytes:
-        return "unknown"
+        return "unknown", None
     try:
         data = json.loads(body_bytes)
-        model = data.get("model")
-        # Guard against None or non-string model values
-        if model is None or not isinstance(model, str):
-            return "unknown"
-        return model
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return "unknown"
+    except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
+        return None, "invalid_json"
+    if not isinstance(data, dict):
+        return None, "invalid_body_type"
+    model = data.get("model")
+    # Guard against None or non-string model values
+    if model is None or not isinstance(model, str):
+        return "unknown", None
+    return model, None
 
 
 def resolve_tier(model_name, config):
@@ -1485,7 +1539,7 @@ def _rewrite_sse_first_event(event_bytes, tier, request_id):
     json_text = "\n".join(data_lines)
     try:
         data = json.loads(json_text)
-    except json.JSONDecodeError:
+    except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
         # Malformed JSON - forward unchanged with warning
         log_trace({
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1516,15 +1570,25 @@ def _rewrite_sse_first_event(event_bytes, tier, request_id):
     message["model"] = tier
     data["message"] = message
 
-    # Rebuild SSE event - preserve original format
-    new_json = json.dumps(data)
-    if event_type:
-        # Had explicit event: line
-        new_event = "event: {}\ndata: {}\n\n".format(event_type, new_json)
-    else:
-        # Data-only format
-        new_event = "data: {}\n\n".format(new_json)
-    return new_event.encode("utf-8")
+    # Rebuild SSE event - preserve original format. The re-serialize runs in
+    # its own guard (mirroring transforms_common._transform_and_guard's
+    # decode/encode pair): json.dumps raises RecursionError at a lower
+    # nesting depth than json.loads, so a message_start payload in the
+    # decode-ok/encode-raise band must degrade to the original event rather
+    # than escape unfenced and abort the stream. Kept separate from the
+    # decode guard so an encode failure does not log
+    # sse_rewrite_malformed_json — the JSON parsed fine.
+    try:
+        new_json = json.dumps(data)
+        if event_type:
+            # Had explicit event: line
+            new_event = "event: {}\ndata: {}\n\n".format(event_type, new_json)
+        else:
+            # Data-only format
+            new_event = "data: {}\n\n".format(new_json)
+        return new_event.encode("utf-8")
+    except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
+        return event_bytes
 
 
 def _rewrite_json_response(body_bytes, tier, request_id):
@@ -1540,18 +1604,19 @@ def _rewrite_json_response(body_bytes, tier, request_id):
     """
     try:
         data = json.loads(body_bytes)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+        if not isinstance(data, dict):
+            return body_bytes
+        upstream_model = data.get("model")
+        if not upstream_model or not isinstance(upstream_model, str):
+            return body_bytes
+        data["model"] = tier
+        # The re-serialize stays INSIDE this guard: json.dumps raises
+        # RecursionError at a lower nesting depth than json.loads, so a body
+        # can parse and then fail to re-encode (the decode-ok/encode-raise
+        # band) — raising here would escape unfenced and abort the response.
+        return json.dumps(data).encode("utf-8")
+    except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
         return body_bytes
-
-    if not isinstance(data, dict):
-        return body_bytes
-
-    upstream_model = data.get("model")
-    if not upstream_model or not isinstance(upstream_model, str):
-        return body_bytes
-
-    data["model"] = tier
-    return json.dumps(data).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -1752,7 +1817,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return None
         return first_byte_ms
 
-    def _sse_event(self, payload):
+    def _sse_event(self, payload, request_id=None):
         """Serialize one SSE frame — `event: <type>` + `data: <json>` lines.
 
         The Anthropic SDKs dispatch streaming events on the SSE `event:` field
@@ -1760,12 +1825,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         event=None and is silently dropped. The type is taken from
         payload["type"], and provider-controlled bytes only ever flow through
         json.dumps (SSE injection guard).
+
+        The encode is fenced: a payload json.dumps cannot serialize (an
+        in-band upstream-typed value that survived every copy-site check)
+        degrades to a standard SSE error event rather than raising — an
+        uncaught raise here surfaced to the client as a silent clean EOF
+        with no terminal events, bypassing the cut-stream error machinery.
         """
         etype = payload.get("type")
         if not isinstance(etype, str) or not etype:
             etype = "message"
+        try:
+            body = json.dumps(payload)
+        except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
+            etype = "error"
+            body = _error_body("api_error", "response_frame_encode_failure",
+                               "response frame could not be serialized",
+                               request_id).decode("utf-8")
         return ("event: " + etype + "\n"
-                "data: " + json.dumps(payload) + "\n\n").encode("utf-8")
+                "data: " + body + "\n\n").encode("utf-8")
 
     def _stream_chat_sse_to_anthropic(self, resp, request_id, tier, first_byte_start,
                                       tools_declared=False, provider=None, key=None,
@@ -1851,7 +1929,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         def write(payload):
             nonlocal bytes_streamed, first_byte_ms
-            data = self._sse_event(payload)
+            data = self._sse_event(payload, request_id)
             self.wfile.write(data)
             self.wfile.flush()
             bytes_streamed += len(data)
@@ -1974,7 +2052,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if validate and not st["dropped"]:
                     try:
                         parsed = json.loads("".join(st["arg_parts"]))
-                    except ValueError:
+                    except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
+                        # RecursionError counts as unparseable: the deep
+                        # content rides inside a JSON string, so the frame
+                        # itself parses even when these arguments do not.
                         unparseable_arg_count += 1
                         continue
                     if not isinstance(parsed, dict):
@@ -2116,10 +2197,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         def terminal(stop_reason, force_log=False):
             close_all_blocks()
             delta_usage = {"input_tokens": 0, "output_tokens": 0}
-            if usage.get("prompt_tokens") is not None:
-                delta_usage["input_tokens"] = usage.get("prompt_tokens")
-            if usage.get("completion_tokens") is not None:
-                delta_usage["output_tokens"] = usage.get("completion_tokens")
+            # usage is stored unvalidated from the upstream frame, so the
+            # copy must type-check: a non-int (bools excluded) — e.g. a
+            # nested structure at encode-band depth — parses under
+            # handle_frame's guarded json.loads but raises RecursionError on
+            # the message_delta re-encode, which used to escape as a silent
+            # clean EOF with no terminal events. Only ints enter the
+            # payload; anything else keeps the 0 default.
+            pt = usage.get("prompt_tokens")
+            if isinstance(pt, int) and not isinstance(pt, bool):
+                delta_usage["input_tokens"] = pt
+            ct = usage.get("completion_tokens")
+            if isinstance(ct, int) and not isinstance(ct, bool):
+                delta_usage["output_tokens"] = ct
             write({
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": None},
@@ -2179,7 +2269,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 return "done"
             try:
                 chunk = json.loads(raw)
-            except json.JSONDecodeError:
+            except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
                 log_trace({
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "event": "chat_sse_malformed_json",
@@ -2565,7 +2655,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 {"type": "message_stop"},
             ]
             for ev in events:
-                self.wfile.write(self._sse_event(ev))
+                self.wfile.write(self._sse_event(ev, request_id))
             self.wfile.flush()
             first_byte_ms = (time.time() - first_byte_start) * 1000
         except _DISCONNECT_ERRORS:
@@ -2687,8 +2777,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             }).encode("utf-8"))
             return
 
-        # Default: 404
-        self._send_response(404, b'{"error":"not found"}')
+        # Default: 404 — answers any non-admin GET, including GET /v1/models,
+        # so it is an Anthropic-surface response and carries the envelope.
+        self._send_response(404, _error_body(
+            "not_found_error", "not_found", "not found", str(uuid.uuid4())))
 
     def do_POST(self):
         global _current_config
@@ -3021,12 +3113,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         try:
             content_length = int(self.headers.get("Content-Length", 0))
         except (ValueError, TypeError):
-            self._send_response(400, b'{"error":"invalid Content-Length"}')
+            self._send_response(400, _error_body(
+                "invalid_request_error", "invalid_content_length",
+                "invalid Content-Length", request_id))
             return
         if content_length > SETTINGS.max_body_size:
             try:
-                self._send_response(413,
-                    b'{"error":"Payload too large"}')
+                self._send_response(413, _error_body(
+                    "request_too_large", "payload_too_large",
+                    "Payload too large", request_id))
             except _DISCONNECT_ERRORS:
                 self._log_client_disconnect(request_id, 413, 0)
             log_trace({
@@ -3047,7 +3142,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(content_length) if content_length > 0 else b""
 
         # request_id already generated above
-        model = extract_model(body)
+        model, _body_error = extract_model(body)
 
         increment_total()
 
@@ -3069,7 +3164,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "request_id": request_id,
             "method": self.command,
             "path": self.path,
-            "model": actual_model or model,
+            "model": actual_model or model or "unknown",
             "tier": tier,
             "provider": provider,
             "key": None,  # resolved below; omitted when resolution fails

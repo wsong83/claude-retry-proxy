@@ -788,12 +788,12 @@ def _compat_stripped_body(body):
     the original body does not parse as a JSON object."""
     try:
         stripped = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        if not isinstance(stripped, dict):
+            return None
+        stripped.pop(COMPAT_FEATURE, None)
+        return json.dumps(stripped).encode("utf-8")
+    except Exception:  # total per _compat_guarded_parse (RecursionError is not a ValueError)
         return None
-    if not isinstance(stripped, dict):
-        return None
-    stripped.pop(COMPAT_FEATURE, None)
-    return json.dumps(stripped).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------

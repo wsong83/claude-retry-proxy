@@ -349,7 +349,10 @@ now drains trailing frames first and emits the terminal sequence afterwards.</p>
       content block. A tool call opens a <em>new</em> block, so it composes with the terminal
       sequence rather than conflicting with it.</li>
   <li><strong><code>usage</code> is still captured</strong>, which is what makes the trailing
-      usage frame reach <code>message_delta</code>.</li>
+      usage frame reach <code>message_delta</code>. Only integer token counts are copied
+      through: the upstream value is stored unvalidated, so a non-integer — or a boolean, which
+      is an <code>int</code> subclass in Python — falls back to <code>0</code> rather than being
+      forwarded into the terminal frame.</li>
   <li><strong><code>content</code> and <code>reasoning</code> deltas are suppressed.</strong> This
       is a <em>policy</em> choice, not a protocol constraint: the terminal sequence is emitted
       after the drain, so no block is closed while the drain runs and a trailing delta would in
@@ -400,6 +403,15 @@ field carries the discriminator:</p>
       <code>end_turn</code> would be indistinguishable, on the wire, from a turn the model
       actually finished: the client would record a completed message, report no error and never
       re-issue the request.</li>
+  <li><strong>A frame that cannot be serialized</strong> — the proxy built a frame that
+      <code>json.dumps</code> rejects. This is reachable because the decoder and the encoder have
+      different ceilings: <code>json.loads</code> survives to roughly 16,920 nesting levels while
+      <code>json.dumps</code> already fails at roughly 15,501, leaving a band of payloads that
+      parse and then fail to re-encode. Instead of aborting the stream with no terminal event —
+      which the client reads as a truncated <em>success</em> — the frame is replaced by an SSE
+      <code>error</code> frame carrying
+      <code>error.code: "response_frame_encode_failure"</code>. See
+      <a href="architecture.html#error-envelope">architecture.html#error-envelope</a>.</li>
 </ul>
 
 <p>Every stream that <em>did</em> reach a <code>finish_reason</code> emits exactly one
