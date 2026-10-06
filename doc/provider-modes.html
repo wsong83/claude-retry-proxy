@@ -136,6 +136,20 @@ records a <code>transform_failure</code> event — so a transform bug degrades t
 <tr><td>tool definitions</td><td>function tools — <code>input_schema</code> → <code>parameters</code></td></tr>
 </table>
 
+<p id="pattern-normalization"><strong>Tool-schema pattern normalization.</strong> Every forwarded tool
+schema has its regexes normalized before the request leaves the proxy: each JSON-Schema
+<code>pattern</code> string, and each <code>patternProperties</code> key, has ECMA
+<em>identity escapes</em> stripped — a backslash before a character that is not a regex
+metacharacter, such as the <code>\_</code> that Zod's <code>startsWith</code> emits for
+<code>"agent_run_"</code>. Those escapes are definitionally redundant (<code>\_</code>
+<em>is</em> <code>_</code>), so the rewrite never changes what a pattern matches — but
+strict backends reject them, so an MCP server's Zod-built schema would otherwise 400 with
+<code>Invalid schema for function …</code>. The normalization is applied in
+<strong>all three modes</strong>: chat and response inside their transforms, and anthropic
+mode on the verbatim forward (<code>_sanitize_body_tools</code>), since that mode never runs
+the transforms. Values under <code>const</code>/<code>enum</code>/<code>default</code>/
+<code>examples</code> are asserted data, not schemas, and are never rewritten.</p>
+
 <p>Dropped at the request level entirely, with no equivalent downstream: <code>thinking</code>,
 <code>metadata</code>, and <code>top_k</code>.</p>
 

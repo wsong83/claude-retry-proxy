@@ -35,7 +35,7 @@ src/claude_retry_proxy/
   config.py             the config.json + models.json document pair: `models_path_for` / `load_models_document` / `load_config` / `validate_config` (the canonical validation policy) / `write_config` / `install_template` + extra-header specs; serves the server and the CLI
   keys.py               keys-index pipeline: `vendor_key_entries`/`vendor_key_names`, `_validate_vendor_keys_shape`, `load_keys_file` (encrypted or plain), `read_passphrase_from_stdin`
   safety.py             task-shaped utility leaf: string-emission-safety predicates (`_validate_admin_name` charset allowlist); docstring indexes the stay-behind safety idioms
-  transforms_common.py  shared endpoint-mode transform mechanism: `_transform_and_guard` (passthrough-on-failure response guard) + `_request_transform_timestamp` helper
+  transforms_common.py  shared endpoint-mode transform mechanism: `_transform_and_guard` (passthrough-on-failure response guard) + `_request_transform_timestamp` helper + the tool-schema pattern sanitizers `_strip_regex_identity_escapes` / `_sanitize_schema_patterns` / `_sanitize_body_tools` (see doc/provider-modes.html#pattern-normalization)
   transforms_chat.py    Anthropic↔Chat (OpenAI chat-completions) body transforms, both directions
   transforms_response.py Anthropic↔Responses body transforms, both directions
   cli.py                the claude-retry-proxy CLI: start / stop / status / reload (passphrase prompt, two-file template provisioning, canonical validation shared with config.py/keys.py, no URL swap; `reload` refreshes the provider catalog only)
@@ -283,6 +283,7 @@ what you need in context, and the link has the rest.
 | In one line | Detail |
 |---|---|
 | Provider mode dispatch — `anthropic`/`chat`/`response` differ in auth header, path, and both body transforms | [doc/provider-modes.html](doc/provider-modes.html) |
+| Tool-schema `pattern` regexes are normalized (ECMA identity escapes stripped) in **all three modes** before forwarding — anthropic mode included, via `_sanitize_body_tools` on its verbatim forward — so strict backends accept MCP/Zod tool schemas | [doc/provider-modes.html#pattern-normalization](doc/provider-modes.html#pattern-normalization) |
 | Chat mode never substitutes `input: {}` for tool arguments it could not parse — it degrades them to a visible placeholder block | [doc/provider-modes.html#malformed-args](doc/provider-modes.html#malformed-args) |
 | A chat-mode stream that goes silent after `finish_reason` waits up to 5 s before the terminal event, not the upstream socket timeout | [doc/provider-modes.html#chat-sse-drain](doc/provider-modes.html#chat-sse-drain) |
 | A chat-mode stream that ends with no `finish_reason` closes differently depending on whether `[DONE]` arrived | [doc/provider-modes.html#chat-sse](doc/provider-modes.html#chat-sse) |

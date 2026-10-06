@@ -58,7 +58,7 @@ from .transforms_chat import (_anthropic_to_chat, _chat_to_anthropic,
                               _transform_anthropic_messages_to_chat,
                               _transform_anthropic_tool_choice_to_chat,
                               _transform_anthropic_tools_to_chat)
-from .transforms_common import _transform_and_guard
+from .transforms_common import _sanitize_body_tools, _transform_and_guard
 from .transforms_response import (_anthropic_to_response, _response_to_anthropic)
 from .safety import _ADMIN_NAME_RE, _validate_admin_name
 from .settings import SETTINGS, resolve_trace_file
@@ -977,17 +977,16 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                     body_json, request_id=request_id, mode=mode,
                     provider=provider_name, tier=tier)).encode("utf-8")
             else:
-                rewritten_body = json.dumps(body_json).encode("utf-8")
+                rewritten_body = json.dumps(_sanitize_body_tools(body_json)).encode("utf-8")
         except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
-            if mode != "anthropic":
-                log_trace({
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "event": "transform_failure",
-                    "request_id": request_id,
-                    "provider": provider_name,
-                    "tier": tier,
-                    "mode": mode,
-                })
+            log_trace({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "event": "transform_failure",
+                "request_id": request_id,
+                "provider": provider_name,
+                "tier": tier,
+                "mode": mode,
+            })
             rewritten_body = body  # Keep original body if transform/parse fails
 
     # Build headers for forwarding

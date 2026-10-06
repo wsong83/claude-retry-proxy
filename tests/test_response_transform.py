@@ -723,6 +723,46 @@ def test_anthropic_to_response_flat_tools():
 
 
 
+def test_anthropic_to_response_tools_pattern_sanitized():
+    """Response mode: input_schema.pattern identity escapes stripped before forwarding.
+
+    Integration for Step 2's response call site (plan
+    2026-10-06-re2-portable-tool-schema-patterns): a tool whose input_schema
+    carries Zod's `^agent\\_run\\_` pattern reaches the backend as
+    `^agent_run_` in the flat tools[0].parameters, and the input body is
+    unmutated.
+    """
+    print("\n--- Test: Anthropic To Response Tools Pattern Sanitized ---")
+    fn = _require_server_func("_anthropic_to_response")
+    if fn is None:
+        return
+    import copy
+    inp = {"model": "sonnet",
+           "messages": [{"role": "user", "content": "hi"}],
+           "tools": [{"name": "mcp__exa__agent_run",
+                      "input_schema": {"type": "object",
+                                       "properties": {"query": {"type": "string",
+                                                                "pattern": r"^agent\_run\_"}},
+                                       "patternProperties": {r"^k\-": {"type": "string"}}}}]}
+    snapshot = copy.deepcopy(inp)
+    out = fn(inp)
+    params = out["tools"][0]["parameters"]
+    if params["properties"]["query"]["pattern"] != "^agent_run_":
+        fail("flat parameters.pattern not sanitized, got {!r}".format(
+            params["properties"]["query"]["pattern"]))
+        return
+    if list(params["patternProperties"].keys())[0] != "^k-":
+        fail("patternProperties key not sanitized, got {!r}".format(
+            list(params["patternProperties"].keys())))
+        return
+    if inp != snapshot:
+        fail("input body was mutated: {!r}".format(inp))
+        return
+    pass_("response parameters sanitized (pattern + patternProperties key); input unmutated")
+
+
+
+
 def test_anthropic_to_response_tool_choice_mapping():
     """tool_choice maps auto/any/none/tool; named unknown tool omitted."""
     print("\n--- Test: Anthropic To Response Tool Choice Mapping ---")
@@ -1149,6 +1189,7 @@ ALL_TESTS = [
     ("anthropic-to-response-mixed-history-content-types", test_anthropic_to_response_mixed_history_content_types),
     ("anthropic-to-response-assistant-empty-string-content", test_anthropic_to_response_assistant_empty_string_content),
     ("anthropic-to-response-flat-tools", test_anthropic_to_response_flat_tools),
+    ("anthropic-to-response-tools-pattern-sanitized", test_anthropic_to_response_tools_pattern_sanitized),
     ("anthropic-to-response-tool-choice-mapping", test_anthropic_to_response_tool_choice_mapping),
     ("anthropic-to-response-no-input-mutation", test_anthropic_to_response_no_input_mutation),
     ("anthropic-to-response-error-result", test_anthropic_to_response_error_result),

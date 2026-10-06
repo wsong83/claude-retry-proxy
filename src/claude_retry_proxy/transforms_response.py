@@ -5,7 +5,7 @@ import time
 
 from .sinks import log_trace
 
-from .transforms_common import _request_transform_timestamp
+from .transforms_common import _request_transform_timestamp, _sanitize_schema_patterns
 
 __all__ = ["_anthropic_to_response", "_response_to_anthropic"]
 
@@ -255,7 +255,7 @@ def _anthropic_to_response(body_json, request_id=None, mode=None, provider=None,
             if not isinstance(name, str) or not name or not isinstance(input_schema, dict):
                 dropped_tools += 1
                 continue
-            fn = {"type": "function", "name": name, "parameters": input_schema}
+            fn = {"type": "function", "name": name, "parameters": _sanitize_schema_patterns(input_schema)}
             if isinstance(tool.get("description"), str):
                 fn["description"] = tool["description"]
             tools_out.append(fn)

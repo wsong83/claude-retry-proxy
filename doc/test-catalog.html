@@ -113,13 +113,13 @@ relative size, not as exact current figures.</p>
     <td>The compatibility learner — both features (<code>context_management</code>,
         <code>reasoning_field</code>): persistence, detection, state machine, concurrency.
         See <a href="compatibility.html">compatibility.html</a>.</td></tr>
-<tr><td><code>test_chat_transform.py</code></td><td class="num">43</td>
+<tr><td><code>test_chat_transform.py</code></td><td class="num">51</td>
     <td>Anthropic → Chat Completions request and response transforms</td></tr>
-<tr><td><code>test_response_transform.py</code></td><td class="num">37</td>
+<tr><td><code>test_response_transform.py</code></td><td class="num">38</td>
     <td>Anthropic → Responses request and response transforms</td></tr>
 <tr><td><code>test_chat_sse.py</code></td><td class="num">66</td>
     <td>Chat-mode SSE synthesis, tool-call deltas, post-finish drain, drain telemetry, truncation, degradation, and the unfinished-turn retry nudge</td></tr>
-<tr><td><code>test_mode_dispatch.py</code></td><td class="num">28</td>
+<tr><td><code>test_mode_dispatch.py</code></td><td class="num">29</td>
     <td>Mode dispatch, auth headers, path rewriting</td></tr>
 <tr><td><code>test_admin.py</code></td><td class="num">25</td>
     <td>Admin API endpoints, CSRF origin rules, switch and reload</td></tr>
@@ -279,7 +279,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> Provider mode selection (<code>anthropic</code> / <code>chat</code> / <code>response</code>) and the auth header and path each one sends.</p>
 
-<h4><code>tests/test_mode_dispatch.py</code> (28 tests) — mode dispatch and auth headers</h4>
+<h4><code>tests/test_mode_dispatch.py</code> (29 tests) — mode dispatch and auth headers</h4>
 <ul>
 <li><code>test_mode_defaults_to_anthropic</code>: Vendor without a mode field is treated as anthropic (x-api-key used).</li>
 <li><code>test_mode_null_defaults_to_anthropic</code>: Vendor with mode: null is treated as anthropic.</li>
@@ -303,6 +303,7 @@ EOF</code></pre>
 <li><code>test_response_mode_assistant_output_text_e2e</code>: E2E: schema-validating mock upstream enforces role-appropriate content types.</li>
 <li><code>test_response_mode_tool_loop_e2e</code>: Two-turn tool loop through response mode: tool_use then final text.</li>
 <li><code>test_anthropic_mode_unchanged</code>: Existing anthropic behavior is preserved (no mode field).</li>
+<li><code>test_anthropic_mode_tools_pattern_sanitized_e2e</code>: Anthropic-mode verbatim forward sanitizes tool <code>input_schema</code> patterns upstream (mutation-proven wiring).</li>
 <li><code>test_chat_mode_non_2xx_passthrough</code>: Chat-mode non-2xx error body passes through untransformed.</li>
 <li><code>test_transform_failure_passthrough</code>: Malformed JSON response body passes through with a transform_failure trace event.</li>
 <li><code>test_tool_args_parse_failure_trace_has_request_id</code>: End-to-end: tool_args_parse_failure trace event carries request_id/mode/provider/tier.</li>
@@ -315,7 +316,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> The Anthropic↔Chat request and response conversions, including tool calls, thinking blocks, and cache control.</p>
 
-<h4><code>tests/test_chat_transform.py</code> (43 tests) — Anthropic → Chat request and response transforms</h4>
+<h4><code>tests/test_chat_transform.py</code> (51 tests) — Anthropic → Chat request and response transforms</h4>
 <ul>
 <li><code>test_anthropic_to_chat_messages_transform</code>: Full message array (thinking/text/tool_use/tool_result) -&gt; valid OpenAI Chat messages.</li>
 <li><code>test_anthropic_to_chat_messages_thinking_stripped</code>: At the default selection no reasoning field is emitted for a thinking block; the echo is the learned per-pair selection's call, not an always-on conversion.</li>
@@ -334,6 +335,14 @@ EOF</code></pre>
 <li><code>test_anthropic_to_chat_tools_cache_control_stripped</code>: cache_control on tool definitions is stripped; cache_control_stripped trace event logged.</li>
 <li><code>test_anthropic_to_chat_tools_non_list_guarded</code>: Non-list tools returns [] (tools: null treated as absent).</li>
 <li><code>test_anthropic_to_chat_tools_malformed_entries_skipped</code>: Entries missing name or input_schema are skipped with a content_block_dropped trace event.</li>
+<li><code>test_strip_regex_identity_escapes_table</code>: The ECMA identity-escape stripper's full reference table (metacharacter/letter-digit/class-`-` rows).</li>
+<li><code>test_sanitize_schema_patterns_walk</code>: The schema walk rewrites <code>pattern</code>/<code>patternProperties</code> at every depth, with totality across malformed shapes.</li>
+<li><code>test_sanitize_schema_patterns_no_mutation</code>: The walk never mutates its argument; returns a freshly-built structure.</li>
+<li><code>test_sanitize_schema_patterns_value_positions</code>: Position-aware split — <code>const</code>/<code>enum</code>/<code>default</code>/<code>examples</code> data is untouched while a property named <code>default</code> is still sanitized.</li>
+<li><code>test_sanitize_schema_patterns_collision_merge</code>: <code>patternProperties</code> keys that collapse to one after stripping merge as <code>allOf</code> rather than dropping an entry.</li>
+<li><code>test_anthropic_to_chat_tools_pattern_sanitized</code>: Chat mode sanitizes <code>input_schema</code> patterns before forwarding; input unmutated.</li>
+<li><code>test_sanitize_body_tools_sanitized_copy</code>: <code>_sanitize_body_tools</code> sanitizes tool schemas in a copy; input not mutated.</li>
+<li><code>test_sanitize_body_tools_totality</code>: <code>_sanitize_body_tools</code> totality across malformed bodies, tool entries and schemas.</li>
 <li><code>test_anthropic_to_chat_tool_choice_mapping</code>: All 4 tool_choice variants map correctly.</li>
 <li><code>test_anthropic_to_chat_tool_choice_none_omitted</code>: None/absent tool_choice is omitted from output.</li>
 <li><code>test_anthropic_to_chat_tool_choice_malformed_omitted</code>: Malformed/unknown tool_choice maps to None (omitted, defensive).</li>
@@ -366,7 +375,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> The Anthropic↔Responses conversions — input items, instructions, and the streaming path.</p>
 
-<h4><code>tests/test_response_transform.py</code> (37 tests) — Anthropic → Responses request and response transforms</h4>
+<h4><code>tests/test_response_transform.py</code> (38 tests) — Anthropic → Responses request and response transforms</h4>
 <ul>
 <li><code>test_anthropic_to_response_basic</code>: model, input items, instructions, max_output_tokens, stream mapped.</li>
 <li><code>test_anthropic_to_response_system_list</code>: system content block list concatenates into instructions.</li>
@@ -391,6 +400,7 @@ EOF</code></pre>
 <li><code>test_anthropic_to_response_mixed_history_content_types</code>: Mixed history preserves order with role-appropriate content types.</li>
 <li><code>test_anthropic_to_response_assistant_empty_string_content</code>: Empty-string assistant content is emitted as an output_text item.</li>
 <li><code>test_anthropic_to_response_flat_tools</code>: Anthropic tools become flat Responses function tools (no nested function).</li>
+<li><code>test_anthropic_to_response_tools_pattern_sanitized</code>: Response mode sanitizes tool <code>input_schema</code> patterns before forwarding; input unmutated.</li>
 <li><code>test_anthropic_to_response_tool_choice_mapping</code>: tool_choice maps auto/any/none/tool; named unknown tool omitted.</li>
 <li><code>test_anthropic_to_response_no_input_mutation</code>: The input body_json object is not mutated.</li>
 <li><code>test_anthropic_to_response_error_result</code>: An error tool_result&#x27;s text is preserved as the output string.</li>

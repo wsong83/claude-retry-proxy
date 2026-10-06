@@ -971,6 +971,73 @@ def test_anthropic_mode_unchanged():
 
 
 
+def test_anthropic_mode_tools_pattern_sanitized_e2e():
+    """Anthropic-mode verbatim forward sanitizes tool input_schema patterns.
+
+    Plan 2026-10-06-re2-portable-tool-schema-patterns, Step 3: the
+    anthropic-mode branch never runs the chat/response transforms, so
+    `_sanitize_body_tools` on the else-branch forward is the only thing
+    standing between a Zod-built `^agent\\_run\\_` pattern and a strict
+    backend's 400. Asserts the upstream-received body carries
+    `^agent_run_`, with the rest of the client body passed through.
+    """
+    print("\n--- Test: Anthropic Mode Tools Pattern Sanitized E2E ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        req_body = {
+            "model": "sonnet",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "mcp__exa__agent_run",
+                       "input_schema": {"type": "object",
+                                        "properties": {"query": {"type": "string",
+                                                                 "pattern": r"^agent\_run\_"}}}}],
+        }
+        status, body = _send_proxy_request(proxy_port, body=json.dumps(req_body))
+        if status != 200:
+            fail("expected 200, got {} ({!r})".format(status, body[:200]))
+            return
+        reqs = mock_servers["p"]["requests"]
+        if not reqs:
+            fail("upstream received no requests")
+            return
+        try:
+            upstream_body = json.loads(reqs[0]["body"])
+        except Exception:
+            fail("upstream request body is not JSON: {!r}".format(reqs[0]["body"][:200]))
+            return
+        tools = upstream_body.get("tools")
+        if not isinstance(tools, list) or not tools:
+            fail("upstream body lost tools: {!r}".format(upstream_body.get("tools")))
+            return
+        schema = tools[0].get("input_schema")
+        pattern = None
+        if isinstance(schema, dict):
+            props = schema.get("properties")
+            if isinstance(props, dict) and isinstance(props.get("query"), dict):
+                pattern = props["query"].get("pattern")
+        if pattern != "^agent_run_":
+            fail("upstream input_schema pattern not sanitized, got {!r}".format(pattern))
+            return
+        if tools[0].get("name") != "mcp__exa__agent_run":
+            fail("upstream tool name altered: {!r}".format(tools[0].get("name")))
+            return
+        if upstream_body.get("messages") != req_body["messages"]:
+            fail("upstream messages altered on verbatim forward: {!r}".format(
+                upstream_body.get("messages")))
+            return
+        pass_("anthropic-mode forward delivered sanitized pattern upstream; rest untouched")
+    finally:
+        cleanup()
+
+
+
+
 def test_chat_mode_non_2xx_passthrough():
     """Chat-mode non-2xx error body passes through untransformed."""
     print("\n--- Test: Chat Mode Non 2xx Passthrough ---")
@@ -1394,6 +1461,7 @@ ALL_TESTS = [
     ("response-mode-assistant-output-text-e2e", test_response_mode_assistant_output_text_e2e),
     ("response-mode-tool-loop-e2e", test_response_mode_tool_loop_e2e),
     ("anthropic-mode-unchanged", test_anthropic_mode_unchanged),
+    ("anthropic-mode-tools-pattern-sanitized-e2e", test_anthropic_mode_tools_pattern_sanitized_e2e),
     ("chat-mode-non-2xx-passthrough", test_chat_mode_non_2xx_passthrough),
     ("transform-failure-passthrough", test_transform_failure_passthrough),
     ("tool-args-parse-failure-trace-has-request-id", test_tool_args_parse_failure_trace_has_request_id),

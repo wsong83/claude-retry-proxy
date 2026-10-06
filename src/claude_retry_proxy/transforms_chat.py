@@ -6,7 +6,7 @@ import uuid
 
 from .sinks import log_trace
 
-from .transforms_common import _request_transform_timestamp
+from .transforms_common import _request_transform_timestamp, _sanitize_schema_patterns
 
 __all__ = ["_anthropic_to_chat", "_transform_anthropic_messages_to_chat",
            "_transform_tool_result_to_chat_tool", "_transform_anthropic_tools_to_chat",
@@ -332,7 +332,7 @@ def _transform_anthropic_tools_to_chat(tools, request_id=None, mode=None,
         if not isinstance(name, str) or not name or not isinstance(input_schema, dict):
             dropped += 1
             continue
-        fn = {"name": name, "parameters": input_schema}
+        fn = {"name": name, "parameters": _sanitize_schema_patterns(input_schema)}
         if isinstance(tool.get("description"), str):
             fn["description"] = tool["description"]
         if "cache_control" in tool:
