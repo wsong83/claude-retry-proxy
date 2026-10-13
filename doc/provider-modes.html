@@ -10,7 +10,7 @@
 
 <h1>Provider Modes<span class="sub">anthropic, chat, and response — and what each one rewrites</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-06</p>
+<p><strong>Last updated:</strong> 2026-10-13</p>
 
 <p>The proxy speaks Anthropic Messages to its clients. What it speaks <em>upstream</em> is
 configurable per provider, because not every provider implements the Anthropic API. A
@@ -395,8 +395,11 @@ now drains trailing frames first and emits the terminal sequence afterwards.</p>
 time budget is enforced <em>at the point of blocking</em>: the drain sets a socket read timeout to
 the remaining budget before each read and restores the original timeout afterwards. Without that,
 a provider that goes silent after <code>finish_reason</code> would pin the worker thread for the
-upstream socket timeout — 300&nbsp;s — instead of 5&nbsp;s, which would also outlast the 30&nbsp;s
-drain-and-swap timeout.</p>
+upstream socket timeout — 300&nbsp;s — instead of 5&nbsp;s. The pin is also bounded by a config
+swap's silence budget while one is in progress (<code>min(5 s, PROXY_SWAP_SILENCE_TIMEOUT)</code>):
+a drain-window read that woke <em>after</em> the swap completed would otherwise synthesise a normal
+terminal on the old routing. An epoch change inside the window closes the turn retryably instead,
+as <code>chat_sse_drain</code> with <code>drain_exit: "swap_abort"</code>.</p>
 
 <p>A stream that ends with <em>no</em> <code>finish_reason</code> at all never reaches the drain.
 It takes the EOF path and reports <code>chat_sse_truncated</code>, whose <code>saw_done</code>
@@ -691,6 +694,6 @@ transform it belongs to, and neither runs in response mode:</p>
 <a href="compatibility.html">compatibility.html</a>, as is the
 <a href="compatibility.html#reasoning-field">reasoning-field selection</a>.</p>
 
-<footer>Last updated: 2026-10-06</footer>
+<footer>Last updated: 2026-10-13</footer>
 </body>
 </html>

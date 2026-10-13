@@ -10,7 +10,7 @@
 
 <h1>Configuration<span class="sub">config.json, models.json, keys-index.json, and the environment</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-06</p>
+<p><strong>Last updated:</strong> 2026-10-13</p>
 
 <p>Three files configure the proxy, and the split between them is the important thing to
 understand: <strong><code>config.json</code> and <code>models.json</code> are safe to read, share,
@@ -338,6 +338,14 @@ is absent both processes honor the same variable.</p>
     <td>Request body cap (bytes) → <code>413</code>. Also caps the give-up error-body drain.</td></tr>
 <tr><td><code>PROXY_MAX_RESPONSE_SIZE</code></td><td class="num">104857600</td><td class="num">1024–1073741824</td>
     <td>Streaming response cap (bytes); exceeding it truncates with a trace event</td></tr>
+<tr><td><code>PROXY_SWAP_SILENCE_TIMEOUT</code></td><td class="num">30</td><td class="num">1–300</td>
+    <td>Per-request silence budget (seconds) for the config-swap drain: the window of
+        <em>no upstream byte from any in-flight request</em> after which the drain declares the
+        remainder silent and evicts it retryably (<code>config_swap_restart</code>). It also bounds a
+        streaming read's socket arm while a swap is in progress, and it is the value reported as
+        <code>budget_s</code> by <code>/admin/api/swap-status</code>. A blank or out-of-range value
+        falls back to <code>30</code>. See
+        <a href="architecture.html#config-swap">architecture.html#config-swap</a>.</td></tr>
 <tr><td><code>PROXY_LOG_ALL</code></td><td class="num">""</td><td>—</td>
     <td>Set to <code>1</code> to record full request and response bodies. See the warning in
         <a href="trace-log.html#all">trace-log.html</a>.</td></tr>
@@ -421,6 +429,6 @@ common mistake: <strong>config is authoritative</strong>. Every provider named i
 <code>config.json</code> must exist in the keys file. Providers that exist only in the keys file
 are ignored.</p>
 
-<footer>Last updated: 2026-10-06</footer>
+<footer>Last updated: 2026-10-13</footer>
 </body>
 </html>

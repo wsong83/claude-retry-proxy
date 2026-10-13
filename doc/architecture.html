@@ -10,7 +10,7 @@
 
 <h1>Architecture<span class="sub">How a request is routed, retried, and rewritten</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-06</p>
+<p><strong>Last updated:</strong> 2026-10-13</p>
 
 <p>This page describes the path a request takes from the moment it reaches the proxy to the
 moment a response leaves it. It is the reference the other pages link back into — in
@@ -41,7 +41,7 @@ where the request should go and what it should look like when it gets there.</p>
 <div class="overview-grid">
   <div class="overview-card"><div class="num">11</div><div class="label">max attempts (default)</div></div>
   <div class="overview-card"><div class="num">30s</div><div class="label">backoff cap (default)</div></div>
-  <div class="overview-card"><div class="num">30s</div><div class="label">admin drain timeout</div></div>
+  <div class="overview-card"><div class="num">30s</div><div class="label">swap silence budget</div></div>
   <div class="overview-card"><div class="num">300s</div><div class="label">upstream socket timeout</div></div>
 </div>
 
@@ -84,7 +84,10 @@ This is a large enough subject to have its own page — see
 <div class="step-box info">
 <div class="step-label">Step 5 — Forward and retry</div>
 <p>A fresh connection is opened to the upstream per attempt, with a 300-second socket timeout,
-and the retry loop in <a href="#retry">Retry and backoff</a> takes over.</p>
+and the retry loop in <a href="#retry">Retry and backoff</a> takes over. (The one exception is a
+streamed read: while a config swap is in progress it arms that socket to the swap's much shorter
+silence budget — see <a href="#config-swap">Configuration snapshots and drain-and-swap</a>. With
+no swap in flight the timeout is untouched.)</p>
 </div>
 
 <div class="step-box info">
@@ -208,6 +211,15 @@ longer than a <code>503</code>-heavy one, and the distinction is deliberate: a r
 means "come back later", not "back off gradually".
 </div>
 
+<p>Retries meet a config swap in one specific way: a chain that is <em>sleeping</em> between
+attempts abandons at the press. Each backoff sleep is taken in ≤ 0.25 s slices, and the loop
+returns <code>503 config_swap_restart</code> as soon as a swap starts — or has completed since the
+request was admitted — so the proxy stops sleep-retrying toward the provider being left and the
+client's own retry lands on the new mapping. An <em>immediate</em> re-issue that is not sleeping is
+unaffected: a compatibility probe's single-shot re-issue is live work, proceeds, and then follows
+the stream rules like any other request. See
+<a href="#config-swap">Configuration snapshots and drain-and-swap</a>.</p>
+
 <h3 id="jitter">Jitter</h3>
 
 <p>Every delay is jittered by a uniform ±25% of its base. The implementation is worth
@@ -291,6 +303,20 @@ must stay JSON-escaped.</p>
 <tr><td><code>upstream_unreachable</code></td><td><code>api_error</code></td><td>502</td>
     <td>The retry budget is exhausted on connection errors — see
         <a href="#give-up">Give-up behaviour</a></td></tr>
+<tr><td><code>config_swap_restart</code></td><td><code>api_error</code></td><td>503</td>
+    <td>The request was evicted by a config swap — a retry chain abandoning at the press, or a
+        straggler that reached a checkpoint after the swap completed. Retryable: the client's next
+        attempt lands on the new mapping. See
+        <a href="#config-swap">Configuration snapshots and drain-and-swap</a></td></tr>
+<tr><td><code>config_swap_in_progress</code></td><td><code>api_error</code></td><td>409</td>
+    <td>An admin press (Apply or Reload) arrived while another swap was already in progress;
+        single-flight refuses it and no drain is entered</td></tr>
+<tr><td><code>config_reload_stale</code></td><td><code>api_error</code></td><td>409</td>
+    <td>A reload's gated candidate was read <em>before</em> a concurrent switch completed a swap, so
+        installing it would silently revert that switch. Refused with no install and no epoch bump —
+        retry the reload. Distinct from the single-flight refusal, because no swap is in progress at
+        that point. See
+        <a href="#config-swap">Configuration snapshots and drain-and-swap</a></td></tr>
 <tr><td><code>response_frame_encode_failure</code></td><td><code>api_error</code></td>
     <td>SSE event</td>
     <td>A synthesized SSE frame cannot be serialized; sent as an <code>event: error</code> frame
@@ -408,20 +434,54 @@ the same lock, and threads those snapshots through the entire call chain. A requ
 before a swap completes uses the old configuration from beginning to end.</p>
 
 <div class="state-diagram">
-<strong>drain-and-swap</strong><br>
-administrator requests a change<br>
+<strong>drain-and-swap (silence-based)</strong><br>
+administrator presses Apply / Reload<br>
 ↓<br>
-set <code>_config_swapping</code> — new requests block on <code>_swap_done</code><br>
+single-flight: a second press while a swap is in progress is refused with <code>409 config_swap_in_progress</code><br>
 ↓<br>
-wait for <code>_inflight_count</code> to reach 0 &nbsp;&nbsp;<span class="optional">(up to 30 s)</span><br>
+set <code>_config_swapping</code> — new requests block on <code>_swap_done</code>; retry chains abandon at their next checkpoint (<code>503 config_swap_restart</code>)<br>
 ↓<br>
-swap configuration under lock → clear flag → signal <code>_swap_done</code><br>
+drain: while in-flight &gt; 0 <em>and</em> an upstream byte arrived within <code>PROXY_SWAP_SILENCE_TIMEOUT</code>, sleep 0.1 s<br>
+&nbsp;&nbsp;<span class="optional">(no wall-clock cap — live work is waited out)</span><br>
 ↓<br>
-blocked requests proceed with the new snapshot
+quiet for <code>budget + 2 s</code>: every remaining request is silent ≥ budget by construction, so the swap proceeds<br>
+↓<br>
+swap configuration under lock → <code>_config_epoch += 1</code> → clear flag → signal <code>_swap_done</code><br>
+↓<br>
+blocked requests proceed with the new snapshot; old-epoch stragglers die at their next checkpoint
 </div>
 
-<p>A request that is in-flight keeps running to completion with its original snapshot; the
-administrator waits for it rather than cancelling it.</p>
+<p>What <em>is</em> waited for is live work: a healthy generation of any length finishes and is
+delivered on its original snapshot, with no wall-clock cap. What is not waited for is silence. One
+shared clock — <code>_last_upstream_activity</code>, reset by any upstream byte from <em>any</em>
+in-flight request — is the only clock the drain reads; there are no per-request timers. When that
+clock has been quiet for the full budget, every request still in the set is silent by
+<em>construction</em>, and the drain stops rather than waiting on a request that has stopped
+producing. The residual case is silence that does not mean death: a long time-to-first-byte or an
+unusually long inter-token gap looks identical on a shared clock and is evicted retryably — raise
+<code>PROXY_SWAP_SILENCE_TIMEOUT</code> if that is hit in practice. The quiet exit is deliberately
+<code>2 s</code> (<code>_SWAP_QUIET_GRACE</code>) longer than the wake a mid-swap stream arms for
+itself, so an evictable straggler is always evicted <em>before</em> the drain exits and the
+reported <code>drained</code> field is a fact rather than a race.</p>
+
+<p>Eviction is retryable, never a silent truncation, and the client is always told: a
+pre-first-byte or buffered request gets <code>503</code> with the
+<code>config_swap_restart</code> code, a stream is closed with an in-stream retryable error, and a
+chat-mode stream emits <code>chat_sse_truncated</code> — or <code>chat_sse_drain</code> carrying
+<code>drain_exit: "swap_abort"</code> when the eviction lands inside the post-finish drain window.
+The client's own retry lands on the new mapping. Retry chains are the common case here: they hold
+no generation work, so they abandon at the press rather than being awaited, which is what keeps a
+switch fast when it is issued <em>because</em> a provider is rate-limiting.</p>
+
+<p>A request parked in a blocking read at the moment of the press cannot be woken — there is no
+cross-thread socket surgery — so it exits <em>late</em>, at its next wake: an upstream answer, a
+socket timeout, or a stream loop's armed budget wake. It never forwards old-routing bytes, because
+the epoch check sits after each read and before the forwarding. A streamed read arms its socket to
+the budget <em>only while a swap is in progress</em>; with no swap in flight the connection keeps
+its documented 300 s stall tolerance byte-for-byte. An armed wake can only ever <em>end</em> a
+stream, never resume one: a timeout on an <code>http.client</code> response is terminal
+(<code>SocketIO._timeout_occurred</code> is set on the first one and never reset), which is why an
+expired arm is a close decision rather than a retry.</p>
 
 <h3 id="split-write">What a config change writes, and what it does not</h3>
 
@@ -442,13 +502,15 @@ refreshes the catalog, never touches tiers, and writes nothing at all. Its guara
 disagree is an external <code>update-claude-env</code> write landing between their reads.</p>
 
 <div class="warn">
-<strong>The drain can time out, and the swap is then aborted.</strong> The wait is bounded at
-30 seconds. A request sitting in retry backoff can easily exceed that — the default worst case
-is about 3.8 minutes (see <a href="#worst-case">Worst case</a>). When the timeout expires the
-proxy <em>abandons the swap</em>, clears the swapping flag, and returns an error to the
-administrator. The configuration is left unmodified and the in-flight request completes
-normally. Nothing is corrupted — but the administrator's change did not take effect, and
-retrying it while the same slow request is still running will fail the same way.
+<strong>A swap can block every new admission for as long as its drain runs.</strong> The drain has
+no wall-clock bound, so while <code>_config_swapping</code> is true new requests stall on
+<code>_swap_done.wait()</code> with no timeout. In practice the drain ends within one live
+generation plus the quiet window — retry chains no longer hold it, because they abandon at the
+press. The case that does not terminate is an upstream that is stuck but keeps sending bytes: it
+keeps the activity clock fresh forever, so the drain never observes quiet. Two escape hatches
+bypass the swap gate entirely and are the immediate remedy: <code>claude-retry-proxy stop</code>
+(kills the process) and <code>POST /admin/shutdown</code> (which never checks the flag). Nothing
+else releases writers.
 </div>
 
 <!-- Owns the heartbeat-projection fact. operations.html#state links here. -->
@@ -549,14 +611,15 @@ not a module imported directly.</p>
 
 <p>Shutdown is immediate rather than graceful, and that follows from one mechanism: worker
 threads are daemon threads, so the interpreter does not join them when the server closes. A
-request that is mid-retry or mid-backoff is <strong>killed</strong>, not awaited — the opposite
-of what <a href="#config-swap">drain-and-swap</a> does with the same condition.</p>
+request that is mid-generation is <strong>killed</strong>, not awaited — where
+<a href="#config-swap">drain-and-swap</a> would wait for that same live work to finish (a swap
+abandons only the retry chains, which hold no generation work).</p>
 
 <p>This is a deliberate trade, not an oversight: making shutdown wait would mean disarming the
 daemon flag and adding a bounded drain, which changes what <code>stop</code> does. What the
 client sees — and why the interrupted request's trace entry never lands — is owned by
 <a href="operations.html#shutdown">operations.html#shutdown</a>.</p>
 
-<footer>Last updated: 2026-10-06</footer>
+<footer>Last updated: 2026-10-13</footer>
 </body>
 </html>

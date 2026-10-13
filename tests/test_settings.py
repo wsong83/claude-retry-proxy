@@ -45,10 +45,25 @@ _INT_CASES = [
 ]
 
 
+# The real binding's parse/clamp surface (plan 2026-10-12-swap-silence-drain):
+# unset -> 30; in-range parses; below-min, above-max, unparseable and empty
+# all fall back to the default rather than to a bound.
+_SWAP_SILENCE_ENV = "PROXY_SWAP_SILENCE_TIMEOUT"
+_SWAP_SILENCE_CASES = [
+    ("valid in-range", "7", 7),
+    ("min boundary", "1", 1),
+    ("below min", "0", 30),
+    ("above max", "400", 30),
+    ("unparseable", "abc", 30),
+    ("empty string", "", 30),
+]
+
+
 def test_env_int_fallback_semantics():
     """The five _env_int branches: valid in-range parses; unparseable,
     below-min, above-max, and empty/unset all fall back to the default (not
-    to a bound)."""
+    to a bound). The same surface is pinned for the real
+    PROXY_SWAP_SILENCE_TIMEOUT binding (default 30, min 1, max 300)."""
     print("\n--- Test: _env_int Fallback Semantics ---")
     absent = _TEST_ENV_NAME not in os.environ
     saved = os.environ.get(_TEST_ENV_NAME)
@@ -68,6 +83,33 @@ def test_env_int_fallback_semantics():
             fail("unset: expected default 7, got {}".format(got))
     finally:
         _restore_env(saved, _TEST_ENV_NAME, absent)
+
+    absent_swap = _SWAP_SILENCE_ENV not in os.environ
+    saved_swap = os.environ.get(_SWAP_SILENCE_ENV)
+    try:
+        for label, raw, expected in _SWAP_SILENCE_CASES:
+            os.environ[_SWAP_SILENCE_ENV] = raw
+            got = settings._env_int(_SWAP_SILENCE_ENV, 30, 1, 300)
+            if got == expected:
+                pass_("swap silence {} -> {}".format(label, got))
+            else:
+                fail("swap silence {}: expected {}, got {}".format(label, expected, got))
+        os.environ.pop(_SWAP_SILENCE_ENV, None)
+        got = settings._env_int(_SWAP_SILENCE_ENV, 30, 1, 300)
+        if got == 30:
+            pass_("swap silence unset -> default 30")
+        else:
+            fail("swap silence unset: expected default 30, got {}".format(got))
+        # The live binding on the SETTINGS singleton — built at import from an
+        # environment the harness never sets this var in, so it reads the
+        # default 30.
+        if settings.SETTINGS.swap_silence_timeout == 30:
+            pass_("SETTINGS.swap_silence_timeout is 30 (env unset)")
+        else:
+            fail("SETTINGS.swap_silence_timeout: expected 30, got {!r}".format(
+                settings.SETTINGS.swap_silence_timeout))
+    finally:
+        _restore_env(saved_swap, _SWAP_SILENCE_ENV, absent_swap)
 
 
 def test_env_str_fallback_semantics():
@@ -99,8 +141,8 @@ def _check_str(name, got, expected):
 
 def test_settings_object_shape():
     """srv.SETTINGS is settings.SETTINGS (one object, one binding — the
-    patch-coherence guarantee). All 16 attributes in the attr_types table
-    exist with pinned types: six ints, one bool (log_all), and nine
+    patch-coherence guarantee). All 17 attributes in the attr_types table
+    exist with pinned types: seven ints, one bool (log_all), and nine
     strings; mode_values is pinned separately below, not in the table."""
     print("\n--- Test: SETTINGS Object Identity and Shape ---")
     if SRV_SETTINGS is settings.SETTINGS:
@@ -119,6 +161,7 @@ def test_settings_object_shape():
         "max_delay": int,
         "max_body_size": int,
         "max_response_size": int,
+        "swap_silence_timeout": int,
         "log_all": bool,
         "trace_file": str,
         "keys_path": str,

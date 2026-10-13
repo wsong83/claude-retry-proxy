@@ -10,6 +10,7 @@ Commands:
 
 import json
 import os
+import socket
 import sys
 import time
 import urllib.request
@@ -764,9 +765,12 @@ def cmd_reload(args):
             "http://127.0.0.1:{}/admin/api/reload".format(port),
             method="POST",
             headers={"Origin": "http://127.0.0.1:{}".format(port)})
-        # The timeout must exceed the server's 30 s drain window; a busy
-        # proxy is a reload that subsequently succeeds, not a CLI failure.
-        with _LOCAL_OPENER.open(req, timeout=40) as resp:
+        # The swap waits for live in-flight work and is unbounded by design
+        # (only silent/straggler requests are evicted), so a client-side
+        # timeout no longer corresponds to any server-side abort: the swap
+        # completes regardless. This bound is only the CLI's own patience,
+        # and a timeout is reported distinctly below rather than as a failure.
+        with _LOCAL_OPENER.open(req, timeout=300) as resp:
             body = resp.read().decode("utf-8")
             data = json.loads(body)
             if data.get("status") == "ok":
@@ -789,17 +793,35 @@ def cmd_reload(args):
                 print("ERROR: {}".format(data.get("error", "unknown error")))
                 return 1
     except urllib.error.HTTPError as e:
-        # A 400 refusal (or a drain-timeout 503) surfaces as an HTTPError;
-        # without reading its body the refusal's own tier/provider/model
-        # detail is discarded and the operator sees only the status line.
+        # A 400 refusal (or a 409 config_swap_in_progress from a concurrent
+        # press) surfaces as an HTTPError; without reading its body the
+        # refusal's own tier/provider/model detail is discarded and the
+        # operator sees only the status line.
         try:
-            refusal = json.loads(e.read().decode("utf-8")).get("error", "")
+            err = json.loads(e.read().decode("utf-8")).get("error", "")
         except Exception:
-            refusal = ""
-        if refusal:
-            print("ERROR: {}".format(refusal))
+            err = ""
+        # Two shapes reach here: the older admin refusals carry a plain
+        # string, while the 409 refusal uses the standard Anthropic envelope
+        # (a dict with a "message"). Render the message for both rather than
+        # printing a Python dict repr.
+        if isinstance(err, dict):
+            err = err.get("message", "")
+        if err:
+            print("ERROR: {}".format(err))
         else:
             print("ERROR: Reload failed: HTTP Error {}: {}".format(e.code, e.reason))
+        return 1
+    except (urllib.error.URLError, socket.timeout) as e:
+        # A timeout during the POST arrives wrapped in URLError; one during
+        # the body read (or from a plain socket call) arrives bare. Neither
+        # aborts anything server-side, so say what actually happens.
+        reason = e.reason if isinstance(e, urllib.error.URLError) else e
+        if isinstance(reason, socket.timeout):
+            print("ERROR: reload still draining after 300s — the swap will "
+                  "complete server-side; check claude-retry-proxy status")
+            return 1
+        print("ERROR: Reload failed: {}".format(e))
         return 1
     except Exception as e:
         print("ERROR: Reload failed: {}".format(e))

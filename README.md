@@ -398,6 +398,16 @@ dropdown lists that provider's key names (never the key material); for a
 single-key provider it shows `default` and appears fixed, disabled, and
 greyed out.
 
+**What Apply and Reload wait for.** A change pauses new requests briefly and then
+lets the requests already in flight finish — a long generation is waited out, not
+killed, so the page can spin for minutes on a heavy turn. What it will *not* wait
+for is silence: once no upstream byte has arrived from any in-flight request for
+`PROXY_SWAP_SILENCE_TIMEOUT` (default 30 s), whatever is still running is stopped
+and told to retry (`config_swap_restart`) — your client's retry then lands on the
+new mapping. Requests sleeping between retries are dropped immediately rather
+than waited on. Presses are single-flight: a second press while one is in
+progress is refused with `409` and changes nothing.
+
 ### Server environment variables
 
 | Variable | Default | Range | Description |
@@ -408,6 +418,7 @@ greyed out.
 | `PROXY_MAX_DELAY` | `30` | 1–300 | Backoff cap, seconds. Applied before jitter; 429 retries use this directly. |
 | `PROXY_MAX_BODY_SIZE` | `10485760` | 1024–100 MiB | Request body size cap (bytes); larger → 413. Also caps the upstream error body drain on retry exhaustion. |
 | `PROXY_MAX_RESPONSE_SIZE` | `104857600` | 1024–1 GiB | Streaming response size cap (bytes); larger → truncated with a warning trace event. |
+| `PROXY_SWAP_SILENCE_TIMEOUT` | `30` | 1–300 | Per-request silence budget (seconds) for the config-swap drain: how long the drain waits with no upstream byte from *any* in-flight request before declaring the remainder silent and evicting it retryably (`config_swap_restart`). Also bounds a streaming read's socket arm while a swap is in progress. Read at startup. |
 | `PROXY_LOG_ALL` | unset | `1` to enable | Log full request bodies; response bodies on error paths only (streamed 2xx bodies are not captured) |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | path | Trace log location |
 | `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | path | Keys file location (encrypted or plain JSON) |

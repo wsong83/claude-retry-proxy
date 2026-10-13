@@ -73,6 +73,15 @@ _config_path = None  # Path to config.json, set at startup
 _inflight_count = 0  # Number of requests currently in-flight
 _config_swapping = False  # True when config swap is in progress
 _swap_done = threading.Event()  # Signaled when swap completes
+_config_epoch = 0  # Incremented on every successful config swap
+_last_upstream_activity = 0.0  # Timestamp of the most recent upstream byte, any request
+_swap_started_at = None  # Timestamp of the current press; None when no swap runs
+_swap_evictions = 0  # Evictions since the last press; `drained` == 0 of them
+
+# The drain's total-quiet window exceeds the armed stream wake (both keyed to
+# the same shared clock) by this margin, so an evictable straggler is always
+# evicted before the drain exits and `drained` stays a fact rather than a race.
+_SWAP_QUIET_GRACE = 2.0
 
 # Startup state dict, kept in memory so the heartbeat can rewrite a
 # proxy-state.json deleted externally without losing pid/port fields.
@@ -93,6 +102,170 @@ def _rng():
         r = random.Random()
         _rng_local.rng = r
     return r
+
+
+# ---------------------------------------------------------------------------
+# Config-swap drain helpers
+# ---------------------------------------------------------------------------
+#
+# The drain replaces the old wall-clock deadline: new admissions pause (the
+# existing _config_swapping gate) while the drain waits for the in-flight set
+# to empty on count alone, or for the SHARED activity clock to read total
+# quiet for a full budget plus _SWAP_QUIET_GRACE. Retry-backoff chains abandon
+# at the press instead of being waited out, and silent stragglers are evicted
+# with a retryable config_swap_restart once the epoch bumps.
+#
+# ACCEPTED RISK: an unbounded drain blocks every new admission for as long as
+# it runs (forward_request waits on _swap_done with no timeout). The escape
+# hatches are `claude-retry-proxy stop` (kills the process) and
+# POST /admin/shutdown (never checks _config_swapping); nothing else releases
+# writers. The residual scenario that never terminates is an upstream that is
+# stuck but keeps sending bytes, keeping the clock fresh forever. Rollback for
+# this design is `git revert` of its commit plus a restart — there is no env
+# var that restores the old bounded drain (PROXY_SWAP_SILENCE_TIMEOUT tunes
+# the budget; it cannot re-introduce the 30 s wall-clock abort).
+
+def _touch_upstream_activity():
+    """Record the most recent upstream byte from any in-flight request.
+
+    The drain reads this single shared clock to decide when everything left
+    is silent. A bare store with no lock: a stale read only makes the drain
+    wait marginally longer, and one assignment cannot tear under the GIL.
+    """
+    global _last_upstream_activity
+    _last_upstream_activity = time.time()
+
+
+def _drain_for_swap():
+    """Pause admissions and wait for in-flight work to drain (Phases 1-2).
+
+    Single-flight: the guard and the press share ONE lock acquisition, so a
+    second press arriving at any point cannot pass — there is no window
+    between deciding and pressing in which a concurrent press could slip
+    through. Returns None when a swap is already in progress; the caller
+    returns its 409 refusal and enters no drain. Otherwise returns
+    (drained, inflight_at_press, waited_s):
+      - `drained` is `_swap_evictions == 0` — "nothing was evicted", NOT
+        "the count reached zero". A post-press eviction can decrement the
+        count before the poll sees it, so keying on the exit branch would
+        make the field a race rather than a fact.
+      - `inflight_at_press` is the count at the press, independent of which
+        exit fires.
+      - `waited_s` is the drain wall-clock.
+
+    Two exits, both by construction safe: count zero (everything left the
+    set), or no upstream byte from anyone for budget + _SWAP_QUIET_GRACE —
+    at which point every remaining request is silent >= budget, because the
+    clock resets on ANY byte. No wall-clock total: live work is waited to
+    completion however long it takes.
+
+    OPERATIONAL NOTE — the accepted risk this creates: while this drain runs,
+    every new admission is blocked (forward_request waits on _swap_done with
+    no timeout). The immediate escapes are `claude-retry-proxy stop` (kills
+    the process) and `POST /admin/shutdown` (never checks _config_swapping);
+    nothing else releases writers. The systemic escape is reverting this
+    change (`git revert` of its commit) plus a restart:
+    PROXY_SWAP_SILENCE_TIMEOUT tunes the budget only — no env var restores
+    the old bounded drain.
+    """
+    global _config_swapping, _swap_started_at, _swap_evictions, _last_upstream_activity
+    with _config_lock:
+        if _config_swapping:
+            # Single-flight refusal: an owner already holds the swap. Taken
+            # under the SAME acquisition that sets the flag below, so the
+            # check-then-act window that let two presses both enter a drain
+            # is gone.
+            return None
+        _config_swapping = True
+        _swap_done.clear()
+        started_at = time.time()
+        _last_upstream_activity = started_at
+        _swap_started_at = started_at
+        inflight_at_press = _inflight_count
+        _swap_evictions = 0
+    quiet_window = SETTINGS.swap_silence_timeout + _SWAP_QUIET_GRACE
+    while True:
+        with _config_lock:
+            inflight = _inflight_count
+            last_activity = _last_upstream_activity
+            evictions = _swap_evictions
+        if inflight == 0:
+            break
+        if time.time() - last_activity >= quiet_window:
+            break
+        time.sleep(0.1)
+    return evictions == 0, inflight_at_press, time.time() - started_at
+
+
+def _note_swap_eviction(phase, request_id, **fields):
+    """Count one eviction and log its swap_abort trace event.
+
+    Called immediately before an evicted request returns its retryable
+    error. The stream phase carries tier + provider and no model — the
+    stream helpers do not receive actual_model.
+    """
+    global _swap_evictions
+    with _config_lock:
+        _swap_evictions += 1
+    event = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": "swap_abort",
+        "phase": phase,
+        "request_id": request_id,
+    }
+    event.update(fields)
+    log_trace(event)
+
+
+def _swap_epoch_changed(entry_epoch):
+    """True when a swap completed after this request was admitted.
+
+    Such a request must never deliver an old-routing result. Reads the
+    epoch without the lock — a single int read is atomic under the GIL,
+    and a stale read only defers the eviction to the next checkpoint.
+    """
+    return entry_epoch is not None and _config_epoch != entry_epoch
+
+
+def _swap_chain_abort(entry_epoch):
+    """True when a retry-backoff chain must abandon toward the left provider.
+
+    Chains additionally abandon at the press, not only at the completed
+    swap: they are proxy-managed idling with no generation work, and
+    waiting them out is what made a swap issued under rate limiting fail.
+    """
+    return _config_swapping or _swap_epoch_changed(entry_epoch)
+
+
+def _interruptible_sleep(seconds, epoch):
+    """Sleep up to `seconds`, in slices, aborting on a swap press.
+
+    Returns True when the chain must abandon (a swap started at any point
+    during the wait), False when the full delay elapsed normally.
+    """
+    deadline = time.time() + seconds
+    while True:
+        if _swap_chain_abort(epoch):
+            return True
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.25, remaining))
+
+
+def _swap_abort_tuple(request_id, total_start, retries, tier, provider_name,
+                      actual_model):
+    """The retryable give-up result for a request evicted by a config swap.
+
+    Mirrors the 429/503 give-up return-tuple shape exactly (nine elements,
+    empty headers, no streamed body), so do_POST's streamed flag and
+    _send_response handle it identically.
+    """
+    return (503, {}, _error_body(
+        "api_error", "config_swap_restart",
+        "config swap in progress: this request was restarted; the client should retry",
+        request_id),
+        None, time.time() - total_start, retries, tier, provider_name, actual_model)
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +641,7 @@ def _read_capped(resp, max_bytes, request_id=None):
             chunk = resp.read(min(8192, max_bytes - total))
             if not chunk:
                 break
+            _touch_upstream_activity()
             chunks.append(chunk)
             total += len(chunk)
     except OSError:
@@ -481,6 +655,7 @@ def _read_capped(resp, max_bytes, request_id=None):
             tail = resp.read(8192)
             if not tail:
                 break
+            _touch_upstream_activity()
             truncated = True
     except OSError:
         pass
@@ -547,13 +722,14 @@ def forward_request(method, path, headers, body, handler=None, request_id=None):
                 _inflight_count += 1
                 config_snapshot = _current_config
                 vendors_snapshot = _vendors
+                epoch_snapshot = _config_epoch
                 break
         # Swap in progress - wait for it to complete
         _swap_done.wait()
 
     try:
         return _forward_request_impl(method, path, headers, body, handler, request_id,
-                                     config_snapshot, vendors_snapshot)
+                                     config_snapshot, vendors_snapshot, epoch_snapshot)
     finally:
         # Decrement counter when request completes (success or failure)
         with _config_lock:
@@ -561,7 +737,7 @@ def forward_request(method, path, headers, body, handler=None, request_id=None):
 
 
 def _compat_probe_outcome(result, key, request_id, tier, method, path,
-                          headers, body, handler, config, vendors,
+                          headers, body, handler, config, vendors, epoch,
                           retry_original_id=None):
     """Process an unstripped probe response under the state machine.
 
@@ -570,7 +746,9 @@ def _compat_probe_outcome(result, key, request_id, tier, method, path,
     threshold and returns the stripped retry result. Anything else is
     inconclusive. The caller owns _compat_retry_lock. retry_original_id is
     forwarded unchanged to the stripped retry, so the entry-time marker
-    decision (loop guard + nudge) survives the re-entry.
+    decision (loop guard + nudge) survives the re-entry. epoch rides along
+    unchanged too, so a compat re-issue inside one client request stays on
+    one logical snapshot.
     """
     status = result[0]
     if 200 <= status < 300:
@@ -584,7 +762,7 @@ def _compat_probe_outcome(result, key, request_id, tier, method, path,
         for _attempt in range(COMPAT_MAX_RETRIES_PER_REQUEST):
             retry_result = _forward_request_impl(
                 method, path, headers, stripped_body, handler, request_id,
-                config, vendors, suppress_compat=True,
+                config, vendors, epoch, suppress_compat=True,
                 retry_original_id=retry_original_id)
             return _compat_merge_retries(result, retry_result)
         return result
@@ -593,7 +771,7 @@ def _compat_probe_outcome(result, key, request_id, tier, method, path,
 
 
 def _reasoning_outcome(result, key, selection, request_id, tier, method, path,
-                       headers, body, handler, config, vendors,
+                       headers, body, handler, config, vendors, epoch,
                        retry_original_id=None):
     """Drive the reasoning_field walk for one client request.
 
@@ -610,7 +788,8 @@ def _reasoning_outcome(result, key, selection, request_id, tier, method, path,
 
     The client receives the ORIGINAL top-level result on every failure exit.
     retry_original_id rides along unchanged to each walk forward, so the
-    entry-time marker decision (loop guard + nudge) survives the walk.
+    entry-time marker decision (loop guard + nudge) survives the walk; epoch
+    rides along with it, so the walk stays on one logical snapshot.
     """
     feature = COMPAT_FEATURES["reasoning_field"]
     if not feature.retry_lock.acquire(blocking=False):
@@ -629,7 +808,7 @@ def _reasoning_outcome(result, key, selection, request_id, tier, method, path,
             candidate = _reasoning_next_candidate(candidate)
             walk_result = _forward_request_impl(
                 method, path, headers, body, handler, request_id,
-                config, vendors, suppress_compat=True,
+                config, vendors, epoch, suppress_compat=True,
                 reasoning_selection=candidate,
                 retry_original_id=retry_original_id)
             walk_status = walk_result[0]
@@ -722,9 +901,13 @@ def _resolve_extra_request_headers(headers, provider_name, config, request_id):
 
 
 def _forward_request_impl(method, path, headers, body, handler, request_id,
-                          config, vendors, suppress_compat=False,
+                          config, vendors, epoch, suppress_compat=False,
                           reasoning_selection=None, retry_original_id=None):
     """Internal implementation of forward_request with snapshot config.
+
+    epoch is the config generation snapshotted at admission. It is required
+    (no default) at every site that checks it: a missed call site must fail
+    loudly at import/run time, never silently disable the swap guards.
 
     suppress_compat=True bypasses the feature-compatibility subsystem
     entirely — compatibility retries call this function with the flag set,
@@ -1032,12 +1215,12 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
             result = _forward_core(
                 method, path, handler, request_id, config, rewritten_body,
                 fwd_headers, upstream_path, host, port, use_ssl, tier,
-                provider_name, actual_model, mode, _is_count_tokens,
+                provider_name, actual_model, mode, _is_count_tokens, epoch,
                 tools_declared=tools_declared, key_name=key_name,
                 retry_original_id=retry_original_id)
             return _compat_probe_outcome(
                 result, compat_decision[1], request_id, tier, method, path,
-                headers, body, handler, config, vendors,
+                headers, body, handler, config, vendors, epoch,
                 retry_original_id=retry_original_id)
         finally:
             _compat_retry_lock.release()
@@ -1045,7 +1228,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     result = _forward_core(
         method, path, handler, request_id, config, rewritten_body,
         fwd_headers, upstream_path, host, port, use_ssl, tier,
-        provider_name, actual_model, mode, _is_count_tokens,
+        provider_name, actual_model, mode, _is_count_tokens, epoch,
         tools_declared=tools_declared, key_name=key_name,
         max_attempts=1 if suppress_compat else None,
         retry_original_id=retry_original_id)
@@ -1079,7 +1262,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
             return result
         return _reasoning_outcome(
             result, reasoning_key, reasoning_selection, request_id, tier,
-            method, path, headers, body, handler, config, vendors,
+            method, path, headers, body, handler, config, vendors, epoch,
             retry_original_id=retry_original_id)
 
     if active_feature.name != COMPAT_FEATURE:
@@ -1127,7 +1310,7 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
             for _attempt in range(COMPAT_MAX_RETRIES_PER_REQUEST):
                 retry_result = _forward_request_impl(
                     method, path, headers, stripped_body, handler,
-                    request_id, config, vendors, suppress_compat=True,
+                    request_id, config, vendors, epoch, suppress_compat=True,
                     retry_original_id=retry_original_id)
                 break
         if retry_result is None:
@@ -1156,13 +1339,17 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
 def _forward_core(method, path, handler, request_id, config,
                   rewritten_body, fwd_headers, upstream_path,
                   host, port, use_ssl, tier, provider_name, actual_model,
-                  mode, is_count_tokens, tools_declared=False, key_name=None,
+                  mode, is_count_tokens, epoch, tools_declared=False, key_name=None,
                   max_attempts=None, retry_original_id=None):
     """Forwarding pass: 429/503/connection retry loop and response handling.
 
     max_attempts=None derives the attempt count from config (SETTINGS.max_retries,
     count_tokens exclusion); an explicit value overrides both — compatibility
     retries pass 1 so a compat retry is a single upstream attempt.
+
+    epoch is the admission-time config generation. Backoff chains abandon at a
+    swap press (retryable 503 config_swap_restart); every read boundary is
+    epoch-checked so no old-routing result is delivered after a swap.
     """
     total_start = time.time()
     last_status = None
@@ -1176,6 +1363,15 @@ def _forward_core(method, path, handler, request_id, config,
                        else SETTINGS.max_retries + 1
 
     for attempt in range(max_attempts):
+        # Retry-loop head: an epoch change means a swap completed while this
+        # request was getting here. Epoch ONLY — an in-progress drain must
+        # not abort an immediate compat single-shot re-issue, which is live
+        # work (test_compat_config_swap_during_retry pins that boundary).
+        if _swap_epoch_changed(epoch):
+            _note_swap_eviction("retry_chain", request_id, tier=tier,
+                                provider=provider_name, model=actual_model)
+            return _swap_abort_tuple(request_id, total_start, retries, tier,
+                                     provider_name, actual_model)
         try:
             if use_ssl:
                 conn = http.client.HTTPSConnection(host, port, timeout=300)
@@ -1183,6 +1379,21 @@ def _forward_core(method, path, handler, request_id, config,
                 conn = http.client.HTTPConnection(host, port, timeout=300)
             conn.request(method, upstream_path, body=rewritten_body, headers=fwd_headers)
             resp = conn.getresponse()
+            _touch_upstream_activity()
+
+            # A response that landed after a completed swap is an old-routing
+            # result: fail it retryably before any byte reaches the client.
+            # getresponse() cannot be woken while blocked, so this is the
+            # accepted late-exit checkpoint.
+            if _swap_epoch_changed(epoch):
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                _note_swap_eviction("pre_first_byte", request_id, tier=tier,
+                                    provider=provider_name, model=actual_model)
+                return _swap_abort_tuple(request_id, total_start, retries, tier,
+                                         provider_name, actual_model)
 
             if resp.status in (429, 503):
                 last_status = resp.status
@@ -1200,6 +1411,26 @@ def _forward_core(method, path, handler, request_id, config,
                         resp.read()  # drain response body before close
                     except (socket.error, OSError):
                         pass
+                    _touch_upstream_activity()
+                    # A backoff chain abandons at the press: sleep in slices
+                    # and close the still-open connection on the way out, or
+                    # every abandoned chain leaks an upstream socket (the
+                    # exact traffic a switch under rate limiting produces).
+                    aborted = _swap_chain_abort(epoch)
+                    if not aborted:
+                        aborted = _interruptible_sleep(delay, epoch)
+                    if aborted:
+                        try:
+                            conn.close()
+                        except OSError:
+                            pass
+                        _note_swap_eviction("retry_chain", request_id, tier=tier,
+                                            provider=provider_name,
+                                            model=actual_model)
+                        return _swap_abort_tuple(request_id, total_start, retries,
+                                                 tier, provider_name, actual_model)
+                    # Accounting follows the completed sleep: an abandoned
+                    # chain must never log a retry it did not take.
                     retries += 1
                     increment_retried()
                     print("[proxy] {} on attempt {}/{}, model={}, provider={}, rid={}, retrying in {}s".format(
@@ -1216,7 +1447,6 @@ def _forward_core(method, path, handler, request_id, config,
                         "request_id": request_id,
                         "path": path,
                     })
-                    time.sleep(delay)
                     conn.close()
                     continue
                 else:
@@ -1238,7 +1468,8 @@ def _forward_core(method, path, handler, request_id, config,
                     # SSE: stream with mode-appropriate rewriting/transform
                     first_byte_ms = handler._stream_upstream_response(
                         resp, resp.status, resp_headers, request_id, retries,
-                        tier=tier, mode=mode, tools_declared=tools_declared,
+                        epoch=epoch, tier=tier, mode=mode,
+                        tools_declared=tools_declared,
                         provider=provider_name, key=key_name,
                         retry_original_id=retry_original_id)
                     conn.close()
@@ -1256,6 +1487,7 @@ def _forward_core(method, path, handler, request_id, config,
                         chunk = resp.read(8192)
                         if not chunk:
                             break
+                        _touch_upstream_activity()
                         if first_byte:
                             first_byte_elapsed = (time.time() - first_byte_start) * 1000
                             first_byte = False
@@ -1276,6 +1508,16 @@ def _forward_core(method, path, handler, request_id, config,
                     total_elapsed = time.time() - total_start
                     resp_body = b"".join(chunks)
                     conn.close()
+
+                    # Buffered bodies cannot be woken mid-read; their stall
+                    # exits late and then fails this checkpoint (recorded
+                    # boundary). The swap's result must not reach the client.
+                    if _swap_epoch_changed(epoch):
+                        _note_swap_eviction("buffered", request_id, tier=tier,
+                                            provider=provider_name,
+                                            model=actual_model)
+                        return _swap_abort_tuple(request_id, total_start, retries,
+                                                 tier, provider_name, actual_model)
 
                     if mode == "chat":
                         resp_body = _transform_and_guard(
@@ -1304,6 +1546,7 @@ def _forward_core(method, path, handler, request_id, config,
                             chunk = resp.read(8192)
                             if not chunk:
                                 break
+                            _touch_upstream_activity()
                             if first_byte:
                                 first_byte_elapsed = (time.time() - first_byte_start) * 1000
                                 first_byte = False
@@ -1323,6 +1566,12 @@ def _forward_core(method, path, handler, request_id, config,
                         total_elapsed = time.time() - total_start
                         resp_body = b"".join(chunks)
                         conn.close()
+                        if _swap_epoch_changed(epoch):
+                            _note_swap_eviction("buffered", request_id, tier=tier,
+                                                provider=provider_name,
+                                                model=actual_model)
+                            return _swap_abort_tuple(request_id, total_start, retries,
+                                                     tier, provider_name, actual_model)
                         transform_fn = _chat_to_anthropic if mode == "chat" else _response_to_anthropic
                         resp_body = _transform_and_guard(
                             resp_body, tier, transform_fn, request_id, mode, provider_name)
@@ -1332,7 +1581,8 @@ def _forward_core(method, path, handler, request_id, config,
                     else:
                         first_byte_ms = handler._stream_upstream_response(
                             resp, resp.status, resp_headers, request_id, retries,
-                            tier=tier, mode=mode, tools_declared=tools_declared,
+                            epoch=epoch, tier=tier, mode=mode,
+                            tools_declared=tools_declared,
                             provider=provider_name, key=key_name,
                             retry_original_id=retry_original_id)
                         conn.close()
@@ -1351,6 +1601,7 @@ def _forward_core(method, path, handler, request_id, config,
                 chunk = resp.read(8192)
                 if not chunk:
                     break
+                _touch_upstream_activity()
                 if first_byte:
                     first_byte_elapsed = (time.time() - first_byte_start) * 1000
                     first_byte = False
@@ -1372,6 +1623,11 @@ def _forward_core(method, path, handler, request_id, config,
 
             resp_body = b"".join(chunks)
             conn.close()
+            if _swap_epoch_changed(epoch):
+                _note_swap_eviction("buffered", request_id, tier=tier,
+                                    provider=provider_name, model=actual_model)
+                return _swap_abort_tuple(request_id, total_start, retries, tier,
+                                         provider_name, actual_model)
 
             # Non-2xx error path: anthropic mode keeps the model rewrite it had before;
             # chat/response modes pass upstream error bodies through
@@ -1388,6 +1644,17 @@ def _forward_core(method, path, handler, request_id, config,
             last_status = 0
             if attempt < max_attempts - 1:
                 delay = compute_jittered_delay(compute_delay(attempt))
+                # Same abandonment rule as the 429/503 site; there is no open
+                # connection to close here (its next statement is `continue`).
+                aborted = _swap_chain_abort(epoch)
+                if not aborted:
+                    aborted = _interruptible_sleep(delay, epoch)
+                if aborted:
+                    _note_swap_eviction("retry_chain", request_id, tier=tier,
+                                        provider=provider_name,
+                                        model=actual_model)
+                    return _swap_abort_tuple(request_id, total_start, retries,
+                                             tier, provider_name, actual_model)
                 retries += 1
                 increment_retried()
                 print("[proxy] Connection error on attempt {}/{}, model={}, provider={}, rid={}: {}, retrying in {}s".format(
@@ -1405,7 +1672,6 @@ def _forward_core(method, path, handler, request_id, config,
                     "error": sanitize_error(str(e)),
                     "path": path,
                 })
-                time.sleep(delay)
                 continue
             else:
                 total_elapsed = time.time() - total_start
@@ -1652,7 +1918,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body_bytes)
 
     def _stream_upstream_response(self, resp, status, resp_headers, request_id, retries,
-                                   tier=None, mode=None, tools_declared=False,
+                                   epoch, tier=None, mode=None, tools_declared=False,
                                    provider=None, key=None, retry_original_id=None):
         """Stream an upstream 2xx response body to the client as it arrives.
 
@@ -1667,12 +1933,88 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         For other content types: streams unchanged.
 
+        Each read iteration arms the upstream socket at the swap silence
+        budget ONLY while a config swap is in progress, and restores the
+        connection's original timeout otherwise — a no-swap stream keeps its
+        documented 300 s stall tolerance byte-for-byte. A `socket.timeout` is
+        terminal (measured: socket.SocketIO._timeout_occurred is set on the
+        first timeout and never reset, so every later read on that response
+        raises `cannot read from timed out object`), so an armed wake can only
+        ever end the stream — there is no wake-and-resume rule.
+
+        A stream admitted before a completed swap is a straggler: the epoch
+        check after each read closes it with the retryable config_swap_restart
+        error instead of delivering old-routing bytes. The residual window
+        (bytes already read under the old routing when the epoch bumps) is the
+        accepted chunk-granularity bound.
+
         Returns the first-byte latency in ms, or None if aborted.
         """
         first_byte_start = time.time()
         first_byte_ms = None
         first_chunk = True
         bytes_streamed = 0
+
+        # Capture the connection's original timeout once. Guarded by a boolean
+        # flag, never a `_orig is not None` test: a captured None (blocking
+        # mode) is a legitimate value that must be restorable.
+        _orig_timeout = None
+        _timeout_saved = False
+        try:
+            _orig_timeout = resp.fp.raw._sock.gettimeout()
+            _timeout_saved = True
+        except (AttributeError, OSError):
+            _timeout_saved = False
+
+        def arm_stream_timeout():
+            """Arm the upstream socket for this read iteration.
+
+            Conditional by construction: while a swap is in progress the read
+            wakes at the silence budget; otherwise the connection's original
+            timeout is restored.
+            """
+            nonlocal _timeout_saved
+            if not _timeout_saved:
+                return
+            try:
+                resp.fp.raw._sock.settimeout(
+                    SETTINGS.swap_silence_timeout if _config_swapping
+                    else _orig_timeout)
+            except (AttributeError, OSError):
+                _timeout_saved = False
+
+        def restore_stream_timeout():
+            if _timeout_saved:
+                try:
+                    resp.fp.raw._sock.settimeout(_orig_timeout)
+                except (AttributeError, OSError):
+                    pass
+
+        def evict_stream():
+            """Close a straggler stream with the retryable swap error.
+
+            The in-stream `event: error` mirrors the existing emission
+            precedent (response_frame_encode_failure). When nothing has been
+            written to the client yet, a minimal message_start opens the
+            stream first — an error frame with no preceding message_start is
+            a shape clients may not surface correctly.
+            """
+            _note_swap_eviction("stream", request_id, tier=tier, provider=provider)
+            if first_byte_ms is None:
+                self.wfile.write(self._sse_event({
+                    "type": "message_start",
+                    "message": {"id": "msg_" + str(uuid.uuid4()),
+                                "type": "message", "role": "assistant",
+                                "content": [], "model": tier,
+                                "stop_reason": None, "stop_sequence": None,
+                                "usage": {"input_tokens": 0, "output_tokens": 0}}},
+                    request_id))
+            self.wfile.write(b"event: error\ndata: " + _error_body(
+                "api_error", "config_swap_restart",
+                "config swap in progress: this request was restarted; "
+                "the client should retry",
+                request_id) + b"\n\n")
+            self.wfile.flush()
 
         # Check Content-Type to determine rewriting strategy
         content_type = resp_headers.get("Content-Type", "").lower()
@@ -1693,12 +2035,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if is_sse and tier:
                 if mode == "chat":
                     return self._stream_chat_sse_to_anthropic(
-                        resp, request_id, tier, first_byte_start,
+                        resp, request_id, tier, first_byte_start, epoch,
                         tools_declared=tools_declared, provider=provider, key=key,
                         retry_original_id=retry_original_id)
                 if mode == "response":
                     return self._stream_response_sse_fallback(
-                        resp, request_id, tier, first_byte_start)
+                        resp, request_id, tier, first_byte_start, epoch)
                 # SSE path (anthropic mode): buffer first event for model
                 # rewriting. Buffer chunks until \n\n delimiter is found or
                 # 64KB cap is exceeded.
@@ -1708,13 +2050,28 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 rewrite_skipped = False
 
                 while not first_event_found:
+                    arm_stream_timeout()
                     try:
                         chunk = resp.read1(8192)
+                    except socket.timeout:
+                        # Terminal by construction (a timed-out response is
+                        # permanently unreadable): the only question is how to
+                        # close. A swap owns this wake — evict; otherwise this
+                        # is today's 300 s stall cut.
+                        if _config_swapping or _swap_epoch_changed(epoch):
+                            evict_stream()
+                            return first_byte_ms
+                        break
                     except (http.client.IncompleteRead, http.client.RemoteDisconnected,
                             socket.error, OSError):
                         break
                     if not chunk:
                         break
+                    _touch_upstream_activity()
+                    if _swap_epoch_changed(epoch):
+                        # A completed swap: never forward old-routing bytes.
+                        evict_stream()
+                        return first_byte_ms
                     first_event_buffer.extend(chunk)
 
                     # Check for event delimiter
@@ -1762,13 +2119,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
                 # Stream remaining events unchanged
                 while True:
+                    arm_stream_timeout()
                     try:
                         chunk = resp.read1(8192)
+                    except socket.timeout:
+                        if _config_swapping or _swap_epoch_changed(epoch):
+                            evict_stream()
+                            return first_byte_ms
+                        break
                     except (http.client.IncompleteRead, http.client.RemoteDisconnected,
                             socket.error, OSError):
                         break
                     if not chunk:
                         break
+                    _touch_upstream_activity()
+                    if _swap_epoch_changed(epoch):
+                        evict_stream()
+                        return first_byte_ms
                     bytes_streamed += len(chunk)
                     if bytes_streamed > SETTINGS.max_response_size:
                         log_trace({
@@ -1786,13 +2153,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             else:
                 # Non-SSE path: stream unchanged
                 while True:
+                    arm_stream_timeout()
                     try:
                         chunk = resp.read1(8192)
+                    except socket.timeout:
+                        if _config_swapping or _swap_epoch_changed(epoch):
+                            evict_stream()
+                            return first_byte_ms
+                        break
                     except (http.client.IncompleteRead, http.client.RemoteDisconnected,
                             socket.error, OSError):
                         break
                     if not chunk:
                         break
+                    _touch_upstream_activity()
+                    if _swap_epoch_changed(epoch):
+                        evict_stream()
+                        return first_byte_ms
                     bytes_streamed += len(chunk)
                     if bytes_streamed > SETTINGS.max_response_size:
                         log_trace({
@@ -1814,6 +2191,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         except _DISCONNECT_ERRORS:
             self._log_client_disconnect(request_id, status, retries)
             return None
+        finally:
+            # Every exit path restores the connection's captured timeout
+            # (harmless after the caller's conn.close(), and the inverse of
+            # the per-iteration arming that only a swap installs).
+            restore_stream_timeout()
         return first_byte_ms
 
     def _sse_event(self, payload, request_id=None):
@@ -1845,7 +2227,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "data: " + body + "\n\n").encode("utf-8")
 
     def _stream_chat_sse_to_anthropic(self, resp, request_id, tier, first_byte_start,
-                                      tools_declared=False, provider=None, key=None,
+                                      epoch, tools_declared=False, provider=None, key=None,
                                       retry_original_id=None):
         """Transform an OpenAI chat-completions SSE stream into Anthropic Messages SSE.
 
@@ -1923,8 +2305,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         drain_done = False
         finish_seen_at = None
         post_finish_suppressed = 0
+
+        # Capture the connection's original socket timeout once, for the
+        # pre-finish arming below. Boolean flag, never a `_orig is not None`
+        # test: a captured None (blocking mode) is a legitimate value. The
+        # drain window separately pins the socket to its own bound and
+        # re-captures _orig_timeout there.
         _orig_timeout = None
         _timeout_saved = False
+        try:
+            _orig_timeout = resp.fp.raw._sock.gettimeout()
+            _timeout_saved = True
+        except (AttributeError, OSError):
+            _timeout_saved = False
 
         def write(payload):
             nonlocal bytes_streamed, first_byte_ms
@@ -2254,6 +2647,62 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     "count": post_finish_suppressed,
                 })
 
+        def evict_swap():
+            """Close a chat stream evicted by a config swap.
+
+            Pre-finish: the ungated cut-stream close — close the open blocks,
+            then the retryable api_error, and no synthesized terminal — with
+            chat_sse_truncated emitted exactly once, keeping the trace
+            invariant (every 200 stream ends with exactly one of
+            chat_sse_drain / chat_sse_truncated).
+            In the drain window: the same close with drain_exit set to
+            "swap_abort", emitted through the drain's own event.
+            """
+            nonlocal drain_exit, drain_ended_at
+            _note_swap_eviction("stream", request_id, tier=tier, provider=provider)
+            if not message_started:
+                start_message()
+            if finish_reason_seen is not None:
+                drain_exit = "swap_abort"
+                drain_ended_at = time.time()
+                close_all_blocks()
+                log_degradation_if_needed()
+                log_drain()
+                log_post_finish_suppressed()
+            else:
+                log_trace({
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "event": "chat_sse_truncated",
+                    "request_id": request_id,
+                    "pending_bytes": len(buf) if isinstance(buf, bytearray) else 0,
+                    "saw_done": 1 if saw_done else 0,
+                })
+                close_all_blocks()
+                log_degradation_if_needed()
+            write({
+                "type": "error",
+                "error": {"type": "api_error",
+                          "message": "config swap in progress: this request was "
+                                     "restarted; the client should retry"},
+            })
+            return first_byte_ms
+
+        def drain_pin():
+            """The drain window's socket bound, in seconds.
+
+            The mode's own budget (MAX_DRAIN_SECONDS) — capped by the swap
+            silence budget while a swap is in progress. The drain's quiet
+            window is `budget + _SWAP_QUIET_GRACE`, so a drain-window wake
+            pinned past the budget would fire after the swap had already
+            completed and synthesize a normal terminal on the old routing.
+            With the cap, an evictable straggler always wakes inside the
+            drain and is evicted before the drain exits.
+            """
+            bound = max(1, MAX_DRAIN_SECONDS)
+            if _config_swapping:
+                bound = min(bound, max(1, SETTINGS.swap_silence_timeout))
+            return bound
+
         def handle_frame(frame):
             nonlocal chat_id, usage, first_frame, tool_calls_seen, scalar_after_tools_dropped, malformed_tool_count
             nonlocal finish_reason_seen, post_finish_suppressed
@@ -2362,10 +2811,40 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         try:
             while True:
+                # Pre-finish only: arm the socket at the swap silence budget
+                # while a swap is in progress, restore the connection's
+                # original timeout otherwise. The drain window below owns its
+                # own pin (drain_pin(), re-pinned per chunk) and must not be
+                # overwritten here — that pin IS the drain's time bound.
+                if finish_reason_seen is None and _timeout_saved:
+                    try:
+                        resp.fp.raw._sock.settimeout(
+                            SETTINGS.swap_silence_timeout if _config_swapping
+                            else _orig_timeout)
+                    except (AttributeError, OSError):
+                        _timeout_saved = False
                 try:
                     chunk = resp.read1(8192)
                 except socket.timeout:
-                    drain_exit = "time_budget"
+                    if finish_reason_seen is not None:
+                        # The drain's own time bound — MUST survive: it is
+                        # what defers the synthesized terminal to the drain
+                        # budget rather than the 300 s socket timeout. A
+                        # completed swap still owns this wake, though: close
+                        # with the retryable error instead of synthesizing a
+                        # terminal on old routing. Defence in depth — the pin
+                        # is already bounded by the swap budget, so a wake
+                        # this late means the door closed while blocked.
+                        if _swap_epoch_changed(epoch):
+                            return evict_swap()
+                        drain_exit = "time_budget"
+                        break
+                    # Pre-finish: a timeout is terminal (an armed wake can
+                    # only end the stream), so the only question is how to
+                    # close. A swap owns this wake — evict; otherwise this is
+                    # today's stall cut.
+                    if _config_swapping or _swap_epoch_changed(epoch):
+                        return evict_swap()
                     break
                 except (http.client.IncompleteRead, http.client.RemoteDisconnected,
                         socket.error, OSError):
@@ -2374,6 +2853,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if not chunk:
                     drain_exit = "eof"
                     break
+                _touch_upstream_activity()
+                if _swap_epoch_changed(epoch):
+                    # A completed swap: no old-routing bytes reach the client.
+                    # In the drain window the epoch rule applies too — close
+                    # instead of synthesizing a terminal.
+                    return evict_swap()
                 if finish_reason_seen is not None:
                     drain_bytes += len(chunk)
                     if drain_bytes > MAX_DRAIN_BYTES:
@@ -2388,7 +2873,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     _tools_before = tool_calls_seen
                     if _timeout_saved:
                         try:
-                            resp.fp.raw._sock.settimeout(max(1, remaining))
+                            resp.fp.raw._sock.settimeout(
+                                min(max(1, remaining), drain_pin()))
                         except (AttributeError, OSError):
                             _timeout_saved = False
                 if first_byte_ms is None:
@@ -2428,10 +2914,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         # pins resp.read1() for the full upstream socket
                         # timeout (300 s). The value tracks the REMAINING drain
                         # budget (recomputed per chunk) and is restored after
-                        # the drain.
+                        # the drain. `drain_pin()` caps it by the swap silence
+                        # budget while a swap is in progress.
                         try:
                             _orig_timeout = resp.fp.raw._sock.gettimeout()
-                            resp.fp.raw._sock.settimeout(max(1, MAX_DRAIN_SECONDS))
+                            resp.fp.raw._sock.settimeout(drain_pin())
                             _timeout_saved = True
                         except (AttributeError, OSError):
                             _timeout_saved = False
@@ -2618,12 +3105,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         })
         return first_byte_ms
 
-    def _stream_response_sse_fallback(self, resp, request_id, tier, first_byte_start):
+    def _stream_response_sse_fallback(self, resp, request_id, tier, first_byte_start,
+                                      epoch):
         """Handle unexpected Responses-mode upstream SSE defensively.
 
         The request transform forces stream:false, so SSE here means a provider
         ignored the flag. Drain the unexpected stream and synthesize a clean,
         empty Anthropic terminal sequence instead of leaking raw OpenAI SSE.
+
+        The drain is an upstream read like any other: it touches the shared
+        activity clock, and an epoch change stops it — the synthesized
+        terminal is then the close (no error event is needed; this is the
+        defensive terminal-only path).
         """
         first_byte_ms = None
         try:
@@ -2633,8 +3126,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "request_id": request_id,
             })
             try:
-                while resp.read1(8192):
-                    pass
+                while True:
+                    chunk = resp.read1(8192)
+                    if not chunk:
+                        break
+                    _touch_upstream_activity()
+                    if _swap_epoch_changed(epoch):
+                        _note_swap_eviction("stream", request_id, tier=tier)
+                        break
             except (http.client.IncompleteRead, http.client.RemoteDisconnected,
                     socket.error, OSError):
                 pass
@@ -2738,6 +3237,40 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._send_response(200, json.dumps(config_copy).encode("utf-8"))
             return
 
+        # Admin API: live config-swap status. Exactly five scalars, nothing
+        # provider-, config- or request-derived, and no CORS headers — the
+        # endpoint widens an existing (explicitly out-of-scope) local
+        # disclosure surface and must not widen it further.
+        if self.path == "/admin/api/swap-status":
+            # localhost-only check
+            if self.client_address[0] not in ("127.0.0.1", "::1"):
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"forbidden"}')
+                return
+
+            # Each nullable field is guarded on its own source, not on
+            # `swapping`: a `time.time() - None` TypeError would 500 the
+            # endpoint, and the admin page swallows poll failures — the bug
+            # would degrade silently into a dead status line.
+            with _config_lock:
+                swapping = _config_swapping
+                now = time.time()
+                waited_s = (now - _swap_started_at) \
+                    if (swapping and _swap_started_at is not None) else None
+                silence_s = (now - _last_upstream_activity) \
+                    if (swapping and _last_upstream_activity) else None
+                inflight = _inflight_count
+            self._send_response(200, json.dumps({
+                "swapping": swapping,
+                "waited_s": waited_s,
+                "inflight": inflight,
+                "silence_s": silence_s,
+                "budget_s": SETTINGS.swap_silence_timeout,
+            }).encode("utf-8"))
+            return
+
         # Admin API: get providers list
         if self.path == "/admin/api/providers":
             # localhost-only check
@@ -2782,7 +3315,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "not_found_error", "not_found", "not found", str(uuid.uuid4())))
 
     def do_POST(self):
-        global _current_config
+        global _current_config, _config_epoch, _config_swapping, _swap_started_at
 
         # Admin shutdown — localhost-only, graceful shutdown via server.shutdown()
         if self.path == "/admin/shutdown":
@@ -2917,30 +3450,27 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     }).encode("utf-8"))
                     return
 
-            # Drain-and-swap: wait for in-flight requests to complete before swapping
+            # Drain-and-swap: pause admissions and wait for in-flight work.
+            # Never fails and never aborts: it always reaches a decision, and
+            # the handler returns 200 with the drain detail. Only a disk-write
+            # failure below (which follows a completed drain) returns 500, and
+            # that path performs no swap and no epoch bump — survivors
+            # legitimately continue on the old mapping.
             response_status = None
             response_body = None
-
-            # Phase 1: Set swap flag and wait for drain
-            with _config_lock:
-                _config_swapping = True
-                _swap_done.clear()
-
-            # Phase 2: Wait for in-flight requests to drain (with timeout)
-            drain_timeout = 30.0  # seconds
-            drain_start = time.time()
-            while True:
-                with _config_lock:
-                    if _inflight_count == 0:
-                        break
-                if time.time() - drain_start > drain_timeout:
-                    # Timeout - abort swap
-                    with _config_lock:
-                        _config_swapping = False
-                        _swap_done.set()
-                    self._send_response(503, b'{"error":"config swap timeout: requests still in-flight"}')
-                    return
-                time.sleep(0.1)
+            drain = _drain_for_swap()
+            if drain is None:
+                # Single-flight: a swap is already in progress. The guard and
+                # the press share one lock acquisition inside _drain_for_swap,
+                # so two concurrent presses cannot both enter a drain — the
+                # second is refused here without disturbing the first swap's
+                # mapping, epoch, or drain counters.
+                self._send_response(409, _error_body(
+                    "api_error", "config_swap_in_progress",
+                    "a config swap is already in progress; retry when it completes",
+                    str(uuid.uuid4())))
+                return
+            drained, inflight_at_press, waited_s = drain
 
             # Phase 3: Perform the swap
             try:
@@ -2966,17 +3496,29 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             write_config(_config_path, disk_config)
                             # Only update in-memory after successful disk write
                             _current_config = new_config
+                            # The epoch bump is the eviction signal for any
+                            # straggler still holding an old snapshot.
+                            _config_epoch += 1
                             response_status = 200
-                            response_body = json.dumps({"status": "ok"}).encode("utf-8")
+                            response_body = json.dumps({
+                                "status": "ok",
+                                "drained": drained,
+                                "waited_s": round(waited_s, 3),
+                                "inflight_at_swap": inflight_at_press,
+                            }).encode("utf-8")
                         except OSError as e:
                             response_status = 500
                             response_body = json.dumps({
                                 "error": "failed to write config: {}".format(e)
                             }).encode("utf-8")
             finally:
-                # Phase 4: Clear swap flag and signal completion
+                # Phase 4: Clear swap flag and signal completion. The
+                # timestamp clears in the SAME acquisition: the status
+                # endpoint must never observe swapping True with a None
+                # started_at.
                 with _config_lock:
                     _config_swapping = False
+                    _swap_started_at = None
                     _swap_done.set()
 
             # Send response after releasing lock
@@ -3001,8 +3543,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             # Reload the provider catalog from models.json. Tiers are not
             # re-read from disk. This happens at handler entry, before the
             # drain, so a missing or malformed catalog fails fast with an
-            # immediate 400 rather than after a drain that can last up to
-            # 30 seconds.
+            # immediate 400 rather than after an unbounded drain.
             try:
                 models_doc = load_models_document(models_path_for(_config_path))
             except ValueError as e:
@@ -3011,95 +3552,119 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 }).encode("utf-8"))
                 return
 
-            # Drain-and-swap: wait for in-flight requests to complete before swapping
-            # Phase 1: Set swap flag and wait for drain
+            # Assemble the candidate and run the membership/validate gate
+            # BEFORE the press, so a refused reload abandons no retry chains.
+            # Safe now that single-flight keeps a concurrent switch from
+            # completing — and being silently reverted in memory — mid-drain,
+            # which is what the original after-drain ordering guarded against.
             with _config_lock:
-                _config_swapping = True
-                _swap_done.clear()
+                # The epoch these tiers are read at, captured in the SAME
+                # acquisition. A /admin/api/switch that completes its whole
+                # press -> drain -> swap -> release cycle after this gate and
+                # before Phase 3 leaves this candidate stale; Phase 3 compares
+                # the epoch before installing, so it can never revert the
+                # switch's mapping.
+                gated_epoch = _config_epoch
+                candidate = {
+                    "tiers": _current_config.get("tiers", {}),
+                    "models": models_doc.get("models", {}),
+                }
+                for _key in ("extra_request_headers",
+                             "disable_retry_claude_count_token",):
+                    if _key in models_doc:
+                        candidate[_key] = models_doc[_key]
 
-            # Phase 2: Wait for in-flight requests to drain (with timeout)
-            drain_timeout = 30.0  # seconds
-            drain_start = time.time()
-            while True:
-                with _config_lock:
-                    if _inflight_count == 0:
+                # Membership gate: every tier must name a provider whose
+                # reloaded catalog lists its model. The gate is total —
+                # a tier it cannot judge is refused with its own 400,
+                # never skipped, and it must run before validate_config
+                # so the specific error is not pre-empted.
+                gate_error = None
+                models_path = models_path_for(_config_path)
+                for tier_name, tier in candidate["tiers"].items():
+                    if not isinstance(tier, dict):
+                        gate_error = "tier '{}' is not an object".format(tier_name)
                         break
-                if time.time() - drain_start > drain_timeout:
-                    # Timeout - abort swap
-                    with _config_lock:
-                        _config_swapping = False
-                        _swap_done.set()
-                    self._send_response(503, b'{"error":"config swap timeout: requests still in-flight"}')
-                    return
-                time.sleep(0.1)
+                    provider = tier.get("provider")
+                    model = tier.get("model")
+                    if not provider or not model \
+                            or not isinstance(provider, str) \
+                            or not isinstance(model, str):
+                        gate_error = "tier '{}' does not name a provider and a model".format(tier_name)
+                        break
+                    catalog_entry = candidate["models"].get(provider)
+                    if not isinstance(catalog_entry, list) \
+                            or model not in catalog_entry:
+                        gate_error = (
+                            "reload refused: tier '{}' uses model '{}', which is "
+                            "not in the reloaded catalog for provider '{}' "
+                            "({})".format(tier_name, model, provider, models_path))
+                        break
+                if gate_error is None:
+                    provider_names = set(_vendors.keys())
+                    provider_keys = {name: vendor_key_names(v)
+                                     for name, v in _vendors.items()}
+                    errors = validate_config(candidate, provider_names,
+                                             provider_keys)
+                    if errors:
+                        gate_error = "config validation failed: {}".format(
+                            "; ".join(errors))
+            if gate_error is not None:
+                # Refusal: no press, no drain, no swap — the previous
+                # catalog stays in effect and no retry chain was disturbed.
+                self._send_response(400, json.dumps({
+                    "error": gate_error
+                }).encode("utf-8"))
+                return
 
-            # Phase 3: Assemble the candidate, gate it, validate it, and swap.
-            # Tiers are assembled under the lock so a /admin/api/switch that
-            # completes during the drain is not silently reverted in memory.
+            # Drain-and-swap: pause admissions and wait for in-flight work
+            # (see /admin/api/switch).
+            drain = _drain_for_swap()
+            if drain is None:
+                # Single-flight, shared with /admin/api/switch: the guard and
+                # the press share one lock acquisition inside _drain_for_swap,
+                # so a reload racing a switch is refused here and leaves the
+                # in-progress swap's mapping intact (see there).
+                self._send_response(409, _error_body(
+                    "api_error", "config_swap_in_progress",
+                    "a config swap is already in progress; retry when it completes",
+                    str(uuid.uuid4())))
+                return
+            drained, inflight_at_press, waited_s = drain
+
+            # Phase 3: swap in the gated candidate and bump the epoch.
             try:
                 with _config_lock:
-                    candidate = {
-                        "tiers": _current_config.get("tiers", {}),
-                        "models": models_doc.get("models", {}),
-                    }
-                    for _key in ("extra_request_headers",
-                                 "disable_retry_claude_count_token",):
-                        if _key in models_doc:
-                            candidate[_key] = models_doc[_key]
-
-                    # Membership gate: every tier must name a provider whose
-                    # reloaded catalog lists its model. The gate is total —
-                    # a tier it cannot judge is refused with its own 400,
-                    # never skipped, and it must run before validate_config
-                    # so the specific error is not pre-empted.
-                    gate_error = None
-                    models_path = models_path_for(_config_path)
-                    for tier_name, tier in candidate["tiers"].items():
-                        if not isinstance(tier, dict):
-                            gate_error = "tier '{}' is not an object".format(tier_name)
-                            break
-                        provider = tier.get("provider")
-                        model = tier.get("model")
-                        if not provider or not model \
-                                or not isinstance(provider, str) \
-                                or not isinstance(model, str):
-                            gate_error = "tier '{}' does not name a provider and a model".format(tier_name)
-                            break
-                        catalog_entry = candidate["models"].get(provider)
-                        if not isinstance(catalog_entry, list) \
-                                or model not in catalog_entry:
-                            gate_error = (
-                                "reload refused: tier '{}' uses model '{}', which is "
-                                "not in the reloaded catalog for provider '{}' "
-                                "({})".format(tier_name, model, provider, models_path))
-                            break
-                    if gate_error is None:
-                        provider_names = set(_vendors.keys())
-                        provider_keys = {name: vendor_key_names(v)
-                                         for name, v in _vendors.items()}
-                        errors = validate_config(candidate, provider_names,
-                                                 provider_keys)
-                        if errors:
-                            gate_error = "config validation failed: {}".format(
-                                "; ".join(errors))
-                    if gate_error is not None:
-                        # Refusal: perform no swap — the previous catalog
-                        # stays in effect.
-                        response_status = 400
-                        response_body = json.dumps({
-                            "error": gate_error
-                        }).encode("utf-8")
+                    if _config_epoch != gated_epoch:
+                        # A concurrent /admin/api/switch completed a swap
+                        # between the gate above and this install, so
+                        # `candidate`'s tiers predate it: installing them would
+                        # silently revert that switch's mapping. No swap is in
+                        # progress at this point, so this is NOT the
+                        # single-flight refusal — it is a stale candidate.
+                        response_status = 409
+                        response_body = _error_body(
+                            "api_error", "config_reload_stale",
+                            "the configuration changed while the reload was "
+                            "being prepared; retry",
+                            str(uuid.uuid4()))
                     else:
                         _current_config = candidate
+                        _config_epoch += 1
                         response_status = 200
                         response_body = json.dumps({
                             "status": "ok",
-                            "config": candidate
+                            "config": candidate,
+                            "drained": drained,
+                            "waited_s": round(waited_s, 3),
+                            "inflight_at_swap": inflight_at_press,
                         }).encode("utf-8")
             finally:
-                # Phase 4: Clear swap flag and signal completion
+                # Phase 4: Clear swap flag and signal completion (the
+                # timestamp clears in the same acquisition — see there).
                 with _config_lock:
                     _config_swapping = False
+                    _swap_started_at = None
                     _swap_done.set()
 
             # Send response after releasing lock

@@ -473,6 +473,76 @@ def _create_test_keys_plain(temp_dir, vendors):
 
 
 
+# The child signals its own readiness: server.py prints this marker on stdout
+# immediately after it has bound its listening socket (just after the
+# ThreadingHTTPServer construction, before serve_forever()).
+_READY_MARKER = "READY"
+
+# Readiness deadline for a directly spawned server. A READY marker normally
+# arrives within a second or two; the deadline only bounds the pathological
+# cases (a child that binds but never speaks, or a port already held by an
+# unrelated listener). It is deliberately generous because whole-suite load
+# can stretch a child's import-and-bind past the old 10 s: a healthy child was
+# measured still alive and listening when that deadline expired, failing the
+# test at setup (see the suite-readiness-probe-timeout report). A child that
+# dies is detected immediately via proc.poll(), so a longer deadline costs
+# nothing on the ordinary failure paths.
+_READY_DEADLINE_SECONDS = 30.0
+
+
+def _await_child_ready_marker(proc, ready_event, seen):
+    """Read a child's stdout until its READY marker arrives (or EOF).
+
+    Runs in a daemon thread so the caller's readiness wait can time out
+    independently of a child that never speaks. The server writes exactly one
+    line to stdout — the READY marker, after it has bound its socket — so
+    returning as soon as it is seen cannot starve the child on a full stdout
+    pipe. Any non-marker line the child did write is kept in `seen` so nothing
+    is silently dropped.
+
+    stderr is deliberately NOT touched here: several callers read it through
+    proc.communicate() after a refused startup, and the refusal diagnostics
+    live there. Draining it here would consume the record those callers assert
+    on.
+    """
+    try:
+        for line in proc.stdout:
+            text = line.rstrip("\n")
+            if text.strip() == _READY_MARKER:
+                ready_event.set()
+                return
+            if text.strip():
+                seen.append(text)
+    except (OSError, ValueError):
+        pass
+
+
+def _read_child_stderr(proc, timeout=2):
+    """Return a child's stderr text, bounded and never blocking.
+
+    Kills the child first (this is the readiness-failure path, where the child
+    is discarded anyway), then reads whatever it emitted. A TimeoutExpired or
+    any other error yields "" rather than propagating — the diagnostic must
+    never be the thing that fails the test.
+    """
+    try:
+        if proc.poll() is None:
+            proc.kill()
+    except OSError:
+        pass
+    try:
+        _, stderr = proc.communicate(timeout=timeout)
+        return stderr or ""
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        return ""
+    except (OSError, ValueError):
+        return ""
+
+
 def _start_proxy_server_directly(port, config_path=None, keys_path=None,
                                   passphrase="test-passphrase", trace_file=None, cwd=None,
                                   extra_env=None):
@@ -522,10 +592,37 @@ def _start_proxy_server_directly(port, config_path=None, keys_path=None,
         # Plain keys: close stdin so server doesn't block on read
         _close_child_stdin(proc)
 
-    # Wait for server to be ready
-    deadline = time.time() + 10
+    # Wait for server to be ready.
+    #
+    # The child's own READY marker on stdout is the primary signal: it is
+    # emitted by the child after it has bound its socket, so a slow-but-healthy
+    # child cannot be mistaken for a dead one, and a child that died before
+    # binding is detected the moment its stdout closes. The TCP connect below
+    # is kept as a fallback for any child that binds without speaking, and to
+    # preserve the pre-existing readiness contract byte-for-byte for such a
+    # child. The deadline is generous (see _READY_DEADLINE_SECONDS): under
+    # whole-suite load a healthy child was measured missing the old 10 s, and
+    # the extra headroom costs nothing because a dead child ends the wait via
+    # proc.poll().
+    ready_event = threading.Event()
+    ready_lines = []
+    threading.Thread(
+        target=_await_child_ready_marker,
+        args=(proc, ready_event, ready_lines),
+        daemon=True,
+    ).start()
+
+    deadline = time.time() + _READY_DEADLINE_SECONDS
     probe_ok = False
     while time.time() < deadline:
+        if ready_event.is_set():
+            probe_ok = True
+            break
+        if proc.poll() is not None:
+            # The child exited before signalling readiness; no later probe can
+            # succeed. Its stderr (not read here — callers drain it themselves)
+            # carries the reason.
+            break
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(1)
@@ -536,8 +633,6 @@ def _start_proxy_server_directly(port, config_path=None, keys_path=None,
         except (socket.error, ConnectionRefusedError):
             time.sleep(0.1)
     return proc, probe_ok
-
-
 
 
 def _send_proxy_request(port, path="/v1/messages", body=None, headers=None):
@@ -569,10 +664,16 @@ def _send_proxy_request(port, path="/v1/messages", body=None, headers=None):
 
 
 
-def _admin_post(proxy_port, path, body, origin=None):
-    """POST to admin API with CSRF Origin header. Returns (status, data)."""
+def _admin_post(proxy_port, path, body, origin=None, timeout=10):
+    """POST to admin API with CSRF Origin header. Returns (status, data).
+
+    `timeout` bounds the whole exchange. A switch/reload drain is unbounded by
+    design (it waits for in-flight work to finish), so a test whose switch
+    legitimately waits out a live stream must raise this past the 10 s default
+    — otherwise the client gives up while the server-side swap still succeeds.
+    """
     import http.client as _hc
-    conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+    conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=timeout)
     headers = {"Content-Type": "application/json"}
     if origin is not None:
         headers["Origin"] = origin
@@ -691,6 +792,10 @@ def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-pas
     )
 
     if not probe_ok:
+        child_stderr = _read_child_stderr(proc)
+        if child_stderr.strip():
+            info("readiness probe failed; child stderr follows:")
+            info(child_stderr.rstrip())
         for ms in mock_servers.values():
             if ms["server"] is not None:
                 ms["server"].shutdown()
@@ -757,8 +862,57 @@ def _start_mock_upstream(port, req_list):
 
 
 
-def _start_admin_proxy(tiers, vendors, models=None):
+def _start_streaming_mock_upstream(port, req_list, handler_fn):
+    """Start a mock upstream whose fixture owns the whole response.
+
+    Unlike _start_mode_mock_upstream (which computes one body and writes it in
+    a single shot), `handler_fn(handler, info)` drives the response itself: it
+    sends the status/headers, flushes bytes incrementally, can block on events
+    the test sets, and can hold the socket open. `info` carries
+    path/body/api_key/authorization/headers; every request is appended to
+    req_list. HTTP/1.0 with no Content-Length makes the response
+    close-delimited, so returning from handler_fn ends the stream.
+    """
+    class MockHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def do_POST(self):
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_len) if content_len > 0 else b""
+            info = {
+                "path": self.path,
+                "body": body,
+                "api_key": self.headers.get("x-api-key", ""),
+                "authorization": self.headers.get("authorization", ""),
+                "headers": _record_request_headers(self.headers),
+            }
+            req_list.append(info)
+            handler_fn(self, info)
+
+        def log_message(self, format, *args):
+            pass
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), MockHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.1)
+    return server
+
+
+
+
+def _start_admin_proxy(tiers, vendors, models=None, extra_env=None,
+                       responders=None, streamers=None):
     """Start proxy via _start_proxy_server_directly with plain keys.
+
+    extra_env: additional env vars for the proxy subprocess (e.g. a reduced
+    PROXY_SWAP_SILENCE_TIMEOUT, without which every swap test silently runs at
+    the 30 s default).
+    responders: optional vendor -> responder(info) -> (status, content_type,
+    body) map, served by the canned mode upstream.
+    streamers: optional vendor -> handler_fn(handler, info) map for a
+    fixture-driven streaming upstream (_start_streaming_mock_upstream); it wins
+    over `responders` for the same vendor. A vendor in neither keeps the
+    default canned 200-JSON upstream.
 
     Returns (proxy_port, proc, mock_servers, temp_dir, cleanup).
     """
@@ -776,20 +930,29 @@ def _start_admin_proxy(tiers, vendors, models=None):
         parsed = urlparse(vendor_info["url"])
         port = parsed.port
         req_list = []
-        mock_servers[vendor_name] = {
-            "server": _start_mock_upstream(port, req_list),
-            "requests": req_list,
-        }
+        if streamers and vendor_name in streamers:
+            server = _start_streaming_mock_upstream(
+                port, req_list, streamers[vendor_name])
+        elif responders and vendor_name in responders:
+            server = _start_mode_mock_upstream(
+                port, req_list, responders[vendor_name])
+        else:
+            server = _start_mock_upstream(port, req_list)
+        mock_servers[vendor_name] = {"server": server, "requests": req_list}
 
     trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
     os.close(trace_fd)
 
     proc, probe_ok = _start_proxy_server_directly(
         proxy_port, config_path=config_path, keys_path=keys_path,
-        passphrase=None, trace_file=trace_file
+        passphrase=None, trace_file=trace_file, extra_env=extra_env
     )
 
     if not probe_ok:
+        child_stderr = _read_child_stderr(proc)
+        if child_stderr.strip():
+            info("readiness probe failed; child stderr follows:")
+            info(child_stderr.rstrip())
         for ms in mock_servers.values():
             ms["server"].shutdown()
         proc.kill()
@@ -990,14 +1153,16 @@ def _mode_default_responder(info):
 
 
 def _start_mode_proxy(tiers, vendors, responders=None, extra_env=None,
-                      extra_headers=None):
+                      extra_headers=None, streamers=None):
     """Start proxy + mode-aware mock upstreams (plain keys).
 
     vendors maps vendor -> {url, key, mode?}. responders maps vendor ->
     responder(info). extra_env passes additional env vars to the proxy
     subprocess (e.g. reduced PROXY_MAX_DELAY for fast retry tests).
     extra_headers: optional provider-keyed extra_request_headers map written
-    into the config. Returns
+    into the config. streamers: optional vendor -> handler_fn(handler, info)
+    map for a fixture-driven streaming upstream; it wins over `responders` for
+    the same vendor. Returns
     (temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup).
     """
     temp_dir = tempfile.mkdtemp(prefix="proxy_mode_")
@@ -1013,8 +1178,12 @@ def _start_mode_proxy(tiers, vendors, responders=None, extra_env=None,
         from urllib.parse import urlparse
         port = urlparse(vendor_info["url"]).port
         req_list = []
-        responder = responders.get(vendor_name, _mode_default_responder)
-        server = _start_mode_mock_upstream(port, req_list, responder)
+        if streamers and vendor_name in streamers:
+            server = _start_streaming_mock_upstream(
+                port, req_list, streamers[vendor_name])
+        else:
+            responder = responders.get(vendor_name, _mode_default_responder)
+            server = _start_mode_mock_upstream(port, req_list, responder)
         mock_servers[vendor_name] = {"server": server, "requests": req_list}
 
     trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
@@ -1026,6 +1195,10 @@ def _start_mode_proxy(tiers, vendors, responders=None, extra_env=None,
     )
 
     if not probe_ok:
+        child_stderr = _read_child_stderr(proc)
+        if child_stderr.strip():
+            info("readiness probe failed; child stderr follows:")
+            info(child_stderr.rstrip())
         for ms in mock_servers.values():
             ms["server"].shutdown()
         proc.kill()
@@ -1170,6 +1343,95 @@ def _trace_events_for_request(request_id):
             if ev.get("request_id") == request_id:
                 out.append(ev)
     return out
+
+
+
+
+def _trace_file_in(temp_dir):
+    """Return the trace file an _start_admin_proxy temp_dir carries, or None.
+
+    _start_admin_proxy returns the temp_dir but not its trace path (its 5-tuple
+    return is depended on by many tests); the trace is the only .jsonl the
+    helper's mkstemp creates there.
+    """
+    try:
+        names = os.listdir(temp_dir)
+    except OSError:
+        return None
+    for name in sorted(names):
+        if name.endswith(".jsonl"):
+            return os.path.join(temp_dir, name)
+    return None
+
+
+
+
+def _trace_events_named(trace_file, event_name):
+    """Return every trace event in `trace_file` whose "event" is `event_name`."""
+    out = []
+    if not trace_file or not os.path.exists(trace_file):
+        return out
+    with open(trace_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("event") == event_name:
+                out.append(ev)
+    return out
+
+
+
+
+def _wait_for_trace_events(trace_file, event_name, timeout_s=3.0):
+    """Poll `trace_file` until at least one `event_name` event appears.
+
+    A client that returns as soon as the terminal frames land can outrun the
+    proxy's trace write, so an immediate single read races the proxy process.
+    Returns the events found, or [] if none landed within `timeout_s`.
+    """
+    deadline = time.time() + timeout_s
+    while True:
+        out = _trace_events_named(trace_file, event_name)
+        if out or time.time() >= deadline:
+            return out
+        time.sleep(0.05)
+
+
+
+
+def _wait_admin_swapping(proxy_port, timeout_s=8.0):
+    """Poll GET /admin/api/swap-status until swapping is True.
+
+    Returns the status payload, or None if the swap never became visible.
+    """
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        status, body, _ = _admin_get(proxy_port, "/admin/api/swap-status")
+        try:
+            data = json.loads(body)
+        except Exception:
+            data = None
+        if status == 200 and isinstance(data, dict) and data.get("swapping") is True:
+            return data
+        time.sleep(0.05)
+    return None
+
+
+
+
+def _wait_upstream_request(mock_servers, vendor, timeout_s=5.0):
+    """Wait until `vendor`'s mock upstream has recorded at least one request."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if mock_servers[vendor]["requests"]:
+            return True
+        time.sleep(0.02)
+    return False
 
 
 

@@ -16,6 +16,7 @@ import threading
 import time
 
 from _harness import (
+    _admin_post,
     _assert_degradation_metadata_only,
     _cc,
     _chat_sse_fetch_frames,
@@ -36,6 +37,8 @@ from _harness import (
     _start_chat_sse_proxy,
     _start_mode_proxy,
     _start_proxy_server_directly,
+    _wait_admin_swapping,
+    _wait_upstream_request,
     errors,
     fail,
     find_free_port,
@@ -45,8 +48,10 @@ from _harness import (
 )
 
 # A post-finish drain that has not terminated by this point is a failure: the
-# drain is bounded by MAX_DRAIN_SECONDS (5s) and must leave ample headroom under
-# the 30s drain-and-swap timeout a config switch waits on.
+# drain is bounded by MAX_DRAIN_SECONDS (5s) and must leave ample headroom
+# under its own socket pin, which is the mode's drain bound rather than any
+# config-swap timeout (the swap drain waits for live work and has no
+# wall-clock cap).
 DRAIN_BOUND_TEST_SECONDS = 20
 
 
@@ -4187,6 +4192,364 @@ def test_sse_event_unserializable_payload_degrades():
 
 
 
+# ===========================================================================
+# Chat-mode streams across a config swap (plan 2026-10-12-swap-silence-drain)
+# ===========================================================================
+
+# The swap tests drive a 2 s silence budget; the 30 s default would make every
+# one of them silently run at 30 s. The drain's quiet window is budget + 2 s.
+_CHAT_SWAP_BUDGET_ENV = {"PROXY_SWAP_SILENCE_TIMEOUT": "2"}
+
+_CHAT_SWITCH_TO_Q = {"tiers": {
+    "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+    "sonnet": {"provider": "q", "model": "claude-sonnet-5"},
+    "opus": {"provider": "p", "model": "claude-opus-5"},
+}}
+
+
+def _chat_swap_proxy(p_streamer):
+    """Start a chat-mode two-provider proxy: sonnet -> p, q for the switch.
+
+    Returns (proxy_port, trace_file, mock_servers, cleanup), or (None,)*4 on
+    failure.
+    """
+    tiers = _mode_tiers()
+    vendors = {
+        "p": {"url": "http://127.0.0.1:{}".format(find_free_port()),
+              "key": "K", "mode": "chat"},
+        "q": {"url": "http://127.0.0.1:{}".format(find_free_port()),
+              "key": "K", "mode": "chat"},
+    }
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, streamers={"p": p_streamer},
+        extra_env=dict(_CHAT_SWAP_BUDGET_ENV))
+    if proc is None:
+        return None, None, None, None
+    return proxy_port, trace_file, mock_servers, cleanup
+
+
+def _chat_stream_in_thread(port, out):
+    """POST a streaming chat request on a background thread into out['result']."""
+    def worker():
+        try:
+            out["result"] = _send_proxy_request_stream(
+                port, {"model": "sonnet", "stream": True,
+                       "messages": [{"role": "user", "content": "hi"}]})
+        except Exception as e:
+            out["result"] = (0, "", str(e).encode())
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    return t
+
+
+def test_chat_sse_swap_evicts_pre_finish():
+    """A chat-mode stream evicted pre-finish (a byte after the press, then
+    silence) closes with the retryable config_swap_restart error and emits
+    chat_sse_truncated, keeping the trace invariant (exactly one of
+    chat_sse_drain / chat_sse_truncated)."""
+    print("\n--- Test: Chat SSE Pre-Finish Swap Eviction ---")
+    post_press_byte = threading.Event()
+
+    def streamer(handler, info):
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.end_headers()
+        handler.wfile.write(_sse_stream_chunks(
+            [_cc({"role": "assistant", "content": "hi"})]))
+        handler.wfile.flush()
+        # A byte AFTER the press, then silence: the loop's next read is then
+        # armed at the budget while _config_swapping is True.
+        post_press_byte.wait(15)
+        handler.wfile.write(_sse_stream_chunks([_cc({"content": "more"})]))
+        handler.wfile.flush()
+        time.sleep(30)  # hold silently
+
+    proxy_port, trace_file, mock_servers, cleanup = _chat_swap_proxy(streamer)
+    if proxy_port is None:
+        fail("Failed to set up test")
+        return
+    try:
+        out = {}
+        client = _chat_stream_in_thread(proxy_port, out)
+        if not _wait_upstream_request(mock_servers, "p"):
+            fail("upstream never received the stream request")
+            return
+        switch_out = {}
+        sw = threading.Thread(
+            target=lambda: switch_out.update(zip(
+                ("status", "data"),
+                _admin_post(proxy_port, "/admin/api/switch", _CHAT_SWITCH_TO_Q))),
+            daemon=True)
+        sw.start()
+        if _wait_admin_swapping(proxy_port) is None:
+            fail("swap never became visible on /admin/api/swap-status")
+            return
+        post_press_byte.set()
+        sw.join(20)
+        client.join(20)
+        if switch_out.get("status") != 200:
+            fail("switch returned {}: {}".format(
+                switch_out.get("status"), switch_out.get("data")))
+            return
+        cstatus, _ctype, raw = out.get("result", (0, "", b""))
+        if cstatus != 200:
+            fail("client stream status {}, expected 200".format(cstatus))
+            return
+        if b"config swap in progress" not in raw:
+            fail("evicted chat stream must end with the retryable error: {!r}".format(raw[-300:]))
+            return
+        if "error" not in [_sse_frame_type(f) for f in _parse_sse_frames(raw)]:
+            fail("evicted chat stream must carry an SSE error frame")
+            return
+        if b"message_stop" in raw:
+            fail("a pre-finish eviction must not synthesize a terminal")
+            return
+        truncated = _wait_for_trace_events(trace_file, "chat_sse_truncated")
+        drains = _trace_events_named(trace_file, "chat_sse_drain")
+        if len(truncated) != 1 or drains:
+            fail("expected exactly one chat_sse_truncated and no chat_sse_drain, "
+                 "got {} / {}".format(len(truncated), len(drains)))
+            return
+        phases = {e.get("phase") for e in _wait_for_trace_events(trace_file, "swap_abort")}
+        if "stream" not in phases:
+            fail("swap_abort phases {} must include stream".format(phases))
+            return
+        pass_("pre-finish eviction: one chat_sse_truncated, retryable error, no terminal")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_swap_abort_in_drain_window():
+    """An epoch change inside the post-finish drain window closes via the
+    api_error path with chat_sse_drain carrying drain_exit 'swap_abort', and
+    never synthesizes a terminal — the invariant holds (exactly one
+    chat_sse_drain, no chat_sse_truncated).
+
+    The finish frame is written at handler entry, i.e. BEFORE the press, so the
+    drain-entry pin is taken with _config_swapping still False and is therefore
+    the mode's own bound, max(1, MAX_DRAIN_SECONDS) = 5 s — longer than the
+    swap's quiet window of budget + _SWAP_QUIET_GRACE = 4 s at this suite's 2 s
+    budget. The swap therefore completes first, and the late frame is then
+    released to trigger the drain's post-read epoch check. (The pin is
+    conditional now: taken WHILE a swap is in progress it is capped at the
+    budget — the other half of that conditional, pinned separately by
+    test_chat_sse_swap_drain_pin_taken_mid_swap.)"""
+    print("\n--- Test: Chat SSE Drain-Window Swap Abort ---")
+    late_frame = threading.Event()
+
+    def streamer(handler, info):
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.end_headers()
+        handler.wfile.write(_sse_stream_chunks([
+            _cc({"role": "assistant", "content": "hi"}),
+            _cc({}, finish="stop")]))
+        handler.wfile.flush()
+        late_frame.wait(20)
+        handler.wfile.write(_sse_stream_chunks([
+            {"id": "c1", "object": "chat.completion.chunk", "created": 1,
+             "model": "gpt-4o", "choices": [],
+             "usage": {"prompt_tokens": 3, "completion_tokens": 4}}]))
+        handler.wfile.flush()
+
+    proxy_port, trace_file, mock_servers, cleanup = _chat_swap_proxy(streamer)
+    if proxy_port is None:
+        fail("Failed to set up test")
+        return
+    try:
+        out = {}
+        client = _chat_stream_in_thread(proxy_port, out)
+        if not _wait_upstream_request(mock_servers, "p"):
+            fail("upstream never received the stream request")
+            return
+        switch_out = {}
+        sw = threading.Thread(
+            target=lambda: switch_out.update(zip(
+                ("status", "data"),
+                _admin_post(proxy_port, "/admin/api/switch", _CHAT_SWITCH_TO_Q))),
+            daemon=True)
+        sw.start()
+        if _wait_admin_swapping(proxy_port) is None:
+            fail("swap never became visible on /admin/api/swap-status")
+            return
+        sw.join(20)
+        if switch_out.get("status") != 200:
+            fail("switch returned {}: {}".format(
+                switch_out.get("status"), switch_out.get("data")))
+            return
+        # The swap is complete (epoch bumped); release the late frame so the
+        # chat drain's post-read epoch check fires inside its window.
+        late_frame.set()
+        client.join(20)
+        cstatus, _ctype, raw = out.get("result", (0, "", b""))
+        if cstatus != 200:
+            fail("client stream status {}, expected 200".format(cstatus))
+            return
+        drains = _wait_for_trace_events(trace_file, "chat_sse_drain")
+        if len(drains) != 1:
+            fail("expected exactly one chat_sse_drain, got {}".format(len(drains)))
+            return
+        if drains[0].get("drain_exit") != "swap_abort":
+            fail("drain_exit must be 'swap_abort', got {!r}".format(drains[0].get("drain_exit")))
+            return
+        if _trace_events_named(trace_file, "chat_sse_truncated"):
+            fail("the drain-window close must not emit chat_sse_truncated")
+            return
+        if b"config swap in progress" not in raw:
+            fail("drain-window close must carry the retryable error: {!r}".format(raw[-300:]))
+            return
+        if b"message_stop" in raw:
+            fail("the drain-window swap close must not synthesize a terminal")
+            return
+        pass_("drain-window epoch change closed with drain_exit 'swap_abort' and no terminal")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_swap_drain_pin_taken_mid_swap():
+    """A chat stream whose drain-entry pin is taken WHILE the swap is in
+    progress — the case fix 2's conditional drain_pin() exists for.
+
+    The finish frame is released only after the press has been observed on
+    /admin/api/swap-status, so drain_pin() sees _config_swapping True and caps
+    the drain window at this suite's 2 s silence budget instead of the mode's
+    own 5 s bound. The drain's quiet window is budget + _SWAP_QUIET_GRACE = 4 s,
+    so a capped pin wakes INSIDE the drain: the drain-window wake takes the
+    time_budget exit and the turn closes normally — which means the request has
+    already left the in-flight set when the drain exits, so the swap lands after
+    the client's terminal, never before it.
+
+    With the old unconditional 5 s pin the wake (t+5) outlives the quiet window
+    (t+4): the swap completes first and the epoch rule closes the stream instead
+    (a swap_abort event plus the retryable config_swap_restart error), so every
+    assertion below fails. The property pinned here is therefore: a drain-entry
+    pin taken mid-swap never delivers a normal terminal on the old routing after
+    the swap has completed.
+    """
+    print("\n--- Test: Chat SSE Drain Pin Taken Mid-Swap ---")
+    release_finish = threading.Event()
+
+    def streamer(handler, info):
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.end_headers()
+        handler.wfile.write(_sse_stream_chunks(
+            [_cc({"role": "assistant", "content": "hi"})]))
+        handler.wfile.flush()
+        # The finish frame is what takes the drain-entry pin; releasing it only
+        # after the press is what makes that pin land while swapping.
+        release_finish.wait(20)
+        handler.wfile.write(_sse_stream_chunks([_cc({}, finish="stop")]))
+        handler.wfile.flush()
+        time.sleep(30)  # hold silently: the drain window is the only exit
+
+    proxy_port, trace_file, mock_servers, cleanup = _chat_swap_proxy(streamer)
+    if proxy_port is None:
+        fail("Failed to set up test")
+        return
+    try:
+        out = {}
+
+        def client_worker():
+            try:
+                out["result"] = _send_proxy_request_stream(
+                    proxy_port, {"model": "sonnet", "stream": True,
+                                 "messages": [{"role": "user", "content": "hi"}]})
+            except Exception as e:
+                out["result"] = (0, "", str(e).encode())
+            out["done_at"] = time.time()
+
+        client = threading.Thread(target=client_worker, daemon=True)
+        client.start()
+        if not _wait_upstream_request(mock_servers, "p"):
+            fail("upstream never received the stream request")
+            return
+        switch_out = {}
+
+        def switch_worker():
+            try:
+                switch_out.update(zip(
+                    ("status", "data"),
+                    _admin_post(proxy_port, "/admin/api/switch", _CHAT_SWITCH_TO_Q)))
+            except Exception as e:
+                switch_out["error"] = str(e)
+            switch_out["done_at"] = time.time()
+
+        sw = threading.Thread(target=switch_worker, daemon=True)
+        sw.start()
+        if _wait_admin_swapping(proxy_port) is None:
+            fail("swap never became visible on /admin/api/swap-status")
+            return
+        # The press has landed: release the finish frame now, so the
+        # drain-entry pin is taken with _config_swapping True.
+        release_finish.set()
+        sw.join(25)
+        client.join(25)
+        if switch_out.get("status") != 200:
+            fail("switch returned {}: {}".format(
+                switch_out.get("status"), switch_out.get("data")))
+            return
+        cstatus, _ctype, raw = out.get("result", (0, "", b""))
+        if cstatus != 200:
+            fail("client stream status {}, expected 200".format(cstatus))
+            return
+        body = json.loads(switch_out.get("data", "{}"))
+        if body.get("drained") is not True:
+            fail("nothing was evicted, so drained must be True; got {!r}".format(
+                body.get("drained")))
+            return
+        if body.get("inflight_at_swap") != 1:
+            fail("the silent chat stream must be counted at the press, got {!r}".format(
+                body.get("inflight_at_swap")))
+            return
+        # The discriminator: a capped pin ends the stream INSIDE the drain, so
+        # the drain exits via count == 0 — after the client's terminal. The old
+        # unconditional 5 s pin instead lets the drain quiet-exit at
+        # budget + _SWAP_QUIET_GRACE = 4 s, and the stream then wakes after it.
+        waited = body.get("waited_s")
+        if not isinstance(waited, (int, float)) or waited >= 3.5:
+            fail("the capped drain-entry pin must end the stream inside the "
+                 "drain window (< the 4 s quiet window), got waited_s {!r}".format(
+                     waited))
+            return
+        if out.get("done_at", 1e18) > switch_out.get("done_at", 0.0) + 0.5:
+            fail("the client's terminal must precede the swap completing "
+                 "(client {!r} vs switch {!r})".format(
+                     out.get("done_at"), switch_out.get("done_at")))
+            return
+        if b"config swap in progress" in raw:
+            fail("the capped pin must not turn the drain-window wake into an "
+                 "eviction: {!r}".format(raw[-300:]))
+            return
+        if b"message_stop" not in raw:
+            fail("the drain-window time_budget exit must synthesize a terminal: "
+                 "{!r}".format(raw[-300:]))
+            return
+        aborts = _trace_events_named(trace_file, "swap_abort")
+        if aborts:
+            fail("nothing was evicted, so no swap_abort event may be emitted: "
+                 "{!r}".format(aborts))
+            return
+        drains = _wait_for_trace_events(trace_file, "chat_sse_drain")
+        if len(drains) != 1:
+            fail("expected exactly one chat_sse_drain, got {}".format(len(drains)))
+            return
+        if drains[0].get("drain_exit") != "time_budget":
+            fail("drain_exit must be 'time_budget' (the drain-window bound, "
+                 "woken inside the drain), got {!r}".format(
+                     drains[0].get("drain_exit")))
+            return
+        if _trace_events_named(trace_file, "chat_sse_truncated"):
+            fail("a drain-window close must not emit chat_sse_truncated")
+            return
+        pass_("mid-swap drain-entry pin capped at the budget: terminal delivered "
+              "before the swap (waited_s {:.2f}), one chat_sse_drain with "
+              "drain_exit 'time_budget', no swap_abort".format(waited))
+    finally:
+        cleanup()
+
+
 ALL_TESTS = [
     ("chat-sse-basic-streaming", test_chat_sse_basic_streaming),
     ("chat-sse-finish-reason-mapping", test_chat_sse_finish_reason_mapping),
@@ -4254,6 +4617,10 @@ ALL_TESTS = [
     ("chat-sse-deep-tool-args-at-close", test_chat_sse_deep_tool_args_at_close),
     ("chat-sse-inband-usage-terminal", test_chat_sse_inband_usage_terminal),
     ("sse-event-unserializable-payload-degrades", test_sse_event_unserializable_payload_degrades),
+    # Config-swap drain (plan 2026-10-12-swap-silence-drain)
+    ("chat-sse-swap-evicts-pre-finish", test_chat_sse_swap_evicts_pre_finish),
+    ("chat-sse-swap-abort-in-drain-window", test_chat_sse_swap_abort_in_drain_window),
+    ("chat-sse-swap-drain-pin-taken-mid-swap", test_chat_sse_swap_drain_pin_taken_mid_swap),
 ]
 
 

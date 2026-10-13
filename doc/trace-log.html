@@ -10,7 +10,7 @@
 
 <h1>Trace Log<span class="sub">What the proxy records, and what it deliberately does not</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-06</p>
+<p><strong>Last updated:</strong> 2026-10-13</p>
 
 <p>The trace log is a JSONL file — one JSON object per line — at
 <code>~/.claude/logs/proxy-trace.jsonl</code> by default, overridable with
@@ -144,6 +144,16 @@ are the complete set the proxy can write.</p>
 <tr><td><code>sse_buffer_cap_exceeded</code>, <code>sse_rewrite_malformed_json</code></td>
     <td>anthropic-mode SSE buffering and rewrite problems</td></tr>
 <tr><td><code>response_sse_unexpected</code></td><td>a response-mode provider streamed despite <code>stream: false</code></td></tr>
+<tr><td><code>swap_abort</code></td>
+    <td>a config swap evicted an in-flight request. Carries <code>phase</code> —
+    <code>"retry_chain"</code> (a backoff chain abandoning at the press), <code>"stream"</code> (a
+    streaming request stopped at a read boundary, or an armed wake, after the swap),
+    <code>"pre_first_byte"</code>, or <code>"buffered"</code> — plus <code>request_id</code>. The
+    <code>stream</code> phase carries <code>tier</code> and <code>provider</code> and no
+    <code>model</code>: the stream helpers never receive the resolved model name. The client is
+    told separately, as a retryable <code>503 config_swap_restart</code> or an in-stream
+    <code>error</code> frame. See
+    <a href="architecture.html#config-swap">architecture.html#config-swap</a></td></tr>
 </table>
 
 <p>Several of these are <strong>metadata-only by design</strong>. <code>transform_failure</code>,
@@ -158,12 +168,18 @@ returned 200 and started ends with <strong>exactly one</strong> of <code>chat_ss
 or an upstream frame shape the parser cannot read. A stream that delivered a
 <code>finish_reason</code> emits <code>chat_sse_drain</code> when its drain ends; a stream that
 never delivered one emits <code>chat_sse_truncated</code> at EOF. Because the two are exhaustive,
-an absent pair is itself a finding: that stream did not complete.</p>
+an absent pair is itself a finding: that stream did not complete. A config-swap
+<strong>eviction</strong> preserves this partition: an eviction before <code>finish_reason</code>
+emits <code>chat_sse_truncated</code> and never synthesises a terminal, while an eviction inside
+the drain window emits <code>chat_sse_drain</code> with <code>drain_exit: "swap_abort"</code>. Both
+also write a <code>swap_abort</code> event.</p>
 
 <p><code>chat_sse_drain</code> carries <code>drain_exit</code>, the reason the drain ended —
 <code>"done"</code> (<code>[DONE]</code>), <code>"eof"</code>, <code>"byte_budget"</code> (the
 64&nbsp;KB budget), <code>"time_budget"</code> (the 5&nbsp;s budget), <code>"read_error"</code>
-(the connection died), or <code>"response_cap"</code> (the response size cap was hit). Alongside
+(the connection died), <code>"response_cap"</code> (the response size cap was hit), or
+<code>"swap_abort"</code> (a config swap completed inside the drain window, so the turn is closed
+retryably instead of being given a terminal on the old routing). Alongside
 it: <code>drain_bytes</code> and <code>drain_ms</code> for the cost, <code>finish_reason</code>
 for what the provider claimed, and three flags — <code>tool_calls_seen</code> (a tool-call delta
 reached the transform), <code>emitted_tool_use</code> (a <code>tool_use</code> block actually
@@ -317,6 +333,6 @@ directory means every request loses its entry until the condition is fixed. See
 <a href="architecture.html#sinks">architecture.html</a> for the full policy.</p>
 </div>
 
-<footer>Last updated: 2026-10-06</footer>
+<footer>Last updated: 2026-10-13</footer>
 </body>
 </html>

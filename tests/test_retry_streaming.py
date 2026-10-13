@@ -17,6 +17,7 @@ import time
 
 from _harness import (
     PROXY_SERVER,
+    _admin_post,
     _create_test_config,
     _create_test_config_with_flag,
     _create_test_keys,
@@ -24,9 +25,14 @@ from _harness import (
     _derive_models_from_tiers,
     _mode_tiers,
     _send_proxy_request,
+    _send_proxy_request_stream,
     _start_mode_mock_upstream,
     _start_mode_proxy,
     _start_proxy_server_directly,
+    _trace_events_named,
+    _wait_admin_swapping,
+    _wait_for_trace_events,
+    _wait_upstream_request,
     errors,
     fail,
     find_free_port,
@@ -2892,6 +2898,102 @@ def test_retry_path_print_failure_does_not_misclassify():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_response_mode_swap_aborts_sse_fallback():
+    """The response-mode SSE fallback's drain is an upstream read like any
+    other: a swap completed mid-drain stops it at the next chunk (the epoch
+    check) with a swap_abort event (phase 'stream'), and the client still gets
+    the synthesized terminal — never the raw upstream SSE."""
+    print("\n--- Test: Response-Mode Swap Aborts the SSE Fallback ---")
+    late_frame = threading.Event()
+
+    def streamer(handler, info):
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.end_headers()
+        handler.wfile.write(
+            b'data: {"type":"response.output_text.delta","delta":"one"}\n\n')
+        handler.wfile.flush()
+        late_frame.wait(20)
+        handler.wfile.write(
+            b'data: {"type":"response.output_text.delta","delta":"OLD-ROUTING-MARKER"}\n\n')
+        handler.wfile.flush()
+
+    tiers = _mode_tiers()
+    vendors = {
+        "p": {"url": "http://127.0.0.1:{}".format(find_free_port()),
+              "key": "K", "mode": "response"},
+        "q": {"url": "http://127.0.0.1:{}".format(find_free_port()),
+              "key": "K", "mode": "response"},
+    }
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, streamers={"p": streamer},
+        extra_env={"PROXY_SWAP_SILENCE_TIMEOUT": "2"})
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        out = {}
+
+        def worker():
+            try:
+                out["result"] = _send_proxy_request_stream(
+                    proxy_port, {"model": "sonnet",
+                                 "messages": [{"role": "user", "content": "hi"}]})
+            except Exception as e:
+                out["result"] = (0, "", str(e).encode())
+
+        client = threading.Thread(target=worker, daemon=True)
+        client.start()
+        if not _wait_upstream_request(mock_servers, "p"):
+            fail("upstream never received the request")
+            return
+        switch_body = {"tiers": {
+            "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+            "sonnet": {"provider": "q", "model": "claude-sonnet-5"},
+            "opus": {"provider": "p", "model": "claude-opus-5"},
+        }}
+        switch_out = {}
+        sw = threading.Thread(
+            target=lambda: switch_out.update(zip(
+                ("status", "data"),
+                _admin_post(proxy_port, "/admin/api/switch", switch_body))),
+            daemon=True)
+        sw.start()
+        if _wait_admin_swapping(proxy_port) is None:
+            fail("swap never became visible on /admin/api/swap-status")
+            return
+        sw.join(20)
+        if switch_out.get("status") != 200:
+            fail("switch returned {}: {}".format(
+                switch_out.get("status"), switch_out.get("data")))
+            return
+        # The swap is complete; release the late frame so the fallback's drain
+        # hits its epoch check.
+        late_frame.set()
+        client.join(20)
+        cstatus, _ctype, raw = out.get("result", (0, "", b""))
+        if cstatus != 200:
+            fail("client status {}, expected 200".format(cstatus))
+            return
+        if b"OLD-ROUTING-MARKER" in raw:
+            fail("raw upstream SSE leaked to the client")
+            return
+        if b"message_stop" not in raw:
+            fail("the fallback must still synthesize the terminal sequence: {!r}".format(raw[:300]))
+            return
+        phases = {e.get("phase") for e in _wait_for_trace_events(trace_file, "swap_abort")}
+        if "stream" not in phases:
+            fail("swap_abort phases {} must include stream".format(phases))
+            return
+        if not _trace_events_named(trace_file, "response_sse_unexpected"):
+            fail("the response-mode SSE fallback path was never entered")
+            return
+        pass_("response-mode fallback stopped on the epoch change; terminal synthesized; "
+              "swap_abort phase 'stream'")
+    finally:
+        cleanup()
+
+
 ALL_TESTS = [
     ("concurrent-requests", test_concurrent_requests),
     ("retry-logic", test_retry_logic),
@@ -2916,6 +3018,8 @@ ALL_TESTS = [
     ("retry-stability-extra-header", test_retry_stability_extra_header),
     ("trace-write-failure-does-not-duplicate-upstream-request", test_trace_write_failure_does_not_duplicate_upstream_request),
     ("retry-path-print-failure-does-not-misclassify", test_retry_path_print_failure_does_not_misclassify),
+    # Config-swap drain (plan 2026-10-12-swap-silence-drain)
+    ("response-mode-swap-aborts-sse-fallback", test_response_mode_swap_aborts_sse_fallback),
 ]
 
 

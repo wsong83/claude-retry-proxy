@@ -46,6 +46,7 @@ class ProxySettings:
         self.max_retries = _env_int("PROXY_MAX_RETRIES", 10, 1, 100)
         self.initial_delay = _env_int("PROXY_INITIAL_DELAY", 1, 1, 60)
         self.max_delay = _env_int("PROXY_MAX_DELAY", 30, 1, 300)
+        self.swap_silence_timeout = _env_int("PROXY_SWAP_SILENCE_TIMEOUT", 30, 1, 300)
         self.max_body_size = _env_int("PROXY_MAX_BODY_SIZE", 10 * 1024 * 1024, 1024, 100 * 1024 * 1024)
         self.max_response_size = _env_int("PROXY_MAX_RESPONSE_SIZE", 100 * 1024 * 1024, 1024, 1024 * 1024 * 1024)
 

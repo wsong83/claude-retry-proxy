@@ -162,20 +162,39 @@ for the rest.
 - **Admin API** (localhost-only, CSRF-protected via Origin validation): the page
   at `GET /admin/` is served from package data; `GET /admin/api/config`,
   `/providers`, `/providers-detail` (mode + key *names* per provider — never
-  payloads); `POST /admin/api/switch` (writes a **tiers-only** `config.json`) and
-  `/reload` (re-reads `models.json` — the provider catalog — and **never** the
-  tier mapping); `POST /admin/shutdown`.
+  payloads), `/swap-status` (live drain state); `POST /admin/api/switch` (writes
+  a **tiers-only** `config.json`) and `/reload` (re-reads `models.json` — the
+  provider catalog — and **never** the tier mapping); `POST /admin/shutdown`.
   Bodies are capped at 64 KB. Endpoint table and the Origin accept/reject sets:
-  [doc/operations.html#admin](doc/operations.html#admin).
+  [doc/operations.html#admin](doc/operations.html#admin). Two distinct 409s guard
+  the press paths: `config_swap_in_progress` (single-flight — a press arrived
+  while a swap was in progress) and `config_reload_stale` (a reload's gated
+  candidate was read before a concurrent switch completed a swap, so installing
+  it would revert that switch).
 
-- **Drain-and-swap.** Config changes (switch and reload) set `_config_swapping`,
-  wait for `_inflight_count` to reach zero (30 s timeout, 100 ms poll), swap
-  under lock, and signal `_swap_done`; new requests block during a swap.
-  `forward_request` snapshots config and vendors at entry and uses those
-  snapshots throughout, so a mid-request change cannot affect it. The timeout
-  aborts the swap, leaving the in-flight request to finish normally. **Shutdown
-  does not use this path** — see Gotchas.
+- **Drain-and-swap (silence-based).** Config changes (switch and reload) are
+  **single-flight** — a second press while one is in progress is refused `409`
+  `config_swap_in_progress`, and the check-and-set is atomic under one
+  `_config_lock` acquisition in `_drain_for_swap()` (a `None` return is the
+  refusal signal). The owner pauses new admissions, stamps the shared
+  `_last_upstream_activity` clock, snapshots `_inflight_count`, and drains while
+  the count is non-zero **and** an upstream byte arrived within
+  `PROXY_SWAP_SILENCE_TIMEOUT` (default 30 s); quiet for `budget + 2 s`
+  (`_SWAP_QUIET_GRACE`) means every survivor is silent by construction. There is
+  **no wall-clock cap** — live work is waited to completion — and retry chains
+  abandon at the press with a retryable `503 config_swap_restart` instead of
+  being awaited. The swap then bumps `_config_epoch` under lock and signals
+  `_swap_done`; old-epoch stragglers die retryably at their next checkpoint, so
+  no old-routing result is delivered after a swap. `forward_request` snapshots
+  config, vendors **and** the epoch at entry and threads them throughout.
+  **Shutdown does not use this path** — see Gotchas.
   [doc/architecture.html#config-swap](doc/architecture.html#config-swap).
+
+- **`GET /admin/api/swap-status`** reports a swap in progress live
+  (`swapping`, `inflight`, `waited_s`, `silence_s`, `budget_s`; the two time
+  fields are `null` when idle). Successful switch/reload responses carry the
+  drain's detail — `drained` (meaning **"nothing was evicted"**, not "the count
+  reached zero"), `waited_s`, `inflight_at_swap` (the count *at the press*).
 
 - **Sinks never raise.** `log_trace` / `write_state` delegate to `TraceSink` /
   `StateSink`, sharing one never-raising implementation in the private `_Sink`
@@ -208,6 +227,7 @@ for the rest.
 | `PROXY_MAX_DELAY` | 30 | Backoff cap, seconds (1-300). Applied *before* jitter, so actual sleeps can exceed it by up to 25%. 429 retries use this value directly (jittered). |
 | `PROXY_MAX_BODY_SIZE` | 10485760 | Request body size cap, bytes (1024-100MiB) → 413. Also caps the upstream error body drain on retry exhaustion (give-up path). |
 | `PROXY_MAX_RESPONSE_SIZE` | 104857600 | Streaming response size cap, bytes (1024-1GiB). Responses exceeding this are truncated with a `response_size_cap_exceeded` warning trace event. |
+| `PROXY_SWAP_SILENCE_TIMEOUT` | 30 | Per-request silence budget for the config-swap drain, seconds (1-300; blank/invalid → 30). The drain exits when no upstream byte has arrived from *any* in-flight request for this long, then evicts the remainder retryably (`config_swap_restart`). Also bounds a streamed read's socket arm while a swap is in progress, and is reported as `budget_s` by `/admin/api/swap-status`. Read at startup. |
 | `PROXY_LOG_ALL` | "" | Set to `1` to log full request/response bodies |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | Trace log path |
 | `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | Keys file path (encrypted or plain JSON) |
@@ -300,7 +320,7 @@ what you need in context, and the link has the rest.
 | Integer-second jitter is degenerate for `base ∈ {1, 2}` — zero de-sync; effective from `base ≥ 3` | [doc/architecture.html#jitter](doc/architecture.html#jitter) |
 | Heartbeat state is in-memory; `proxy-state.json` is a projection rewritten every 30 s | [doc/architecture.html#heartbeat](doc/architecture.html#heartbeat) |
 | Shutdown kills in-flight requests — it does not drain them, and the killed request's trace entry never lands | [doc/operations.html#shutdown](doc/operations.html#shutdown) |
-| Drain-and-swap aborts after 30 s if a request is stuck in retry backoff | [doc/architecture.html#config-swap](doc/architecture.html#config-swap) |
+| A swap has **no wall-clock cap**: live work is waited to completion and only silence is evicted (retryably, `config_swap_restart`) — the consequence being that an unbounded drain blocks all new admissions, with `stop` / `/admin/shutdown` as the escape hatches | [doc/architecture.html#config-swap](doc/architecture.html#config-swap) |
 | Readiness is two-phase: the `READY` marker (5 s), then a TCP probe (2 s) | [doc/operations.html#readiness](doc/operations.html#readiness) |
 | A client-write `OSError` outside `_DISCONNECT_ERRORS` can be misread as a connection error and re-issue the POST | [doc/architecture.html#disconnects](doc/architecture.html#disconnects) |
 
@@ -364,12 +384,21 @@ No other supplementary docs.
 {"issue_id": "posix-sigterm-shutdown-deadlock", "title": "server.py's SIGTERM handler calls server.shutdown() on the serve_forever thread, which socketserver documents as a guaranteed deadlock: on POSIX one SIGTERM permanently wedges the proxy while claude-retry-proxy stop reports success", "target_repo": null, "report": "./tmp/reports/defer-issue-posix-sigterm-shutdown-deadlock.json", "deferred": "2026-10-04", "date_source": "creation"},
 {"issue_id": "operate-round-ends-turn-before-waiting", "title": "Unattended --operate rounds frequently end their turn while a background full-suite run is still in flight, killing the run and leaving the round with no session report", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-operate-round-ends-turn-before-waiting.json", "deferred": "2026-10-04", "date_source": "creation"},
 {"issue_id": "chat-sse-done-framing-assumption", "title": "A `data: [DONE]` frame without a trailing blank line is never assembled, so saw_done stays 0 and a protocol-complete chat-mode stream is closed with a retryable error instead of a synthesised terminal sequence", "target_repo": null, "report": "./tmp/reports/defer-issue-chat-sse-done-framing-assumption.json", "deferred": "2026-10-04", "date_source": "creation"},
-{"issue_id": "chat-sse-late-frame-offsets-unasserted", "title": "first_late_ms and last_late_ms are gated only by the structural step-2 script and never asserted behaviorally, so the null-vs-set distinction — the one that separates a stream that ended at the finish frame from one that drained — is unpinned by any committed test", "target_repo": null, "report": "./tmp/reports/defer-issue-chat-sse-late-frame-offsets-unasserted.json", "deferred": "2026-10-04", "date_source": "creation"}
+{"issue_id": "chat-sse-late-frame-offsets-unasserted", "title": "first_late_ms and last_late_ms are gated only by the structural step-2 script and never asserted behaviorally, so the null-vs-set distinction — the one that separates a stream that ended at the finish frame from one that drained — is unpinned by any committed test", "target_repo": null, "report": "./tmp/reports/defer-issue-chat-sse-late-frame-offsets-unasserted.json", "deferred": "2026-10-04", "date_source": "creation"},
+{"issue_id": "suite-load-admin-connection-abort", "title": "Whole-suite runs intermittently abort a connection inside _admin_post (ConnectionAbortedError WinError 10053), which carries no transport tolerance — the exception escapes the test body and is reported as 'Test crashed' instead of failing an assertion; the proxy child's stderr pipe is also never drained, so no diagnostic accompanies the abort", "target_repo": null, "report": "./tmp/reports/defer-issue-suite-load-admin-connection-abort.json", "deferred": "2026-10-13", "date_source": "creation"}
 ]```
 
 ## Future Work — TODO
 
-Twelve deferred issues remain (see above); the three newest were filed on
+Thirteen deferred issues remain (see above). The newest was filed on
+2026-10-13 by plan 2026-10-12-swap-silence-drain's round-8 tester run — a
+whole-suite transient in pre-existing harness code: `_admin_post` has no
+transport tolerance, so a `ConnectionAbortedError` (WinError 10053) on the
+admin-reload test crashes the test body instead of failing an assertion, and the
+proxy child's stderr pipe is never drained, so no diagnostic accompanies it
+(1 red / 1 green across full-suite runs, 0/1 standalone; the plan verified it did
+not touch `_admin_post` beyond adding a default-preserving `timeout`
+parameter). The three before it were filed on
 2026-10-04 by plan 2026-10-04-truncation-error-and-drain-trace's Phase 6
 review, all in the chat-mode SSE path that plan reworked — a `[DONE]` sentinel
 with no trailing blank line that never assembles (so a protocol-complete stream

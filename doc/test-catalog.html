@@ -10,7 +10,7 @@
 
 <h1>Test Catalog<span class="sub">Suite layout, harness isolation, and testing patterns</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-06</p>
+<p><strong>Last updated:</strong> 2026-10-13</p>
 
 <p>The suite is a set of per-area modules merged by a single aggregator. It runs against
 <em>real</em> proxy processes and <em>real</em> mock upstream servers over loopback sockets —
@@ -18,11 +18,11 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>393 test functions across 19 files</strong>, but this number moves whenever
-tests are added. (It read <em>379 across 19</em> before this recount, <em>372 across 19</em> before that, <em>371 across 19</em> before that, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
+suite has <strong>418 test functions across 19 files</strong>, but this number moves whenever
+tests are added. (It read <em>393 across 19</em> before this recount, <em>379 across 19</em> before that, <em>372 across 19</em> before that, <em>371 across 19</em> before that, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
 before that, <em>334 across 19</em> before that, and <em>322 across 18</em> before an earlier
 one — the page has drifted behind the
-suite nine times, and in each case the stale total disagreed with the page's own catalog table
+suite ten times, and in each case the stale total disagreed with the page's own catalog table
 as well.)
 Re-count before quoting it:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
@@ -117,13 +117,13 @@ relative size, not as exact current figures.</p>
     <td>Anthropic → Chat Completions request and response transforms</td></tr>
 <tr><td><code>test_response_transform.py</code></td><td class="num">38</td>
     <td>Anthropic → Responses request and response transforms</td></tr>
-<tr><td><code>test_chat_sse.py</code></td><td class="num">66</td>
-    <td>Chat-mode SSE synthesis, tool-call deltas, post-finish drain, drain telemetry, truncation, degradation, and the unfinished-turn retry nudge</td></tr>
+<tr><td><code>test_chat_sse.py</code></td><td class="num">69</td>
+    <td>Chat-mode SSE synthesis, tool-call deltas, post-finish drain, drain telemetry, truncation, degradation, the unfinished-turn retry nudge, and eviction across a config swap</td></tr>
 <tr><td><code>test_mode_dispatch.py</code></td><td class="num">29</td>
     <td>Mode dispatch, auth headers, path rewriting</td></tr>
-<tr><td><code>test_admin.py</code></td><td class="num">25</td>
-    <td>Admin API endpoints, CSRF origin rules, switch and reload</td></tr>
-<tr><td><code>test_retry_streaming.py</code></td><td class="num">23</td>
+<tr><td><code>test_admin.py</code></td><td class="num">34</td>
+    <td>Admin API endpoints, CSRF origin rules, switch and reload, and the config-swap drain — single-flight presses, silence-based eviction, retry-chain abandonment, and the swap-status endpoint</td></tr>
+<tr><td><code>test_retry_streaming.py</code></td><td class="num">24</td>
     <td>Retry behaviour, streaming, response-size caps</td></tr>
 <tr><td><code>test_config_keys.py</code></td><td class="num">18</td>
     <td>Config validation, key decryption, multi-key shapes</td></tr>
@@ -242,7 +242,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> The retry ladder, the streaming and buffered response paths, and the body/response size limits that cut them short.</p>
 
-<h4><code>tests/test_retry_streaming.py</code> (23 tests) — retry, streaming, size caps</h4>
+<h4><code>tests/test_retry_streaming.py</code> (24 tests) — retry, streaming, size caps</h4>
 <ul>
 <li><code>test_concurrent_requests</code>: 10+ parallel requests complete successfully.</li>
 <li><code>test_retry_logic</code>: Start proxy; mock upstream returns 503 3x then 200; verify exponential backoff.</li>
@@ -267,6 +267,7 @@ EOF</code></pre>
 <li><code>test_trace_write_failure_does_not_duplicate_upstream_request</code>: A trace-write failure inside the retry loop must not be misread as a connection error and re-issue the upstream POST.</li>
 <li><code>test_retry_path_print_failure_does_not_misclassify</code>: A failing print inside the retry loop must not read as a connection error.</li>
 <li><code>test_give_up_truncated_body_envelope</code>: A truncated give-up body carries <code>upstream_body_truncated</code> and the status-appropriate <code>error.type</code>. On retry exhaustion the loop drains the upstream body through <code>_read_capped</code>; when that drain hits <code>PROXY_MAX_BODY_SIZE</code> the proxy substitutes its own body.</li>
+<li><code>test_response_mode_swap_aborts_sse_fallback</code>: In response mode, the SSE-fallback drain's epoch check stops the drain and closes once a swap completes — the client never receives old-routing bytes after the swap, and a <code>swap_abort</code> event fires with phase <code>stream</code>.</li>
 </ul>
 
 <h4><code>tests/test_unit.py</code> (2 tests) — delay and header helpers</h4>
@@ -421,7 +422,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> Synthesising Anthropic SSE events from a chat provider's stream: framing, tool-call deltas, and every degradation path.</p>
 
-<h4><code>tests/test_chat_sse.py</code> (66 tests) — chat-mode SSE synthesis, post-finish drain, drain telemetry, and framing</h4>
+<h4><code>tests/test_chat_sse.py</code> (69 tests) — chat-mode SSE synthesis, post-finish drain, drain telemetry, and framing</h4>
 <ul>
 <li><code>test_chat_sse_basic_streaming</code>: Simulated OpenAI SSE chunks produce valid Anthropic SSE events.</li>
 <li><code>test_chat_sse_finish_reason_mapping</code>: finish_reason maps to stop_reason in the terminal message_delta.</li>
@@ -489,6 +490,9 @@ EOF</code></pre>
 <li><code>test_chat_sse_deep_tool_args_at_close</code>: Deep tool arguments inside a <em>shallow</em> frame degrade at close, not fatal. Pins <code>close_open_tool_blocks</code>' widened guard (review-2): it caught only <code>ValueError</code>, and the deep content rides inside a JSON <em>string</em>, so the frame itself still parses.</li>
 <li><code>test_chat_sse_inband_usage_terminal</code>: An in-band upstream <code>usage</code> value still yields <code>message_delta</code> and <code>message_stop</code>. Pins <code>terminal()</code>'s int-only usage copy (review-3 finding): <code>usage</code> is stored unvalidated from the upstream frame, so without the type check a deep value parses and then fails at encode — leaving a clean EOF that reads as a truncated success.</li>
 <li><code>test_sse_event_unserializable_payload_degrades</code>: A payload <code>_sse_event</code> cannot serialize degrades to an SSE <code>error</code> frame carrying <code>error.code: &quot;response_frame_encode_failure&quot;</code> rather than raising. Pins the encode fence added for the review-3 finding — <code>_sse_event</code>'s <code>json.dumps</code> had been the only request/response-path encode with no enclosing <code>try</code>.</li>
+<li><code>test_chat_sse_swap_evicts_pre_finish</code>: A chat-mode stream evicted <em>before</em> <code>finish_reason</code> closes with the retryable <code>config_swap_restart</code> error and emits <code>chat_sse_truncated</code> — the pre-finish eviction never synthesizes a terminal, and the trace-log invariant (exactly one of <code>chat_sse_drain</code> / <code>chat_sse_truncated</code>) holds.</li>
+<li><code>test_chat_sse_swap_abort_in_drain_window</code>: An epoch change arriving inside the post-finish drain window closes via the <code>api_error</code> path with <code>chat_sse_drain</code> carrying <code>drain_exit: &quot;swap_abort&quot;</code>, and never synthesizes a terminal on the old routing.</li>
+<li><code>test_chat_sse_swap_drain_pin_taken_mid_swap</code>: The drain-window socket pin is <em>conditional</em>: a drain-entry pin taken while a swap is in progress is bounded by <code>min(MAX_DRAIN_SECONDS, swap_silence_timeout)</code>, so the drain's own wake cannot outlive the swap's quiet window at small budgets. With the earlier unconditional 5 s pin the read woke after the swap had completed and the stream synthesized a normal terminal on the old routing with zero <code>swap_abort</code> events.</li>
 </ul>
 
 <h3 id="cat-7">Category 7 — Compatibility Learner</h3>
@@ -559,7 +563,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> The admin page and its endpoints, including the Origin check and hot-switch behaviour.</p>
 
-<h4><code>tests/test_admin.py</code> (25 tests) — admin page, API, CSRF</h4>
+<h4><code>tests/test_admin.py</code> (36 tests) — admin page, API, CSRF, the config-swap drain</h4>
 <ul>
 <li><code>test_admin_reload_non_dict_extra_tier</code>: A non-dict extra tier — which startup validation lets through — must not crash the reload gate; the reload still answers and never drops the connection with no response.</li>
 <li><code>test_admin_switch_validates_key_names</code>: Key-selector validation now lives on the switch path: the reload handler's candidate tiers come from in-memory state, so a bad key on disk is never seen by reload.</li>
@@ -586,6 +590,17 @@ EOF</code></pre>
 <li><code>test_admin_switch_invalid_key_type_rejected</code>: Non-string key values (false/0/[]) in a switch payload are rejected with 400 &#x27;invalid key name&#x27;; config on disk is unchanged.</li>
 <li><code>test_admin_switch_missing_key_defaults</code>: A switch body without key selectors succeeds and the persisted config gains the provider&#x27;s first key name (canonical config on disk).</li>
 <li><code>test_admin_html_key_column</code>: admin.html gains a per-tier key &lt;select&gt;, a disabled-select style, a static column header row (Provider/Model/Key) above #tiers-container, and a populateKeys wired in…</li>
+<li><code>test_switch_succeeds_during_long_live_stream</code>: A continuously-streaming request (chunk cadence well under the budget) is in flight when the switch is pressed: the switch returns 200 with <code>drained: true</code>, the client receives the <em>complete</em> stream rather than being killed, and a post-switch request routes to the new provider.</li>
+<li><code>test_switch_evicts_silent_stream</code>: The stream emits at least one byte <em>after</em> the press and then goes silent, so its next read is armed at the budget while <code>_config_swapping</code> is true and its wake is deterministic. The switch returns 200 within <code>[budget, budget + grace + 8]</code> s with <code>drained: false</code> and <code>inflight_at_swap: 1</code>, the client's stream ends with the retryable <code>config_swap_restart</code> error (not a normal terminal), a <code>swap_abort</code> event carries <code>phase: &quot;stream&quot;</code>, and post-switch requests route to the new provider. The outcome is deterministic <em>because</em> the drain's quiet window is <code>budget + _SWAP_QUIET_GRACE</code> while the armed wake is <code>budget</code> — if this test ever flakes, that ordering has been broken.</li>
+<li><code>test_switch_silent_before_press_is_late_exit</code>: The accepted boundary, pinned so it is not mistaken for a bug: upstream sends two chunks then holds the socket open silently, and the press lands while the loop is already blocked in an unarmed read (the connection's 300 s timeout, not the budget). The switch still returns 200 promptly (<code>drained: true</code> — nothing was evicted during the drain — and <code>inflight_at_swap: 1</code>) and post-swap routing is in place; the client-side error lands at the straggler's own wake.</li>
+<li><code>test_switch_abandons_retry_chain</code>: A request sitting in 429 backoff when the switch is pressed returns <code>503 config_swap_restart</code> promptly (≈ the sleep slice, well under the backoff) while the switch returns 200 quickly; a <code>swap_abort</code> event carries <code>phase: &quot;retry_chain&quot;</code>; the client's re-issue routes to the new provider; and the abandoned chain logs <em>no</em> <code>retry</code> event for the sleep it never took (the accounting reorder).</li>
+<li><code>test_switch_straggler_pre_first_byte_fails_retryably</code>: An upstream that holds the response for ~2× budget and then answers 200 with a marker body: the switch returns 200 (<code>drained: true</code>) after the quiet window, and when the upstream finally answers the client gets <code>503 config_swap_restart</code> — never the marker body. No old-routing content is delivered after the swap.</li>
+<li><code>test_swap_status_endpoint</code>: During a held-stream drain <code>GET /admin/api/swap-status</code> reports <code>swapping: true</code>, <code>inflight ≥ 1</code>, numeric <code>waited_s</code>/<code>silence_s</code>, and <code>budget_s</code> equal to the configured env value; when idle it reports <code>swapping: false</code> with both nullable fields <code>null</code> — asserted as <code>null</code>, not a <code>TypeError</code>-shaped 500 (the per-field guard).</li>
+<li><code>test_second_press_refused_409</code>: While a drain is in progress a second switch or reload returns <code>409 config_swap_in_progress</code>, the in-flight request is unaffected, and exactly one <code>_config_epoch</code> bump occurs for the pair.</li>
+<li><code>test_concurrent_presses_single_flight</code>: Two presses issued <em>concurrently</em> (inside the race window the sequential 409 test cannot reach) must not both land: the outcome is asserted tolerantly as one 200 + one 409 <em>or</em> two sequential 200s, so a scheduling flip on a <em>correct</em> tree cannot be misread as the single-flight defect, and the refusal is checked as the Anthropic envelope accepting <em>either</em> legitimate 409 code (<code>config_swap_in_progress</code>, or the stale-candidate <code>config_reload_stale</code>). The load-bearing assertion holds in both outcomes: the surviving press's mapping is the one in force afterwards (two post-swap route probes). That is what catches the measured silent revert — with the guard and the press split across two lock acquisitions, both presses drained and the reload's stale candidate reverted the switch while the switch still reported success. The epoch-advances-once pin holds only in the one-200 branch: the two-200 outcome is by definition two landed presses, hence two bumps.</li>
+<li><code>test_request_blocked_at_admission_not_evicted</code>: A request blocked at admission in <code>_swap_done.wait()</code> while a swap runs is <em>not</em> evicted by the swap it waited on: it is admitted after the release with the POST-swap epoch and completes against the new provider, never with <code>config_swap_restart</code>.</li>
+<li><code>test_reload_does_not_revert_concurrent_switch</code>: The reload's stale-candidate epoch guard, driven <em>deterministically in-process</em>: <code>_drain_for_swap</code> is monkeypatched to simulate a switch completing its whole press → swap → release cycle between the reload's gated tier read and Phase 3's compare-and-install, then the reload handler runs via the suite's <code>object.__new__(srv.ProxyHandler)</code> pattern. Phase 3 must refuse <code>409 config_reload_stale</code> (Anthropic envelope), install nothing and bump no epoch, and the switch's mapping must survive — a guard that fired but reverted the mapping would still fail. The window cannot be driven from outside the process (an 8/8-trial E2E probe saw only <code>config_swap_in_progress</code> in both geometries), so the guard's precondition is driven directly; <code>tmp/verification/2026-10-12-swap-silence-drain-reload-stale-guard-sensitivity.py</code> proves sensitivity in both directions — with the epoch signal defeated the stale candidate <em>does</em> revert the switch, which is what makes the mapping assertion load-bearing.</li>
+<li><code>test_admin_html_poll_guard_after_await</code>: Both swap-status poll callbacks must carry the top-of-callback <code>swapSettled</code> guard <em>and</em> a second check after <code>await resp.json()</code> that sits before the <code>showStatus</code> repaint — the fix for a 1 Hz poll response that resolves after the press wrote its terminal line and repaints over it. Pins source <em>ordering</em> on the page the proxy actually serves (fetched from <code>/admin/</code>, both <code>setInterval</code> callbacks extracted): a JS harness was judged disproportionate for a cosmetic status-line guard, so runtime behaviour is verified by reading, and this structural assertion is what fails if the post-await check is deleted.</li>
 </ul>
 
 <h3 id="cat-9">Category 9 — CLI Lifecycle</h3>
@@ -800,6 +815,6 @@ whenever a proxy is running.</p>
       that the full suite passes with a live proxy running.</li>
 </ol>
 
-<footer>Last updated: 2026-10-06</footer>
+<footer>Last updated: 2026-10-13</footer>
 </body>
 </html>

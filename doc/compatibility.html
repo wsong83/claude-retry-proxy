@@ -10,7 +10,7 @@
 
 <h1>Compatibility Learner<span class="sub">How the proxy learns, per provider-model pair, what an upstream will accept</span></h1>
 
-<p><strong>Last updated:</strong> 2026-09-30</p>
+<p><strong>Last updated:</strong> 2026-10-13</p>
 
 <p>Third-party providers that speak the Anthropic wire format do not always implement every
 field, and they disagree about how to echo an assistant turn's reasoning. Neither fact can be
@@ -314,7 +314,12 @@ non-blockingly. When it is contended the request issues no retry, mutates no cou
 upstream error reaches the client unchanged. Because the lock is per-feature rather than
 module-global, a chat-mode walk can never deny an <code>anthropic</code>-mode probe its retry.
 The cost is real but bounded: a walk is up to three upstream attempts, so a stuck chat upstream
-can hold one worker thread — and delay a concurrent admin switch's drain — for several minutes.</p>
+can hold one worker thread for several minutes. A concurrent admin switch's drain <em>waits</em>
+for that work rather than being bounded by it: a walk step is an immediate single-shot re-issue,
+not a backoff chain, so it is explicitly <em>not</em> abandoned at the press — what bounds the wait
+is the drain's own silence rule (a walk that stops producing upstream bytes is evicted retryably
+like anything else). A chain that is merely <em>sleeping</em> between retries is the case that does
+abandon at the press, returning <code>503 config_swap_restart</code>.</p>
 
 <h3 id="reasoning-complaint">What counts as a complaint</h3>
 
@@ -439,6 +444,6 @@ request or response content. The strip, probe and suppression events belong to
 <p>The full trace schema, including the fields common to every entry, is in
 <a href="trace-log.html">trace-log.html</a>.</p>
 
-<footer>Last updated: 2026-09-30</footer>
+<footer>Last updated: 2026-10-13</footer>
 </body>
 </html>

@@ -10,7 +10,7 @@
 
 <h1>Operations<span class="sub">Running, inspecting, and stopping the proxy</span></h1>
 
-<p><strong>Last updated:</strong> 2026-09-12</p>
+<p><strong>Last updated:</strong> 2026-10-13</p>
 
 <p>The <code>claude-retry-proxy</code> command manages a <em>background server process</em>. It
 does not run in the foreground. Understanding that split explains most of the command's
@@ -151,6 +151,10 @@ buttons, which do deliberately different things:</p>
     <td>Available provider names</td></tr>
 <tr><td><span class="badge badge-local">GET</span></td><td><code>/admin/api/providers-detail</code></td>
     <td>Per provider: its mode and its key <em>names</em></td></tr>
+<tr><td><span class="badge badge-local">GET</span></td><td><code>/admin/api/swap-status</code></td>
+    <td>Whether a config swap is in progress: <code>swapping</code>, the in-flight count, how long
+        the drain has been waiting, how long since the last upstream byte, and the configured
+        silence budget (<code>budget_s</code>)</td></tr>
 <tr><td><span class="badge badge-anthropic">POST</span></td><td><code>/admin/api/switch</code></td>
     <td>Update tier mappings</td></tr>
 <tr><td><span class="badge badge-anthropic">POST</span></td><td><code>/admin/api/reload</code></td>
@@ -177,6 +181,40 @@ survive a hot tier switch. Applying a switch cannot silently discard your header
 the asymmetry: those three live in <code>models.json</code>, which the proxy never writes, so they
 survive <em>in memory</em> across a switch while the document written to disk holds only the tier
 mapping. See <a href="architecture.html#split-write">architecture.html#split-write</a>.</p>
+
+<h3 id="swap-drain">What a switch or reload waits for</h3>
+
+<p>A switch and a reload share the same <strong>drain-and-swap</strong>: new requests are paused at
+admission, then the handler waits for the requests already in flight. That wait has no wall-clock
+cap — a healthy generation of any length is allowed to finish — but it does not wait out
+<em>silence</em>. When no upstream byte has arrived from <em>any</em> in-flight request for
+<code>PROXY_SWAP_SILENCE_TIMEOUT</code> (default 30 s), whatever is still running is treated as
+silent and <strong>evicted retryably</strong> rather than awaited. Retry chains never hold the
+drain: a request sleeping between attempts abandons at the press and returns
+<code>503 config_swap_restart</code>, so its client retry lands on the new mapping. The full
+mechanism — and the accepted consequence that a swap can block new admissions for as long as its
+drain runs — is in
+<a href="architecture.html#config-swap">architecture.html#config-swap</a>.</p>
+
+<p><strong>Swaps are single-flight.</strong> A second press while one is in progress — a
+double-clicked Apply, or the CLI racing the page — is refused with <code>409</code> and the
+<code>config_swap_in_progress</code> code (see
+<a href="architecture.html#error-envelope">the error taxonomy</a>; both the admin page and
+<code>claude-retry-proxy reload</code> unwrap the envelope's <code>error</code> object). No second
+drain is entered and the refused press changes nothing. A <strong>reload</strong> carries a second
+409 of its own: it gates its candidate catalog <em>before</em> pressing, so if a switch completes
+its whole cycle between that gate and the install, the reload answers
+<code>409 config_reload_stale</code> instead of installing tiers that predate the switch.</p>
+
+<p>A successful press returns the drain's own detail: <code>drained</code>, <code>waited_s</code>,
+and <code>inflight_at_swap</code>. <code>drained</code> means <em>"nothing was evicted"</em> — not
+"the in-flight count reached zero" — and <code>inflight_at_swap</code> is the count at the moment
+of the press, so both are facts about the press rather than a race with it.
+<code>GET /admin/api/swap-status</code> reports the same information live while a press is
+pending, which is what the admin page's status line polls at 1 Hz. The CLI's <code>reload</code>
+waits up to <strong>300 s</strong> for the drain; because the drain is unbounded server-side, a
+client-side timeout does <em>not</em> abort the swap — the message says so and points at
+<code>claude-retry-proxy status</code>.</p>
 
 <h3 id="csrf">CSRF protection</h3>
 
@@ -223,9 +261,11 @@ that point.</p>
 </div>
 
 <p>This differs from the <a href="architecture.html#config-swap">drain-and-swap</a> used by
-config changes, which <em>does</em> wait for in-flight requests — up to 30 seconds. The two
-paths treat the same condition (a request sitting in retry backoff) in opposite ways: a config
-swap waits, a shutdown does not wait at all.</p>
+config changes. The two paths treat the same condition — a request sitting in retry backoff — in
+opposite ways: a config swap <em>abandons</em> the chain at the press (returning it a retryable
+<code>503</code> so the client's own retry lands on the new mapping), while a shutdown kills it
+where it stands. For <em>live</em> work the difference is subtler: a swap waits for a generation
+to finish, and a shutdown does not wait at all.</p>
 
 <h2 id="artifacts">Runtime artifacts</h2>
 
@@ -269,6 +309,6 @@ server's memory and is rewritten every 30 seconds, so deleting the file is harml
 external edit is overwritten rather than merged. The mechanism is owned by
 <a href="architecture.html#heartbeat">architecture.html#heartbeat</a>.</p>
 
-<footer>Last updated: 2026-09-12</footer>
+<footer>Last updated: 2026-10-13</footer>
 </body>
 </html>

@@ -55,6 +55,35 @@
         let providers = [];
         let providerModes = {};
         let providerKeys = {};
+        // Handle for the 1 Hz swap-status poll; null when no press is pending.
+        let swapPollHandle = null;
+        // Set once a press has written its terminal status line, so a poll
+        // whose response was generated while swapping was still true cannot
+        // resolve late and overwrite that line.
+        let swapSettled = false;
+
+        // Numeric-only rendering of the swap detail the server returns.
+        // Never interpolate a raw response string here.
+        function swapDetail(result) {
+            if (!result || typeof result.waited_s !== 'number') {
+                return '';
+            }
+            const inflight = (typeof result.inflight_at_swap === 'number')
+                ? result.inflight_at_swap : 0;
+            return ' (waited ' + result.waited_s.toFixed(1) + 's, ' +
+                inflight + ' in-flight at press)';
+        }
+
+        // The 409 refusal carries the standard Anthropic envelope, so `error`
+        // is an object; the older admin refusals carry a plain string. Render
+        // the message for both shapes rather than "[object Object]".
+        function errorText(result) {
+            const err = result && result.error;
+            if (err && typeof err === 'object') {
+                return err.message || 'Unknown error';
+            }
+            return err || 'Unknown error';
+        }
 
         async function loadProviderModes() {
             try {
@@ -199,6 +228,43 @@
                 }
             }
 
+            // The swap pauses new admissions and waits for in-flight work
+            // (unbounded by design), so show live progress instead of an
+            // apparently hung Apply. A prior handle is cleared first so a
+            // second press cannot stack intervals.
+            if (swapPollHandle !== null) {
+                clearInterval(swapPollHandle);
+            }
+            swapSettled = false;
+            showStatus('', 'applying — waiting for in-flight requests…');
+            swapPollHandle = setInterval(async () => {
+                if (swapSettled) {
+                    // The press already wrote its terminal line: bail out.
+                    return;
+                }
+                try {
+                    const resp = await fetch('/admin/api/swap-status');
+                    if (!resp.ok) {
+                        return;
+                    }
+                    const st = await resp.json();
+                    if (swapSettled) {
+                        // The press can write its terminal line while this
+                        // poll response is in flight (the callback's top
+                        // check ran before the awaits). Re-check here so a
+                        // late response never repaints over that line.
+                        return;
+                    }
+                    if (st.swapping && st.inflight > 0 && st.silence_s !== null) {
+                        showStatus('', 'applying — waiting for ' + st.inflight +
+                            ' in-flight request(s), silence ' +
+                            Math.floor(st.silence_s) + 's / ' + st.budget_s + 's…');
+                    }
+                } catch (e) {
+                    // Poll failures are cosmetic — never break the flow.
+                }
+            }, 1000);
+
             try {
                 const resp = await fetch('/admin/api/switch', {
                     method: 'POST',
@@ -209,33 +275,82 @@
                     body: JSON.stringify(newConfig)
                 });
                 const result = await resp.json();
+                swapSettled = true;
                 if (resp.ok) {
-                    showStatus('success', 'Configuration saved successfully');
+                    showStatus('success', 'Configuration saved successfully' +
+                        swapDetail(result));
                     config.tiers = newConfig.tiers;
                 } else {
-                    showStatus('error', 'Error: ' + (result.error || 'Unknown error'));
+                    showStatus('error', 'Error: ' + errorText(result));
                 }
             } catch (e) {
+                swapSettled = true;
                 showStatus('error', 'Failed to save: ' + e.message);
+            } finally {
+                // Must run on reject too: a network-level failure rejects the
+                // fetch promise, and a clear wired only into the resolve path
+                // would leak the interval forever.
+                clearInterval(swapPollHandle);
+                swapPollHandle = null;
             }
         }
 
         async function reloadConfig() {
+            // Same pending-apply treatment as saveConfig (see there).
+            if (swapPollHandle !== null) {
+                clearInterval(swapPollHandle);
+            }
+            swapSettled = false;
+            showStatus('', 'applying — waiting for in-flight requests…');
+            swapPollHandle = setInterval(async () => {
+                if (swapSettled) {
+                    // The press already wrote its terminal line: bail out.
+                    return;
+                }
+                try {
+                    const resp = await fetch('/admin/api/swap-status');
+                    if (!resp.ok) {
+                        return;
+                    }
+                    const st = await resp.json();
+                    if (swapSettled) {
+                        // The press can write its terminal line while this
+                        // poll response is in flight (the callback's top
+                        // check ran before the awaits). Re-check here so a
+                        // late response never repaints over that line.
+                        return;
+                    }
+                    if (st.swapping && st.inflight > 0 && st.silence_s !== null) {
+                        showStatus('', 'applying — waiting for ' + st.inflight +
+                            ' in-flight request(s), silence ' +
+                            Math.floor(st.silence_s) + 's / ' + st.budget_s + 's…');
+                    }
+                } catch (e) {
+                    // Poll failures are cosmetic — never break the flow.
+                }
+            }, 1000);
+
             try {
                 const resp = await fetch('/admin/api/reload', {
                     method: 'POST',
                     headers: { 'Origin': window.location.origin }
                 });
                 const result = await resp.json();
+                swapSettled = true;
                 if (resp.ok) {
                     config = result.config;
                     renderTiers();
-                    showStatus('success', 'Providers reloaded from models.json');
+                    showStatus('success', 'Providers reloaded from models.json' +
+                        swapDetail(result));
                 } else {
-                    showStatus('error', 'Error: ' + (result.error || 'Unknown error'));
+                    showStatus('error', 'Error: ' + errorText(result));
                 }
             } catch (e) {
+                swapSettled = true;
                 showStatus('error', 'Failed to reload providers: ' + e.message);
+            } finally {
+                clearInterval(swapPollHandle);
+                swapPollHandle = null;
             }
         }
 

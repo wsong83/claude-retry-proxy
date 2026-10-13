@@ -2558,7 +2558,12 @@ def test_compat_retry_lock_released_on_exception():
 def test_compat_config_swap_during_retry():
     """The compatibility retry uses the entry-time config snapshot: the
     in-flight request completes against its original provider, and the admin
-    switch (drained afterwards) routes new requests elsewhere."""
+    switch (whose silence-based drain waits for the live re-issue rather than
+    aborting it) routes new requests elsewhere.
+
+    This pins the boundary of the retry-loop head's epoch-only check: an
+    immediate compat re-issue is live work, so an in-progress drain must not
+    abort it (only backoff chains abandon at the press)."""
     print("\n--- Test: Compat Config Swap During Retry ---")
     state_dir, state_path = _make_state_dir()
     p_port = find_free_port()
@@ -3663,9 +3668,13 @@ def test_reasoning_latched_outcome_issues_no_retry():
     compat._state.reasoning_latched[key] = True
     srv._forward_request_impl = spy
     try:
+        # The epoch parameter is required (no default) — a default would
+        # silently disable the swap epoch guard on the compat re-entry path.
+        # The module epoch is the natural admission-time value here.
         got = srv._reasoning_outcome(
             original, key, "reasoning_content", "req-l1", "sonnet",
-            "POST", "/v1/messages", {}, b'{"x": 1}', None, None, None)
+            "POST", "/v1/messages", {}, b'{"x": 1}', None, None, None,
+            srv._config_epoch)
         if calls:
             fail("a latched pair forwarded %d upstream call(s) — "
                  "_reasoning_outcome did not re-check the latch after "
