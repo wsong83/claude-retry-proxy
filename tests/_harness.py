@@ -474,8 +474,11 @@ def _create_test_keys_plain(temp_dir, vendors):
 
 
 # The child signals its own readiness: server.py prints this marker on stdout
-# immediately after it has bound its listening socket (just after the
-# ThreadingHTTPServer construction, before serve_forever()).
+# after it has bound its listening socket, started the heartbeat thread, and
+# registered both signal handlers (READY post-dates signal.signal() since
+# 2026-10-15-posix-shutdown-and-stop-reporting, so a proxy that has emitted
+# this marker will run the graceful-shutdown handler if signalled) — still
+# before serve_forever().
 _READY_MARKER = "READY"
 
 # Readiness deadline for a directly spawned server. A READY marker normally

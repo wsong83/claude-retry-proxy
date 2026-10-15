@@ -10,7 +10,7 @@
 
 <h1>Operations<span class="sub">Running, inspecting, and stopping the proxy</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-13</p>
+<p><strong>Last updated:</strong> 2026-10-15</p>
 
 <p>The <code>claude-retry-proxy</code> command manages a <em>background server process</em>. It
 does not run in the foreground. Understanding that split explains most of the command's
@@ -23,7 +23,9 @@ server owns the listening socket and the request path.</p>
 <tr><th>Command</th><th>What it does</th></tr>
 <tr><td><code>start</code></td><td>Validates configuration, decrypts keys, prunes the trace log,
     spawns the server, waits for readiness</td></tr>
-<tr><td><code>stop</code></td><td>Reads the state file and terminates the process</td></tr>
+<tr><td><code>stop</code></td><td>Reads the state file and terminates the process — gracefully first,
+    then by force — and <strong>exits 1 without removing the state file</strong> if the process
+    survives (see <a href="#stop-contract">the stop contract</a>)</td></tr>
 <tr><td><code>status</code></td><td>Reports running / stopped / stale, plus the current tier mapping</td></tr>
 <tr><td><code>reload</code></td><td>Refreshes the provider catalog in the running proxy from
     <code>models.json</code>, without restarting it. It does <em>not</em> re-read the tier mapping
@@ -267,6 +269,34 @@ opposite ways: a config swap <em>abandons</em> the chain at the press (returning
 where it stands. For <em>live</em> work the difference is subtler: a swap waits for a generation
 to finish, and a shutdown does not wait at all.</p>
 
+<h3 id="stop-contract">The stop contract</h3>
+
+<p>Shutdown is <em>asked</em> for, not assumed — and the exit code reports what actually happened
+rather than what was attempted. <code>claude-retry-proxy stop</code> sends the graceful
+<code>/admin/shutdown</code> request, then waits up to <strong>5 seconds</strong>, then
+force-kills if the process is still alive (<code>taskkill</code> on Windows,
+<code>SIGTERM</code> on POSIX). Every one of those bounds runs on a monotonic clock, so a
+wall-clock step cannot lengthen or shorten a documented deadline.</p>
+
+<p>If the process is <em>still</em> alive after the force-kill, <code>stop</code>
+<strong>exits 1</strong> and <strong>leaves <code>proxy-state.json</code> in place</strong>: that
+file is the one record which makes an orphan findable by a later <code>stop</code>,
+<code>status</code>, or <code>reload</code>. It is removed only once the process is confirmed
+gone, and never before the final liveness check. So <code>Proxy: stopped</code> and a removed
+state file mean the same thing — the proxy is not running — and a <code>stop</code> that could not
+finish says so instead of reporting success.</p>
+
+<div class="warn">
+<strong><code>stop</code> does not escalate to <code>SIGKILL</code>.</strong> PID liveness is not
+proxy identity: a state file whose PID has been recycled answers <code>is_pid_alive</code>
+perfectly well, and on POSIX an unreaped zombie answers it too. An unblockable signal aimed on
+that evidence would be destructive against an unrelated process — and because the state file is
+deliberately preserved on failure, every later <code>stop</code> would repeat the mistake. The
+<code>SIGTERM</code> above is therefore sent on best-effort liveness alone: a process that ignores
+it is unharmed, which is exactly the difference between <code>SIGTERM</code> and
+<code>SIGKILL</code> here.
+</div>
+
 <h2 id="artifacts">Runtime artifacts</h2>
 
 <p>Everything the proxy writes at runtime lives under <code>~/.claude/</code>:</p>
@@ -309,6 +339,6 @@ server's memory and is rewritten every 30 seconds, so deleting the file is harml
 external edit is overwritten rather than merged. The mechanism is owned by
 <a href="architecture.html#heartbeat">architecture.html#heartbeat</a>.</p>
 
-<footer>Last updated: 2026-10-13</footer>
+<footer>Last updated: 2026-10-15</footer>
 </body>
 </html>

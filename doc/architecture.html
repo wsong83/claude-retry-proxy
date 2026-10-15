@@ -10,7 +10,7 @@
 
 <h1>Architecture<span class="sub">How a request is routed, retried, and rewritten</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-13</p>
+<p><strong>Last updated:</strong> 2026-10-15</p>
 
 <p>This page describes the path a request takes from the moment it reaches the proxy to the
 moment a response leaves it. It is the reference the other pages link back into — in
@@ -620,6 +620,30 @@ daemon flag and adding a bounded drain, which changes what <code>stop</code> doe
 client sees — and why the interrupted request's trace entry never lands — is owned by
 <a href="operations.html#shutdown">operations.html#shutdown</a>.</p>
 
-<footer>Last updated: 2026-10-13</footer>
+<h3 id="sigterm">The signal path, and why it is dispatched</h3>
+
+<p>A signal-triggered shutdown takes a different route to the same place, and the route is the
+whole point. <code>SIGTERM</code> runs a Python signal handler <em>on the
+<code>serve_forever</code> thread</em>, and <code>socketserver.BaseServer.shutdown()</code> blocks
+until <code>serve_forever()</code> returns — so calling it inline from the handler deadlocks
+against the very call it is interrupting, permanently, with the process still holding its
+listening socket. The handler therefore starts a daemon thread targeting
+<code>server.shutdown</code> and returns, which is the same idiom the admin path's delayed
+shut-down already uses.</p>
+
+<p><code>SIGTERM</code> is registered on every platform. <code>SIGINT</code> is registered for
+the same handler on POSIX only; on Windows Ctrl+C arrives as <code>KeyboardInterrupt</code> and is
+handled by the ordinary <code>try/except</code>, so no handler is registered for it there.</p>
+
+<p>Both the <code>READY</code> stdout marker and the <code>proxy_ready</code> trace event are
+emitted <em>after</em> that registration, so a consumer acting on either can safely deliver
+<code>SIGTERM</code>: a proxy that has announced itself will run the graceful handler rather than
+the default action, and will therefore reach <code>serve_forever</code>'s <code>finally</code> —
+writing the <code>proxy_stop</code> marker and removing its state file. That ordering is why
+readiness is two-phase and why the trace carries a marker of its own; see
+<a href="operations.html#readiness">operations.html#readiness</a> and
+<a href="trace-log.html#markers">trace-log.html#markers</a>.</p>
+
+<footer>Last updated: 2026-10-15</footer>
 </body>
 </html>

@@ -10,7 +10,7 @@
 
 <h1>Trace Log<span class="sub">What the proxy records, and what it deliberately does not</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-13</p>
+<p><strong>Last updated:</strong> 2026-10-15</p>
 
 <p>The trace log is a JSONL file — one JSON object per line — at
 <code>~/.claude/logs/proxy-trace.jsonl</code> by default, overridable with
@@ -66,13 +66,16 @@ applies to any tier present in the configuration, not only the three standard on
 
 <h2 id="markers">Lifecycle markers</h2>
 
-<p>Two entries bracket each run of the proxy. They are what tell you the process was restarted,
+<p>Three entries bracket each run of the proxy. They are what tell you the process was restarted,
 and they survive things the request entries do not.</p>
 
 <table>
 <tr><th>Event</th><th>Fields</th><th>Written</th></tr>
 <tr><td><code>proxy_start</code></td><td><code>timestamp</code>, <code>port</code>, <code>pid</code></td>
     <td>At startup, before the server begins serving</td></tr>
+<tr><td><code>proxy_ready</code></td><td><code>timestamp</code>, <code>port</code>, <code>pid</code></td>
+    <td>At startup, immediately after the signal handlers are registered and after the
+    <code>READY</code> stdout marker — still before <code>serve_forever()</code></td></tr>
 <tr><td><code>proxy_stop</code></td><td><code>timestamp</code>, <code>pid</code>,
     <code>requests_total</code>, <code>requests_retried</code></td>
     <td>During shutdown, in a <code>finally</code> block</td></tr>
@@ -80,6 +83,16 @@ and they survive things the request entries do not.</p>
 
 <p>The stop marker carries the run's request and retry counts, so a run's totals are recoverable
 from the marker pair even if you do not want to aggregate the request entries.</p>
+
+<p><code>proxy_start</code> and <code>proxy_ready</code> differ in what they promise.
+<code>proxy_start</code> says the process exists; <code>proxy_ready</code> says it is
+<strong>fully initialised</strong> — socket bound, heartbeat thread running, signal handlers
+registered. That last part is what makes it useful: a <code>SIGTERM</code> delivered before
+handler registration takes the default action, killing the process without running
+<code>serve_forever</code>'s <code>finally</code> (so no <code>proxy_stop</code> marker and no
+state-file cleanup). Anything that signals the proxy on startup should wait for
+<code>proxy_ready</code> rather than <code>proxy_start</code>. See
+<a href="architecture.html#sigterm">architecture.html#sigterm</a>.</p>
 
 <div class="warn">
 <strong>A missing <code>request</code> entry does not mean the request did not happen.</strong>
@@ -100,7 +113,7 @@ are the complete set the proxy can write.</p>
 <table>
 <tr><th>Event</th><th>When</th></tr>
 <tr><td><code>request</code></td><td>one per completed request</td></tr>
-<tr><td><code>proxy_start</code> / <code>proxy_stop</code></td><td>process lifecycle — see above</td></tr>
+<tr><td><code>proxy_start</code> / <code>proxy_ready</code> / <code>proxy_stop</code></td><td>process lifecycle — see above</td></tr>
 <tr><td><code>retry</code></td><td>a retry was scheduled. Carries <code>attempt</code>,
     <code>delay_s</code>, and a <code>reason</code> of <code>"429"</code>, <code>"503"</code>, or
     <code>"connection_error"</code>.</td></tr>
@@ -333,6 +346,6 @@ directory means every request loses its entry until the condition is fixed. See
 <a href="architecture.html#sinks">architecture.html</a> for the full policy.</p>
 </div>
 
-<footer>Last updated: 2026-10-13</footer>
+<footer>Last updated: 2026-10-15</footer>
 </body>
 </html>

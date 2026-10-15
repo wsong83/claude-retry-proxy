@@ -3964,19 +3964,30 @@ def main():
     server = http.server.ThreadingHTTPServer(("127.0.0.1", SETTINGS.port), ProxyHandler)
     print("[proxy] Listening on 127.0.0.1:{}".format(SETTINGS.port), file=sys.stderr)
     print("[proxy] Providers: {}".format(", ".join(_vendors.keys())), file=sys.stderr)
-    # Print readiness marker to stdout for CLI to detect (separate from stderr logs)
-    print("READY", flush=True)
     # Register graceful shutdown signal handlers so write_stop_marker()
     # runs on normal shutdown (claude-retry-proxy stop sends SIGTERM/taskkill).
-    # server.shutdown() causes serve_forever() to return normally into
-    # the finally block, which writes the proxy_stop trace marker.
     def _shutdown_handler(signum, frame):
-        server.shutdown()
+        # socketserver.BaseServer.shutdown() blocks until serve_forever()
+        # returns, and a Python signal handler runs ON the serve_forever
+        # thread — calling it inline is the documented deadlock. Dispatch it,
+        # mirroring the admin path's _delayed_shutdown.
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown_handler)
     if sys.platform != "win32":
         signal.signal(signal.SIGINT, _shutdown_handler)
     # On Windows, Ctrl+C raises KeyboardInterrupt which the try/except already handles
+
+    # Readiness now post-dates handler registration: READY (stdout marker for
+    # the CLI) and the pollable proxy_ready trace event both mean "fully
+    # initialised" — a consumer acting on either can safely deliver SIGTERM.
+    print("READY", flush=True)
+    log_trace({
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+        "event": "proxy_ready",
+        "port": SETTINGS.port,
+        "pid": os.getpid(),
+    })
 
     try:
         server.serve_forever()

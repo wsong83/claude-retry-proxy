@@ -155,6 +155,29 @@ def test_trace_markers():
         else:
             fail("No proxy_start event in trace")
 
+        # Verify proxy_ready event (4d of 2026-10-15-posix-shutdown-and-
+        # stop-reporting): emitted once per run immediately after the signal
+        # handlers are registered. This pin MUST run on every platform — the
+        # only other reference to the event lives inside the POSIX-gated SIGTERM
+        # test in test_cli.py, which skips on Windows, so removing or renaming
+        # the event would otherwise go unnoticed by any runnable test. The field
+        # set (pid + port) matches its lifecycle siblings proxy_start/proxy_stop.
+        ready_events = [l for l in lines if l.get("event") == "proxy_ready"]
+        if len(ready_events) >= 1:
+            ready = ready_events[0]
+            if ready.get("pid") is not None:
+                pass_(f"proxy_ready event found (pid={ready.get('pid')})")
+            else:
+                fail(f"proxy_ready event missing 'pid': {ready}")
+            if ready.get("port") is not None:
+                pass_(f"proxy_ready event carries port={ready.get('port')}")
+            else:
+                fail(f"proxy_ready event missing 'port': {ready}")
+        else:
+            fail("No proxy_ready event in trace — readiness no longer "
+                 "post-dates signal-handler registration, or the event was "
+                 "removed/renamed")
+
         # Verify request events
         request_events = [l for l in lines if l.get("event") == "request"]
         if len(request_events) >= 3:

@@ -79,6 +79,13 @@ claude-retry-proxy status     # running/stopped + tier mapping
 claude-retry-proxy reload     # refresh the provider catalog from models.json
 ```
 
+`stop` asks the proxy to shut down, waits up to 5 seconds, then force-kills it
+if it is still alive. If the process survives that too, `stop` **exits 1** and
+**leaves `~/.claude/proxy/proxy-state.json` in place**, so the orphan stays
+findable by a later `stop`, `status`, or `reload`. The state file is removed
+only once the process is confirmed gone — so `Proxy: stopped` and a removed
+state file both mean the proxy really is not running.
+
 ## How it works
 
 When you run `claude-retry-proxy start`:
@@ -448,8 +455,11 @@ first-byte latency, and a sanitized error. Only the key **name** is logged —
 never the key material — and the field is omitted when resolution is
 impossible. Requests to providers with `extra_request_headers` rules
 additionally log an `extra_request_headers` field with the resolved header
-map. Lifecycle markers (`proxy_start`, `proxy_stop`) and per-retry events
-are also logged. When a client disconnects mid-response, a
+map. Lifecycle markers (`proxy_start`, `proxy_ready`, `proxy_stop`) and per-retry
+events are also logged. `proxy_ready` is written once the proxy is fully
+initialised — socket bound, heartbeat thread running, signal handlers registered
+— so it, not `proxy_start`, is the marker to wait on before signalling the
+process. When a client disconnects mid-response, a
 `client_disconnect` event is logged instead of printing a traceback.
 
 Entries older than 5 days are pruned on each `claude-retry-proxy start`.

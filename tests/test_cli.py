@@ -375,6 +375,216 @@ def test_stop_cleans_proxy_state_lock():
 
 
 # ===========================================================================
+# Test: stop reports failure truthfully (plan 2026-10-15-posix-shutdown-and-
+# stop-reporting)
+# ===========================================================================
+
+def test_stop_returns_one_and_keeps_state_file_when_proxy_survives():
+    """cmd_stop returns 1 and preserves the state file when the PID survives.
+
+    Regression guard for the cmd_stop reordering (Step 2 of
+    2026-10-15-posix-shutdown-and-stop-reporting): the old code returned 0 on
+    every path and deleted proxy-state.json BEFORE the force-kill, so a failed
+    kill destroyed the only record of the orphan and no later `stop` could
+    find it.
+
+    Drives cmd_stop in a child process (the file's established driver
+    pattern) with _read_state faked to a live-looking PID on port 1 — the
+    graceful HTTP attempt fails fast against port 1 — is_pid_alive stubbed
+    True, and both platform kill paths stubbed to no-ops so nothing is ever
+    signalled. The child prints the return code and whether the state file
+    survived; this test asserts rc == 1, the file was NOT removed, and the
+    success headline stayed on the success path.
+    """
+    print("\n--- Test: stop Returns 1 And Keeps State File When Proxy Survives ---")
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_stop_survives_")
+    state_file = os.path.join(temp_dir, "proxy-state.json")
+    try:
+        with open(state_file, "w") as f:
+            json.dump({"pid": 424242, "port": 1}, f)
+
+        driver = (
+            "import os, sys\n"
+            "import claude_retry_proxy.cli as cli\n"
+            "cli._read_state = lambda: {'pid': 424242, 'port': 1}\n"
+            "cli.is_pid_alive = lambda pid: True\n"
+            "cli.kill_process_windows = lambda pid: None\n"
+            "os.kill = lambda pid, sig: None\n"
+            "rc = cli.cmd_stop(None)\n"
+            "print('DRIVER rc=%s state_exists=%s' % (\n"
+            "    rc, os.path.exists(cli.PROXY_STATE_FILE)))\n"
+        )
+        env = os.environ.copy()
+        env["PROXY_STATE_FILE"] = state_file
+        proc = subprocess.run(
+            [sys.executable, "-c", driver],
+            capture_output=True, text=True, env=env, timeout=60)
+
+        line = [l for l in proc.stdout.splitlines() if l.startswith("DRIVER ")]
+        if not line:
+            fail("child produced no DRIVER result (rc={}): stdout={!r} "
+                 "stderr={!r}".format(proc.returncode, proc.stdout[-500:],
+                                      proc.stderr[-500:]))
+            return
+        fields = dict(kv.split("=", 1) for kv in line[-1].split()[1:])
+
+        if fields.get("rc") == "1":
+            pass_("cmd_stop returned 1 with the proxy still alive")
+        else:
+            fail("cmd_stop returned {!r}, expected 1 (stderr: {!r})".format(
+                fields.get("rc"), proc.stderr[-300:]))
+
+        if fields.get("state_exists") == "True":
+            pass_("state file preserved after the failed stop")
+        else:
+            fail("state file was removed despite the proxy surviving — the "
+                 "PID record is destroyed and no later stop can find it")
+
+        if "Proxy: stopped" not in proc.stdout:
+            pass_("no 'Proxy: stopped' on the failure path")
+        else:
+            fail("'Proxy: stopped' printed despite the failed stop: {!r}".format(
+                proc.stdout[:300]))
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_sigterm_shutdown_is_graceful_on_posix():
+    """POSIX-gated: SIGTERM runs the graceful shutdown path to completion.
+
+    Regression guard for the _shutdown_handler deadlock (Step 1 of
+    2026-10-15-posix-shutdown-and-stop-reporting): a Python signal handler
+    runs ON the serve_forever thread, so calling server.shutdown() inline
+    blocks until the very serve_forever call it is interrupting returns — an
+    unrecoverable wedge. The fix dispatches shutdown to a daemon thread (the
+    idiom the admin path's _delayed_shutdown already uses).
+
+    Spawns a proxy directly, sends SIGTERM, and asserts the process exits
+    within the budget, its state file is gone (main()'s finally), and the
+    trace's final event is the proxy_stop marker written by that same finally
+    block.
+
+    Skipped on Windows by design: os.kill(pid, SIGTERM) there is
+    TerminateProcess, which never runs the handler — the same gap that let
+    the defect live on a Windows dev box with no POSIX CI. Do not delete this
+    test for being permanently skipped here — it gates the branch on every
+    POSIX environment.
+    """
+    print("\n--- Test: SIGTERM Shutdown Is Graceful on POSIX ---")
+    if os.name != "posix":
+        pass_("skipped on Windows — POSIX SIGTERM handler path by design; "
+              "see docstring")
+        return
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_sigterm_")
+    state_file = os.path.join(temp_dir, "proxy-state.json")
+    trace_file = os.path.join(temp_dir, "trace.jsonl")
+    port = find_free_port()
+    tiers, vendors = _sink_tiers_and_vendors(find_free_port())
+    config_path = _create_test_config(temp_dir, tiers)
+    keys_path = _create_test_keys_plain(temp_dir, vendors)
+
+    proc, probe_ok = _start_proxy_server_directly(
+        port, config_path=config_path, keys_path=keys_path,
+        passphrase=None, trace_file=trace_file,
+        extra_env={"PROXY_STATE_FILE": state_file})
+    try:
+        if not probe_ok:
+            fail("proxy failed to start for the SIGTERM test")
+            return
+
+        # Sync on the proxy_ready trace event, which main() emits AFTER
+        # signal.signal() registers the handlers. The state file and the READY
+        # marker both precede registration, so a SIGTERM sent on either can
+        # take the default action — the process dies with no finally block,
+        # no proxy_stop marker, and no state cleanup. Bounded poll (~10 s).
+        deadline = time.monotonic() + 10
+        ready = False
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                fail("proxy child exited (rc={}) before emitting proxy_ready"
+                     .format(proc.returncode))
+                return
+            if os.path.exists(trace_file):
+                with open(trace_file) as f:
+                    for trace_line in f:
+                        trace_line = trace_line.strip()
+                        if not trace_line:
+                            continue
+                        try:
+                            if json.loads(trace_line).get("event") == "proxy_ready":
+                                ready = True
+                                break
+                        except Exception:
+                            pass
+                if ready:
+                    break
+            time.sleep(0.1)
+        if ready:
+            pass_("proxy_ready trace event observed; signal handlers registered")
+        else:
+            fail("proxy_ready trace event never appeared within 10s — handler "
+                 "registration unconfirmed, refusing to SIGTERM")
+            return
+
+        os.kill(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=15)
+            pass_("SIGTERM'd proxy exited within the 15s budget (rc={})".format(
+                proc.returncode))
+        except subprocess.TimeoutExpired:
+            fail("proxy did not exit within 15s of SIGTERM — the signal "
+                 "handler is blocking serve_forever inline (deadlock)")
+            return
+
+        # 4c: the exit code is the one behavioural pin for Step 1's thread
+        # dispatch. A handler that crashes but still runs main()'s finally
+        # (writing proxy_stop and removing the state file) exits rc=1 and
+        # would otherwise pass every assertion below — exactly the regression
+        # this test exists to catch.
+        if proc.returncode == 0:
+            pass_("SIGTERM exit code 0 — graceful path ran to completion")
+        else:
+            fail("SIGTERM'd proxy exited rc={} — expected 0; the handler "
+                 "crashed or ran the default SIGTERM action"
+                 .format(proc.returncode))
+
+        if not os.path.exists(state_file):
+            pass_("state file removed by the graceful shutdown")
+        else:
+            fail("state file still present after SIGTERM shutdown: {!r}".format(
+                state_file))
+
+        last_event = None
+        if os.path.exists(trace_file):
+            with open(trace_file) as f:
+                for trace_line in f:
+                    trace_line = trace_line.strip()
+                    if not trace_line:
+                        continue
+                    try:
+                        last_event = json.loads(trace_line).get("event")
+                    except Exception:
+                        pass
+        if last_event == "proxy_stop":
+            pass_("trace ends with proxy_stop")
+        else:
+            fail("trace final event is {!r}, expected 'proxy_stop' (trace: "
+                 "{!r})".format(last_event, trace_file))
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+
+
+# ===========================================================================
 # Test Case 22: Start Stdout Not Contaminated by Trace
 # ===========================================================================
 
@@ -1620,6 +1830,8 @@ ALL_TESTS = [
     ("cli-stop-cleans-proxy-state-lock", test_stop_cleans_proxy_state_lock),
     ("cli-stop-cleans-proxy-state", test_stop_cleans_proxy_state),
     ("cli-stop-trace-with-proxy", test_stop_trace_with_proxy),
+    ("cli-stop-returns-one-and-keeps-state-when-proxy-survives", test_stop_returns_one_and_keeps_state_file_when_proxy_survives),
+    ("sigterm-shutdown-is-graceful-on-posix", test_sigterm_shutdown_is_graceful_on_posix),
     ("cli-start-stdout-not-contaminated", test_start_stdout_not_contaminated),
     ("startup-aborts-on-unwritable-trace-path", test_startup_aborts_on_unwritable_trace_path),
     ("startup-aborts-on-unwritable-state-path", test_startup_aborts_on_unwritable_state_path),

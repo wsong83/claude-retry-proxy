@@ -659,9 +659,9 @@ def cmd_stop(args):
     # 2. Wait for graceful exit (5s timeout)
     if shutdown_ok:
         _trace("cmd_stop: waiting for proxy to exit...")
-        deadline = time.time() + 5
+        deadline = time.monotonic() + 5
         try:
-            while time.time() < deadline:
+            while time.monotonic() < deadline:
                 if not os.path.exists(PROXY_STATE_FILE):
                     _trace("cmd_stop: proxy exited gracefully")
                     break
@@ -671,7 +671,46 @@ def cmd_stop(args):
         except KeyboardInterrupt:
             _trace("cmd_stop: interrupted, proceeding to cleanup")
 
-    # 3. Clean up state file
+    # 3. Force kill if still running
+    if pid and is_pid_alive(pid):
+        _trace("cmd_stop: force-killing pid={}".format(pid))
+        if sys.platform == "win32":
+            kill_process_windows(pid)
+            time.sleep(0.3)
+        else:
+            import signal
+            # A kill raising ProcessLookupError/OSError means the process is
+            # already gone — treated as exit, not failure.
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+            # The SIGTERM above is sent on best-effort liveness alone
+            # (is_pid_alive is os.kill(pid, 0), which answers "does something
+            # hold this PID", not "is it our proxy"), and that is accepted
+            # here: a wrong target that ignores SIGTERM is unharmed, and if it
+            # does die, the next `stop` simply re-checks. No SIGKILL
+            # escalation, though: an unrecoverable kill of an unverified PID
+            # would be a different matter — and because the state file is
+            # deliberately preserved on failure, every later `stop` would
+            # repeat it. A proxy that survives SIGTERM is reported (rc 1,
+            # WARNING naming the PID, state file preserved) and left for a
+            # human — the deadlock escalation once defended against is fixed
+            # by the handler's thread dispatch.
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and is_pid_alive(pid):
+                time.sleep(0.3)
+
+    # 4. Re-check liveness — a failed stop must preserve the PID record
+    if pid and is_pid_alive(pid):
+        _trace("cmd_stop: pid={} still alive -> returning 1, "
+               "state file preserved".format(pid))
+        print("WARNING: Proxy PID {} may still be running".format(pid),
+              file=sys.stderr)
+        return 1
+
+    # 5. Clean up state file (best-effort and last: on a graceful exit the
+    # server has already removed it in serve_forever()'s finally)
     try:
         os.remove(PROXY_STATE_FILE)
         _trace("cmd_stop: proxy-state.json removed")
@@ -679,22 +718,6 @@ def cmd_stop(args):
         _trace("cmd_stop: proxy-state.json not found")
 
     print("Proxy: stopped")
-
-    # 4. Force kill if still running
-    if pid and is_pid_alive(pid):
-        _trace("cmd_stop: force-killing pid={}".format(pid))
-        if sys.platform == "win32":
-            kill_process_windows(pid)
-            time.sleep(0.3)
-            if is_pid_alive(pid):
-                print("WARNING: Proxy PID {} may still be running".format(pid),
-                      file=sys.stderr)
-        else:
-            import signal
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
 
     _trace("cmd_stop: returning 0")
     return 0
