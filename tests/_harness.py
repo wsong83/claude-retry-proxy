@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 
 
 
@@ -105,9 +106,11 @@ def _remove_test_state_file():
     Python cleanup — TerminateProcess on Windows, SIGKILL on POSIX — so the
     server's own finally: os.remove(...) never fires either. Called from
     every layer that leaks it: harness import
-    (clean slate), the three wrapper cleanup() closures (wrapper tests), and
+    (clean slate), the three wrapper cleanup() closures (wrapper tests),
     run_cli's per-test loop (the chokepoint every module passes through —
-    the only point that covers direct _start_proxy_server_directly spawns).
+    the only point that covers direct _start_proxy_server_directly spawns),
+    and test_cli.py's test bodies, which clear the file before invoking a CLI
+    start so cmd_start cannot refuse the run with "Proxy already running".
     Never raises: cleanup must stay best-effort.
     """
     try:
@@ -475,7 +478,8 @@ def _create_test_keys_plain(temp_dir, vendors):
 
 # The child signals its own readiness: server.py prints this marker on stdout
 # after it has bound its listening socket, started the heartbeat thread, and
-# registered both signal handlers (READY post-dates signal.signal() since
+# registered its signal handlers — SIGTERM on every platform, SIGINT
+# additionally on POSIX (READY post-dates signal.signal() since
 # 2026-10-15-posix-shutdown-and-stop-reporting, so a proxy that has emitted
 # this marker will run the graceful-shutdown handler if signalled) — still
 # before serve_forever().
@@ -503,10 +507,11 @@ def _await_child_ready_marker(proc, ready_event, seen):
     pipe. Any non-marker line the child did write is kept in `seen` so nothing
     is silently dropped.
 
-    stderr is deliberately NOT touched here: several callers read it through
-    proc.communicate() after a refused startup, and the refusal diagnostics
-    live there. Draining it here would consume the record those callers assert
-    on.
+    stderr is deliberately NOT touched here: its owner is the daemon reader
+    that _drain_child_stderr installs at spawn, and the refusal diagnostics the
+    callers assert on are read back through _read_child_stderr from that
+    reader's buffer. Reading stderr here as well would race that reader for the
+    same pipe.
     """
     try:
         for line in proc.stdout:
@@ -520,14 +525,78 @@ def _await_child_ready_marker(proc, ready_event, seen):
         pass
 
 
+# Children whose stderr is drained by a background reader, keyed BY THE CHILD
+# (not by id(proc) — CPython reuses id() values once an object is collected, so
+# an address-keyed entry that outlives its child can be found again by a later,
+# unrelated child). A WeakKeyDictionary releases the entry when the child goes,
+# which is also what makes the retention here bounded.
+_CHILD_STDERR_BUFFERS = weakref.WeakKeyDictionary()
+_CHILD_STDERR_READERS = weakref.WeakKeyDictionary()
+
+
+def _drain_child_stderr(proc):
+    """Continuously drain a long-lived child's stderr into a buffer.
+
+    The child is spawned with stderr=subprocess.PIPE and outlives the test
+    body, so nothing reads that pipe until teardown: a chatty child under
+    whole-suite load can fill the buffer and block. A daemon reader thread
+    removes the mechanism. The captured text is appended to the module-level
+    buffer that _read_child_stderr consults when the pipe is no longer the
+    source of truth.
+    """
+    chunks = []
+    _CHILD_STDERR_BUFFERS[proc] = chunks
+
+    def reader():
+        try:
+            # text=True at both call sites, so readline yields str and "" at EOF.
+            for line in iter(proc.stderr.readline, ""):
+                chunks.append(line)
+        except (OSError, ValueError):
+            # The pipe closed under us — teardown killed the child, or the
+            # handle was closed. Whatever was read is still the diagnostic.
+            pass
+
+    thread = threading.Thread(target=reader, name="stderr-drain", daemon=True)
+    thread.start()
+    _CHILD_STDERR_READERS[proc] = thread
+    return thread
+
+
 def _read_child_stderr(proc, timeout=2):
     """Return a child's stderr text, bounded and never blocking.
 
-    Kills the child first (this is the readiness-failure path, where the child
-    is discarded anyway), then reads whatever it emitted. A TimeoutExpired or
-    any other error yields "" rather than propagating — the diagnostic must
-    never be the thing that fails the test.
+    For a child spawned by a drain-owning helper the background reader holds
+    the pipe, so this waits the child out and returns the captured buffer —
+    calling communicate() here would race that reader for the same pipe. For
+    every other child it keeps the original path: kill first (this is the
+    readiness-failure path, where the child is discarded anyway), then read
+    whatever it emitted. A TimeoutExpired or any other error yields "" rather
+    than propagating — the diagnostic must never be the thing that fails the
+    test.
+
+    The read is repeatable: the buffer belongs to the child and is released when
+    the child is collected, so calling this twice returns the same text rather
+    than falling through to communicate() and returning "". It is best-effort
+    only in one direction -- if the reader has not reached EOF within `timeout`
+    (possible only for a child that survived the kill), the text captured so far
+    is what comes back.
     """
+    if proc in _CHILD_STDERR_BUFFERS:
+        chunks = _CHILD_STDERR_BUFFERS[proc]
+        reader = _CHILD_STDERR_READERS.get(proc)
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except OSError:
+            pass
+        if reader is not None:
+            # join() is idempotent, so a repeat read returns immediately.
+            reader.join(timeout=timeout)
+        # The entry is released by the WeakKeyDictionary when the child goes,
+        # not here: popping it would make a second read fall through to
+        # communicate() and silently return "".
+        return "".join(chunks)
     try:
         if proc.poll() is None:
             proc.kill()
@@ -585,6 +654,7 @@ def _start_proxy_server_directly(port, config_path=None, keys_path=None,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
         text=True, cwd=cwd
     )
+    _drain_child_stderr(proc)
 
     # Pipe passphrase to server (or close stdin for plain keys); the handle
     # is dropped after the close so a later proc.communicate() — the refusal
@@ -674,6 +744,12 @@ def _admin_post(proxy_port, path, body, origin=None, timeout=10):
     design (it waits for in-flight work to finish), so a test whose switch
     legitimately waits out a live stream must raise this past the 10 s default
     — otherwise the client gives up while the server-side swap still succeeds.
+
+    Transport failures are tolerated the way `_send_proxy_request` tolerates
+    them: the caller receives (0, "<error text>") and fails an assertion that
+    carries the reason, rather than an exception escaping the test body and
+    surfacing as "Test crashed" with no diagnostic. This makes the flake
+    diagnosable; it does not make it pass.
     """
     import http.client as _hc
     conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=timeout)
@@ -682,11 +758,16 @@ def _admin_post(proxy_port, path, body, origin=None, timeout=10):
         headers["Origin"] = origin
     else:
         headers["Origin"] = "http://127.0.0.1:{}".format(proxy_port)
-    conn.request("POST", path, body=json.dumps(body), headers=headers)
-    resp = conn.getresponse()
-    data = resp.read().decode()
-    conn.close()
-    return resp.status, data
+    try:
+        conn.request("POST", path, body=json.dumps(body), headers=headers)
+        resp = conn.getresponse()
+        data = resp.read().decode()
+        status = resp.status
+        conn.close()
+        return status, data
+    except Exception as e:
+        conn.close()
+        return 0, str(e)
 
 
 
@@ -1009,56 +1090,6 @@ def _create_test_config_with_flag(temp_dir, tiers, flag_value=None,
     with open(models_path, "w", encoding="utf-8") as f:
         json.dump(models_doc, f)
     return path
-
-
-
-
-def _start_proxy_with_flag(proxy_port, temp_dir, flag_value, extra_env=None):
-    """Start the proxy server with a config carrying the flag.
-
-    Returns (proc, probe_ok). Config/keys written to temp_dir.
-    """
-    tiers = {
-        "haiku": {"provider": "test-provider", "model": "claude-haiku-4-5"},
-        "sonnet": {"provider": "test-provider", "model": "claude-sonnet-5"},
-        "opus": {"provider": "test-provider", "model": "claude-opus-5"},
-    }
-    vendors = {
-        "test-provider": {"url": f"http://127.0.0.1:{find_free_port()}", "key": "test-api-key"}
-    }
-    config_path = _create_test_config_with_flag(temp_dir, tiers, flag_value)
-    keys_path = _create_test_keys(temp_dir, vendors)
-
-    env = os.environ.copy()
-    env["PROXY_PORT"] = str(proxy_port)
-    env["PROXY_MAX_RETRIES"] = "3"
-    env["PROXY_INITIAL_DELAY"] = "1"
-    env["PROXY_MAX_DELAY"] = "1"
-    if extra_env:
-        env.update(extra_env)
-
-    proc = subprocess.Popen(
-        PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
-    )
-    if proc.stdin:
-        _close_child_stdin(proc, line="test-passphrase\n")
-
-    probe_ok = False
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            sock.connect(("127.0.0.1", proxy_port))
-            sock.close()
-            probe_ok = True
-            break
-        except (socket.error, ConnectionRefusedError):
-            time.sleep(0.1)
-    return proc, probe_ok
-
-
 
 
 # ===========================================================================

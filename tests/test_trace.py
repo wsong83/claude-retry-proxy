@@ -19,9 +19,11 @@ import time
 
 from _harness import (
     PROXY_SERVER,
+    _admin_post,
     _create_test_config,
     _create_test_config_with_flag,
     _create_test_keys,
+    _drain_child_stderr,
     _mode_tiers,
     _send_proxy_request,
     _start_mode_proxy,
@@ -30,7 +32,6 @@ from _harness import (
     info,
     pass_,
     run_cli,
-    warn,
 )
 
 
@@ -89,6 +90,7 @@ def test_trace_markers():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
 
     # Pipe passphrase to server
     if proc.stdin:
@@ -131,12 +133,25 @@ def test_trace_markers():
 
         time.sleep(0.5)
 
-        # Kill proxy to trigger stop marker
-        proc.terminate()
+        # Stop the proxy through the graceful path this test targets:
+        # POST /admin/shutdown carries the CSRF Origin header and makes
+        # serve_forever() return, so the process runs its finally block and
+        # write_stop_marker() actually fires. proc.terminate() is
+        # TerminateProcess on Windows, which bypasses that path entirely —
+        # which is why the marker assertion below could never fail before.
+        status, data = _admin_post(proxy_port, "/admin/shutdown", {})
+        if status == 200:
+            pass_("graceful shutdown accepted (HTTP 200)")
+        else:
+            fail("admin shutdown returned {}: {!r} — the graceful path is "
+                 "unreachable, so the proxy_stop assertion cannot be trusted"
+                 .format(status, data[:200]))
+
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
             proc.kill()
+            fail("proxy did not exit after /admin/shutdown")
 
         time.sleep(0.5)
 
@@ -194,7 +209,8 @@ def test_trace_markers():
             else:
                 fail("proxy_stop missing requests_total counter")
         else:
-            warn("No proxy_stop event in trace (may be expected if termination was abrupt)")
+            fail("No proxy_stop event in trace — the graceful shutdown path "
+                 "did not write its stop marker")
 
     finally:
         mock_server.shutdown()
@@ -266,6 +282,7 @@ def test_relative_log_path():
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
         text=True, cwd=tmpdir
     )
+    _drain_child_stderr(proc)
 
     # Pipe passphrase to server
     if proc.stdin:
@@ -422,6 +439,7 @@ def test_trace_logs_oversized_body():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
 
     # Pipe passphrase to server
     if proc.stdin:
@@ -724,6 +742,7 @@ def test_retry_trace_event_enriched():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
     if proc.stdin:
         try:
             proc.stdin.write("test-passphrase\n")

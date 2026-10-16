@@ -25,6 +25,7 @@ from _harness import (
     _create_test_config,
     _create_test_keys,
     _create_test_keys_plain,
+    _read_child_stderr,
     _remove_test_state_file,
     _restore_proxy_state,
     _send_proxy_request,
@@ -83,10 +84,7 @@ def test_stop_cleans_proxy_state():
 
     try:
         # Ensure cmd_start doesn't refuse with "Proxy already running"
-        try:
-            os.remove(PROXY_STATE_FILE)
-        except OSError:
-            pass
+        _remove_test_state_file()
 
         port = find_free_port()
         temp_dir = tempfile.mkdtemp(prefix="proxy_stop_state_")
@@ -184,10 +182,7 @@ def test_stop_cleans_proxy_state():
         # Remove the stale state file so the restore reliably puts back the
         # pre-test backup (server wrote state on startup, force-kill bypassed
         # its cleanup, leaving a dead test PID).
-        try:
-            os.remove(PROXY_STATE_FILE)
-        except OSError:
-            pass
+        _remove_test_state_file()
         _restore_proxy_state(state_backup)
 
 
@@ -201,10 +196,7 @@ def test_stop_trace_with_proxy():
 
     try:
         # Ensure cmd_start doesn't refuse with "Proxy already running"
-        try:
-            os.remove(PROXY_STATE_FILE)
-        except OSError:
-            pass
+        _remove_test_state_file()
 
         port = find_free_port()
         temp_dir = tempfile.mkdtemp(prefix="proxy_stop_trace_")
@@ -596,10 +588,7 @@ def test_start_stdout_not_contaminated():
 
     try:
         # Ensure cmd_start doesn't refuse with "Proxy already running"
-        try:
-            os.remove(PROXY_STATE_FILE)
-        except OSError:
-            pass
+        _remove_test_state_file()
 
         port = find_free_port()
         temp_dir = tempfile.mkdtemp(prefix="proxy_stdout_")
@@ -692,10 +681,7 @@ def test_cli_reload():
     cleanup_lock_files()
 
     try:
-        try:
-            os.remove(PROXY_STATE_FILE)
-        except OSError:
-            pass
+        _remove_test_state_file()
 
         port = find_free_port()
         p_port = find_free_port()
@@ -903,7 +889,7 @@ def test_start_rejects_uncatalogued_model_selector_at_cli():
                 proc.kill()
             else:
                 try:
-                    _, srv_err = proc.communicate(timeout=10)
+                    srv_err = _read_child_stderr(proc, timeout=10)
                 except Exception:
                     srv_err = ""
                 if ("[proxy] ERROR: Config validation failed:" in srv_err
@@ -941,7 +927,7 @@ def test_start_rejects_uncatalogued_model_selector_at_cli():
                 proc.kill()
             else:
                 try:
-                    _, srv_err = proc.communicate(timeout=10)
+                    srv_err = _read_child_stderr(proc, timeout=10)
                 except Exception:
                     srv_err = ""
                 if "[proxy] ERROR: Config validation failed:" in srv_err and catalog_err in srv_err:
@@ -1157,10 +1143,7 @@ def test_cli_start_invalid_config():
     cleanup_lock_files()
 
     try:
-        try:
-            os.remove(PROXY_STATE_FILE)
-        except OSError:
-            pass
+        _remove_test_state_file()
 
         temp_dir = tempfile.mkdtemp(prefix="proxy_cli_invalidcfg_")
         try:
@@ -1212,10 +1195,7 @@ def test_cli_status_shows_tiers():
     cleanup_lock_files()
 
     try:
-        try:
-            os.remove(PROXY_STATE_FILE)
-        except OSError:
-            pass
+        _remove_test_state_file()
 
         port = find_free_port()
         p_port = find_free_port()
@@ -1339,10 +1319,7 @@ def test_start_status_reload_tier_lines_show_key():
     cleanup_lock_files()
 
     try:
-        try:
-            os.remove(PROXY_STATE_FILE)
-        except OSError:
-            pass
+        _remove_test_state_file()
 
         port = find_free_port()
         p_port = find_free_port()
@@ -1410,25 +1387,45 @@ def test_start_status_reload_tier_lines_show_key():
 # write is the check.
 
 def _drain_after_exit(proc, timeout=20):
-    """Wait for a server process to exit; return (stdout, stderr)."""
+    """Wait for a server process to exit; return (stdout, stderr).
+
+    stderr is read back through the harness drain buffer rather than through
+    communicate(): a child spawned by _start_proxy_server_directly has its
+    stderr pipe owned by that helper's daemon reader, so communicate() returns
+    "" for it and would leave the caller's diagnostic assertion empty. stdout
+    still comes from communicate(), whose closing of the child's stdout pipe is still needed; no caller asserts
+on stdout any more -- the readiness signal they need is the spawn's probe_ok.
+    """
     try:
-        return proc.communicate(timeout=timeout)
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        return proc.communicate()
+        pass
+    stderr = _read_child_stderr(proc, timeout=timeout)
+    try:
+        stdout, _ = proc.communicate(timeout=timeout)
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        stdout = ""
+    return stdout, stderr
 
 
-def _assert_startup_aborted(proc, blocked, label):
-    """Assert a direct server invocation exited before READY, naming `blocked`."""
-    stdout, stderr = _drain_after_exit(proc)
+def _assert_startup_aborted(proc, probe_ok, blocked, label):
+    """Assert a direct server invocation exited before READY, naming `blocked`.
+
+    Readiness is asserted from `probe_ok`, the signal
+    _start_proxy_server_directly actually computes -- not from the child's
+    stdout, which that helper's _await_child_ready_marker daemon thread has
+    already read to EOF, so the communicate() in _drain_after_exit returns ""
+    and a READY-marker check against stdout could never fail.
+    """
+    _, stderr = _drain_after_exit(proc)
     if proc.returncode not in (0, None):
         pass_("{}: server exited non-zero ({})".format(label, proc.returncode))
     else:
         fail("{}: expected non-zero exit, got {}".format(label, proc.returncode))
-    if "READY" not in (stdout or ""):
-        pass_("{}: no READY marker on stdout".format(label))
+    if not probe_ok:
+        pass_("{}: server never signalled readiness".format(label))
     else:
-        fail("{}: READY printed despite the unwritable path".format(label))
+        fail("{}: server signalled readiness despite the unwritable path".format(label))
     if "is not writable" in (stderr or "") and blocked in (stderr or ""):
         pass_("{}: stderr ERROR names the unwritable path".format(label))
     else:
@@ -1463,11 +1460,11 @@ def test_startup_aborts_on_unwritable_trace_path():
     blocked = os.path.join(temp_dir, "trace-is-a-directory")
     os.mkdir(blocked)
 
-    proc, _probe = _start_proxy_server_directly(
+    proc, probe = _start_proxy_server_directly(
         port, config_path=config_path, keys_path=keys_path,
         passphrase=None, trace_file=blocked)
     try:
-        _assert_startup_aborted(proc, blocked, "unwritable trace path")
+        _assert_startup_aborted(proc, probe, blocked, "unwritable trace path")
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -1502,11 +1499,11 @@ def test_startup_aborts_on_unwritable_state_path():
     blocked = os.path.join(temp_dir, "state-is-a-directory")
     os.mkdir(blocked)
 
-    proc, _probe = _start_proxy_server_directly(
+    proc, probe = _start_proxy_server_directly(
         port, config_path=config_path, keys_path=keys_path, passphrase=None,
         trace_file=trace_file, extra_env={"PROXY_STATE_FILE": blocked})
     try:
-        _assert_startup_aborted(proc, blocked, "unwritable state path")
+        _assert_startup_aborted(proc, probe, blocked, "unwritable state path")
     finally:
         if proc.poll() is None:
             proc.kill()

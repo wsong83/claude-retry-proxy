@@ -74,7 +74,14 @@ survived across runs, and because Windows recycles PID numbers aggressively, <co
 <code>Proxy already running</code> and refuse to start. The path stays identical for the whole
 run — the harness, every spawned CLI subprocess and every spawned server inherit it through
 <code>os.environ.copy()</code> — and <code>run_cli</code>'s per-test loop removes the file after
-every test, so no test inherits one left by an earlier test (neither the wrapper
+every test, so no test inherits one left by an earlier test. Since 2026-10-16 the
+removals the <code>test_cli.py</code> bodies perform go through the shared
+<code>_remove_test_state_file()</code> helper — plan 2026-10-15-test-harness-robustness
+single-sourced eight hand-rolled copies of that removal, seven of them ahead of a CLI
+<code>start</code> (<code>cmd_start</code> otherwise refuses the run with
+<code>Proxy already running</code>) and one in a teardown. A body that starts a proxy without
+clearing first — <code>test_start_rejects_uncatalogued_model_selector_at_cli</code> is one —
+relies on <code>run_cli</code>'s per-test removal instead. Neither the wrapper
 <code>cleanup()</code> closures nor a direct <code>_start_proxy_server_directly</code> spawn is
 relied on for this; a direct spawn's file is written by the server child, and on Windows
 <code>terminate()</code> is <code>TerminateProcess</code>, which runs no Python cleanup).
@@ -640,7 +647,7 @@ EOF</code></pre>
 
 <h4><code>tests/test_trace.py</code> (12 tests) — trace log and analysis</h4>
 <ul>
-<li><code>test_trace_markers</code>: Start proxy, send requests, kill; verify trace has start/end markers with counters, plus the <code>proxy_ready</code> marker and its <code>pid</code>/<code>port</code> fields. This is the only <code>proxy_ready</code> pin that runs on Windows — the test's other reference lives inside the POSIX-gated SIGTERM test in <code>test_cli.py</code>, so without it a removal or rename of the event would go unnoticed by any runnable test.</li>
+<li><code>test_trace_markers</code>: Start proxy, send requests, then stop it through <code>POST /admin/shutdown</code> — the <em>graceful</em> path, so the <code>proxy_stop</code> marker is actually written (changed 2026-10-16 by plan 2026-10-15-test-harness-robustness; it previously killed the proxy and merely warned when the marker was missing). Verify the trace has start/end markers with counters, plus the <code>proxy_ready</code> marker and its <code>pid</code>/<code>port</code> fields. A missing <code>proxy_stop</code> is now a hard <strong>failure</strong>, not a warning, so the marker is pinned rather than tolerated. This is the only <code>proxy_ready</code> pin that runs on Windows — the test's other reference lives inside the POSIX-gated SIGTERM test in <code>test_cli.py</code>, so without it a removal or rename of the event would go unnoticed by any runnable test.</li>
 <li><code>test_relative_log_path</code>: Start proxy server directly with &#x27;-l relative.jsonl&#x27; and cwd=temp dir.</li>
 <li><code>test_trace_logs_oversized_body</code>: Send POST with body exceeding PROXY_MAX_BODY_SIZE; verify 413 AND trace entry.</li>
 <li><code>test_start_prunes_old_trace_entries</code>: Directly import prune_trace_file from claude_retry_proxy.cli; create temp trace file with entries dated now, 10 days ago, and a malformed line; assert return is (2, 1)…</li>
@@ -763,7 +770,11 @@ headers, path, and body — rather than only on what came back.</p>
 <tr><th>Helper</th><th>Purpose</th></tr>
 <tr><td><code>_send_proxy_request(port, path, body, headers)</code></td><td>Send a buffered request</td></tr>
 <tr><td><code>_send_proxy_request_stream(port, body, path)</code></td><td>Send and read a streaming response</td></tr>
-<tr><td><code>_admin_get</code> / <code>_admin_post</code></td><td>Hit the admin API with a correct Origin by default</td></tr>
+<tr><td><code>_admin_get</code> / <code>_admin_post</code></td><td>Hit the admin API with a correct Origin by default. <code>_admin_post</code> also carries the transport tolerance its sibling <code>_send_proxy_request</code> has: a <code>ConnectionAbortedError</code> or other transport abort during the request/read is returned as <code>(0, str(e))</code> rather than raised, so a whole-suite abort under load surfaces as a <strong>failed assertion carrying the error text</strong> instead of <code>Test crashed</code> with no diagnostic. The error is a <code>str</code>, not the sibling's <code>bytes</code>, matching <code>_admin_post</code>'s own decoded-<code>str</code> contract</td></tr>
+<tr><td><code>_drain_child_stderr(proc)</code></td>
+    <td>Install a daemon reader for a long-lived child's stderr so the ~64&nbsp;KiB pipe buffer cannot fill and block the child. Called at spawn time by the one long-lived spawn helper (<code>_start_proxy_server_directly</code>) and by the <strong>21 long-lived spawn sites whose children nothing else reads</strong> — 17 in <code>test_retry_streaming.py</code>, 4 in <code>test_trace.py</code>. The reader is keyed <em>by the child</em> (<code>weakref.WeakKeyDictionary</code>), so its buffer is released when the child is collected rather than by an address that a later child could reuse</td></tr>
+<tr><td><code>_read_child_stderr(proc, timeout)</code></td>
+    <td>Read a spawned child's stderr. This is the <strong>only</strong> accessor for a child whose stderr is drained at spawn: the reader owns that pipe, so <em>any</em> direct read returns <code>""</code> — a plain <code>proc.communicate()</code> (measured, plan 2026-10-15-test-harness-robustness's Step&nbsp;2 issue report) and equally a plain <code>proc.stderr.read()</code> (measured, that plan's Step&nbsp;6 issue: it is the one failure a whole-suite run caught, because the assertions that break <em>silently</em> are the ones checking for absence). Returns the retained buffer, so a repeat read gives the same text. Falls back to the original kill-then-<code>communicate()</code> path for every other child</td></tr>
 <tr><td><code>_parse_sse_frames(raw)</code>, <code>_sse_types(frames)</code>, <code>_sse_frames_with_type</code></td>
     <td>Decode an SSE stream into frames and assert on their types</td></tr>
 <tr><td><code>_trace_events_for_request(request_id)</code></td>

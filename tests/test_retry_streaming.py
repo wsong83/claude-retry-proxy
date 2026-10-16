@@ -23,7 +23,9 @@ from _harness import (
     _create_test_keys,
     _create_test_keys_plain,
     _derive_models_from_tiers,
+    _drain_child_stderr,
     _mode_tiers,
+    _read_child_stderr,
     _send_proxy_request,
     _send_proxy_request_stream,
     _start_mode_mock_upstream,
@@ -95,6 +97,7 @@ def test_concurrent_requests():
         PROXY_SERVER + ["--port", str(port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
 
     # Pipe passphrase to server
     if proc.stdin:
@@ -240,6 +243,7 @@ def test_retry_logic():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
 
     # Pipe passphrase to server
     if proc.stdin:
@@ -375,6 +379,7 @@ def test_retry_429():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
 
     # Pipe passphrase to server
     if proc.stdin:
@@ -515,6 +520,7 @@ def test_retry_429_exhaust_returns_429():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
 
     # Pipe passphrase to server
     if proc.stdin:
@@ -640,6 +646,7 @@ def test_thread_safety():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
 
     # Pipe passphrase to server
     if proc.stdin:
@@ -801,6 +808,7 @@ def test_start_no_auth_header_required():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
 
     # Pipe passphrase to server
     if proc.stdin:
@@ -923,6 +931,7 @@ def test_exhaust_429_preserves_body():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
 
     # Pipe passphrase to server
     if proc.stdin:
@@ -1063,6 +1072,7 @@ def test_exhaust_connection_error_synthesizes_body():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
 
     # Pipe passphrase to server
     if proc.stdin:
@@ -1207,6 +1217,7 @@ def test_client_disconnect_no_traceback():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
 
     # Pipe passphrase to server
     if proc.stdin:
@@ -1308,11 +1319,11 @@ def test_client_disconnect_no_traceback():
             proc.kill()
         time.sleep(0.3)
 
-        # Collect stderr
-        try:
-            stderr_output = proc.stderr.read() if proc.stderr else ""
-        except Exception:
-            stderr_output = ""
+        # Collect stderr through the harness accessor: this child's stderr pipe
+        # is owned by the drain reader _drain_child_stderr installed at spawn,
+        # so a direct proc.stderr.read() here returns "" and the assertion below
+        # would fail on an empty diagnostic rather than on a real one.
+        stderr_output = _read_child_stderr(proc, timeout=5)
 
         # Assert: NO Traceback in stderr
         if "Traceback" not in stderr_output:
@@ -1437,6 +1448,7 @@ def test_streaming_response_body():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
 
     # Pipe passphrase to server
     if proc.stdin:
@@ -1587,6 +1599,7 @@ def test_streaming_mid_stream_upstream_failure():
             PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
         )
+        _drain_child_stderr(proc)
 
         # Pipe passphrase to server
         if proc.stdin:
@@ -1650,10 +1663,10 @@ def test_streaming_mid_stream_upstream_failure():
                 proc.kill()
             time.sleep(0.3)
 
-            try:
-                stderr_output = proc.stderr.read() if proc.stderr else ""
-            except Exception:
-                stderr_output = ""
+            # Same as above: the drain reader owns this child's stderr pipe, so
+            # a direct proc.stderr.read() would return "" and the no-Traceback
+            # assertion would pass vacuously.
+            stderr_output = _read_child_stderr(proc, timeout=5)
 
             if "Traceback" not in stderr_output:
                 pass_(f"[{name}] stderr contains NO Traceback on upstream truncation")
@@ -1790,6 +1803,7 @@ def test_empty_body_429_exhaust():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
 
     # Pipe passphrase to server
     if proc.stdin:
@@ -1889,6 +1903,7 @@ def test_disable_retry_count_tokens_503():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
     if proc.stdin:
         try:
             proc.stdin.write("test-passphrase\n")
@@ -1991,6 +2006,7 @@ def test_disable_retry_count_tokens_conn_error():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
     if proc.stdin:
         try:
             proc.stdin.write("test-passphrase\n")
@@ -2186,6 +2202,7 @@ def test_disable_retry_count_tokens_normal_path_unaffected():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
     if proc.stdin:
         try:
             proc.stdin.write("test-passphrase\n")
@@ -2293,6 +2310,7 @@ def test_disable_retry_count_tokens_false_retries():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
     if proc.stdin:
         try:
             proc.stdin.write("test-passphrase\n")
@@ -2402,6 +2420,7 @@ def test_disable_retry_count_tokens_path_anchoring():
         PROXY_SERVER + ["--port", str(proxy_port), "--config-path", config_path, "--keys-path", keys_path],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True
     )
+    _drain_child_stderr(proc)
     if proc.stdin:
         try:
             proc.stdin.write("test-passphrase\n")

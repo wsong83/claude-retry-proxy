@@ -17,6 +17,7 @@ from _harness import (
     _create_test_config,
     _create_test_keys,
     _create_test_keys_plain,
+    _read_child_stderr,
     _restore_proxy_state,
     _send_proxy_request,
     _setup_tier_routing_test,
@@ -185,7 +186,7 @@ def test_config_validation_models_to_keys():
 
         if not probe_ok:
             try:
-                _, err = proc.communicate(timeout=5)
+                err = _read_child_stderr(proc, timeout=5)
             except Exception:
                 err = ""
             if "has no entry in keys-index.json" in err:
@@ -227,7 +228,7 @@ def test_config_validation_models_to_keys():
                 proc2.kill()
         else:
             try:
-                _, err2 = proc2.communicate(timeout=5)
+                err2 = _read_child_stderr(proc2, timeout=5)
             except Exception:
                 err2 = ""
             fail(f"Server refused to start with tier-unreferenced keys-only provider: {err2[:300]!r}")
@@ -276,7 +277,7 @@ def test_config_validation_tier_provider_needs_models():
 
         if not probe_ok:
             try:
-                _, err = proc.communicate(timeout=5)
+                err = _read_child_stderr(proc, timeout=5)
             except Exception:
                 err = ""
             if "used by tier" in err and "opus" in err:
@@ -420,7 +421,7 @@ def test_models_per_provider_validation():
             else:
                 # Validation refused startup — collect the error message
                 try:
-                    _, err = proc.communicate(timeout=5)
+                    err = _read_child_stderr(proc, timeout=5)
                 except Exception:
                     try:
                         proc.kill()
@@ -517,7 +518,7 @@ def test_key_decryption_wrong_passphrase():
             pass_("Server failed to start with wrong passphrase")
             # Check stderr for error message
             try:
-                _, stderr = proc.communicate(timeout=2)
+                stderr = _read_child_stderr(proc, timeout=2)
                 if "passphrase" in stderr.lower() or "decrypt" in stderr.lower():
                     pass_("Error message mentions passphrase/decryption")
                 else:
@@ -859,7 +860,7 @@ def test_extra_request_headers_startup_refusal():
                     proc.kill()
             else:
                 try:
-                    _, err = proc.communicate(timeout=5)
+                    err = _read_child_stderr(proc, timeout=5)
                 except Exception:
                     pass
             return probe_ok, err or ""
@@ -1107,7 +1108,7 @@ def test_keys_file_invalid_multikey_shapes_rejected():
                     proc.kill()
             else:
                 try:
-                    _, err = proc.communicate(timeout=5)
+                    err = _read_child_stderr(proc, timeout=5)
                 except Exception:
                     pass
             return probe_ok, err or ""
@@ -1210,7 +1211,7 @@ def test_string_form_empty_key_warns_not_rejects():
                 proc.kill()
             # stderr is line-buffered; the startup warning is already flushed
             try:
-                _, err = proc.communicate(timeout=5)
+                err = _read_child_stderr(proc, timeout=5)
             except Exception:
                 err = ""
             if "WARNING" in err and ("empty" in err or "key" in err):
