@@ -381,18 +381,25 @@ No other supplementary docs.
 {"issue_id": "httpx2-native-sse-transport", "title": "Adopt httpx2 for upstream transport and native SSE parsing: client.sse() replaces the hand-rolled SSE frame scanner and obsoletes httpx-sse", "target_repo": null, "report": "./tmp/reports/defer-issue-httpx2-native-sse-transport.json", "deferred": "2026-09-27", "date_source": "creation"},
 {"issue_id": "operate-round-ends-turn-before-waiting", "title": "Unattended --operate rounds frequently end their turn while a background full-suite run is still in flight, killing the run and leaving the round with no session report", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-operate-round-ends-turn-before-waiting.json", "deferred": "2026-10-04", "date_source": "creation"},
 {"issue_id": "orphaned-test-state-files", "title": "Orphaned per-run state files accumulate in ~/.claude/proxy, and this repo's own verification scripts are a systematic source: they spawn children directly, so they never pass through run_cli's per-test removal loop", "target_repo": null, "report": "./tmp/reports/defer-issue-orphaned-test-state-files.json", "deferred": "2026-10-16", "date_source": "creation"},
-{"issue_id": "recursion-guard-residual-sites", "title": "Three json.loads guards still omit RecursionError, so a deeply nested payload escapes them: the admin switch body and the two upstream tool-call argument parses — a fourth site has the same narrow shape but was measured unreachable", "target_repo": null, "report": "./tmp/reports/defer-issue-recursion-guard-residual-sites.json", "deferred": "2026-10-16", "date_source": "creation"}
+{"issue_id": "recursion-guard-residual-sites", "title": "Three json.loads guards still omit RecursionError, so a deeply nested payload escapes them: the admin switch body and the two upstream tool-call argument parses — a fourth site has the same narrow shape but was measured unreachable", "target_repo": null, "report": "./tmp/reports/defer-issue-recursion-guard-residual-sites.json", "deferred": "2026-10-16", "date_source": "creation"},
+{"issue_id": "planner-doctrine-gaps", "title": "Three planner-doctrine gaps that cost this repo real rounds are absent from planner.md: gate calibration is undocumented, ownership changes carry no reader-enumeration rule, and the round-triage freshness notion stops at session reports instead of covering any artifact read off disk", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-planner-doctrine-gaps.json", "deferred": "2026-10-16", "date_source": "creation"}
 ]```
 
 ## Future Work — TODO
 
-Seven deferred issues remain (see above). Five are the long tail this cycle
+Eight deferred issues remain (see above). Five are the long tail this cycle
 deliberately left alone: chat-mode image content block mapping, the
 start-on-a-busy-port readiness hazard, `proxy-stderr.log`'s append-only tail
 across runs, adopting httpx2 for upstream transport and native SSE parsing (a
-design change rather than a fix), and — cross-repo, against `claude-config` —
-unattended `--operate` rounds ending their turn while a background suite is
-still in flight.
+design change rather than a fix), and unattended `--operate` rounds ending their
+turn while a background suite is still in flight. **Two** of the eight are
+cross-repo, both against `claude-config`: that last one, and
+`planner-doctrine-gaps`, which carries the three plan-authoring rules this
+cycle's failures taught and `planner.md` does not yet state — a gate that cannot
+go red is worse than no gate, a step that changes who owns a resource must
+enumerate the resource's readers, and an artifact found on disk must be dated
+before it is believed. The five agent-memory notes holding those lessons stay
+until the doctrine lands, because a project memory loads for one repo only.
 
 The newest two were filed on 2026-10-16 by `2026-10-15-deferred-corpus-sweep`,
 the cycle's closeout plan, which retired the 24 terminal reports the corpus had
