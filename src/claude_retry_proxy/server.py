@@ -2703,16 +2703,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 bound = min(bound, max(1, SETTINGS.swap_silence_timeout))
             return bound
 
+        def sentinel_of(text):
+            """The frame payload as handle_frame reads it — every `data:` line,
+            joined and stripped — or None when the frame carries none at all."""
+            data_lines = [ln[5:].strip() for ln in text.splitlines()
+                          if ln.startswith("data:")]
+            if not data_lines:
+                return None
+            return "\n".join(data_lines).strip()
+
         def handle_frame(frame):
             nonlocal chat_id, usage, first_frame, tool_calls_seen, scalar_after_tools_dropped, malformed_tool_count
             nonlocal finish_reason_seen, post_finish_suppressed
             nonlocal text_emitted, text_tail
             text = frame.decode("utf-8", errors="replace")
-            data_lines = [ln[5:].strip() for ln in text.splitlines()
-                          if ln.startswith("data:")]
-            if not data_lines:
+            raw = sentinel_of(text)
+            if raw is None:
                 return None  # comment/event-only frame — skip silently
-            raw = "\n".join(data_lines).strip()
             if raw == "[DONE]":
                 return "done"
             try:
@@ -2848,9 +2855,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     break
                 except (http.client.IncompleteRead, http.client.RemoteDisconnected,
                         socket.error, OSError):
+                    # A completed swap owns this exit too: dying retryably beats
+                    # delivering an old-routing result the client would trust.
+                    if _swap_epoch_changed(epoch):
+                        return evict_swap()
                     drain_exit = "read_error"
                     break
                 if not chunk:
+                    if _swap_epoch_changed(epoch):
+                        return evict_swap()
                     drain_exit = "eof"
                     break
                 _touch_upstream_activity()
@@ -3068,6 +3081,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # EOF reached without a finish_reason chunk. Two dispositions: with
         # [DONE] the stream is protocol-complete and just never said why it
         # stopped; without it the connection was cut mid-response.
+        # A provider may write `data: [DONE]` and close without the blank
+        # line that delimits a frame, stranding the sentinel in the buffer.
+        # At EOF the sentinel is unambiguous, so honour it rather than
+        # treating a protocol-complete stream as one that was cut.
+        if not saw_done and buf is not None:
+            if sentinel_of(bytes(buf).decode("utf-8", errors="replace")) == "[DONE]":
+                saw_done = True
         if not message_started:
             start_message()
         log_trace({

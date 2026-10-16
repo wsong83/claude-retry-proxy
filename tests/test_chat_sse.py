@@ -503,6 +503,124 @@ def test_chat_sse_done_without_finish_reason_is_terminal():
 
 
 
+def test_chat_sse_done_without_trailing_blank_line():
+    """A [DONE] sentinel stranded at EOF (no trailing blank line) is honoured.
+
+    A provider may write `data: [DONE]\\n` and close without the blank line
+    that delimits a frame, stranding the sentinel in the buffer. At EOF the
+    sentinel is unambiguous, so the stream is protocol-complete: it closes
+    with the synthesized terminal sequence — never a retryable error — and
+    chat_sse_truncated records saw_done: 1. Without the EOF flush the client
+    would re-issue a request that already succeeded.
+
+    No finish frame is declared: the flush under test lives on the pre-finish
+    EOF disposition, where a stranded [DONE] is the only completion signal.
+    """
+    print("\n--- Test: Chat SSE DONE Without Trailing Blank Line ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    chunks = [_cc({"role": "assistant", "content": "hello"})]
+    sse_body = _sse_stream_chunks(chunks) + b"data: [DONE]\n"
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        frames = _parse_sse_frames(raw)
+        types = _sse_types(frames)
+        missing = [t for t in ("message_delta", "message_stop") if t not in types]
+        if missing:
+            fail("stranded-[DONE] stream must close with the terminal sequence; "
+                 "missing {} ({})".format(missing, types))
+            return
+        errs = _sse_frames_with_type(frames, "error")
+        if errs:
+            fail("stranded-[DONE] stream must not emit an error frame, got {!r}".format(errs))
+            return
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("stranded [DONE] should synthesize end_turn, got {!r}".format(
+                _sse_stop_reason(frames)))
+            return
+        events = _trace_events_named(trace_file, "chat_sse_truncated")
+        if len(events) != 1:
+            fail("expected exactly one chat_sse_truncated event, got {}".format(len(events)))
+            return
+        if events[0].get("saw_done") != 1:
+            fail("chat_sse_truncated must record saw_done: 1 for a stranded [DONE], "
+                 "got {!r}".format(events[0].get("saw_done")))
+            return
+        pass_("[DONE] without trailing blank line: terminal sequence, no error frame, saw_done 1")
+    finally:
+        cleanup()
+
+
+
+
+def test_chat_sse_partial_frame_at_eof_is_not_flushed():
+    """A partial data payload stranded at EOF is discarded, not flushed.
+
+    The stranded-sentinel flush at EOF honours only an exact [DONE]. A
+    truncated payload (`data: {"cho`) is ambiguous, so the stream keeps the
+    cut-stream disposition: chat_sse_truncated records saw_done: 0 and a
+    retryable api_error closes it — the negative control proving the flush
+    does not over-reach into partial payloads.
+    """
+    print("\n--- Test: Chat SSE Partial Frame At EOF Is Not Flushed ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
+    chunks = [_cc({"role": "assistant", "content": "hello"})]
+    sse_body = _sse_stream_chunks(chunks) + b'data: {"cho'
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port, body={"model": "sonnet", "messages": [{"role": "user", "content": "hi"}]})
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        frames = _parse_sse_frames(raw)
+        types = _sse_types(frames)
+        present = [t for t in ("message_delta", "message_stop") if t in types]
+        if present:
+            fail("partial-payload stream must not synthesize {}; got {}".format(present, types))
+            return
+        errs = _sse_frames_with_type(frames, "error")
+        if len(errs) != 1:
+            fail("partial-payload stream must close with exactly one error frame, "
+                 "got {} ({})".format(len(errs), types))
+            return
+        if (errs[0].get("error") or {}).get("type") != "api_error":
+            fail("partial-payload error must be api_error (retryable), got {!r}".format(
+                errs[0].get("error")))
+            return
+        events = _trace_events_named(trace_file, "chat_sse_truncated")
+        if len(events) != 1:
+            fail("expected exactly one chat_sse_truncated event, got {}".format(len(events)))
+            return
+        if events[0].get("saw_done") != 0:
+            fail("chat_sse_truncated must record saw_done: 0 for a partial payload, "
+                 "got {!r}".format(events[0].get("saw_done")))
+            return
+        pass_("partial payload at EOF: api_error closes, saw_done 0, no flushed terminal")
+    finally:
+        cleanup()
+
+
+
+
 def test_chat_sse_first_event_has_content():
     """A first chunk that carries real content emits a content_block_delta."""
     print("\n--- Test: Chat SSE First Event Has Content ---")
@@ -2544,6 +2662,16 @@ def test_chat_sse_drain_event_on_done():
         if ev.get("tools_declared") != 0:
             fail("a request with no tools must log tools_declared 0, got {!r}".format(ev.get("tools_declared")))
             return
+        # Late-frame offsets are null on a stream that ended at the finish
+        # frame: the content, finish and [DONE] frames all arrive in a single
+        # read chunk, so the post-finish offset is never stamped and the
+        # late-frame block is skipped outright. A stream that ended at the
+        # finish signal must not claim something arrived after it.
+        if ev.get("first_late_ms") is not None or ev.get("last_late_ms") is not None:
+            fail("first_late_ms/last_late_ms must both be null when no frame "
+                 "followed the finish signal, got {!r}/{!r}".format(
+                     ev.get("first_late_ms"), ev.get("last_late_ms")))
+            return
         pass_("chat_sse_drain on [DONE]: finish_reason stop, drain_exit done, tools_declared 0")
     finally:
         cleanup()
@@ -3592,6 +3720,23 @@ def test_chat_sse_drain_late_tool_call_time_budget():
         if ev.get("late_tool_call_ms") < 0:
             fail("late_tool_call_ms must be non-negative, got {!r}".format(ev.get("late_tool_call_ms")))
             return
+        # The tool call is one of this stream's late frames, so its arrival
+        # offset must sit inside the [first, last] late-frame window. Guard
+        # all three on non-None first — comparing against None raises on
+        # Python 3, and the None cases are pinned by the drain-on-done fixture.
+        _first_late = ev.get("first_late_ms")
+        _last_late = ev.get("last_late_ms")
+        _late_tool = ev.get("late_tool_call_ms")
+        if _first_late is None or _last_late is None or _late_tool is None:
+            fail("first_late_ms/last_late_ms/late_tool_call_ms must all be set "
+                 "when a late tool call arrived, got {!r}/{!r}/{!r}".format(
+                     _first_late, _last_late, _late_tool))
+            return
+        if not (_first_late <= _late_tool <= _last_late):
+            fail("late_tool_call_ms must be sandwiched between first_late_ms and "
+                 "last_late_ms, got first={} tool={} last={}".format(
+                     _first_late, _late_tool, _last_late))
+            return
         if not ev.get("late_frames"):
             fail("late_frames must count the post-finish chunk, got {!r}".format(ev.get("late_frames")))
             return
@@ -4550,6 +4695,207 @@ def test_chat_sse_swap_drain_pin_taken_mid_swap():
         cleanup()
 
 
+def test_chat_sse_eviction_stranded_sentinel_never_flushes():
+    """A genuine eviction carrying a stranded `data: [DONE]\\n` in the residual
+    buffer never runs the EOF flush: evict_swap returns before the flush, so
+    the pre-finish close stays the cut-stream disposition with the retryable
+    config_swap_restart error.
+
+    Pins the eviction-never-flushes invariant (doc/trace-log.html): saw_done
+    must stay 0 WITH pending_bytes == 13 — the 13-byte sentinel is sitting in
+    buf, so saw_done 0 is evidence the flush did not run, not evidence the
+    buffer was empty. Either assertion alone could pass vacuously.
+    """
+    print("\n--- Test: Chat SSE Eviction With Stranded Sentinel Never Flushes ---")
+    post_press_byte = threading.Event()
+
+    def streamer(handler, info):
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.end_headers()
+        handler.wfile.write(_sse_stream_chunks(
+            [_cc({"role": "assistant", "content": "hi"})]))
+        handler.wfile.flush()
+        # The stranded sentinel arrives AFTER the press, so it lands in buf
+        # while _config_swapping; the next read is then armed at the budget
+        # and times out into the pre-finish eviction arm.
+        post_press_byte.wait(15)
+        handler.wfile.write(b"data: [DONE]\n")
+        handler.wfile.flush()
+        time.sleep(30)  # hold silently
+
+    proxy_port, trace_file, mock_servers, cleanup = _chat_swap_proxy(streamer)
+    if proxy_port is None:
+        fail("Failed to set up test")
+        return
+    try:
+        out = {}
+        client = _chat_stream_in_thread(proxy_port, out)
+        if not _wait_upstream_request(mock_servers, "p"):
+            fail("upstream never received the stream request")
+            return
+        switch_out = {}
+        sw = threading.Thread(
+            target=lambda: switch_out.update(zip(
+                ("status", "data"),
+                _admin_post(proxy_port, "/admin/api/switch", _CHAT_SWITCH_TO_Q))),
+            daemon=True)
+        sw.start()
+        if _wait_admin_swapping(proxy_port) is None:
+            fail("swap never became visible on /admin/api/swap-status")
+            return
+        post_press_byte.set()
+        sw.join(20)
+        client.join(25)
+        if switch_out.get("status") != 200:
+            fail("switch returned {}: {}".format(
+                switch_out.get("status"), switch_out.get("data")))
+            return
+        cstatus, _ctype, raw = out.get("result", (0, "", b""))
+        if cstatus != 200:
+            fail("client stream status {}, expected 200".format(cstatus))
+            return
+        if b"message_stop" in raw or b"message_delta" in raw:
+            fail("an eviction must never synthesize a terminal: {!r}".format(raw[-300:]))
+            return
+        if b"config swap in progress" not in raw:
+            fail("evicted chat stream must end with the retryable error: {!r}".format(raw[-300:]))
+            return
+        if "error" not in [_sse_frame_type(f) for f in _parse_sse_frames(raw)]:
+            fail("evicted chat stream must carry an SSE error frame")
+            return
+        truncated = _wait_for_trace_events(trace_file, "chat_sse_truncated")
+        drains = _trace_events_named(trace_file, "chat_sse_drain")
+        if len(truncated) != 1 or drains:
+            fail("expected exactly one chat_sse_truncated and no chat_sse_drain, "
+                 "got {} / {}".format(len(truncated), len(drains)))
+            return
+        ev = truncated[0]
+        # The two assertions are ONE invariant: pending_bytes 13 proves the
+        # sentinel sat in buf, so saw_done 0 proves the flush did not run.
+        if not (ev.get("saw_done") == 0 and ev.get("pending_bytes") == 13):
+            fail("the stranded sentinel must sit unparsed at eviction: saw_done={!r} "
+                 "pending_bytes={!r} (expected 0 and 13)".format(
+                     ev.get("saw_done"), ev.get("pending_bytes")))
+            return
+        phases = {e.get("phase") for e in _wait_for_trace_events(trace_file, "swap_abort")}
+        if "stream" not in phases:
+            fail("swap_abort phases {} must include stream".format(phases))
+            return
+        pass_("eviction with a stranded sentinel: flush never ran (saw_done 0 / "
+              "pending_bytes 13), retryable error, no terminal, swap_abort stream")
+    finally:
+        cleanup()
+
+
+def test_chat_sse_post_swap_straggler_dies_retryably():
+    """A pre-finish straggler whose upstream closes AFTER a config swap has
+    completed dies retryably at the EOF exit's epoch checkpoint — it must not
+    deliver an old-routing terminal.
+
+    Both sentinel shapes, because the epoch checkpoint is what makes them
+    agree: the stranded form (data: [DONE]\\n without the blank line,
+    pending_bytes 13, saw_done 0 — the flush never runs, the eviction
+    pre-empts it) and the framed control (data: [DONE]\\n\\n, pending_bytes 0,
+    saw_done 1 — handle_frame consumed the sentinel before the swap).
+    Reference: ./tmp/probe_stranded_swap_straggler_2026-10-16.py and
+    ./tmp/probe_framed_swap_straggler_2026-10-16.py assert the PRE-FIX
+    behaviour (terminal synthesised, no swap_abort) and pass while asserting
+    the defect; the assertions here are their inverse.
+    """
+    print("\n--- Test: Chat SSE Post-Swap Straggler Dies Retryably ---")
+
+    def run_shape(label, sentinel, expect_pending, expect_saw_done):
+        post_press_byte = threading.Event()
+
+        def streamer(handler, info):
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.end_headers()
+            handler.wfile.write(
+                _sse_stream_chunks([_cc({"role": "assistant", "content": "hi"})])
+                + sentinel)
+            handler.wfile.flush()
+            # No byte after the press: the reader stays on its original
+            # timeout while the swap's silence drain completes around it;
+            # the close below is then an EOF on an already-bumped epoch.
+            post_press_byte.wait(15)
+            time.sleep(8)  # hold silently past budget(2)+grace(2)
+            # returning closes the upstream response -> EOF at the proxy
+
+        proxy_port, trace_file, mock_servers, cleanup = _chat_swap_proxy(streamer)
+        if proxy_port is None:
+            fail("{}: failed to set up test".format(label))
+            return False
+        try:
+            out = {}
+            client = _chat_stream_in_thread(proxy_port, out)
+            if not _wait_upstream_request(mock_servers, "p"):
+                fail("{}: upstream never received the stream request".format(label))
+                return False
+            switch_out = {}
+            sw = threading.Thread(
+                target=lambda: switch_out.update(zip(
+                    ("status", "data"),
+                    _admin_post(proxy_port, "/admin/api/switch", _CHAT_SWITCH_TO_Q))),
+                daemon=True)
+            sw.start()
+            if _wait_admin_swapping(proxy_port) is None:
+                fail("{}: swap never became visible on /admin/api/swap-status".format(label))
+                return False
+            post_press_byte.set()
+            sw.join(20)
+            client.join(30)
+            if switch_out.get("status") != 200:
+                fail("{}: switch returned {}: {}".format(
+                    label, switch_out.get("status"), switch_out.get("data")))
+                return False
+            cstatus, _ctype, raw = out.get("result", (0, "", b""))
+            if cstatus != 200:
+                fail("{}: client stream status {}, expected 200".format(label, cstatus))
+                return False
+            if b"message_stop" in raw or b"message_delta" in raw:
+                fail("{}: a post-swap straggler must not deliver an old-routing "
+                     "terminal: {!r}".format(label, raw[-300:]))
+                return False
+            if b"config swap in progress" not in raw:
+                fail("{}: straggler must close with the retryable error: {!r}".format(
+                    label, raw[-300:]))
+                return False
+            if "error" not in [_sse_frame_type(f) for f in _parse_sse_frames(raw)]:
+                fail("{}: straggler close must carry an SSE error frame".format(label))
+                return False
+            truncated = _wait_for_trace_events(trace_file, "chat_sse_truncated")
+            drains = _trace_events_named(trace_file, "chat_sse_drain")
+            if len(truncated) != 1 or drains:
+                fail("{}: expected exactly one chat_sse_truncated and no "
+                     "chat_sse_drain, got {} / {}".format(
+                         label, len(truncated), len(drains)))
+                return False
+            ev = truncated[0]
+            if not (ev.get("pending_bytes") == expect_pending
+                    and ev.get("saw_done") == expect_saw_done):
+                fail("{}: truncated event must show the sentinel shape: "
+                     "pending_bytes={!r} saw_done={!r} (expected {} and {})".format(
+                         label, ev.get("pending_bytes"), ev.get("saw_done"),
+                         expect_pending, expect_saw_done))
+                return False
+            phases = {e.get("phase") for e in _wait_for_trace_events(trace_file, "swap_abort")}
+            if "stream" not in phases:
+                fail("{}: swap_abort phases {} must include stream".format(label, phases))
+                return False
+            return True
+        finally:
+            cleanup()
+
+    ok_stranded = run_shape("stranded", b"data: [DONE]\n", 13, 0)
+    ok_framed = run_shape("framed", b"data: [DONE]\n\n", 0, 1)
+    if ok_stranded and ok_framed:
+        pass_("post-swap stragglers die retryably in both sentinel shapes: "
+              "stranded (pending 13 / saw_done 0) and framed (pending 0 / "
+              "saw_done 1), retryable error, no terminal, swap_abort stream")
+
+
 ALL_TESTS = [
     ("chat-sse-basic-streaming", test_chat_sse_basic_streaming),
     ("chat-sse-finish-reason-mapping", test_chat_sse_finish_reason_mapping),
@@ -4599,6 +4945,8 @@ ALL_TESTS = [
     ("chat-sse-unmapped-finish-with-tools", test_chat_sse_unmapped_finish_with_tools),
     ("chat-sse-empty-revision-no-downgrade", test_chat_sse_empty_revision_does_not_downgrade),
     ("chat-sse-done-without-finish-reason-is-terminal", test_chat_sse_done_without_finish_reason_is_terminal),
+    ("chat-sse-done-without-trailing-blank-line", test_chat_sse_done_without_trailing_blank_line),
+    ("chat-sse-partial-frame-at-eof-is-not-flushed", test_chat_sse_partial_frame_at_eof_is_not_flushed),
     ("chat-sse-truncation-with-tool-block-emits-error", test_chat_sse_truncation_with_tool_block_emits_error_event),
     ("chat-sse-drain-event-on-done", test_chat_sse_drain_event_on_done),
     ("chat-sse-drain-event-trailing-tool-calls", test_chat_sse_drain_event_trailing_tool_calls),
@@ -4621,6 +4969,8 @@ ALL_TESTS = [
     ("chat-sse-swap-evicts-pre-finish", test_chat_sse_swap_evicts_pre_finish),
     ("chat-sse-swap-abort-in-drain-window", test_chat_sse_swap_abort_in_drain_window),
     ("chat-sse-swap-drain-pin-taken-mid-swap", test_chat_sse_swap_drain_pin_taken_mid_swap),
+    ("chat-sse-eviction-stranded-sentinel-never-flushes", test_chat_sse_eviction_stranded_sentinel_never_flushes),
+    ("chat-sse-post-swap-straggler-dies-retryably", test_chat_sse_post_swap_straggler_dies_retryably),
 ]
 
 

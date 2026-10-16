@@ -10,7 +10,7 @@
 
 <h1>Provider Modes<span class="sub">anthropic, chat, and response — and what each one rewrites</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-13</p>
+<p><strong>Last updated:</strong> 2026-10-15</p>
 
 <p>The proxy speaks Anthropic Messages to its clients. What it speaks <em>upstream</em> is
 configurable per provider, because not every provider implements the Anthropic API. A
@@ -411,7 +411,13 @@ field carries the discriminator:</p>
       synthesised terminal sequence: <code>end_turn</code>, or a null <code>stop_reason</code>
       when tool-call deltas were seen. Treating <code>[DONE]</code> as proof of completeness is
       what keeps a provider that omits <code>finish_reason</code> but terminates correctly from
-      being turned into a retry storm.</li>
+      being turned into a retry storm. A sentinel written <em>without</em> the blank line that
+      delimits a frame counts here too: it is left stranded in the read buffer when the frame loop
+      ends, and a sentinel-only flush at EOF honours it, because at EOF an exact
+      <code>[DONE]</code> is unambiguous while a partial payload is not. That narrowness is the
+      point — a stranded <em>partial</em> is still discarded and takes the cut disposition
+      below, so the flush cannot turn a genuinely truncated stream into a finished-looking
+      one.</li>
   <li><strong><code>saw_done: 0</code></strong> — no <code>[DONE]</code> ever arrived, so the
       connection was cut mid-response and the turn is incomplete. The open content blocks are
       closed, the degradation diagnostics are finalised, and the stream is then closed by an SSE
@@ -440,7 +446,13 @@ contained (<code>finish_reason</code>, <code>tool_calls_seen</code>,
 <code>emitted_tool_use</code>, <code>tools_declared</code>), and when the trailing frames actually
 arrived (<code>late_frames</code>, <code>first_late_ms</code>, <code>last_late_ms</code>,
 <code>late_tool_call_ms</code> — the offset from the finish signal, which is what answers whether
-the 5&nbsp;s budget is generous or binding). Between them, <code>chat_sse_drain</code> and
+the 5&nbsp;s budget is generous or binding). <code>first_late_ms</code> and
+<code>last_late_ms</code> are <code>null</code>, and <code>late_frames</code> is
+<code>0</code>, when <em>no</em> frame followed the finish signal — the distinction those
+fields exist to draw, and one that is now pinned by tests in both directions (the null case on
+a stream that ends at the finish frame, and the ordering
+<code>first_late_ms &lt;= late_tool_call_ms &lt;= last_late_ms</code> on a stream that drains).
+Between them, <code>chat_sse_drain</code> and
 <code>chat_sse_truncated</code> are exhaustive: every chat-mode stream that returned 200 and
 started ends with exactly one of the two, unless the request aborts with an exception — a client
 disconnect, or an upstream frame shape the parser cannot read. Field-by-field reference:
@@ -633,7 +645,7 @@ message carrying the <code>tool_calls</code>, so the ordering the upstream expec
 <tr><td><code>chat_sse_tool_degradation</code></td><td>one or more streaming tool calls degraded (metadata only, once per stream)</td></tr>
 <tr><td><code>chat_sse_post_finish_suppressed</code></td><td>the post-finish drain suppressed <code>content</code>/<code>reasoning</code> deltas (carries <code>count</code>, once per stream)</td></tr>
 <tr><td><code>response_sse_unexpected</code></td><td>a response-mode provider streamed despite <code>stream: false</code></td></tr>
-<tr><td><code>chat_sse_truncated</code></td><td>a chat-mode stream ended with no <code>finish_reason</code> at all (a whole-stream disposition, not a framing fault); carries <code>pending_bytes</code> and <code>saw_done</code>, which discriminates a protocol-complete stream (<code>1</code>) from one cut mid-response (<code>0</code>, closed with an <code>error</code> frame)</td></tr>
+<tr><td><code>chat_sse_truncated</code></td><td>a chat-mode stream ended with no <code>finish_reason</code> at all (a whole-stream disposition, not a framing fault); carries <code>pending_bytes</code> and <code>saw_done</code>, which discriminates a protocol-complete stream (<code>1</code>) from one cut mid-response (<code>0</code>, closed with an <code>error</code> frame). A <code>[DONE]</code> <em>stranded</em> at EOF — written without the blank line that delimits a frame — counts as protocol-complete: the sentinel is unambiguous at EOF, so the proxy honours it instead of erroring a stream that actually finished. The flush is deliberately sentinel-only, so a <em>partial</em> payload stranded at EOF is still discarded and the stream keeps the cut disposition (<a href="#chat-sse">see the SSE section</a>)</td></tr>
 <tr><td><code>chat_sse_drain</code></td><td>the post-finish drain of a chat-mode stream ended (once per stream that reached a <code>finish_reason</code>); carries <code>drain_exit</code>, <code>drain_bytes</code>, <code>drain_ms</code>, the tool-call flags and the late-frame offsets</td></tr>
 <tr><td><code>chat_sse_unfinished_turn</code></td><td>the detector saw a turn that ends with no tool call and no tool call on the wire (tools were declared, <code>finish_reason</code> was <code>stop</code>, and the text tail ends with <code>":"</code>); with the retry nudge enabled the turn is then closed with a retryable <code>error</code> and its marker armed, instead of a terminal sequence</td></tr>
 <tr><td><code>chat_retry_nudge</code></td><td>the nudge text was injected into a retry that matched an armed unfinished-turn marker (logged after the transform, so it never claims a nudge the upstream did not see)</td></tr>
@@ -694,6 +706,6 @@ transform it belongs to, and neither runs in response mode:</p>
 <a href="compatibility.html">compatibility.html</a>, as is the
 <a href="compatibility.html#reasoning-field">reasoning-field selection</a>.</p>
 
-<footer>Last updated: 2026-10-13</footer>
+<footer>Last updated: 2026-10-15</footer>
 </body>
 </html>

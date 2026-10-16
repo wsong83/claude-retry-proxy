@@ -383,9 +383,10 @@ frames), and reads on past `finish_reason` so a trailing usage chunk or a
 late tool call is not lost; a provider that then goes silent is bounded by a
 5-second drain rather than held to the upstream socket timeout. A stream that
 ends with no `finish_reason` at all is closed with a synthesised ending if the
-provider sent its `[DONE]` sentinel, and with a retryable `api_error` event if
-the connection was cut before it did — a truncated turn is never reported to
-the client as a turn the model finished. A tool-bearing turn whose stream ends
+provider sent its `[DONE]` sentinel — even one written without the blank line
+that normally delimits a frame, since the sentinel is unambiguous at EOF — and
+with a retryable `api_error` event if the connection was cut before it did; a
+truncated turn is never reported to the client as a turn the model finished. A tool-bearing turn whose stream ends
 in a colon with no tool call is closed with a retryable error the same way
 rather than passed off as `end_turn`, and the retry that continues the
 conversation is nudged upstream to emit the tool call it narrated (see
