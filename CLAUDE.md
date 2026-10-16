@@ -382,24 +382,29 @@ No other supplementary docs.
 {"issue_id": "operate-round-ends-turn-before-waiting", "title": "Unattended --operate rounds frequently end their turn while a background full-suite run is still in flight, killing the run and leaving the round with no session report", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-operate-round-ends-turn-before-waiting.json", "deferred": "2026-10-04", "date_source": "creation"},
 {"issue_id": "orphaned-test-state-files", "title": "Orphaned per-run state files accumulate in ~/.claude/proxy, and this repo's own verification scripts are a systematic source: they spawn children directly, so they never pass through run_cli's per-test removal loop", "target_repo": null, "report": "./tmp/reports/defer-issue-orphaned-test-state-files.json", "deferred": "2026-10-16", "date_source": "creation"},
 {"issue_id": "recursion-guard-residual-sites", "title": "Three json.loads guards still omit RecursionError, so a deeply nested payload escapes them: the admin switch body and the two upstream tool-call argument parses — a fourth site has the same narrow shape but was measured unreachable", "target_repo": null, "report": "./tmp/reports/defer-issue-recursion-guard-residual-sites.json", "deferred": "2026-10-16", "date_source": "creation"},
-{"issue_id": "planner-doctrine-gaps", "title": "Three planner-doctrine gaps that cost this repo real rounds are absent from planner.md: gate calibration is undocumented, ownership changes carry no reader-enumeration rule, and the round-triage freshness notion stops at session reports instead of covering any artifact read off disk", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-planner-doctrine-gaps.json", "deferred": "2026-10-16", "date_source": "creation"}
+{"issue_id": "planner-doctrine-gaps", "title": "Three planner-doctrine gaps that cost this repo real rounds are absent from planner.md: gate calibration is undocumented, ownership changes carry no reader-enumeration rule, and the round-triage freshness notion stops at session reports instead of covering any artifact read off disk", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-planner-doctrine-gaps.json", "deferred": "2026-10-16", "date_source": "creation"},
+{"issue_id": "cross-repo-deferral-not-stored-in-target", "title": "/defer-issue records a cross-repo deferral in the filing repo only, so the repo that is supposed to fix it never sees the issue; the filing half of the cross-repo pair is missing while the closing half already exists", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-cross-repo-deferral-not-stored-in-target.json", "deferred": "2026-10-16", "date_source": "creation"}
 ]```
 
 ## Future Work — TODO
 
-Eight deferred issues remain (see above). Five are the long tail this cycle
+Nine deferred issues remain (see above). Five are the long tail this cycle
 deliberately left alone: chat-mode image content block mapping, the
 start-on-a-busy-port readiness hazard, `proxy-stderr.log`'s append-only tail
 across runs, adopting httpx2 for upstream transport and native SSE parsing (a
 design change rather than a fix), and unattended `--operate` rounds ending their
-turn while a background suite is still in flight. **Two** of the eight are
-cross-repo, both against `claude-config`: that last one, and
-`planner-doctrine-gaps`, which carries the three plan-authoring rules this
-cycle's failures taught and `planner.md` does not yet state — a gate that cannot
-go red is worse than no gate, a step that changes who owns a resource must
-enumerate the resource's readers, and an artifact found on disk must be dated
-before it is believed. The five agent-memory notes holding those lessons stay
-until the doctrine lands, because a project memory loads for one repo only.
+turn while a background suite is still in flight. **Three** of the nine are
+cross-repo, all against `claude-config`: that last one; `planner-doctrine-gaps`,
+which carries the three plan-authoring rules this cycle's failures taught and
+`planner.md` does not yet state — a gate that cannot go red is worse than no
+gate, a step that changes who owns a resource must enumerate the resource's
+readers, and an artifact found on disk must be dated before it is believed; and
+`cross-repo-deferral-not-stored-in-target`, which records that the defer command
+files a cross-repo issue in the filing repo only, so the repo that must fix it
+never sees it — written into both corpora by hand, which is the behaviour its
+fix asks the command to perform. The five agent-memory notes holding those
+lessons stay until the doctrine lands, because a project memory loads for one
+repo only.
 
 The newest two were filed on 2026-10-16 by `2026-10-15-deferred-corpus-sweep`,
 the cycle's closeout plan, which retired the 24 terminal reports the corpus had
@@ -435,7 +440,8 @@ Overrides). The config/keys extraction (`2026-09-17-extract-config-keys`, step 4
 moved the config pipeline into `config.py`, the keys pipeline into `keys.py`, and
 the string-emission-safety utility leaf into `safety.py` (a declared override of
 the guide's §2/§3 role-grouping rule — see the plan's Document Overrides; the
-doctrine amendment itself is deferred to claude-config), and single-sourced the
+amendment landed in claude-config as the utility-cluster genus, commit
+`4210166`), and single-sourced the
 CLI's template/keys/validation onto the shared policy. The compat extraction
 (`2026-09-18-extract-compat`, step 5) moved the compatibility learner cluster
 into `compat.py` behind an owned `_CompatState` state object with
