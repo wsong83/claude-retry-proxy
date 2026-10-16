@@ -375,73 +375,40 @@ No other supplementary docs.
 
 ```json
 [
-{"issue_id": "extract-model-raises-on-non-object-json", "title": "extract_model raises AttributeError on valid JSON that is not an object, so do_POST aborts with no HTTP response; the unguarded call at do_POST pre-empts the whole downstream guard chain", "target_repo": null, "report": "./tmp/reports/defer-issue-extract-model-raises-on-non-object-json.json", "deferred": "2026-09-12", "date_source": "creation"},
 {"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "target_repo": null, "report": "./tmp/reports/defer-issue-image-content-blocks-chat-mode.json", "deferred": "2026-08-29", "date_source": "creation"},
-{"issue_id": "no-proxy-stop-trace-warning", "title": "Full-suite run warns 'No proxy_stop event in trace' when the proxy is terminated abruptly (low priority)", "target_repo": null, "report": "./tmp/reports/defer-issue-no-proxy-stop-trace-warning.json", "deferred": "2026-09-14", "date_source": "creation"},
 {"issue_id": "port-default-collision-hazard", "title": "A start on the default port can report success against a pre-existing listener: the readiness TCP probe cannot distinguish the spawned child's socket from a live proxy already on 8080", "target_repo": null, "report": "./tmp/reports/defer-issue-port-default-collision-hazard.json", "deferred": "2026-09-18", "date_source": "creation"},
 {"issue_id": "proxy-stderr-append-stale-tail", "title": "proxy-stderr.log is append-only across runs, so read_tail failure diagnostics can surface lines from previous sessions instead of the current attempt", "target_repo": null, "report": "./tmp/reports/defer-issue-proxy-stderr-append-stale-tail.json", "deferred": "2026-09-18", "date_source": "creation"},
-{"issue_id": "client-body-recursionerror-no-response", "title": "A deeply nested client body raises RecursionError out of the request path: the parse guards omit it (RecursionError is not a ValueError) and neither forward_request nor do_POST fences the call, so the request aborts with no HTTP response", "target_repo": null, "report": "./tmp/reports/defer-issue-client-body-recursionerror-no-response.json", "deferred": "2026-09-30", "date_source": "creation"},
 {"issue_id": "httpx2-native-sse-transport", "title": "Adopt httpx2 for upstream transport and native SSE parsing: client.sse() replaces the hand-rolled SSE frame scanner and obsoletes httpx-sse", "target_repo": null, "report": "./tmp/reports/defer-issue-httpx2-native-sse-transport.json", "deferred": "2026-09-27", "date_source": "creation"},
-{"issue_id": "cli-pre-existing-remove-idiom-copies", "title": "tests/test_cli.py still hand-rolls the guarded state-file removal at 8 test-body sites, one file over from the shared _remove_test_state_file() helper that Step 5 introduced to eliminate exactly that hazard", "target_repo": null, "report": "./tmp/reports/defer-issue-cli-pre-existing-remove-idiom-copies.json", "deferred": "2026-10-04", "date_source": "creation"},
-{"issue_id": "posix-sigterm-shutdown-deadlock", "title": "server.py's SIGTERM handler calls server.shutdown() on the serve_forever thread, which socketserver documents as a guaranteed deadlock: on POSIX one SIGTERM permanently wedges the proxy while claude-retry-proxy stop reports success", "target_repo": null, "report": "./tmp/reports/defer-issue-posix-sigterm-shutdown-deadlock.json", "deferred": "2026-10-04", "date_source": "creation"},
 {"issue_id": "operate-round-ends-turn-before-waiting", "title": "Unattended --operate rounds frequently end their turn while a background full-suite run is still in flight, killing the run and leaving the round with no session report", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-operate-round-ends-turn-before-waiting.json", "deferred": "2026-10-04", "date_source": "creation"},
-{"issue_id": "chat-sse-done-framing-assumption", "title": "A `data: [DONE]` frame without a trailing blank line is never assembled, so saw_done stays 0 and a protocol-complete chat-mode stream is closed with a retryable error instead of a synthesised terminal sequence", "target_repo": null, "report": "./tmp/reports/defer-issue-chat-sse-done-framing-assumption.json", "deferred": "2026-10-04", "date_source": "creation"},
-{"issue_id": "chat-sse-late-frame-offsets-unasserted", "title": "first_late_ms and last_late_ms are gated only by the structural step-2 script and never asserted behaviorally, so the null-vs-set distinction — the one that separates a stream that ended at the finish frame from one that drained — is unpinned by any committed test", "target_repo": null, "report": "./tmp/reports/defer-issue-chat-sse-late-frame-offsets-unasserted.json", "deferred": "2026-10-04", "date_source": "creation"},
-{"issue_id": "suite-load-admin-connection-abort", "title": "Whole-suite runs intermittently abort a connection inside _admin_post (ConnectionAbortedError WinError 10053), which carries no transport tolerance — the exception escapes the test body and is reported as 'Test crashed' instead of failing an assertion; the proxy child's stderr pipe is also never drained, so no diagnostic accompanies the abort", "target_repo": null, "report": "./tmp/reports/defer-issue-suite-load-admin-connection-abort.json", "deferred": "2026-10-13", "date_source": "creation"}
+{"issue_id": "orphaned-test-state-files", "title": "Orphaned per-run state files accumulate in ~/.claude/proxy, and this repo's own verification scripts are a systematic source: they spawn children directly, so they never pass through run_cli's per-test removal loop", "target_repo": null, "report": "./tmp/reports/defer-issue-orphaned-test-state-files.json", "deferred": "2026-10-16", "date_source": "creation"},
+{"issue_id": "recursion-guard-residual-sites", "title": "Three json.loads guards still omit RecursionError, so a deeply nested payload escapes them: the admin switch body and the two upstream tool-call argument parses — a fourth site has the same narrow shape but was measured unreachable", "target_repo": null, "report": "./tmp/reports/defer-issue-recursion-guard-residual-sites.json", "deferred": "2026-10-16", "date_source": "creation"}
 ]```
 
 ## Future Work — TODO
 
-Thirteen deferred issues remain (see above). The newest was filed on
-2026-10-13 by plan 2026-10-12-swap-silence-drain's round-8 tester run — a
-whole-suite transient in pre-existing harness code: `_admin_post` has no
-transport tolerance, so a `ConnectionAbortedError` (WinError 10053) on the
-admin-reload test crashes the test body instead of failing an assertion, and the
-proxy child's stderr pipe is never drained, so no diagnostic accompanies it
-(1 red / 1 green across full-suite runs, 0/1 standalone; the plan verified it did
-not touch `_admin_post` beyond adding a default-preserving `timeout`
-parameter). The three before it were filed on
-2026-10-04 by plan 2026-10-04-truncation-error-and-drain-trace's Phase 6
-review, all in the chat-mode SSE path that plan reworked — a `[DONE]` sentinel
-with no trailing blank line that never assembles (so a protocol-complete stream
-is errored and retried), the two late-frame offset fields asserted only
-structurally and never behaviorally, and a detector predicate that counted a
-proxy-side tool-block degradation as a model omission, which plan
-2026-10-05-chat-retry-nudge resolved on 2026-10-06 with the
-`not tool_calls_seen` clause (the nudge it ships errors the unarmed turn and
-nudges the recovery — `PROXY_CHAT_RETRY_NUDGE`, kill-switchable; the two
-chat-SSE issues above remain open). The
-previous three were filed on
-2026-10-04 by plan 2026-10-03-stale-test-state-file-pid-reuse's closeout — the
-POSIX-only deadlock in the server's SIGTERM handler (it calls
-`server.shutdown()` on the `serve_forever` thread, which `socketserver`
-documents as a guaranteed hang), the residual hand-rolled state-file removals in
-`tests/test_cli.py` that could now call the shared helper, and, against
-`claude-config`, the unattended-round launcher ending its turn while a
-background suite is still in flight. The previous newest,
-`client-body-recursionerror-no-response`, was filed on 2026-09-30 by plan
-2026-09-29-chat-reasoning-field-learner's code review — the client-body parse
-was left unhardened while the plan's own upstream-body helper was made total
-against the same failure class. Plan
-2026-10-03-stale-test-state-file-pid-reuse resolved the test-isolation defect
-where a fixed machine-global `PROXY_STATE_FILE` survived each run: the path is
-now keyed to the runner PID, cleared at harness import and after every test in
-`run_cli`'s loop. Plan
-2026-09-23-drop-dead-failed-confirmations-field resolved the compatibility
-entry's dead `failed_confirmations` field — the persisted schema no longer
-carries it, and the in-memory suppression counter it shadowed is unchanged.
-Plan
-2026-09-15-sanitize-sinks-deferred resolved the five extract-sinks deferred
-issues — the `sanitize_error` exponential-backtracking regex and its inert
-Windows path redaction, `write_state`'s lock-free concurrent `os.replace`, the
-state sink's stray `.tmp` on an empty path, and the POSIX-only sink `chmod`
-branch, untested on the Windows dev box. The doc-tree plan's two findings —
-the missing committed anchor check and the raw-Markdown `../README.md` link —
-were resolved by 2026-09-14-commit-doc-anchor-check. The CodeGraph prompt-hook
-entry (indexed 2026-09-13 without a report file) was removed on 2026-09-15 —
-resolved by other repos. Unresolved: chat-mode image content block mapping,
-the doc-tree plan's surviving finding (`extract_model` raising on
-non-object JSON), and the no-`proxy_stop` trace warning. The large source/test file
+Seven deferred issues remain (see above). Five are the long tail this cycle
+deliberately left alone: chat-mode image content block mapping, the
+start-on-a-busy-port readiness hazard, `proxy-stderr.log`'s append-only tail
+across runs, adopting httpx2 for upstream transport and native SSE parsing (a
+design change rather than a fix), and — cross-repo, against `claude-config` —
+unattended `--operate` rounds ending their turn while a background suite is
+still in flight.
+
+The newest two were filed on 2026-10-16 by `2026-10-15-deferred-corpus-sweep`,
+the cycle's closeout plan, which retired the 24 terminal reports the corpus had
+accumulated (`presence means open`, so a file whose issue is fixed reads as live
+until it is gone) and rewrote this list so that every entry has a report on disk
+and every report is listed. `recursion-guard-residual-sites` is the residual of
+the retired `client-body-recursionerror-no-response`: three `json.loads` guards
+that still omit `RecursionError` — the admin switch body, and the two upstream
+tool-call argument parses — plus a fourth of the same shape measured
+unreachable, because the encode ceiling sits below the decode ceiling.
+`orphaned-test-state-files` records that per-run state files accumulate in
+`~/.claude/proxy/`, with this repo's own verification scripts a systematic
+source: they spawn children directly, so they never pass through `run_cli`'s
+per-test removal loop.
+
+The large source/test file
 split and the module-split guidance consolidation were retired 2026-09-16 by
 the global refactor-split consolidation (claude-config plan
 2026-09-16-refactor-split-skill): the extraction doctrine now lives in the
@@ -449,30 +416,27 @@ global guide, and the /refactor-split survey tracks oversized-file state,
 superseding the retired break-up backlog report.
 
 The `sanitize.py` + `sinks.py` extraction (2026-09-12) was the first step of the
-staged decomposition prescribed by the global refactor-split guidance; the
-transforms extraction (`2026-09-14-extract-transforms`) landed 2026-09-15 as
-step 2 — `server.py` 4,650 → 3,719 wc lines, with the mode-transform cluster
-now in `transforms_common.py` / `transforms_chat.py` / `transforms_response.py`.
-The settings extraction (`2026-09-16-extract-settings`) landed 2026-09-16 as
-step 3 — `server.py` 3,719 → 3,661 wc lines, with the env-derived `SETTINGS`
-value object and the shared `resolve_trace_file` chain in `settings.py`
-(imported by both the server and the CLI; the import-time `SETTINGS`
-derivation is a declared override of the guide's build-in-`main()` rule,
-recorded in that plan's Document Overrides).
-The config/keys extraction (`2026-09-17-extract-config-keys`) landed
-2026-09-18 as step 4 — `server.py` 3,661 → 3,129 wc lines, with the config
-pipeline in `config.py`, the keys pipeline in `keys.py`, the
-string-emission-safety utility leaf in `safety.py` (a declared override of the
-guide's §2/§3 role-grouping rule — see the plan's Document Overrides; the
-doctrine amendment itself is deferred to claude-config), and the CLI's
-template/keys/validation single-sourced onto the shared policy.
-The compat extraction (`2026-09-18-extract-compat`) landed 2026-09-19 as
-step 5 — `server.py` 3,129 → 2,613 wc lines, with the compatibility learner
-cluster in `compat.py` (569 wc lines) behind an owned `_CompatState` state
-object with default-parameter injection; the extraction was a verbatim move
-plus a design step, and the moving plan's two verification gates were
-revised twice during implementation (nested-def walkers, HEAD-sourced
-byte-identity, dotless ImportFrom matching).
-The remaining clusters (router/forwarder, admin/handler) are
+staged decomposition prescribed by the global refactor-split guidance. Four more
+followed. The transforms extraction (`2026-09-14-extract-transforms`, step 2)
+moved the mode-transform cluster into `transforms_common.py` /
+`transforms_chat.py` / `transforms_response.py`. The settings extraction
+(`2026-09-16-extract-settings`, step 3) moved the env-derived `SETTINGS` value
+object and the shared `resolve_trace_file` chain into `settings.py` (imported by
+both the server and the CLI; the import-time `SETTINGS` derivation is a declared
+override of the guide's build-in-`main()` rule, recorded in that plan's Document
+Overrides). The config/keys extraction (`2026-09-17-extract-config-keys`, step 4)
+moved the config pipeline into `config.py`, the keys pipeline into `keys.py`, and
+the string-emission-safety utility leaf into `safety.py` (a declared override of
+the guide's §2/§3 role-grouping rule — see the plan's Document Overrides; the
+doctrine amendment itself is deferred to claude-config), and single-sourced the
+CLI's template/keys/validation onto the shared policy. The compat extraction
+(`2026-09-18-extract-compat`, step 5) moved the compatibility learner cluster
+into `compat.py` behind an owned `_CompatState` state object with
+default-parameter injection; it was a verbatim move plus a design step, and its
+two verification gates were revised twice during implementation (nested-def
+walkers, HEAD-sourced byte-identity, dotless ImportFrom matching).
+
+Per-step line counts are deliberately not repeated here — they rot, and the plan
+archives hold them. The remaining clusters (router/forwarder, admin/handler) are
 tracked by the /refactor-split survey, which replaced the retired break-up
 backlog report on 2026-09-16. New deep detail belongs in `doc/`, not here.
