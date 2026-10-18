@@ -10,7 +10,7 @@
 
 <h1>Operations<span class="sub">Running, inspecting, and stopping the proxy</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-15</p>
+<p><strong>Last updated:</strong> 2026-10-18</p>
 
 <p>The <code>claude-retry-proxy</code> command manages a <em>background server process</em>. It
 does not run in the foreground. Understanding that split explains most of the command's
@@ -203,10 +203,35 @@ double-clicked Apply, or the CLI racing the page — is refused with <code>409</
 <code>config_swap_in_progress</code> code (see
 <a href="architecture.html#error-envelope">the error taxonomy</a>; both the admin page and
 <code>claude-retry-proxy reload</code> unwrap the envelope's <code>error</code> object). No second
-drain is entered and the refused press changes nothing. A <strong>reload</strong> carries a second
-409 of its own: it gates its candidate catalog <em>before</em> pressing, so if a switch completes
-its whole cycle between that gate and the install, the reload answers
-<code>409 config_reload_stale</code> instead of installing tiers that predate the switch.</p>
+drain is entered and the refused press changes nothing <em>to the config</em>. The page does not
+dead-end on that refusal: it <strong>attaches</strong> to the in-flight swap, keeps reporting it,
+and stays locked until the swap ends. The enforcement is server-side in
+<code>_drain_for_swap()</code>; the page's lockout is an affordance on top of it. A
+<strong>reload</strong> carries a second 409 of its own: it gates its candidate catalog
+<em>before</em> pressing, so if a switch completes its whole cycle between that gate and the
+install, the reload answers <code>409 config_reload_stale</code> instead of installing tiers that
+predate the switch. Because the server emits that code <em>because</em> a concurrent switch
+completed, the page's tier row is one swap behind by construction: the page re-reads the row and
+unlocks only on a <strong>successful</strong> re-read; a failed re-read leaves the controls locked
+and says so. The same gate covers the third site — a page that loads with no swap running: the
+drain may have finished between that page's two reads, so its one-shot check re-reads the row as
+well, and a failed re-read keeps the controls locked and paints the sticky "reload this page
+before applying" line. In every case a possibly pre-swap row is what must not be left pressable,
+because <code>/admin/api/switch</code> carries no staleness guard of its own — only the reload
+path has one.</p>
+
+<p><strong>The page's swap-time behaviour.</strong> A press paints a sticky pending line that
+repaints at 1 Hz from <code>/admin/api/swap-status</code>; whenever a swap is in play — this page's
+press, one detected on load, or one it was refused into — <em>both buttons and all nine tier
+selects</em> are locked, so nothing can be edited against a mapping about to change. Locking the
+selects is what makes the completion re-render safe. The line reads <strong>"no need to
+refresh"</strong>, not "do not refresh": a mid-swap refresh is harmless, because the fresh page's
+one-shot check detects the running swap, re-locks, and resumes the progress line. On completion
+the page re-reads the tier row <em>before</em> unlocking, because <code>_current_config</code> is
+still the pre-swap document during the drain and the page may have painted the mapping the drain
+was about to replace. If the status poll fails 5 times consecutively the line says the proxy is
+unreachable and that reloading is now safe — the controls stay locked, since an unreadable status
+is not evidence that no swap is running.</p>
 
 <p>A successful press returns the drain's own detail: <code>drained</code>, <code>waited_s</code>,
 and <code>inflight_at_swap</code>. <code>drained</code> means <em>"nothing was evicted"</em> — not
@@ -217,6 +242,10 @@ pending, which is what the admin page's status line polls at 1 Hz. The CLI's <co
 waits up to <strong>300 s</strong> for the drain; because the drain is unbounded server-side, a
 client-side timeout does <em>not</em> abort the swap — the message says so and points at
 <code>claude-retry-proxy status</code>.</p>
+
+<p><strong>Restarting the proxy after an upgrade.</strong> The server serves
+<code>admin.html</code> from a process-lifetime in-memory cache, so an upgraded page is not
+picked up until the proxy is stopped and started.</p>
 
 <h3 id="csrf">CSRF protection</h3>
 
@@ -339,6 +368,6 @@ server's memory and is rewritten every 30 seconds, so deleting the file is harml
 external edit is overwritten rather than merged. The mechanism is owned by
 <a href="architecture.html#heartbeat">architecture.html#heartbeat</a>.</p>
 
-<footer>Last updated: 2026-10-15</footer>
+<footer>Last updated: 2026-10-18</footer>
 </body>
 </html>

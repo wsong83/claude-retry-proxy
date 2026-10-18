@@ -24,9 +24,13 @@
         button:hover { background: #81d4fa; }
         button.secondary { background: #455a64; color: #eee; }
         button.secondary:hover { background: #607d8b; }
+        button:disabled,
+        button.secondary:disabled,
+        button.secondary:disabled:hover { background: #3a3a4a; color: #9a9a9a; cursor: not-allowed; }
         .status { padding: 1rem; border-radius: 4px; margin-top: 1rem; display: none; }
         .status.success { background: #1b5e20; display: block; }
         .status.error { background: #b71c1c; display: block; }
+        .status.pending { background: #0f3460; display: block; }
     </style>
 </head>
 <body>
@@ -42,8 +46,8 @@
             </div>
             <div id="tiers-container"></div>
             <div style="margin-top: 1.5rem;">
-                <button onclick="saveConfig()">Apply Config</button>
-                <button class="secondary" onclick="reloadConfig()">Reload Providers</button>
+                <button id="apply-btn" onclick="saveConfig()">Apply Config</button>
+                <button id="reload-btn" class="secondary" onclick="reloadConfig()">Reload Providers</button>
             </div>
             <div id="status" class="status"></div>
         </div>
@@ -61,6 +65,13 @@
         // whose response was generated while swapping was still true cannot
         // resolve late and overwrite that line.
         let swapSettled = false;
+        // Each attach takes its own generation, and the watcher's callback
+        // compares the one it captured, so a late response from a stale
+        // watcher can only bail out — it can never settle the current one.
+        let attachGeneration = 0;
+        let attachPollHandle = null;
+        let attachPollFailures = 0;
+        let statusTimer = null;
 
         // Numeric-only rendering of the swap detail the server returns.
         // Never interpolate a raw response string here.
@@ -117,6 +128,7 @@
             } catch (e) {
                 showStatus('error', 'Failed to load config: ' + e.message);
             }
+            checkInFlightSwapOnLoad();
         }
 
         function renderTiers() {
@@ -236,7 +248,8 @@
                 clearInterval(swapPollHandle);
             }
             swapSettled = false;
-            showStatus('', 'applying — waiting for in-flight requests…');
+            setSwapControlsDisabled(true);
+            showStatus('pending', swapWaitText(null, 'applying — '), true);
             swapPollHandle = setInterval(async () => {
                 if (swapSettled) {
                     // The press already wrote its terminal line: bail out.
@@ -256,9 +269,7 @@
                         return;
                     }
                     if (st.swapping && st.inflight > 0 && st.silence_s !== null) {
-                        showStatus('', 'applying — waiting for ' + st.inflight +
-                            ' in-flight request(s), silence ' +
-                            Math.floor(st.silence_s) + 's / ' + st.budget_s + 's…');
+                        showStatus('pending', swapWaitText(st, 'applying — '), true);
                     }
                 } catch (e) {
                     // Poll failures are cosmetic — never break the flow.
@@ -280,6 +291,14 @@
                     showStatus('success', 'Configuration saved successfully' +
                         swapDetail(result));
                     config.tiers = newConfig.tiers;
+                } else if (result && result.error && result.error.code === 'config_swap_in_progress') {
+                    // Single-flight refusal: a swap this page did not press is in flight.
+                    // Hand off to the attach watcher — the controls stay locked and its
+                    // progress stays visible; the watcher re-renders the tier row on
+                    // completion, so the operator re-enters their changes against a
+                    // baseline that matches the server.
+                    attachToInFlightSwap('a config swap is already in progress — ',
+                        'the in-flight config swap completed — the tier list has been refreshed; make your changes again');
                 } else {
                     showStatus('error', 'Error: ' + errorText(result));
                 }
@@ -292,6 +311,11 @@
                 // would leak the interval forever.
                 clearInterval(swapPollHandle);
                 swapPollHandle = null;
+                // The 409 branch hands off to the attach watcher, which owns the locked
+                // state until that swap ends; every other terminal path unlocks here.
+                if (attachPollHandle === null) {
+                    setSwapControlsDisabled(false);
+                }
             }
         }
 
@@ -301,7 +325,8 @@
                 clearInterval(swapPollHandle);
             }
             swapSettled = false;
-            showStatus('', 'applying — waiting for in-flight requests…');
+            setSwapControlsDisabled(true);
+            showStatus('pending', swapWaitText(null, 'applying — '), true);
             swapPollHandle = setInterval(async () => {
                 if (swapSettled) {
                     // The press already wrote its terminal line: bail out.
@@ -321,15 +346,17 @@
                         return;
                     }
                     if (st.swapping && st.inflight > 0 && st.silence_s !== null) {
-                        showStatus('', 'applying — waiting for ' + st.inflight +
-                            ' in-flight request(s), silence ' +
-                            Math.floor(st.silence_s) + 's / ' + st.budget_s + 's…');
+                        showStatus('pending', swapWaitText(st, 'applying — '), true);
                     }
                 } catch (e) {
                     // Poll failures are cosmetic — never break the flow.
                 }
             }, 1000);
 
+            // Set when a stale-refusal's tier re-read FAILED: the row may still be one
+            // swap behind, so the finally below must not hand back an actionable
+            // surface. Mirrors the attach path's failed-re-read contract.
+            let reloadStaleUnresolved = false;
             try {
                 const resp = await fetch('/admin/api/reload', {
                     method: 'POST',
@@ -342,6 +369,29 @@
                     renderTiers();
                     showStatus('success', 'Providers reloaded from models.json' +
                         swapDetail(result));
+                } else if (result && result.error && result.error.code === 'config_swap_in_progress') {
+                    // Single-flight refusal: a swap this page did not press is in flight.
+                    // Hand off to the attach watcher — the controls stay locked and its
+                    // progress stays visible; the watcher re-renders the tier row on
+                    // completion, so the operator re-enters their changes against a
+                    // baseline that matches the server.
+                    attachToInFlightSwap('a config swap is already in progress — ',
+                        'the in-flight config swap completed — press Reload Providers again to refresh');
+                } else if (result && result.error && result.error.code === 'config_reload_stale') {
+                    // A concurrent switch completed while this reload's candidate was
+                    // being prepared, so the tier row on screen predates it. Re-read it
+                    // before unlocking, or the next Apply writes that pre-switch baseline
+                    // back — the same hazard the attach path closes.
+                    const refreshed = await refreshTiersFromServer();
+                    if (refreshed) {
+                        showStatus('error', 'The configuration changed while reloading — the ' +
+                            'tier list has been refreshed; press Reload Providers again');
+                    } else {
+                        reloadStaleUnresolved = true;
+                        showStatus('pending', 'The configuration changed while reloading, and ' +
+                            'the tier list could not be re-read — reload this page before applying',
+                            true);
+                    }
                 } else {
                     showStatus('error', 'Error: ' + errorText(result));
                 }
@@ -351,14 +401,226 @@
             } finally {
                 clearInterval(swapPollHandle);
                 swapPollHandle = null;
+                // The 409 branch hands off to the attach watcher, which owns the locked
+                // state until that swap ends; every other terminal path unlocks here.
+                if (attachPollHandle === null && !reloadStaleUnresolved) {
+                    setSwapControlsDisabled(false);
+                }
             }
         }
 
-        function showStatus(type, message) {
+        function showStatus(type, message, sticky) {
             const el = document.getElementById('status');
+            if (statusTimer !== null) { clearTimeout(statusTimer); statusTimer = null; }
             el.className = 'status ' + type;
             el.textContent = message;
-            setTimeout(() => { el.className = 'status'; }, 5000);
+            if (!sticky) {
+                statusTimer = setTimeout(() => { el.className = 'status'; statusTimer = null; }, 5000);
+            }
+        }
+
+        // Live pending line from a swap-status payload. prefix differs by context:
+        // 'applying — ' (a press) vs 'config swap in progress — ' (a swap this
+        // page did not press). Falls back to the base text when no detail is
+        // available (initial paint, or a transient zero in-flight reading).
+        // Every numeric field is guarded before interpolation — including
+        // budget_s, whose absence must fall back rather than render "… / null s…".
+        function swapWaitText(st, prefix) {
+            const tail = ' (no need to refresh — this page follows the switch)';
+            if (st && typeof st.inflight === 'number' && st.inflight > 0 &&
+                typeof st.silence_s === 'number' && typeof st.budget_s === 'number') {
+                return prefix + 'waiting for ' + st.inflight + ' in-flight request(s), silence ' +
+                    Math.floor(st.silence_s) + 's / ' + st.budget_s + 's…' + tail;
+            }
+            return prefix + 'waiting for in-flight requests…' + tail;
+        }
+
+        // Lock the entire switch surface — both buttons AND all nine tier
+        // selects — for as long as a swap is in play. Locking the selects is
+        // what makes the completion re-render safe: no edit can be in flight.
+        function setSwapControlsDisabled(disabled) {
+            for (const id of ['apply-btn', 'reload-btn']) {
+                const el = document.getElementById(id);
+                if (el) { el.disabled = disabled; }
+            }
+            TIERS.forEach(tier => {
+                for (const field of ['provider', 'model', 'key']) {
+                    const el = document.getElementById(tier + '-' + field);
+                    if (!el) { continue; }
+                    if (disabled) {
+                        el.disabled = true;
+                    } else if (field === 'key') {
+                        // Unlocking must RESTORE populateKeys' rule, not blanket-
+                        // enable: a single-key provider's key select stays disabled.
+                        const prov = document.getElementById(tier + '-provider');
+                        const keys = providerKeys[(prov && prov.value) || ''] || [];
+                        el.disabled = (keys.length <= 1);
+                    } else {
+                        el.disabled = false;
+                    }
+                }
+            });
+        }
+
+        // Re-read the tier row from the server. Called on attach completion: the
+        // document this page loaded may predate the swap that just installed.
+        // Returns true only when the row was actually re-rendered — the caller
+        // must NOT unlock on a failed read, or the operator re-enters the very
+        // pre-swap baseline this re-render exists to replace.
+        async function refreshTiersFromServer() {
+            try {
+                const resp = await fetch('/admin/api/config');
+                if (!resp.ok) { return false; }
+                config = await resp.json();
+                renderTiers();
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        // Watch a swap this page did not press — detected on load, or refused 409
+        // on a press. The controls stay locked and the pending line repaints at
+        // 1 Hz until the server reports swapping false. Idempotent: a second call
+        // is a no-op. Completion RE-RENDERS the tier row from the server: the
+        // document this page loaded may predate the swap that just installed, so a
+        // press from the values still on screen would write back a pre-swap
+        // baseline (the same hazard the 409 refusal used to prevent by refusing).
+        function attachToInFlightSwap(prefix, doneText) {
+            if (attachPollHandle !== null) {
+                return;
+            }
+            const myGeneration = ++attachGeneration;
+            let settled = false;
+            attachPollFailures = 0;
+            setSwapControlsDisabled(true);
+            showStatus('pending', swapWaitText(null, prefix), true);
+            attachPollHandle = setInterval(async () => {
+                if (myGeneration !== attachGeneration) {
+                    // A later attach owns the page now: only ever bail out.
+                    return;
+                }
+                try {
+                    const resp = await fetch('/admin/api/swap-status');
+                    if (!resp.ok) {
+                        noteAttachPollFailure(prefix);
+                        return;
+                    }
+                    const st = await resp.json();
+                    if (myGeneration !== attachGeneration) {
+                        // Post-await re-check: a late response from a stale
+                        // watcher must never repaint over the terminal line.
+                        return;
+                    }
+                    attachPollFailures = 0;
+                    if (settled) {
+                        // A sibling tick of THIS attach already settled: its
+                        // terminal line stands, and the interval is cleared so
+                        // nothing would correct a repaint here.
+                        return;
+                    }
+                    if (!st.swapping) {
+                        // Per-attach settledness. The generation guard covers a
+                        // NEWER attach; it cannot cover a second tick of THIS one,
+                        // and the interval deliberately survives the await below
+                        // (so the poll-failure signal keeps working), so without
+                        // this flag two ticks would both settle and the later
+                        // terminal line would win regardless of which re-read was
+                        // truthful. Cleared implicitly: a new attach makes a new
+                        // closure.
+                        settled = true;
+                        const refreshed = await refreshTiersFromServer();
+                        clearInterval(attachPollHandle);
+                        attachPollHandle = null;
+                        if (refreshed) {
+                            setSwapControlsDisabled(false);
+                            showStatus('success', doneText);
+                        } else {
+                            // The tier row could not be re-read, so it may
+                            // still be one swap behind. Stay locked and say
+                            // so — unlocking here would let a press write
+                            // that stale baseline back over the swap.
+                            showStatus('pending', prefix +
+                                'the config could not be re-read — reload this page before applying', true);
+                        }
+                        return;
+                    }
+                    showStatus('pending', swapWaitText(st, prefix), true);
+                } catch (e) {
+                    noteAttachPollFailure(prefix);
+                }
+            }, 1000);
+        }
+
+        // A poll failure is NOT cosmetic on this path, unlike in the press path:
+        // a successful `swapping: false` read is the watcher's only exit and
+        // nothing else unlocks the controls, so a persistent failure would leave
+        // the page locked while still narrating progress. After 5 consecutive
+        // failures (~5 s) the line says so and names the way out. Retrying
+        // continues, and the controls stay locked — an unreadable status is not
+        // evidence that no swap is running.
+        function noteAttachPollFailure(prefix) {
+            attachPollFailures += 1;
+            if (attachPollFailures === 5) {
+                showStatus('pending', prefix +
+                    'cannot reach the proxy — the switch may still be running; ' +
+                    'reload this page when it is back', true);
+            }
+        }
+
+        // A page loaded while a swap is in flight must say so immediately, not
+        // only after the operator presses Apply and collects a 409.
+        async function checkInFlightSwapOnLoad() {
+            if (swapPollHandle !== null || attachPollHandle !== null) {
+                return;
+            }
+            try {
+                const resp = await fetch('/admin/api/swap-status');
+                if (!resp.ok) {
+                    return;
+                }
+                const st = await resp.json();
+                // Three conditions, and the third is the load-bearing one: the
+                // handler checks catch a press that is RUNNING, while swapSettled
+                // catches one that started AND finished inside this one-shot's
+                // fetch→parse window — otherwise a swap this very page performed
+                // would be re-attached, overwriting its own success line and
+                // re-locking the controls. The pre-fetch handler check is
+                // unreachable from today's single call site (`loadConfig` runs once,
+                // before any press can exist) and is kept only as a cheap guard
+                // against a future second caller.
+                if (swapPollHandle !== null || attachPollHandle !== null || swapSettled) {
+                    return;
+                }
+                if (st.swapping) {
+                    attachToInFlightSwap('config swap in progress — ',
+                        'the in-flight config swap completed — the tier list has been refreshed');
+                } else {
+                    // The drain may have completed between loadConfig's config read and
+                    // this read, which would leave the row one swap behind. Re-read it —
+                    // but gate on the result: a failed re-read must NOT leave a
+                    // possibly-pre-swap row unlocked and pressable, because
+                    // /admin/api/switch has no staleness guard and the next Apply would
+                    // write that baseline back. Same discipline as the reload-stale and
+                    // attach-completion sites.
+                    const refreshed = await refreshTiersFromServer();
+                    if (!refreshed) {
+                        setSwapControlsDisabled(true);
+                        showStatus('pending', 'the tier list could not be re-read — ' +
+                            'reload this page before applying', true);
+                        return;
+                    }
+                    // renderTiers() rebuilt the selects as fresh enabled nodes, so a press
+                    // that started inside that fetch has just had its lock dropped.
+                    // Re-assert the guards now, after the await, or the load path is the
+                    // only re-render site that can unlock a press.
+                    if (swapPollHandle !== null || attachPollHandle !== null || swapSettled) {
+                        setSwapControlsDisabled(true);
+                    }
+                }
+            } catch (e) {
+                // Cosmetic — a failed check must not brick the page.
+            }
         }
 
         // Load config on page load

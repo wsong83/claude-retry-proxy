@@ -171,6 +171,15 @@ for the rest.
   while a swap was in progress) and `config_reload_stale` (a reload's gated
   candidate was read before a concurrent switch completed a swap, so installing
   it would revert that switch).
+  **The page mirrors that server-side contract.** While any swap is in play it
+  locks both buttons *and* all nine tier selects, reports the drain live at 1 Hz
+  from `/admin/api/swap-status`, and re-reads the tier row before unlocking —
+  unlocking only on a **successful** re-read, at all three call sites (attach
+  completion, `config_reload_stale`, and the one-shot load check). This matters
+  because `/admin/api/switch` carries **no** staleness guard; only the reload
+  path has one, so an unlocked pre-swap row would write its baseline back over a
+  completed swap. Same section:
+  [doc/operations.html#admin](doc/operations.html#admin).
 
 - **Drain-and-swap (silence-based).** Config changes (switch and reload) are
   **single-flight** — a second press while one is in progress is refused `409`
@@ -371,54 +380,7 @@ what you need in context, and the link has the rest.
 
 No other supplementary docs.
 
-## Unresolved Deferred Issues
-
-```json
-[
-{"issue_id": "image-content-blocks-chat-mode", "title": "Chat mode: image content blocks not transformed between Anthropic and OpenAI formats", "target_repo": null, "report": "./tmp/reports/defer-issue-image-content-blocks-chat-mode.json", "deferred": "2026-08-29", "date_source": "creation"},
-{"issue_id": "port-default-collision-hazard", "title": "A start on the default port can report success against a pre-existing listener: the readiness TCP probe cannot distinguish the spawned child's socket from a live proxy already on 8080", "target_repo": null, "report": "./tmp/reports/defer-issue-port-default-collision-hazard.json", "deferred": "2026-09-18", "date_source": "creation"},
-{"issue_id": "proxy-stderr-append-stale-tail", "title": "proxy-stderr.log is append-only across runs, so read_tail failure diagnostics can surface lines from previous sessions instead of the current attempt", "target_repo": null, "report": "./tmp/reports/defer-issue-proxy-stderr-append-stale-tail.json", "deferred": "2026-09-18", "date_source": "creation"},
-{"issue_id": "httpx2-native-sse-transport", "title": "Adopt httpx2 for upstream transport and native SSE parsing: client.sse() replaces the hand-rolled SSE frame scanner and obsoletes httpx-sse", "target_repo": null, "report": "./tmp/reports/defer-issue-httpx2-native-sse-transport.json", "deferred": "2026-09-27", "date_source": "creation"},
-{"issue_id": "operate-round-ends-turn-before-waiting", "title": "Unattended --operate rounds frequently end their turn while a background full-suite run is still in flight, killing the run and leaving the round with no session report", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-operate-round-ends-turn-before-waiting.json", "deferred": "2026-10-04", "date_source": "creation"},
-{"issue_id": "orphaned-test-state-files", "title": "Orphaned per-run state files accumulate in ~/.claude/proxy, and this repo's own verification scripts are a systematic source: they spawn children directly, so they never pass through run_cli's per-test removal loop", "target_repo": null, "report": "./tmp/reports/defer-issue-orphaned-test-state-files.json", "deferred": "2026-10-16", "date_source": "creation"},
-{"issue_id": "recursion-guard-residual-sites", "title": "Three json.loads guards still omit RecursionError, so a deeply nested payload escapes them: the admin switch body and the two upstream tool-call argument parses — a fourth site has the same narrow shape but was measured unreachable", "target_repo": null, "report": "./tmp/reports/defer-issue-recursion-guard-residual-sites.json", "deferred": "2026-10-16", "date_source": "creation"},
-{"issue_id": "planner-doctrine-gaps", "title": "Three planner-doctrine gaps that cost this repo real rounds are absent from planner.md: gate calibration is undocumented, ownership changes carry no reader-enumeration rule, and the round-triage freshness notion stops at session reports instead of covering any artifact read off disk", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-planner-doctrine-gaps.json", "deferred": "2026-10-16", "date_source": "creation"},
-{"issue_id": "cross-repo-deferral-not-stored-in-target", "title": "/defer-issue records a cross-repo deferral in the filing repo only, so the repo that is supposed to fix it never sees the issue; the filing half of the cross-repo pair is missing while the closing half already exists", "target_repo": "claude-config", "report": "./tmp/reports/defer-issue-cross-repo-deferral-not-stored-in-target.json", "deferred": "2026-10-16", "date_source": "creation"}
-]```
-
 ## Future Work — TODO
-
-Nine deferred issues remain (see above). Five are the long tail this cycle
-deliberately left alone: chat-mode image content block mapping, the
-start-on-a-busy-port readiness hazard, `proxy-stderr.log`'s append-only tail
-across runs, adopting httpx2 for upstream transport and native SSE parsing (a
-design change rather than a fix), and unattended `--operate` rounds ending their
-turn while a background suite is still in flight. **Three** of the nine are
-cross-repo, all against `claude-config`: that last one; `planner-doctrine-gaps`,
-which carries the three plan-authoring rules this cycle's failures taught and
-`planner.md` does not yet state — a gate that cannot go red is worse than no
-gate, a step that changes who owns a resource must enumerate the resource's
-readers, and an artifact found on disk must be dated before it is believed; and
-`cross-repo-deferral-not-stored-in-target`, which records that the defer command
-files a cross-repo issue in the filing repo only, so the repo that must fix it
-never sees it — written into both corpora by hand, which is the behaviour its
-fix asks the command to perform. The five agent-memory notes holding those
-lessons stay until the doctrine lands, because a project memory loads for one
-repo only.
-
-The newest two were filed on 2026-10-16 by `2026-10-15-deferred-corpus-sweep`,
-the cycle's closeout plan, which retired the 24 terminal reports the corpus had
-accumulated (`presence means open`, so a file whose issue is fixed reads as live
-until it is gone) and rewrote this list so that every entry has a report on disk
-and every report is listed. `recursion-guard-residual-sites` is the residual of
-the retired `client-body-recursionerror-no-response`: three `json.loads` guards
-that still omit `RecursionError` — the admin switch body, and the two upstream
-tool-call argument parses — plus a fourth of the same shape measured
-unreachable, because the encode ceiling sits below the decode ceiling.
-`orphaned-test-state-files` records that per-run state files accumulate in
-`~/.claude/proxy/`, with this repo's own verification scripts a systematic
-source: they spawn children directly, so they never pass through `run_cli`'s
-per-test removal loop.
 
 The large source/test file
 split and the module-split guidance consolidation were retired 2026-09-16 by

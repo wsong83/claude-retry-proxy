@@ -413,8 +413,43 @@ for is silence: once no upstream byte has arrived from any in-flight request for
 `PROXY_SWAP_SILENCE_TIMEOUT` (default 30 s), whatever is still running is stopped
 and told to retry (`config_swap_restart`) — your client's retry then lands on the
 new mapping. Requests sleeping between retries are dropped immediately rather
-than waited on. Presses are single-flight: a second press while one is in
-progress is refused with `409` and changes nothing.
+than waited on.
+
+**The page shows what a press is doing, and locks while it does it.** A press
+paints a live status line that keeps repainting at 1 Hz with the drain's own
+detail (how many requests are in flight, and how long the upstream has been
+silent against the silence budget), so
+a multi-minute wait is legible rather than a blank page. From the moment a swap is
+in play — this page's own press, an in-flight swap detected on load, or one it was
+refused into — both buttons **and** all nine tier selects are locked, so nothing
+can be edited against a mapping that is about to change. The line says **no need
+to refresh**: a mid-swap refresh is harmless, because the fresh page detects the
+running swap on load, re-locks, and takes over the progress line where the old one
+left off.
+
+**Presses are single-flight, and the refusal is handled.** A second press while
+one is in progress is refused with `409 config_swap_in_progress` and changes
+nothing to the config; rather than dead-ending in a red line, the page attaches to
+the in-flight swap, keeps reporting it, and stays locked until it ends — then
+re-reads the tier row from the server and unlocks, so the operator's next press is
+based on a truthful baseline. The real single-flight guard is server-side in
+`_drain_for_swap()`; the page's lockout is an affordance on top of it, not the
+enforcement.
+
+If the swap-status poll fails repeatedly (5 consecutive failures) the page says the
+proxy is unreachable and that reloading is now safe — it stays locked, because an
+unreadable status is not evidence that no swap is running. Likewise, if a reload is
+refused `409 config_reload_stale` the page re-reads the tier row and only unlocks on
+a **successful** re-read; if that re-read fails it says so and stays locked. The same
+gate covers a page that loads with no swap running: the drain may have finished
+between that page's two reads, so its one-shot check re-reads the row too, and if that
+re-read fails the controls stay locked and the line says the tier list could not be
+re-read — a possibly pre-swap row must never be left pressable, because
+`/admin/api/switch` carries no staleness guard of its own.
+
+> **Restart the proxy after upgrading.** The running server serves `admin.html`
+> from a process-lifetime in-memory cache, so a new page is not picked up until
+> `claude-retry-proxy stop` then `start`.
 
 ### Server environment variables
 
