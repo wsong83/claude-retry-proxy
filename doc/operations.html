@@ -87,7 +87,17 @@ so phase 1 alone would not prove the port is reachable.</p>
 </div>
 
 <p>If either phase fails, the CLI rolls back and reports what it saw — including the tail of the
-server's stderr, which is usually where the real error is.</p>
+server's stderr, which is usually where the real error is. That tail is scoped to the current
+attempt: the log is append-only across runs, so a whole-file tail would print earlier sessions'
+lines as this start's cause.</p>
+
+<p><strong>A port held by another listener</strong> is refused by the child <em>before</em>
+<code>READY</code>, because its pre-bind probe and its listening socket use the same bind
+semantics. On POSIX both use <code>SO_REUSEADDR</code>, which tolerates a port left in
+<code>TIME_WAIT</code> while still refusing a second <code>LISTEN</code>. On Windows both use a
+plain bind, because Windows' <code>SO_REUSEADDR</code> would otherwise permit binding a port that
+already has a live listener — the duplicate bind is accepted and the readiness probe cannot tell
+whose socket answered. A plain bind on Windows still tolerates <code>TIME_WAIT</code>.</p>
 
 <div class="note">
 The line-by-line stdout reader replaced an earlier <code>select.select()</code> based approach
@@ -343,7 +353,7 @@ it is unharmed, which is exactly the difference between <code>SIGTERM</code> and
 <tr><td><code>proxy/proxy-state.json</code></td><td>the heartbeat, every 30 s</td>
     <td>PID, port, start time; read by <code>stop</code>, <code>status</code>, <code>reload</code></td></tr>
 <tr><td><code>proxy/proxy-stderr.log</code></td><td>the CLI</td>
-    <td>The spawned server's stderr</td></tr>
+    <td>The spawned server's stderr, append-only across runs; <code>start</code>'s failure diagnostics read only the current attempt's window</td></tr>
 <tr><td><code>logs/proxy-trace.jsonl</code></td><td>the request path</td>
     <td>The trace log — see <a href="trace-log.html">trace-log.html</a></td></tr>
 <tr><td><code>proxy/feature-compatibility.json</code></td><td>the compatibility learner</td>

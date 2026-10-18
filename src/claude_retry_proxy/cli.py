@@ -470,6 +470,29 @@ def cmd_start(args):
 
     os.makedirs(PROXY_DIR, exist_ok=True)
     stderr_fh = open(os.path.join(PROXY_DIR, "proxy-stderr.log"), "ab")
+    # The log is append-only across runs. Everything this attempt's child
+    # writes starts at this offset; failure diagnostics must not reach back
+    # past it. Captured before Popen so no child byte can precede it.
+    attempt_offset = os.fstat(stderr_fh.fileno()).st_size
+
+    def read_tail(fh, n):
+        """Return at most the last n bytes written by THIS start attempt.
+
+        The log is append-only, so a plain tail-of-file read would include
+        earlier sessions' output and present it as this attempt's failure.
+        The window starts at attempt_offset, captured when the file was
+        opened for this child.
+        """
+        try:
+            fh.flush()
+            size = os.fstat(fh.fileno()).st_size
+            start = max(attempt_offset, size - n)
+            with open(fh.name, "rb") as f:
+                f.seek(start)
+                return f.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+
     proc = subprocess.Popen(
         proxy_cmd,
         stdin=subprocess.PIPE,
@@ -487,13 +510,8 @@ def cmd_start(args):
             proc.stdin.close()
         except (BrokenPipeError, OSError) as e:
             _trace("cmd_start: stdin write failed: {}".format(e))
-            # Read stderr for error message
-            stderr_fh.flush()
-            try:
-                with open(stderr_fh.name, "rb") as f:
-                    tail = f.read(2048).decode("utf-8", errors="replace")
-            except OSError:
-                tail = ""
+            # Read this attempt's stderr for the error message
+            tail = read_tail(stderr_fh, 2048)
             print("ERROR: Server failed to start: {}".format(tail))
             # Cleanup
             if proc.poll() is None:
@@ -509,17 +527,6 @@ def cmd_start(args):
             proc.stdin.close()
         except OSError:
             pass
-
-    def read_tail(fh, n):
-        try:
-            fh.flush()
-            size = os.fstat(fh.fileno()).st_size
-            with open(fh.name, "rb") as f:
-                if size > n:
-                    f.seek(-n, os.SEEK_END)
-                return f.read().decode("utf-8", errors="replace")
-        except OSError:
-            return ""
 
     def cleanup(kill_proc=False):
         """Clean up after a failed start."""
