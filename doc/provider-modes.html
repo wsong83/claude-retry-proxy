@@ -10,7 +10,7 @@
 
 <h1>Provider Modes<span class="sub">anthropic, chat, and response — and what each one rewrites</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-15</p>
+<p><strong>Last updated:</strong> 2026-10-18</p>
 
 <p>The proxy speaks Anthropic Messages to its clients. What it speaks <em>upstream</em> is
 configurable per provider, because not every provider implements the Anthropic API. A
@@ -498,9 +498,11 @@ disposition, on the wire, as a cut stream. A client that would previously have s
 happens.
 </div>
 
-<p>The marker is what makes the retry a repair. It remembers the conversation's messages in
-process memory, and the next request that recovers it — a byte-identical re-issue, or the
-conversation extended strictly past the stored messages — consumes it and gets the nudge text
+<p>The marker is what makes the retry a repair. It stores a fingerprint of the conversation rather
+than the conversation itself — a hash of the request body, plus the stored prefix's length and a
+hash of its canonical serialization — and the next request that recovers it — a byte-identical
+re-issue, or the conversation extended strictly past the stored prefix — consumes it and gets the
+nudge text
 appended as a trailing user message to the <em>upstream copy only</em>: the client's bytes are
 never modified, the client response never carries the nudge, and the transform remains the single
 mapping authority for the upstream shape. The nudge tells the model its previous turn ended
@@ -511,15 +513,16 @@ upstream did not see. A recovery request is itself marked as such, so a turn tha
 and closed with the normal terminal synthesis, so a model that keeps stalling surfaces as one
 error and one ordinary turn rather than an error loop.</p>
 
-<p>Two boundaries are deliberate. A conversation whose messages could not be stored (malformed, or
-larger than 1&nbsp;MiB) can never be nudged, so it is never errored — "cannot be nudged" implies
-"must not error", or every stall on that conversation would become a repeated-error loop. And the
-marker store is bounded and short-lived: at most 32 conversations, at most 1&nbsp;MiB of messages
-each, retained in process memory for up to 180&nbsp;s from the error (the TTL is anchored at the
-error, not at the request's start, so a long generation cannot expire its own marker). It is
-never persisted, never logged, and never served by any endpoint; a restart between the stall and
-the recovery simply means the recovery proceeds without a nudge — the client already received the
-retryable error.</p>
+<p>Two boundaries are deliberate. A conversation whose messages could not be stored (a malformed
+<code>messages</code> array — anything but a non-empty list of objects) can never be nudged, so it
+is never errored — "cannot be nudged" implies "must not error", or every stall on that
+conversation would become a repeated-error loop. And the marker store is bounded and short-lived:
+at most 64 conversations, each a sub-kilobyte digest and no messages copy at all (measured: 718
+bytes per entry, ~45&nbsp;KB for a full store), retained in process memory for up to 180&nbsp;s from
+the error (the TTL is anchored at the error, not at the request's start, so a long generation
+cannot expire its own marker). It is never persisted, never logged, and never served by any
+endpoint; a restart between the stall and the recovery simply means the recovery proceeds without
+a nudge — the client already received the retryable error.</p>
 
 <p><strong>The kill switch is the environment variable itself.</strong> Set
 <code>PROXY_CHAT_RETRY_NUDGE=""</code> — empty, whitespace-only, or longer than 4096 characters,
@@ -706,6 +709,6 @@ transform it belongs to, and neither runs in response mode:</p>
 <a href="compatibility.html">compatibility.html</a>, as is the
 <a href="compatibility.html#reasoning-field">reasoning-field selection</a>.</p>
 
-<footer>Last updated: 2026-10-15</footer>
+<footer>Last updated: 2026-10-18</footer>
 </body>
 </html>

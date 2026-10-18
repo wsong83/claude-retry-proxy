@@ -10,7 +10,7 @@
 
 <h1>Trace Log<span class="sub">What the proxy records, and what it deliberately does not</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-15</p>
+<p><strong>Last updated:</strong> 2026-10-18</p>
 
 <p>The trace log is a JSONL file — one JSON object per line — at
 <code>~/.claude/logs/proxy-trace.jsonl</code> by default, overridable with
@@ -218,10 +218,14 @@ entry by <code>request_id</code> for the provider name.</p>
 tool call seen on the wire <em>and</em> no <code>tool_use</code> emitted, <code>finish_reason:
 "stop"</code>, and text ending in a colon. It carries <code>request_id</code>, <code>tier</code>,
 <code>provider</code>, <code>key</code>, <code>finish_reason</code>, <code>tool_calls_seen</code>,
-<code>emitted_tool_use</code>, <code>tools_declared</code>, <code>text_tail_len</code>, and
-<code>rule</code>. It is evaluated after the drain has ended, so a tool call that merely arrived
-late is never counted as one that never came; the text tail it matches on is held in memory only —
-the event records its length, not its content. The <code>tool_calls_seen</code> test is what keeps
+<code>emitted_tool_use</code>, <code>tools_declared</code>, <code>text_tail_len</code>,
+<code>messages_bytes</code>, and <code>rule</code>. It is evaluated after the drain has ended, so a
+tool call that merely arrived late is never counted as one that never came; the text tail it
+matches on is held in memory only — the event records its length, not its content.
+<code>messages_bytes</code> is the serialized size of the <code>messages</code> array the marker
+was built from, and <code>null</code> when no marker was stored — it puts a skipped marker on the
+wire rather than leaving it to be inferred from session transcripts. The
+<code>tool_calls_seen</code> test is what keeps
 a proxy-side degradation — a tool call seen on the wire but never started as a block — from being
 counted as a model omission.</p>
 
@@ -346,6 +350,6 @@ directory means every request loses its entry until the condition is fixed. See
 <a href="architecture.html#sinks">architecture.html</a> for the full policy.</p>
 </div>
 
-<footer>Last updated: 2026-10-15</footer>
+<footer>Last updated: 2026-10-18</footer>
 </body>
 </html>

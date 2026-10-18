@@ -18,7 +18,7 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>425 test functions across 19 files</strong>, but this number moves whenever
+suite has <strong>428 test functions across 19 files</strong>, but this number moves whenever
 tests are added. (It read <em>424 across 19</em> before this recount, <em>422 across 19</em> before that, <em>420 across 19</em> before that, <em>418 across 19</em> before that, <em>393 across 19</em> before that, <em>379 across 19</em> before that, <em>372 across 19</em> before that, <em>371 across 19</em> before that, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
 before that, <em>334 across 19</em> before that, and <em>322 across 18</em> before an earlier
 one — the page has drifted behind the
@@ -124,7 +124,7 @@ relative size, not as exact current figures.</p>
     <td>Anthropic → Chat Completions request and response transforms</td></tr>
 <tr><td><code>test_response_transform.py</code></td><td class="num">38</td>
     <td>Anthropic → Responses request and response transforms</td></tr>
-<tr><td><code>test_chat_sse.py</code></td><td class="num">73</td>
+<tr><td><code>test_chat_sse.py</code></td><td class="num">76</td>
     <td>Chat-mode SSE synthesis, tool-call deltas, post-finish drain, drain telemetry, truncation, degradation, the unfinished-turn retry nudge, and eviction across a config swap</td></tr>
 <tr><td><code>test_mode_dispatch.py</code></td><td class="num">29</td>
     <td>Mode dispatch, auth headers, path rewriting</td></tr>
@@ -429,7 +429,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> Synthesising Anthropic SSE events from a chat provider's stream: framing, tool-call deltas, and every degradation path.</p>
 
-<h4><code>tests/test_chat_sse.py</code> (73 tests) — chat-mode SSE synthesis, post-finish drain, drain telemetry, and framing</h4>
+<h4><code>tests/test_chat_sse.py</code> (76 tests) — chat-mode SSE synthesis, post-finish drain, drain telemetry, and framing</h4>
 <ul>
 <li><code>test_chat_sse_basic_streaming</code>: Simulated OpenAI SSE chunks produce valid Anthropic SSE events.</li>
 <li><code>test_chat_sse_finish_reason_mapping</code>: finish_reason maps to stop_reason in the terminal message_delta.</li>
@@ -496,6 +496,9 @@ EOF</code></pre>
 <li><code>test_chat_sse_nudge_reentry_walk_stall_passthrough</code>: A nudge recovery whose first upstream attempt is rejected with a matched reasoning-field complaint is re-entered by the candidate walk, and the <em>served</em> attempt still carries the entry-time marker decision: the served stream has no error frame (the loop guard survives re-entry) and the served upstream body contains the nudge text exactly once as its trailing user message (injection re-runs on the inherited decision). The three-request upstream count pins that a walk step actually happened, so neither assertion can pass vacuously.</li>
 <li><code>test_chat_retry_nudge_sweep_expires_armed_only</code>: Store level: an <em>unarmed</em> entry backdated past the TTL survives another request's sweep — arm still returns True (the TTL is anchored at arm) and the recovery still matches it — while an <em>armed</em> entry backdated past the TTL is expired by the same sweep. Pins the sweep ordering that keeps a generation longer than the TTL from losing its own marker to a concurrent eligible request.</li>
 <li><code>test_chat_retry_nudge_ineligible_request_does_not_consume</code>: The marker check runs only inside the eligibility gate (chat mode <em>and</em> tools declared), so an <em>ineligible</em> request whose body strict-extends an armed entry is served un-nudged with an unchanged upstream body and leaves the single-use marker intact; the following eligible recovery then fires <code>chat_retry_nudge</code> naming the errored request.</li>
+<li><code>test_chat_retry_nudge_large_conversation_is_nudgeable</code>: A conversation whose serialized <code>messages</code> exceed the removed 1&nbsp;MiB cap is still remembered, armed, and matched (added 2026-10-18) — the regression for the size skip that silently killed the feature on every real chat-mode body. Store level: the fixture serializes to 1,500,086 bytes, 451,510 bytes over the old 1,048,576-byte cap; the stored <code>messages_bytes</code> equals that serialized size, and the strict extension of the large conversation matches. Measured load-bearing: run against <code>server.py</code> at the preceding commit, this test FAILS.</li>
+<li><code>test_chat_retry_nudge_prefix_digest_matches_strict_extension</code>: The digest Pass 2 matches a strict extension and rejects both near-misses (added 2026-10-18) — a same-length body with different content, and a shorter body — neither of which consumes the marker, after which the matching extension consumes it. Pins the <code>len(messages) &lt;= prefix_len</code> guard alongside the prefix hash, so a short or same-length body cannot reach the digest comparison at all.</li>
+<li><code>test_chat_retry_nudge_evicts_at_sixty_four_entries</code>: Store level: storing a 65th distinct entry evicts the oldest unarmed one, so the store holds exactly 64 and the newest survives (added 2026-10-18) — the entry cap, raised from 32 as headroom rather than as a fix, pinned at its new value.</li>
 <li><code>test_chat_sse_tool_degradation_on_cut_stream</code>: A cut stream (no <code>[DONE]</code>) whose tool-call delta never opens a block still fires exactly one coalesced <code>chat_sse_tool_degradation</code>, with no block started, an <code>error</code> frame and no terminal sequence, and <code>saw_done: 0</code> on <code>chat_sse_truncated</code>. This is the only committed test that reaches the unstarted-tool counting loop on the cut path — the loop's relocation into <code>log_degradation_if_needed()</code> is what the cut path depends on, and this test is what keeps that relocation from being silently undone.</li>
 <li><code>test_chat_sse_deep_frame_skipped</code>: A chat frame deeper than the decode ceiling is skipped, not fatal. Pins <code>handle_frame</code>'s widened guard (review-2): its <code>json.loads</code> caught only <code>json.JSONDecodeError</code>, and no fence exists between it and <code>do_POST</code>, so a deep frame aborted the request with zero bytes.</li>
 <li><code>test_chat_sse_deep_tool_args_at_close</code>: Deep tool arguments inside a <em>shallow</em> frame degrade at close, not fatal. Pins <code>close_open_tool_blocks</code>' widened guard (review-2): it caught only <code>ValueError</code>, and the deep content rides inside a JSON <em>string</em>, so the frame itself still parses.</li>

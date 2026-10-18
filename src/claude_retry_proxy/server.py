@@ -279,13 +279,13 @@ def _swap_abort_tuple(request_id, total_start, retries, tier, provider_name,
 # extension) and CONSUMES the entry on match. Only armed entries age-expire,
 # on a TTL anchored at arm (unarmed entries are never age-swept — the cap's
 # oldest-unarmed-first eviction bounds them), so a long generation cannot
-# expire its own marker. Bounded by RETRY_NUDGE_MAX_ENTRIES entries of at
-# most RETRY_NUDGE_MAX_MESSAGES_BYTES of serialized messages each; cleared
-# on restart, never persisted. Helpers never raise: an internal failure
-# returns None/False and mutates nothing (the sinks' discipline).
+# expire its own marker. Bounded by RETRY_NUDGE_MAX_ENTRIES entries, each
+# holding only a body hash, a prefix digest and the prefix's byte count — no
+# messages copy; cleared on restart, never persisted. Helpers never raise:
+# an internal failure returns None/False and mutates nothing (the sinks'
+# discipline).
 RETRY_NUDGE_TTL_SECONDS = 180
-RETRY_NUDGE_MAX_ENTRIES = 32
-RETRY_NUDGE_MAX_MESSAGES_BYTES = 1024 * 1024
+RETRY_NUDGE_MAX_ENTRIES = 64
 
 # Every read and write of _retry_nudge_entries — including the sweep and the
 # eviction scan — runs under this lock. remember/arm/check each acquire it
@@ -319,11 +319,12 @@ def _retry_nudge_remember(request_id, body, body_json):
 
     Skips (mutating nothing) when request_id is falsy or already present (a
     compat/reasoning re-entry of the same request must not clobber an entry
-    armed earlier in its lifecycle), when messages is not a non-empty list
-    of dicts, or when its serialization exceeds
-    RETRY_NUDGE_MAX_MESSAGES_BYTES. At the entry cap, unarmed entries are
-    evicted first (oldest first) and armed only as a last resort — armed
-    entries are the ones with imminent recoveries.
+    armed earlier in its lifecycle), or when messages is not a non-empty
+    list of dicts. The marker holds a body hash, the prefix length, a
+    prefix digest and the prefix's byte count — never a copy of the
+    messages. At the entry cap, unarmed entries are evicted first (oldest
+    first) and armed only as a last resort — armed entries are the ones
+    with imminent recoveries.
     """
     if not request_id:
         return False
@@ -333,11 +334,10 @@ def _retry_nudge_remember(request_id, body, body_json):
     if not all(isinstance(m, dict) for m in messages):
         return False
     try:
-        messages_json = json.dumps(messages, separators=(",", ":"))
+        canonical = json.dumps(messages, separators=(",", ":"), sort_keys=True)
         body_hash = hashlib.sha256(body).hexdigest()
+        prefix_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     except (TypeError, ValueError, RecursionError):
-        return False
-    if len(messages_json.encode("utf-8")) > RETRY_NUDGE_MAX_MESSAGES_BYTES:
         return False
     with _retry_nudge_lock:
         if request_id in _retry_nudge_entries:
@@ -345,7 +345,9 @@ def _retry_nudge_remember(request_id, body, body_json):
         _retry_nudge_sweep()
         _retry_nudge_entries[request_id] = {
             "hash": body_hash,
-            "messages_json": messages_json,
+            "prefix_len": len(messages),
+            "prefix_hash": prefix_hash,
+            "messages_bytes": len(canonical.encode("utf-8")),
             "armed": False,
             "stored_at": time.time(),
         }
@@ -389,12 +391,30 @@ def _retry_nudge_arm(request_id):
         return True
 
 
+def _retry_nudge_messages_bytes(request_id):
+    """The stored prefix's byte count for this request, or None if no marker.
+
+    Read-only diagnostic companion to the fire event: a None here means the
+    marker was never stored for this request (an ineligible body — falsy id,
+    or messages not a non-empty list of dicts), while a number is the size of
+    the serialized messages array the marker was built from. This is the
+    quantity the removed messages-size cap measured, kept on the trace so a
+    future skip is visible on the wire rather than inferred from session
+    transcripts.
+    """
+    if not request_id:
+        return None
+    with _retry_nudge_lock:
+        entry = _retry_nudge_entries.get(request_id)
+        return entry.get("messages_bytes") if entry is not None else None
+
+
 def _retry_nudge_check(body, body_json):
     """Find the armed marker this request recovers; consume it on match.
 
     Two passes over the (swept) armed entries: exact sha256(body) first (a
     byte-identical re-issue), then the strict-extension prefix (the new
-    messages list starts with the stored list AND is longer — the realistic
+    messages list starts with the stored prefix AND is longer — the realistic
     recovery appends the interrupted turn and its continuation prompt; a
     byte-identical re-send belongs to the exact-hash branch, and the
     strictness keeps an equal-length non-identical list from matching).
@@ -421,20 +441,28 @@ def _retry_nudge_check(body, body_json):
             if entry.get("hash") == body_hash:
                 del _retry_nudge_entries[rid]
                 return rid
-        # Pass 2: strict extension of the stored conversation prefix.
+        # Pass 2: strict extension of the stored conversation prefix — the
+        # recovery's messages start with the stored prefix AND are longer.
+        # The store keeps a digest, not a copy, so re-serialize the candidate
+        # prefix with the same canonical form remember used.
         messages = body_json.get("messages") if isinstance(body_json, dict) else None
         if not isinstance(messages, list) or not messages:
             return None
         if not all(isinstance(m, dict) for m in messages):
             return None
         for rid, entry in armed:
+            prefix_len = entry.get("prefix_len")
+            if not isinstance(prefix_len, int) or prefix_len <= 0:
+                continue
+            if len(messages) <= prefix_len:
+                continue
             try:
-                stored = json.loads(entry["messages_json"])
-            except (TypeError, ValueError):
+                canonical = json.dumps(messages[:prefix_len],
+                                       separators=(",", ":"), sort_keys=True)
+                prefix_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            except (TypeError, ValueError, RecursionError):
                 continue
-            if not isinstance(stored, list):
-                continue
-            if len(messages) > len(stored) and messages[:len(stored)] == stored:
+            if prefix_hash == entry.get("prefix_hash"):
                 del _retry_nudge_entries[rid]
                 return rid
     return None
@@ -3012,6 +3040,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     and not tool_calls_seen
                     and finish_reason_seen == "stop"
                     and text_emitted and text_tail.rstrip().endswith(":")):
+                messages_bytes = _retry_nudge_messages_bytes(request_id)
                 log_trace({
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "event": "chat_sse_unfinished_turn",
@@ -3024,6 +3053,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     "emitted_tool_use": 1 if emitted_tool_use else 0,
                     "tools_declared": 1 if tools_declared else 0,
                     "text_tail_len": len(text_tail),
+                    "messages_bytes": messages_bytes,
                     "rule": "colon_after_prose",
                 })
                 if (retry_original_id is None
@@ -3033,10 +3063,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     # as the cut path below — trace writes first, then the
                     # retryable api_error, and no terminal sequence follows.
                     # The arm must succeed before the error is written: a turn
-                    # whose marker could never be stored (oversized or
-                    # malformed messages) must pass through, never error, or
-                    # every stall on that conversation becomes a
-                    # repeated-error loop.
+                    # whose marker could never be stored (a malformed messages
+                    # array, or one already armed earlier in the request's
+                    # lifecycle) must pass through, never error, or every stall
+                    # on that conversation becomes a repeated-error loop.
                     log_drain()
                     log_post_finish_suppressed()
                     close_all_blocks()

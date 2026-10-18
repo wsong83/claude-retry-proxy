@@ -3673,6 +3673,120 @@ def test_chat_retry_nudge_ineligible_request_does_not_consume():
 
 
 
+def _nudge_canonical(messages):
+    import json as _j
+    return _j.dumps(messages, separators=(",", ":"), sort_keys=True)
+
+
+def test_chat_retry_nudge_large_conversation_is_nudgeable():
+    """A conversation whose serialized messages exceed the old 1 MiB cap must
+    still be remembered, armed, and matched. Regression for the size cap that
+    silently killed the feature on every real chat-mode body."""
+    print("\n--- Test: Chat Retry Nudge — Large Conversation Is Nudgeable ---")
+    import claude_retry_proxy.server as srv
+    with srv._retry_nudge_lock:
+        srv._retry_nudge_entries.clear()
+    messages = [
+        {"role": "user", "content": "x" * 1_500_000},
+        {"role": "assistant", "content": "Now running the suite:"},
+    ]
+    body = json.dumps({"messages": messages}).encode("utf-8")
+    size = len(_nudge_canonical(messages).encode("utf-8"))
+    if size <= 1024 * 1024:
+        fail("fixture must exceed the old 1 MiB cap, got {} bytes".format(size))
+        return
+    if not srv._retry_nudge_remember("rid-big", body, json.loads(body)):
+        fail("a >1 MiB conversation must be remembered (the cap is removed)")
+        return
+    if srv._retry_nudge_messages_bytes("rid-big") != size:
+        fail("the stored messages_bytes must equal the serialized prefix size")
+        return
+    if not srv._retry_nudge_arm("rid-big"):
+        fail("remembered entry must arm")
+        return
+    extended = messages + [{"role": "user", "content": "[proxy nudge]"}]
+    ebody = json.dumps({"messages": extended}).encode("utf-8")
+    if srv._retry_nudge_check(ebody, json.loads(ebody)) != "rid-big":
+        fail("the strict-extension recovery of a large conversation must match")
+        return
+    pass_(">1 MiB conversation remembered, armed, and matched")
+
+
+def test_chat_retry_nudge_prefix_digest_matches_strict_extension():
+    """The digest Pass 2 matches a strict extension and rejects the two
+    near-misses: a same-length different-content body and a shorter body."""
+    print("\n--- Test: Chat Retry Nudge — Prefix Digest Pass 2 ---")
+    import claude_retry_proxy.server as srv
+    with srv._retry_nudge_lock:
+        srv._retry_nudge_entries.clear()
+    messages = [{"role": "user", "content": "alpha"},
+                {"role": "assistant", "content": "beta"}]
+    body = json.dumps({"messages": messages}).encode("utf-8")
+    if not srv._retry_nudge_remember("rid-digest", body, json.loads(body)):
+        fail("remember must store the entry")
+        return
+    if not srv._retry_nudge_arm("rid-digest"):
+        fail("entry must arm")
+        return
+    # (a) same length, different content -> no match, entry survives
+    same_len = [{"role": "user", "content": "alpha"},
+                {"role": "assistant", "content": "GAMMA"}]
+    sbody = json.dumps({"messages": same_len}).encode("utf-8")
+    if srv._retry_nudge_check(sbody, json.loads(sbody)) is not None:
+        fail("a same-length non-identical body must not match the prefix digest")
+        return
+    with srv._retry_nudge_lock:
+        if "rid-digest" not in srv._retry_nudge_entries:
+            fail("the non-match must not consume the marker")
+            return
+    # (b) shorter -> no match
+    short = messages[:1]
+    hbody = json.dumps({"messages": short}).encode("utf-8")
+    if srv._retry_nudge_check(hbody, json.loads(hbody)) is not None:
+        fail("a shorter body must not match the strict-extension prefix")
+        return
+    # (c) strict extension -> match and consume
+    extended = messages + [{"role": "user", "content": "continue"}]
+    ebody = json.dumps({"messages": extended}).encode("utf-8")
+    if srv._retry_nudge_check(ebody, json.loads(ebody)) != "rid-digest":
+        fail("a strict extension must match")
+        return
+    with srv._retry_nudge_lock:
+        if "rid-digest" in srv._retry_nudge_entries:
+            fail("a match must consume the single-use marker")
+            return
+    pass_("prefix digest: extension matches; same-length and shorter rejected")
+
+
+def test_chat_retry_nudge_evicts_at_sixty_four_entries():
+    """The entry cap is 64: storing a 65th distinct entry evicts the oldest
+    unarmed one and the store never exceeds the cap."""
+    print("\n--- Test: Chat Retry Nudge — Eviction At 64 Entries ---")
+    import claude_retry_proxy.server as srv
+    with srv._retry_nudge_lock:
+        srv._retry_nudge_entries.clear()
+    for i in range(65):
+        messages = [{"role": "user", "content": "conv-%d" % i}]
+        body = json.dumps({"messages": messages}).encode("utf-8")
+        if not srv._retry_nudge_remember("rid-%d" % i, body, json.loads(body)):
+            fail("remember(rid-%d) must store" % i)
+            return
+    with srv._retry_nudge_lock:
+        n = len(srv._retry_nudge_entries)
+        oldest = "rid-0" in srv._retry_nudge_entries
+        newest = "rid-64" in srv._retry_nudge_entries
+    if n != 64:
+        fail("store must hold exactly 64 entries, got {}".format(n))
+        return
+    if oldest:
+        fail("the oldest unarmed entry must be the eviction victim")
+        return
+    if not newest:
+        fail("the newest entry must survive")
+        return
+    pass_("store capped at 64; oldest unarmed evicted, newest kept")
+
+
 def test_chat_sse_drain_late_tool_call_time_budget():
     """A tool call that arrives after finish_reason on a drain that ends by
     the time budget reports a non-null late_tool_call_ms — the arrival latency
@@ -4959,6 +5073,12 @@ ALL_TESTS = [
     ("chat-sse-nudge-reentry-walk-stall-passthrough", test_chat_sse_nudge_reentry_walk_stall_passthrough),
     ("chat-retry-nudge-sweep-expires-armed-only", test_chat_retry_nudge_sweep_expires_armed_only),
     ("chat-retry-nudge-ineligible-request-does-not-consume", test_chat_retry_nudge_ineligible_request_does_not_consume),
+    ("chat-retry-nudge-large-conversation-is-nudgeable",
+     test_chat_retry_nudge_large_conversation_is_nudgeable),
+    ("chat-retry-nudge-prefix-digest-matches-strict-extension",
+     test_chat_retry_nudge_prefix_digest_matches_strict_extension),
+    ("chat-retry-nudge-evicts-at-sixty-four-entries",
+     test_chat_retry_nudge_evicts_at_sixty_four_entries),
     ("chat-sse-drain-late-tool-call-time-budget", test_chat_sse_drain_late_tool_call_time_budget),
     ("chat-sse-tool-degradation-on-cut-stream", test_chat_sse_tool_degradation_on_cut_stream),
     ("chat-sse-deep-frame-skipped", test_chat_sse_deep_frame_skipped),
