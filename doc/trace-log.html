@@ -10,7 +10,7 @@
 
 <h1>Trace Log<span class="sub">What the proxy records, and what it deliberately does not</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-18</p>
+<p><strong>Last updated:</strong> 2026-10-21</p>
 
 <p>The trace log is a JSONL file — one JSON object per line — at
 <code>~/.claude/logs/proxy-trace.jsonl</code> by default, overridable with
@@ -45,16 +45,21 @@ entry, not the file.</p>
 <tr><td><code>first_byte_latency_ms</code></td><td>number or null</td><td>Time to first byte; <code>null</code> when not measured</td></tr>
 <tr><td><code>error</code></td><td>string or null</td><td>Redacted error text on failure; <code>null</code> on success</td></tr>
 <tr><td><code>extra_request_headers</code></td><td>object</td><td><strong>Only present when non-empty</strong> — the resolved extra-header values for this request</td></tr>
+<tr><td><code>client_user_agent</code></td><td>string</td><td>The client's inbound <code>User-Agent</code> <em>as forwarded</em> — the inverse of the row above, which records resolved <em>outbound</em> values. <strong>Only present when the resolved value is non-empty</strong>; a longer value is truncated to 512 bytes with a visible <code>[proxy: user-agent truncated]</code> marker, and a repeated header resolves to the last line the proxy sends upstream. Not gated by <code>--all</code> — see <a href="#all">below</a></td></tr>
 <tr><td><code>request_body</code>, <code>response_body</code></td><td>any</td><td><strong>Only under <code>--all</code></strong> — see <a href="#all">below</a></td></tr>
 </table>
 
 <div class="warn">
 <strong>The "present on every entry" invariant above has two exceptions.</strong> The oversized-body
 rejection writes its entry <em>before</em> routing, so it carries no <code>tier</code> and no
-<code>provider</code>. Separately, on the pre-routing 400 paths — an unrecognised model, a
+<code>provider</code> — and, for the same reason, no <code>client_user_agent</code> either: that
+entry is written before the request is routed, and a client's User-Agent cannot cause a 413.
+Separately, on the pre-routing 400 paths — an unrecognised model, a
 disallowed method, a disallowed path — the entry carries <code>provider: null</code>, even though the
 table above types <code>provider</code> as a string. Both follow from where the entry is written: at
-the point the request failed, before any provider had been chosen.
+the point the request failed, before any provider had been chosen. (The <code>key</code> and
+<code>client_user_agent</code> fields have their own omit-when-unresolvable conditions, stated in
+their table rows — those are field conditions, not entry shapes.)
 </div>
 
 <div class="note">
@@ -286,15 +291,24 @@ express. The trace log, the state file, and the keys file are therefore readable
 that can reach your home directory unless you restrict them yourself.
 <p>Restrict the directory ACL manually with <code>icacls</code>. This applies to
 <code>~/.claude/logs/</code> and <code>~/.claude/proxy/</code>, and it applies whether or not
-you use <code>--all</code>, because error text and resolved extra-header values are recorded
-regardless.</p>
+you use <code>--all</code>, because error text, resolved extra-header values and the client
+User-Agent are recorded regardless.</p>
 </div>
 
 <div class="note">
-<strong>The <code>extra_request_headers</code> field is not gated by <code>--all</code>.</strong>
-Resolved header values — for example a client's per-conversation session identifier — are
-recorded on every request for a provider that has rules. If you configure such a rule, assume
-that identifier is in the trace log.
+<strong>Two fields are not gated by <code>--all</code>: <code>extra_request_headers</code> and
+<code>client_user_agent</code>.</strong> Resolved header values — for example a client's
+per-conversation session identifier — are recorded on every request for a provider that has
+rules; if you configure such a rule, assume that identifier is in the trace log. The
+<code>client_user_agent</code> field is ungated for the same reason it exists: a User-Agent
+refused at the edge is refused on an ordinary request, so a diagnostic that required
+<code>--all</code> would be absent exactly when it is wanted. Its value is arbitrary raw client text
+with no allowlist — so treat it as untrusted, and note that it is <em>not alone</em> in that:
+<code>method</code>, <code>path</code> and <code>model</code> are also verbatim client strings, and
+<code>extra_request_headers</code> copies client header values too. The sink escapes every one of
+them (<code>json.dumps</code> with <code>ensure_ascii</code>), which keeps the file one entry per
+line and free of raw control characters — but escaping is not trust: each is still whatever the
+client sent.
 </div>
 
 <!-- Owns the pruning fact: retention window, best-effort behaviour, malformed-line handling.
@@ -350,6 +364,6 @@ directory means every request loses its entry until the condition is fixed. See
 <a href="architecture.html#sinks">architecture.html</a> for the full policy.</p>
 </div>
 
-<footer>Last updated: 2026-10-18</footer>
+<footer>Last updated: 2026-10-21</footer>
 </body>
 </html>

@@ -491,7 +491,17 @@ first-byte latency, and a sanitized error. Only the key **name** is logged —
 never the key material — and the field is omitted when resolution is
 impossible. Requests to providers with `extra_request_headers` rules
 additionally log an `extra_request_headers` field with the resolved header
-map. Lifecycle markers (`proxy_start`, `proxy_ready`, `proxy_stop`) and per-retry
+map. Every routed request also logs `client_user_agent` — your client's inbound
+`User-Agent` as the proxy forwards it, capped at 512 bytes with a visible
+`[proxy: user-agent truncated]` marker. When a request carries the header more
+than once, the recorded value is the last `User-Agent` line the proxy sends
+upstream, so it still names the UA that produced the response; the field is
+omitted when that resolved value is empty (no header at all, or an empty last
+one). (The pre-routing 413 entry is the one exception: it is written before routing
+and carries no `client_user_agent`, no `tier` and no `provider`.) It is the
+*inbound* value, the opposite of `extra_request_headers`, which records
+resolved *outbound* values.
+Lifecycle markers (`proxy_start`, `proxy_ready`, `proxy_stop`) and per-retry
 events are also logged. `proxy_ready` is written once the proxy is fully
 initialised — socket bound, heartbeat thread running, signal handlers registered
 — so it, not `proxy_start`, is the marker to wait on before signalling the
@@ -537,7 +547,14 @@ response bodies) in plaintext; streamed 2xx success bodies are not captured.
 Resolved `extra_request_headers` values are logged on every request for
 providers with rules regardless of `--all` — a resolved session id is a
 stable per-conversation identifier, so treat the trace file accordingly.
-The resolved key **name** (`key` field) is likewise logged on every request
+The `client_user_agent` field is likewise logged on every routed request
+regardless of `--all`; its value is arbitrary raw client text with no
+allowlist, and it is not the only such field — `method`, `path` and `model`
+are verbatim client strings too, and `extra_request_headers` copies client
+header values. The trace escapes all of them, which keeps the file one entry
+per line and free of raw control characters, but escaping is not trust. The
+resolved key **name**
+(`key` field) is likewise logged on every request
 regardless of `--all`; the key material itself never enters the trace. The
 proxy applies `0600` permissions to the trace and state files on
 **POSIX** systems. On **Windows**, `chmod` is effectively a no-op (it only

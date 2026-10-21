@@ -27,6 +27,7 @@ from _harness import (
     _mode_tiers,
     _send_proxy_request,
     _start_mode_proxy,
+    _trace_events_named,
     fail,
     find_free_port,
     info,
@@ -998,6 +999,375 @@ def test_trace_includes_key_name_not_payload():
         cleanup()
 
 
+# --- client_user_agent in trace events ---
+# (plan 2026-10-21-trace-client-user-agent)
+
+REQUEST_BODY = json.dumps({"model": "sonnet",
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+
+# The values the docs state for the two server constants (doc/trace-log.html,
+# README.md and CLAUDE.md all name 512 and "[proxy: user-agent truncated]").
+# Pinned as literals here so a change to the server constants cannot leave the
+# prose stale while every test stays green: test_client_user_agent_in_trace
+# asserts the pair matches before using the module's own values.
+DOCUMENTED_CLIENT_UA_MAX_CHARS = 512
+DOCUMENTED_CLIENT_UA_MARKER = "[proxy: user-agent truncated]"
+
+
+def test_client_user_agent_in_trace():
+    """The request entry carries the client User-Agent as received: verbatim
+    when short, truncated to exactly 512 characters with a visible marker when
+    long, and OMITTED entirely (not null) when absent, empty or whitespace-only.
+    The cap is characters, which for latin-1-decoded header values is bytes."""
+    print("\n--- Test: client User-Agent in trace events ---")
+    import claude_retry_proxy.server as srv
+    cap = srv.CLIENT_USER_AGENT_MAX_CHARS
+    marker = srv.CLIENT_USER_AGENT_TRUNCATION_MARKER
+    # Pin the documented literals: without this, changing the constant to 1024
+    # would keep every test green while the three documents still say 512.
+    if (cap != DOCUMENTED_CLIENT_UA_MAX_CHARS
+            or marker != DOCUMENTED_CLIENT_UA_MARKER):
+        fail("the server's client-UA constants ({!r} / {!r}) no longer match the "
+             "documented values ({!r} / {!r}); update doc/trace-log.html, "
+             "README.md and CLAUDE.md in the same change".format(
+                 cap, marker, DOCUMENTED_CLIENT_UA_MAX_CHARS,
+                 DOCUMENTED_CLIENT_UA_MARKER))
+        return
+    pass_("server cap/marker match the documented literals")
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        _mode_tiers(), {"p": {"url": "http://127.0.0.1:{}".format(find_free_port()),
+                              "key": "K"}})
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        def ua_of(headers):
+            """Send one request and return (status, its own request entry).
+
+            The trace write precedes the response on this path:
+            `log_trace(trace_entry)` is immediately followed by
+            `self._send_response(status, resp_body, resp_headers)`, so
+            `events[-1]` is deterministic — but assert the entry count grew by
+            exactly one, so a stale read can never pass silently.
+            """
+            before = len(_read_request_events(trace_file))
+            status, _ = _send_proxy_request(proxy_port, headers=headers)
+            events = _read_request_events(trace_file)
+            if len(events) != before + 1:
+                fail("expected exactly one new request entry, {} -> {}".format(
+                    before, len(events)))
+                return status, None
+            return status, events[-1]
+
+        # (a) a short UA is recorded verbatim
+        status, ev = ua_of({"User-Agent": "Python-urllib/3.11"})
+        if status != 200 or ev is None:
+            fail("short-UA request expected 200 + a trace entry, got {}".format(status))
+            return
+        if ev.get("client_user_agent") != "Python-urllib/3.11":
+            fail("expected the UA verbatim, got {!r}".format(ev.get("client_user_agent")))
+            return
+        pass_("short UA recorded verbatim")
+
+        # (b) no UA -> the key is ABSENT, not null
+        status, ev = ua_of({})
+        if status != 200 or ev is None:
+            fail("no-UA request expected 200 + a trace entry, got {}".format(status))
+            return
+        if "client_user_agent" not in ev:
+            pass_("absent UA omits the key")
+        else:
+            fail("expected the key to be omitted for a UA-less request, got {!r}".format(
+                ev.get("client_user_agent")))
+            return
+
+        # (c) empty and whitespace-only UA -> also absent
+        for label, sent in (("empty", ""), ("whitespace-only", "   ")):
+            status, ev = ua_of({"User-Agent": sent})
+            if ev is None or "client_user_agent" in ev:
+                fail("{} UA must omit the key, got {!r}".format(
+                    label, ev.get("client_user_agent") if ev else None))
+                return
+        pass_("empty and whitespace-only UA omit the key")
+
+        # (d) an oversize ASCII UA -> exactly the cap, head preserved, marker last
+        sent = "A" * (cap + 88)
+        status, ev = ua_of({"User-Agent": sent})
+        got = (ev or {}).get("client_user_agent")
+        if not isinstance(got, str) or len(got) != cap:
+            fail("oversize UA must truncate to exactly {} chars, got {!r}".format(
+                cap, len(got) if isinstance(got, str) else got))
+            return
+        if not got.endswith(marker) or got != "A" * (cap - len(marker)) + marker:
+            fail("expected head + marker, got {!r}".format(got))
+            return
+        pass_("oversize ASCII UA truncated to exactly {} chars with the marker".format(cap))
+
+        # (e) an oversize NON-ASCII UA pins the byte bound: 512 chars == 512
+        #     latin-1 bytes. http.client sends these as latin-1 bytes, and the
+        #     handler decodes them back latin-1, so a 600-char feed must come
+        #     back as exactly 512 characters AND 512 bytes.
+        status, ev = ua_of({"User-Agent": "é" * (cap + 88)})
+        got = (ev or {}).get("client_user_agent")
+        if not isinstance(got, str) or len(got) != cap:
+            fail("non-ASCII oversize UA must be {} chars, got {!r}".format(
+                cap, len(got) if isinstance(got, str) else got))
+            return
+        if len(got.encode("latin-1")) != cap:
+            fail("the cap must be {} latin-1 BYTES, got {}".format(
+                cap, len(got.encode("latin-1"))))
+            return
+        pass_("non-ASCII oversize UA is exactly {} chars == {} latin-1 bytes".format(cap, cap))
+    finally:
+        cleanup()
+
+
+def test_client_user_agent_control_characters_stay_one_line():
+    """A hostile UA cannot forge a trace line. Control bytes (NUL, ESC, BEL, C1
+    CSI) sent through the normal helper, and a literal CRLF injected by a header
+    continuation line over a raw socket, must all leave the JSONL file with
+    exactly one physical line per entry, parse as JSON, and round-trip to the
+    value the client actually sent."""
+    print("\n--- Test: client User-Agent — control characters stay one line ---")
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        _mode_tiers(), {"p": {"url": "http://127.0.0.1:{}".format(find_free_port()),
+                              "key": "K"}})
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        # (a) control bytes that http.client accepts
+        hostile = "x\x00y\x1b[31mz\x07w\x9bv"
+        status, _ = _send_proxy_request(proxy_port, headers={"User-Agent": hostile})
+        if status != 200:
+            fail("hostile-UA request expected 200, got {}".format(status))
+            return
+        events = _read_request_events(trace_file)
+        got = events[-1].get("client_user_agent") if events else None
+        if got != hostile:
+            fail("control characters must survive verbatim, got {!r}".format(got))
+            return
+        pass_("NUL / ESC / BEL / C1-CSI survive verbatim in the entry")
+
+        # (b) a literal CRLF via obs-fold, over a raw socket — http.client
+        #     refuses to send this, so build the request by hand.
+        raw = (b"POST /v1/messages HTTP/1.1\r\n"
+               b"Host: 127.0.0.1\r\n"
+               b"User-Agent: foldhead\r\n foldtail\r\n"
+               b"Content-Type: application/json\r\n"
+               b"Content-Length: " + str(len(REQUEST_BODY)).encode() +
+               b"\r\n\r\n" + REQUEST_BODY)
+        s = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
+        try:
+            s.sendall(raw)
+            s.recv(65536)
+        finally:
+            s.close()
+
+        # (c) the file is intact: one physical line per entry, every line parses.
+        #     `TraceSink._emit` writes json.dumps(payload) + "\n", so the number
+        #     of newlines equals the number of entries -- a raw newline smuggled
+        #     in through the UA would show up here as a surplus, and the torn
+        #     halves would fail to parse.
+        with open(trace_file, "rb") as f:
+            raw_bytes = f.read()
+        physical = [ln for ln in raw_bytes.split(b"\n") if ln.strip()]
+        parsed = []
+        for i, ln in enumerate(physical):
+            try:
+                parsed.append(json.loads(ln))
+            except Exception as e:
+                fail("physical line {} does not parse as JSON: {}".format(i, e))
+                return
+        if raw_bytes.count(b"\n") != len(physical):
+            fail("entry count and newline count disagree ({} vs {}) — a raw "
+                 "newline reached the file".format(raw_bytes.count(b"\n"), len(physical)))
+            return
+        for i, obj in enumerate(parsed):
+            if not isinstance(obj, dict) or "event" not in obj or "timestamp" not in obj:
+                fail("physical line {} is not a trace entry: {!r}".format(i, obj))
+                return
+        folded = [e for e in parsed if str(e.get("client_user_agent", "")).startswith("foldhead")]
+        if not folded:
+            fail("the obs-fold request produced no request entry")
+            return
+        if folded[-1].get("client_user_agent") != "foldhead\r\n foldtail":
+            fail("expected the folded value with its literal CRLF, got {!r}".format(
+                folded[-1].get("client_user_agent")))
+            return
+        # every line is pure ASCII: json.dumps escapes control chars and non-ASCII
+        for i, ln in enumerate(physical):
+            try:
+                ln.decode("ascii")
+            except UnicodeDecodeError:
+                fail("physical line {} carries raw non-ASCII bytes — the sink's "
+                     "json.dumps no longer escapes them".format(i))
+                return
+        pass_("obs-fold CRLF escaped; every line parses and is pure ASCII")
+    finally:
+        cleanup()
+
+
+def test_client_user_agent_ungated_and_entry_scoped():
+    """The field is NOT gated by --all (a normal request carries it while
+    request_body does not), it lands on the `request` entry and NOT on
+    `mode_dispatch`, and it is absent from the pre-routing 413 entry — whose
+    reduced shape is a documented exclusion, not an oversight."""
+    print("\n--- Test: client User-Agent — ungated and entry-scoped ---")
+    # PROXY_MAX_BODY_SIZE is lowered to its 1024-byte minimum so part (c) can
+    # reach the 413 path with a 1.5 KB body; the same idiom as
+    # test_trace_logs_oversized_body (tests/test_trace.py:432-436).
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        _mode_tiers(), {"p": {"url": "http://127.0.0.1:{}".format(find_free_port()),
+                              "key": "K", "mode": "chat"}},
+        extra_env={"PROXY_MAX_BODY_SIZE": "1024"})
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        # (a) present on a normal request, with --all off (the default)
+        status, _ = _send_proxy_request(proxy_port, headers={"User-Agent": "gated/probe"})
+        if status != 200:
+            fail("chat-mode request expected 200, got {}".format(status))
+            return
+        events = _read_request_events(trace_file)
+        if not events:
+            fail("no request trace entry")
+            return
+        ev = events[-1]
+        if ev.get("client_user_agent") != "gated/probe":
+            fail("the field must be present without --all, got {!r}".format(
+                ev.get("client_user_agent")))
+            return
+        if "request_body" in ev:
+            fail("this test assumes --all is OFF; request_body is present")
+            return
+        pass_("present without --all (and request_body correctly absent)")
+
+        # (b) the mode_dispatch event for the same request does NOT carry it
+        dispatches = _trace_events_named(trace_file, "mode_dispatch")
+        if not dispatches:
+            fail("chat mode produced no mode_dispatch event")
+            return
+        if any("client_user_agent" in d for d in dispatches):
+            fail("mode_dispatch must not carry the field")
+            return
+        pass_("mode_dispatch carries no client_user_agent")
+
+        # (c) the pre-routing 413 entry omits it (documented exclusion).
+        #     The body must exceed the lowered 1024-byte cap; 1500 does.
+        huge = json.dumps({"model": "sonnet",
+                           "messages": [{"role": "user", "content": "x" * 1500}]}).encode()
+        import http.client as _hc
+        conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+        conn.request("POST", "/v1/messages", body=huge,
+                     headers={"Content-Type": "application/json",
+                              "User-Agent": "oversize/probe"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        if resp.status != 413:
+            fail("expected 413 for an oversized body, got {}".format(resp.status))
+            return
+        # The 413 path RESPONDS first and writes its trace entry second, so a
+        # client that returns as soon as the response lands can outrun the
+        # write. Poll for the 413 entry ITSELF under a deadline:
+        # `_wait_for_trace_events(trace_file, "request")` returns as soon as ANY
+        # request event exists -- part (a) already wrote one -- so it would
+        # return immediately and never wait for this entry.
+        deadline = time.time() + 5.0
+        while True:
+            ev413 = [e for e in _read_request_events(trace_file)
+                     if e.get("http_status") == 413]
+            if ev413 or time.time() >= deadline:
+                break
+            time.sleep(0.05)
+        if not ev413:
+            fail("no 413 request entry in the trace")
+            return
+        if "client_user_agent" in ev413[-1]:
+            fail("the 413 entry must omit the field — its absence is documented; "
+                 "if this is deliberate, update doc/trace-log.html and this test together")
+            return
+        pass_("413 entry omits the field, as documented")
+    finally:
+        cleanup()
+
+
+def test_client_user_agent_duplicate_headers_match_forwarded():
+    """With more than one User-Agent header, the traced value names the line the
+    forwarding path actually sends. `do_POST` hands `forward_request` a plain
+    dict built from `self.headers.items()`, which keeps the LAST value per
+    distinct key, and `http.client` then sends that dict in order: same-cased
+    duplicates reach the upstream as ONE line carrying the second value, and
+    differently-cased ones as TWO lines. The entry records the last of them --
+    never the first, which for same-cased duplicates the upstream never received.
+
+    Duplicate headers cannot be sent by `http.client`, so these go over a raw
+    socket, as the obs-fold case above already does."""
+    print("\n--- Test: client User-Agent — duplicates match what was forwarded ---")
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        _mode_tiers(), {"p": {"url": "http://127.0.0.1:{}".format(find_free_port()),
+                              "key": "K"}})
+    if proc is None:
+        fail("Failed to set up test")
+        return
+
+    def raw_ua_request(pairs):
+        """POST REQUEST_BODY with the given User-Agent header lines, by hand."""
+        lines = [b"POST /v1/messages HTTP/1.1",
+                 b"Host: 127.0.0.1",
+                 b"Content-Type: application/json",
+                 b"Content-Length: " + str(len(REQUEST_BODY)).encode()]
+        for k, v in pairs:
+            lines.append(("{}: {}".format(k, v)).encode("latin-1"))
+        raw = b"\r\n".join(lines) + b"\r\n\r\n" + REQUEST_BODY
+        s = socket.create_connection(("127.0.0.1", proxy_port), timeout=15)
+        try:
+            s.sendall(raw)
+            s.recv(65536)
+        finally:
+            s.close()
+
+    try:
+        cases = (
+            # (label, header lines to send, how many UA lines must reach upstream)
+            ("same-cased duplicates", [("User-Agent", "one"),
+                                       ("User-Agent", "two")], 1),
+            ("mixed-cased duplicates", [("User-Agent", "one"),
+                                        ("user-agent", "two")], 2),
+            ("interleaved casings", [("User-Agent", "a"), ("user-agent", "b"),
+                                     ("User-Agent", "c")], 2),
+        )
+        for _label, pairs, _n in cases:
+            raw_ua_request(pairs)
+
+        # Each raw request completes before the next is sent, and this path
+        # writes the trace entry BEFORE the response (log_trace precedes
+        # _send_response), so the last len(cases) entries are these requests.
+        entries = _read_request_events(trace_file)[-len(cases):]
+        reqs = mock_servers["p"]["requests"][-len(cases):]
+        if len(entries) != len(cases) or len(reqs) != len(cases):
+            fail("expected {} request entries and {} upstream requests, got {} and {}"
+                 .format(len(cases), len(cases), len(entries), len(reqs)))
+            return
+        for i, (label, _pairs, n_lines) in enumerate(cases):
+            wire = ((reqs[i].get("headers") or {}).get("user-agent"))
+            if wire is None or len(wire) != n_lines:
+                fail("{}: expected {} user-agent line(s) at the upstream, got {!r}"
+                     .format(label, n_lines, wire))
+                return
+            traced = entries[i].get("client_user_agent")
+            if traced != wire[-1]:
+                fail("{}: the entry records {!r} but the upstream received {!r} — the "
+                     "traced value must name the UA that was forwarded".format(
+                         label, traced, wire))
+                return
+        pass_("duplicate User-Agent headers: the traced value is the last line forwarded")
+    finally:
+        cleanup()
+
+
 # --- Sink I/O failure guards (plan 2026-09-10-guard-trace-state-sinks) ---
 #
 # The trace and state sinks must never raise into their callers: a trace-write
@@ -1355,6 +1725,13 @@ ALL_TESTS = [
     ("heartbeat-survives-failed-state-write", test_heartbeat_survives_failed_state_write),
     ("sink-emission-survives-failing-stderr", test_sink_emission_survives_failing_stderr),
     ("best-effort-stderr-wrapper", test_best_effort_stderr_wrapper),
+    ("client-user-agent-in-trace", test_client_user_agent_in_trace),
+    ("client-user-agent-control-characters-stay-one-line",
+     test_client_user_agent_control_characters_stay_one_line),
+    ("client-user-agent-ungated-and-entry-scoped",
+     test_client_user_agent_ungated_and_entry_scoped),
+    ("client-user-agent-duplicate-headers-match-forwarded",
+     test_client_user_agent_duplicate_headers_match_forwarded),
 ]
 
 

@@ -928,6 +928,58 @@ def _resolve_extra_request_headers(headers, provider_name, config, request_id):
     return resolved
 
 
+# --- the client User-Agent on the request trace entry ------------------------
+# The proxy forwards the client's User-Agent upstream, so a UA-based edge
+# refusal (Cloudflare's `1010` browser-signature block) is only legible next to
+# the UA that produced it. This field records that value -- the last one the
+# forwarding path sends -- never rewritten, so it names the INBOUND string,
+# unlike `extra_request_headers`, which records resolved OUTBOUND values. A UA
+# is client-controlled and otherwise unbounded, so it is capped, visibly.
+CLIENT_USER_AGENT_MAX_CHARS = 512
+CLIENT_USER_AGENT_TRUNCATION_MARKER = "[proxy: user-agent truncated]"
+
+
+def _client_user_agent(headers):
+    """The User-Agent the proxy forwards, capped; None when absent or empty.
+
+    `headers` is the request's header mapping -- an `email.message.Message`,
+    whose keys keep the casing the client sent. The parser strips a header's
+    leading whitespace and normalizes a whitespace-only header to "", so such a
+    header is omitted rather than recorded as blank; a non-empty value keeps its
+    trailing whitespace.
+
+    Resolution MIRRORS THE FORWARDING PATH, because the field exists to name the
+    UA that produced an upstream refusal, so a value the upstream never received
+    is worse than no value at all. `do_POST` hands `forward_request` a plain dict
+    built from `self.headers.items()`, and `http.client` then sends that dict in
+    order: same-cased duplicates collapse to the last value (the single line the
+    upstream receives), while differently-cased ones survive as separate keys
+    and put two lines on the wire. Taking the collapse's last value names the
+    last UA line forwarded. When the request carried one casing -- the ordinary
+    case, and the only one in which a single value is a well-defined mirror --
+    that is exactly the line on the wire.
+
+    No sanitizing: the value IS the diagnostic, and `sanitize_error` exists for
+    error text (it redacts home-directory paths and IPv4 literals and caps at
+    200 chars), none of which applies to a UA.
+
+    A value longer than the cap keeps its head -- the informative prefix, e.g.
+    "Python-urllib/3.11" -- and gains a visible marker, so a truncated UA is
+    never mistaken for a genuine one. The result is at most
+    CLIENT_USER_AGENT_MAX_CHARS characters; `http.server` decodes header values
+    as latin-1, so one character is one byte and that is also the byte bound.
+    """
+    forwarded = {k: v for k, v in headers.items() if k.lower() == "user-agent"}
+    values = list(forwarded.values())
+    value = values[-1] if values else None
+    if not value:
+        return None
+    if len(value) <= CLIENT_USER_AGENT_MAX_CHARS:
+        return value
+    keep = CLIENT_USER_AGENT_MAX_CHARS - len(CLIENT_USER_AGENT_TRUNCATION_MARKER)
+    return value[:keep] + CLIENT_USER_AGENT_TRUNCATION_MARKER
+
+
 def _forward_request_impl(method, path, headers, body, handler, request_id,
                           config, vendors, epoch, suppress_compat=False,
                           reasoning_selection=None, retry_original_id=None):
@@ -3802,6 +3854,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             provider, _current_config, request_id)
         if resolved_extra:
             trace_entry["extra_request_headers"] = resolved_extra
+
+        # The client's User-Agent as received. Recorded on every request, not
+        # only under --all -- like extra_request_headers above, and unlike the
+        # bodies. It is the input a UA-based edge refusal keys on, and the one
+        # thing the entry otherwise omits when a 403 comes back carrying
+        # nothing but `error code: 1010`.
+        _client_ua = _client_user_agent(self.headers)
+        if _client_ua is not None:
+            trace_entry["client_user_agent"] = _client_ua
 
         # Re-resolve the provider key name for the trace (never threaded
         # through forward_request's return tuple — signature discipline; the

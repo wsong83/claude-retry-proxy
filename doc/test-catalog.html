@@ -10,7 +10,7 @@
 
 <h1>Test Catalog<span class="sub">Suite layout, harness isolation, and testing patterns</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-18</p>
+<p><strong>Last updated:</strong> 2026-10-21</p>
 
 <p>The suite is a set of per-area modules merged by a single aggregator. It runs against
 <em>real</em> proxy processes and <em>real</em> mock upstream servers over loopback sockets —
@@ -18,11 +18,11 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>428 test functions across 19 files</strong>, but this number moves whenever
-tests are added. (It read <em>424 across 19</em> before this recount, <em>422 across 19</em> before that, <em>420 across 19</em> before that, <em>418 across 19</em> before that, <em>393 across 19</em> before that, <em>379 across 19</em> before that, <em>372 across 19</em> before that, <em>371 across 19</em> before that, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
+suite has <strong>432 test functions across 19 files</strong>, but this number moves whenever
+tests are added. (It read <em>431 across 19</em> before this recount, <em>428 across 19</em> before that, <em>424 across 19</em> before that, <em>422 across 19</em> before that, <em>420 across 19</em> before that, <em>418 across 19</em> before that, <em>393 across 19</em> before that, <em>379 across 19</em> before that, <em>372 across 19</em> before that, <em>371 across 19</em> before that, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
 before that, <em>334 across 19</em> before that, and <em>322 across 18</em> before an earlier
 one — the page has drifted behind the
-suite sixteen times, and in each case the stale total disagreed with the page's own catalog table
+suite eighteen times, and in each case the stale total disagreed with the page's own catalog table
 as well.)
 Re-count before quoting it:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
@@ -139,7 +139,7 @@ relative size, not as exact current figures.</p>
         resolution, and the unreadable-shape conversion</td></tr>
 <tr><td><code>test_cli.py</code></td><td class="num">19</td>
     <td>CLI lifecycle: start, stop, status, reload</td></tr>
-<tr><td><code>test_trace.py</code></td><td class="num">12</td>
+<tr><td><code>test_trace.py</code></td><td class="num">16</td>
     <td>Trace logging and trace analysis</td></tr>
 <tr><td><code>test_tier_routing.py</code></td><td class="num">19</td>
     <td>Tier resolution, model resolution, reverse lookup</td></tr>
@@ -649,7 +649,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> What the proxy records, and the write contract that keeps a failing sink from stopping it.</p>
 
-<h4><code>tests/test_trace.py</code> (12 tests) — trace log and analysis</h4>
+<h4><code>tests/test_trace.py</code> (16 tests) — trace log and analysis</h4>
 <ul>
 <li><code>test_trace_markers</code>: Start proxy, send requests, then stop it through <code>POST /admin/shutdown</code> — the <em>graceful</em> path, so the <code>proxy_stop</code> marker is actually written (changed 2026-10-16 by plan 2026-10-15-test-harness-robustness; it previously killed the proxy and merely warned when the marker was missing). Verify the trace has start/end markers with counters, plus the <code>proxy_ready</code> marker and its <code>pid</code>/<code>port</code> fields. A missing <code>proxy_stop</code> is now a hard <strong>failure</strong>, not a warning, so the marker is pinned rather than tolerated. This is the only <code>proxy_ready</code> pin that runs on Windows — the test's other reference lives inside the POSIX-gated SIGTERM test in <code>test_cli.py</code>, so without it a removal or rename of the event would go unnoticed by any runnable test.</li>
 <li><code>test_relative_log_path</code>: Start proxy server directly with &#x27;-l relative.jsonl&#x27; and cwd=temp dir.</li>
@@ -663,6 +663,10 @@ EOF</code></pre>
 <li><code>test_heartbeat_survives_failed_state_write</code>: The heartbeat thread survives a failing state write.</li>
 <li><code>test_sink_emission_survives_failing_stderr</code>: The guard&#x27;s own warning/recovery emission must not raise.</li>
 <li><code>test_best_effort_stderr_wrapper</code>: _BestEffortStderr makes a failing stderr stream non-raising.</li>
+<li><code>test_client_user_agent_in_trace</code>: The request entry carries the client User-Agent as received — verbatim when short, truncated to exactly 512 characters with a visible <code>[proxy: user-agent truncated]</code> marker when long, and <strong>omitted entirely</strong> (not null) when absent, empty or whitespace-only. A non-ASCII oversize feed pins that the 512-character cap is also 512 latin-1 <em>bytes</em>, which is what <code>http.server</code>'s header decoding makes true.</li>
+<li><code>test_client_user_agent_control_characters_stay_one_line</code>: A hostile UA cannot forge a trace line. Control bytes (NUL, ESC, BEL, C1 CSI) sent through the normal helper, and a literal CRLF injected by a header continuation line (obs-fold) over a raw socket, all survive verbatim in the entry while the JSONL keeps exactly one physical line per entry, every line parses as a JSON object, and the file stays pure ASCII — <code>TraceSink</code>'s <code>json.dumps</code> escapes them.</li>
+<li><code>test_client_user_agent_ungated_and_entry_scoped</code>: Pins the three deliberate boundaries so a later "consistency fix" must change the doc and the test together — the field is present <em>without</em> <code>--all</code> (while <code>request_body</code> is absent), the <code>mode_dispatch</code> event does not carry it (the <code>request</code> entry only), and the pre-routing 413 entry omits it (whose absence is a documented exclusion, not an oversight).</li>
+<li><code>test_client_user_agent_duplicate_headers_match_forwarded</code>: When a request carries more than one <code>User-Agent</code> header, the traced value names the line the forwarding path actually sends — asserted against the mock upstream&#x27;s own record of the header lines it received, never against a restatement of the rule. Same-cased duplicates reach the upstream as <strong>one</strong> line carrying the second value (the pre-fix code recorded the first, which the upstream never received at all); differently-cased ones arrive as <strong>two</strong>; and the interleaved-casing case pins the forwarding path&#x27;s own dict collapse, which <em>reorders</em> — the request&#x27;s last UA line is <code>c</code> while the wire&#x27;s last line is <code>b</code>, so a later "simplification" to <code>get_all(...)[-1]</code> fails here. Duplicate headers cannot be sent by <code>http.client</code>, so the cases go over a raw socket.</li>
 </ul>
 
 <h4><code>tests/test_sinks.py</code> (12 tests) — the sink class family</h4>
@@ -836,6 +840,6 @@ whenever a proxy is running.</p>
       that the full suite passes with a live proxy running.</li>
 </ol>
 
-<footer>Last updated: 2026-10-18</footer>
+<footer>Last updated: 2026-10-21</footer>
 </body>
 </html>

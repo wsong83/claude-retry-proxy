@@ -267,10 +267,15 @@ startup on failure).
   `os.chmod(0o600)` on **POSIX only** (guarded by `os.name == 'posix'`) — on
   Windows `chmod` is a near-no-op (read-only bit only; no group/other model).
   Windows users must restrict the trace/state directory ACL manually
-  (`icacls`). The `extra_request_headers` trace field is NOT gated by `--all`:
-  resolved values (e.g. the client's per-conversation session id) are logged on
-  every request for providers with rules — the Windows caveat above applies to
-  them too. [doc/trace-log.html#all](doc/trace-log.html#all)
+  (`icacls`). Two trace fields are NOT gated by `--all`: `extra_request_headers`
+  (resolved values, e.g. the client's per-conversation session id, logged on
+  every request for providers with rules) and `client_user_agent` (the inbound
+  User-Agent as the proxy forwards it — a repeated header resolves to the last
+  line sent upstream — capped at 512 bytes with a visible marker, and omitted
+  when that resolved value is empty; its value is arbitrary raw client text with
+  no allowlist, and `method`/`path`/`model` are client strings too). The Windows
+  caveat above applies to both.
+  [doc/trace-log.html#all](doc/trace-log.html#all)
 
 - **Admin API CSRF protection.** Admin POST endpoints validate the Origin
   header. Non-browser clients (curl, CLI `reload`) must include an Origin
