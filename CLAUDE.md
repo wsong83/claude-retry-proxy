@@ -337,7 +337,7 @@ what you need in context, and the link has the rest.
 | `stop` exits **1** and **keeps** `proxy-state.json` when the process survives its force-kill (that file is what makes the orphan findable); it never escalates to `SIGKILL`, because PID liveness is not proxy identity and a recycled PID would be signalled | [doc/operations.html#stop-contract](doc/operations.html#stop-contract) |
 | A SIGTERM handler runs *on* the `serve_forever` thread, so `server.shutdown()` must be dispatched to another thread; `READY` and the `proxy_ready` trace event post-date handler registration, so wait on either before signalling a starting proxy | [doc/architecture.html#sigterm](doc/architecture.html#sigterm) |
 | A swap has **no wall-clock cap**: live work is waited to completion and only silence is evicted (retryably, `config_swap_restart`) — the consequence being that an unbounded drain blocks all new admissions, with `stop` / `/admin/shutdown` as the escape hatches | [doc/architecture.html#config-swap](doc/architecture.html#config-swap) |
-| Readiness is two-phase: the `READY` marker (5 s), then a TCP probe (2 s) | [doc/operations.html#readiness](doc/operations.html#readiness) |
+| Readiness is two-phase: the `READY` marker (5 s), then a TCP probe (2 s); a port held by another listener is refused before `READY` (POSIX `SO_REUSEADDR`, Windows plain bind — Windows `SO_REUSEADDR` would permit a second `LISTEN`), and start-failure diagnostics read only the current attempt's stderr window | [doc/operations.html#readiness](doc/operations.html#readiness) |
 | A client-write `OSError` outside `_DISCONNECT_ERRORS` can be misread as a connection error and re-issue the POST | [doc/architecture.html#disconnects](doc/architecture.html#disconnects) |
 
 ## Refactoring

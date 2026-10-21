@@ -1816,6 +1816,355 @@ print("CHOKEPOINT rc={} file_gone={}".format(
                                               proc.stdout[-500:]))
 
 
+# --- Port ownership and per-attempt stderr diagnostics (plan ---------------
+# 2026-10-18-start-truthfulness) --------------------------------------------
+#
+# Two coupled attribution defects in what `start` reports. On Windows the
+# pre-bind guard set SO_REUSEADDR, which there permits binding a port that
+# already has a live listener: the child printed READY, the CLI's TCP probe
+# connected to the pre-existing socket, and start reported success while a
+# different process served the port. Separately, proxy-stderr.log is
+# append-only across runs, so a failed start's diagnostic reached back into
+# earlier sessions' output.
+
+def _occupied_reuse_port():
+    """Bind and listen on a free port with SO_REUSEADDR set before binding.
+
+    The proxy's own listener sets the flag, and on Windows a reuse-bound
+    listener is the one occupier class a reuse-bound probe accepts — so a
+    plain-bound occupier is already refused on the pre-fix tree and would pin
+    nothing. Returns (sock, port); the caller closes the socket.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(5)
+    return sock, sock.getsockname()[1]
+
+
+def _kill_pid(pid):
+    """Best-effort termination of a leaked child by PID. Never raises."""
+    if not pid:
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=10)
+        else:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(0.3)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+
+
+def _terminate_state_file_child():
+    """Terminate the PID the state file names, if any.
+
+    A false-success start — the pre-fix behavior on Windows — exits 0 and
+    leaves a live child plus a state file naming it. Killing that child keeps a
+    red run from leaking a proxy into the rest of the suite. The state file
+    itself is left in place: the callers assert on its absence, and the harness
+    loop clears it. Never raises.
+    """
+    try:
+        with open(PROXY_STATE_FILE) as f:
+            _kill_pid(json.load(f).get("pid"))
+    except (OSError, ValueError):
+        pass
+
+
+def _accepts_connection(port, timeout=3.0):
+    """True once something accepts a TCP connection on 127.0.0.1:port.
+
+    Polls rather than probing once: a just-killed child's socket teardown is
+    not instantaneous on Windows, so a single immediate connect would race it.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            s = socket.create_connection(("127.0.0.1", port), 1.0)
+            s.close()
+            return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
+def test_start_refuses_occupied_port():
+    """`start` against a port held by a reuse-bound listener must fail.
+
+    Regression guard for plan 2026-10-18-start-truthfulness Step 1. A
+    reuse-bound occupier is the only class the pre-fix guard accepted on
+    Windows, so it is the only occupier that pins the defect. After the fix the
+    probe and the listener both use a plain bind on Windows, the child refuses
+    the port before READY, and the existing "Proxy exited during startup" path
+    reports it — no CLI-side pre-flight check is involved.
+
+    On POSIX this passes before and after the change, where the semantics were
+    already correct. It is load-bearing on Windows, where it is red on HEAD.
+    """
+    print("\n--- Test: Start Refuses Occupied Port ---")
+
+    state_backup = _backup_proxy_state()
+    cleanup_lock_files()
+    listener = None
+    temp_dir = tempfile.mkdtemp(prefix="proxy_start_occupied_")
+    try:
+        _remove_test_state_file()
+
+        listener, port = _occupied_reuse_port()
+        tiers, vendors = _sink_tiers_and_vendors(find_free_port())
+        config_path = _create_test_config(temp_dir, tiers)
+        keys_path = _create_test_keys_plain(temp_dir, vendors)
+        trace_file = os.path.join(temp_dir, "trace.jsonl")
+
+        _proc, stdout, stderr, rc = _cli_start_with_plain_keys(
+            port, config_path, keys_path, trace_file)
+        combined = (stdout or "") + (stderr or "")
+
+        # A false success leaves a live child bound to the port. Kill it before
+        # the occupancy check below so that check sees only the occupier; the
+        # state file is deliberately left in place for the absence check.
+        _terminate_state_file_child()
+
+        if rc == 1:
+            pass_("start refused the occupied port (exit 1)")
+        else:
+            fail("start did not fail against an occupied port (exit {}): "
+                 "{!r}".format(rc, combined[-400:]))
+
+        if "Port {} is already in use".format(port) in combined:
+            pass_("the caller was told the port is already in use")
+        else:
+            fail("no port diagnostic in the start output: {!r}".format(
+                combined[-400:]))
+
+        if not os.path.exists(PROXY_STATE_FILE):
+            pass_("no state file survived the failed start")
+        else:
+            fail("a start that should have failed left a state file at "
+                 "{!r}".format(PROXY_STATE_FILE))
+
+        if _accepts_connection(port):
+            pass_("the occupying listener is untouched")
+        else:
+            fail("the occupying listener stopped accepting connections")
+    finally:
+        _terminate_state_file_child()
+        _remove_test_state_file()
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        cleanup_lock_files()
+        _restore_proxy_state(state_backup)
+
+
+def test_server_refuses_occupied_port_directly():
+    """The server's own port guard refuses a reuse-bound occupier.
+
+    Isolates the server-side half of Step 1 from the CLI. A directly spawned
+    server must abort against an occupied port, must exit non-zero, and must
+    name the port as already in use — the message the CLI's failure path then
+    surfaces. On Windows the pre-fix guard's SO_REUSEADDR permitted the bind,
+    so the server started happily and reported readiness.
+
+    Readiness is asserted from the `proxy_ready` trace event, NOT from the
+    spawn helper's `probe_ok`: that flag's readiness wait falls back to a TCP
+    connect, which succeeds against the OCCUPIER's socket, so it reads True
+    whether the child bound the port itself or refused it. Asserting on it
+    would fail on the fixed tree (measured) — the same socket-attribution
+    weakness this plan fixes at the CLI. `proxy_ready` is emitted after
+    handler registration and only once the server has bound its own socket, so
+    its absence is the discriminating signal.
+    """
+    print("\n--- Test: Server Refuses Occupied Port Directly ---")
+
+    listener = None
+    temp_dir = tempfile.mkdtemp(prefix="proxy_server_occupied_")
+    try:
+        listener, port = _occupied_reuse_port()
+        tiers, vendors = _sink_tiers_and_vendors(find_free_port())
+        config_path = _create_test_config(temp_dir, tiers)
+        keys_path = _create_test_keys_plain(temp_dir, vendors)
+        trace_file = os.path.join(temp_dir, "trace.jsonl")
+
+        proc, probe_ok = _start_proxy_server_directly(
+            port, config_path=config_path, keys_path=keys_path,
+            passphrase=None, trace_file=trace_file)
+        try:
+            _stdout, stderr = _drain_after_exit(proc)
+            info("spawn helper probe_ok={} (unreliable here — the occupier "
+                 "answers its TCP fallback)".format(probe_ok))
+
+            trace_text = ""
+            if os.path.exists(trace_file):
+                with open(trace_file, encoding="utf-8", errors="replace") as f:
+                    trace_text = f.read()
+
+            if "proxy_ready" not in trace_text:
+                pass_("the server never reached readiness (no proxy_ready event)")
+            else:
+                fail("the server reached readiness against an occupied port")
+
+            if proc.returncode not in (0, None):
+                pass_("the server exited non-zero ({})".format(proc.returncode))
+            else:
+                fail("expected a non-zero exit, got {}".format(proc.returncode))
+
+            if "Port {} is already in use".format(port) in (stderr or ""):
+                pass_("the server's stderr names the port as already in use")
+            else:
+                fail("expected a port diagnostic on stderr, got: {!r}".format(
+                    (stderr or "")[-400:]))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+    finally:
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_proxy_http_server_class_pins_platform_reuse():
+    """The listening class refuses a live listener when the probe is bypassed.
+
+    Pins the listener half of plan 2026-10-18-start-truthfulness Step 1. The
+    CLI-level occupancy tests cannot reach it: the pre-bind probe refuses an
+    occupied port before the listening class is ever constructed, so reverting
+    `allow_reuse_address` to the pre-fix unconditional `True` leaves the rest
+    of the suite green (measured). The flag is nevertheless load-bearing — with
+    `True` the class binds a live SO_REUSEADDR-bound occupier on Windows, which
+    is the false success this plan exists to remove.
+
+    Both assertions are needed for a non-vacuous pin on every platform:
+      * the attribute itself, universally — on POSIX the constructor refuses a
+        second LISTEN either way, so only the attribute discriminates there;
+      * the constructor's refusal, which is the behavioral half on Windows.
+    """
+    print("\n--- Test: Proxy HTTP Server Class Pins Platform Reuse ---")
+
+    import claude_retry_proxy.server as srv
+
+    # The universal pin: the platform-conditional flag itself. A revert to the
+    # pre-fix unconditional True fails here on every platform.
+    expected = sys.platform != "win32"
+    if srv._ProxyHTTPServer.allow_reuse_address == expected:
+        pass_("allow_reuse_address is platform-conditional ({})".format(expected))
+    else:
+        fail("_ProxyHTTPServer.allow_reuse_address is {!r}, expected {!r} "
+             "(sys.platform={!r})".format(
+                 srv._ProxyHTTPServer.allow_reuse_address, expected,
+                 sys.platform))
+
+    # The behavioral half. A reuse-bound occupier is the one class a reverted
+    # unconditional True would bind, so it is the occupier that pins the flag.
+    listener = None
+    server = None
+    try:
+        listener, port = _occupied_reuse_port()
+        try:
+            server = srv._ProxyHTTPServer(("127.0.0.1", port), srv.ProxyHandler)
+        except OSError as exc:
+            pass_("the class refuses a live reuse-bound listener (OSError: "
+                  "{})".format(exc))
+        else:
+            fail("_ProxyHTTPServer bound 127.0.0.1:{} although a live "
+                 "listener holds it — allow_reuse_address must be False on "
+                 "Windows".format(port))
+    finally:
+        if server is not None:
+            try:
+                server.server_close()
+            except OSError:
+                pass
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+
+
+def test_start_failure_reports_only_this_attempts_stderr():
+    """A failed start reports this attempt's stderr window, not an earlier run's.
+
+    proxy-stderr.log is append-only across runs, and two failing starts in
+    sequence each write a line naming their own blocked trace path. The second
+    attempt's reported diagnostic must carry its own line and must not reach
+    back into the first attempt's window — the pre-fix diagnostics read the
+    last 2048 bytes of the whole file (and, on the stdin-failure path, its
+    first 2048).
+
+    This appends a few lines to the live ~/.claude/proxy/proxy-stderr.log. The
+    path is not overridable and the log is append-only by design, so the test
+    never truncates or removes it.
+    """
+    print("\n--- Test: Start Failure Reports Only This Attempt's stderr ---")
+
+    state_backup = _backup_proxy_state()
+    cleanup_lock_files()
+    temp_dir = tempfile.mkdtemp(prefix="proxy_start_stderr_window_")
+    try:
+        _remove_test_state_file()
+        tiers, vendors = _sink_tiers_and_vendors(find_free_port())
+        config_path = _create_test_config(temp_dir, tiers)
+        keys_path = _create_test_keys_plain(temp_dir, vendors)
+
+        # Two distinct blocked trace paths, each a directory named as the
+        # trace file — the technique the unwritable-trace-path test already
+        # uses. Each child exits before READY with a line naming its own path.
+        blocked_a = os.path.join(temp_dir, "trace-attempt-a-is-a-directory")
+        blocked_b = os.path.join(temp_dir, "trace-attempt-b-is-a-directory")
+        os.mkdir(blocked_a)
+        os.mkdir(blocked_b)
+
+        _proc_a, out_a, err_a, rc_a = _cli_start_with_plain_keys(
+            find_free_port(), config_path, keys_path, blocked_a)
+        _proc_b, out_b, err_b, rc_b = _cli_start_with_plain_keys(
+            find_free_port(), config_path, keys_path, blocked_b)
+        combined_b = (out_b or "") + (err_b or "")
+
+        line_a = "[proxy] ERROR: trace file {}".format(blocked_a)
+        line_b = "[proxy] ERROR: trace file {}".format(blocked_b)
+
+        if rc_a not in (0, None):
+            pass_("the first start failed as designed (exit {})".format(rc_a))
+        else:
+            fail("the first start unexpectedly succeeded (exit {})".format(rc_a))
+        if rc_b not in (0, None):
+            pass_("the second start failed as designed (exit {})".format(rc_b))
+        else:
+            fail("the second start unexpectedly succeeded (exit {})".format(rc_b))
+
+        if line_b in combined_b:
+            pass_("the second attempt's diagnostic names its own trace path")
+        else:
+            fail("the second attempt's own child line is missing: {!r}".format(
+                combined_b[-400:]))
+
+        if line_a not in combined_b:
+            pass_("the second attempt's diagnostic excludes the first attempt's line")
+        else:
+            fail("the first attempt's child line leaked into the second "
+                 "attempt's report — the diagnostic window is not bounded by "
+                 "this attempt's start offset: {!r}".format(combined_b[-800:]))
+    finally:
+        _terminate_state_file_child()
+        _remove_test_state_file()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        cleanup_lock_files()
+        _restore_proxy_state(state_backup)
+
+
 ALL_TESTS = [
     ("cli-reload", test_cli_reload),
     ("start-rejects-uncatalogued-model-selector-at-cli", test_start_rejects_uncatalogued_model_selector_at_cli),
@@ -1836,6 +2185,10 @@ ALL_TESTS = [
     ("startup-abort-exits-one-with-failing-stderr", test_startup_abort_exits_one_with_failing_stderr),
     ("state-file-path-is-per-run-isolated", test_state_file_path_is_per_run_isolated),
     ("run-cli-loop-clears-direct-spawn-state-file", test_run_cli_loop_clears_direct_spawn_state_file),
+    ("start-refuses-occupied-port", test_start_refuses_occupied_port),
+    ("server-refuses-occupied-port-directly", test_server_refuses_occupied_port_directly),
+    ("start-failure-reports-only-this-attempts-stderr", test_start_failure_reports_only_this_attempts_stderr),
+    ("proxy-http-server-class-pins-platform-reuse", test_proxy_http_server_class_pins_platform_reuse),
 ]
 
 

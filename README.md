@@ -613,7 +613,7 @@ While the proxy runs, it creates (all under `~/.claude/`):
 | `proxy/config.json` | Tier→provider mapping (written by "Apply Config" in the admin page) |
 | `proxy/models.json` | Provider catalog, header rules, and the count-tokens flag (written by `update-claude-env` or by hand — never by the proxy) |
 | `proxy/proxy-state.json` | Runtime state (PID, port, heartbeat); removed on clean shutdown |
-| `proxy/proxy-stderr.log` | Server stderr (startup messages, retry notices) |
+| `proxy/proxy-stderr.log` | Server stderr (startup messages, retry notices); append-only across runs — `start`'s failure diagnostics read only the current attempt's window |
 | `logs/proxy-trace.jsonl` | The JSONL request trace (pruned of entries >5 days on each `start`) |
 
 ## Testing

@@ -18,11 +18,11 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>432 test functions across 19 files</strong>, but this number moves whenever
-tests are added. (It read <em>431 across 19</em> before this recount, <em>428 across 19</em> before that, <em>424 across 19</em> before that, <em>422 across 19</em> before that, <em>420 across 19</em> before that, <em>418 across 19</em> before that, <em>393 across 19</em> before that, <em>379 across 19</em> before that, <em>372 across 19</em> before that, <em>371 across 19</em> before that, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
+suite has <strong>436 test functions across 19 files</strong>, but this number moves whenever
+tests are added. (It read <em>432 across 19</em> before this recount, <em>431 across 19</em> before that, <em>428 across 19</em> before that, <em>425 across 19</em> before that, <em>424 across 19</em> before that, <em>422 across 19</em> before that, <em>420 across 19</em> before that, <em>418 across 19</em> before that, <em>393 across 19</em> before that, <em>379 across 19</em> before that, <em>372 across 19</em> before that, <em>371 across 19</em> before that, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
 before that, <em>334 across 19</em> before that, and <em>322 across 18</em> before an earlier
 one — the page has drifted behind the
-suite eighteen times, and in each case the stale total disagreed with the page's own catalog table
+suite twenty times, and in each case the stale total disagreed with the page's own catalog table
 as well.)
 Re-count before quoting it:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
@@ -137,7 +137,7 @@ relative size, not as exact current figures.</p>
 <tr><td><code>test_config_split.py</code></td><td class="num">10</td>
     <td>The two-document loader: merged load, the required sibling, leftover-key warnings, sibling
         resolution, and the unreadable-shape conversion</td></tr>
-<tr><td><code>test_cli.py</code></td><td class="num">19</td>
+<tr><td><code>test_cli.py</code></td><td class="num">23</td>
     <td>CLI lifecycle: start, stop, status, reload</td></tr>
 <tr><td><code>test_trace.py</code></td><td class="num">16</td>
     <td>Trace logging and trace analysis</td></tr>
@@ -622,7 +622,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> Start, stop, status, and reload as the operator runs them — including the passphrase pipe and readiness probe.</p>
 
-<h4><code>tests/test_cli.py</code> (19 tests) — CLI lifecycle</h4>
+<h4><code>tests/test_cli.py</code> (23 tests) — CLI lifecycle</h4>
 <ul>
 <li><code>test_cli_status_shows_loader_error</code>: A deleted or malformed <code>models.json</code> makes <code>status</code> print the loader diagnostic rather than silently omitting the tier section.</li>
 <li><code>test_stop_cleans_proxy_state</code>: Start proxy, force-kill server, run stop, verify proxy-state.json deleted.</li>
@@ -641,6 +641,10 @@ EOF</code></pre>
 <li><code>test_startup_aborts_on_unwritable_state_path</code>: An unwritable state path aborts startup before READY.</li>
 <li><code>test_relative_state_path_starts_and_writes</code>: A bare relative PROXY_STATE_FILE must not abort startup.</li>
 <li><code>test_startup_abort_exits_one_with_failing_stderr</code>: An unwritable trace path still aborts with exit 1 when stderr is broken.</li>
+<li><code>test_start_refuses_occupied_port</code>: A start against a <code>SO_REUSEADDR</code>-bound occupier — the bind kind the proxy itself uses — exits 1, names the port, leaves no state file, and leaves the occupier serving. Load-bearing on Windows (the pre-fix probe accepted the duplicate bind and the CLI reported success); green on POSIX before and after.</li>
+<li><code>test_server_refuses_occupied_port_directly</code>: A directly spawned server never reaches readiness against an occupied port, exits non-zero, and names the port on stderr. Readiness is asserted from the <code>proxy_ready</code> trace event, <em>not</em> the spawn helper's <code>probe_ok</code> — that helper's TCP fallback is answered by the occupier's socket and reads True whether the child bound the port or refused it.</li>
+<li><code>test_start_failure_reports_only_this_attempts_stderr</code>: Two failing starts in sequence, each with its own blocked trace path; the second attempt's reported diagnostic carries its own child line and excludes the first attempt's, pinning the per-attempt byte window over the append-only <code>proxy-stderr.log</code>.</li>
+<li><code>test_proxy_http_server_class_pins_platform_reuse</code>: Pins the listener half of the port-ownership change, which the CLI-level occupancy tests cannot reach — the pre-bind probe refuses an occupied port before the class is constructed. Asserts <code>_ProxyHTTPServer.allow_reuse_address == (sys.platform != &quot;win32&quot;)</code>, then that constructing the class directly against a <code>SO_REUSEADDR</code>-bound occupier raises <code>OSError</code>. Both assertions fail under a reverted <code>True</code> flag (measured), so the pin is not vacuous.</li>
 <li><code>test_state_file_path_is_per_run_isolated</code>: The harness state path is keyed to the runner PID (<code>claude-retry-proxy-test-state-&lt;pid&gt;.json</code>), is distinct from the legacy fixed name, and the harness constant agrees with <code>os.environ[&#x27;PROXY_STATE_FILE&#x27;]</code> within the run — the regression guard against a revert to a fixed machine-global path whose dead PID could be recycled and trip <code>start</code>&#x27;s liveness gate.</li>
 <li><code>test_run_cli_loop_clears_direct_spawn_state_file</code>: A child <code>run_cli</code> drives a direct <code>_start_proxy_server_directly</code> spawn that hard-kills its server leaving the state file behind; a sentinel test then asserts the loop removed it between tests. Guards the chokepoint that closes the leak for spawn paths bypassing the wrapper <code>cleanup()</code> closures.</li>
 </ul>
