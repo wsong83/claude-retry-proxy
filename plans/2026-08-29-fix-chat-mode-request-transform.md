@@ -21,7 +21,7 @@
 | [nan-tool-use-placeholder](./tmp/reports/2026-08-29-fix-chat-mode-request-transform-nan-tool-use-placeholder.json) | Resolved | 2026-08-29 | 2026-08-29 | tester |
 | [user-text-blocks-array](./tmp/reports/2026-08-29-fix-chat-mode-request-transform-user-text-blocks-array.json) | Resolved | 2026-08-29 | 2026-08-29 | tester |
 | [streaming-tool-call-deltas](./tmp/reports/defer-issue-streaming-tool-call-deltas.json) | Open | 2026-08-29 | — | — |
-| [image-content-blocks-chat-mode](./tmp/reports/defer-issue-image-content-blocks-chat-mode.json) | Open | 2026-08-29 | — | — |
+| [image-content-blocks-chat-mode](./tmp/reports/defer-issue-image-content-blocks-chat-mode.json) | Resolved | 2026-08-29 | 2026-10-22 | plan 2026-10-22-chat-mode-image-blocks — Anthropic image blocks mapped to OpenAI image_url parts in the chat request direction (top-level and tool_result-nested; base64 to data: URI, url verbatim, inconvertible dropped and counted) with four permanent tests and doc reconciliation; the reverse direction stays deliberately unmapped by operator decision 2026-10-22 |
 
 ## Guidance for Coder
 
@@ -489,7 +489,7 @@ Single-commit revert of the transform functions and `_anthropic_to_chat` rewire.
 | Issue | Reason |
 |-------|--------|
 | [streaming-tool-call-deltas](./tmp/reports/defer-issue-streaming-tool-call-deltas.json) | SSE input_json_delta ↔ function.arguments delta streaming |
-| [image-content-blocks-chat-mode](./tmp/reports/defer-issue-image-content-blocks-chat-mode.json) | image ↔ image_url mapping |
+| [image-content-blocks-chat-mode](./tmp/reports/defer-issue-image-content-blocks-chat-mode.json) | image ↔ image_url mapping — Resolved 2026-10-22 by plan 2026-10-22-chat-mode-image-blocks: request-direction image to image_url mapping landed with tests and docs |
 
 ### Deliberately Dropped
 

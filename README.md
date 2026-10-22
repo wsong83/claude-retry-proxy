@@ -416,8 +416,11 @@ in a colon with no tool call is closed with a retryable error the same way
 rather than passed off as `end_turn`, and the retry that continues the
 conversation is nudged upstream to emit the tool call it narrated (see
 `PROXY_CHAT_RETRY_NUDGE` below; setting it empty restores the old
-pass-through). Image
-content blocks are not mapped between Anthropic and OpenAI formats. In chat and response modes, error responses (non-2xx) pass through
+pass-through). Image content blocks are mapped in the Anthropic&rarr;Chat request
+direction: valid `image` blocks — top-level and inside `tool_result` content —
+become `image_url` parts (base64 as `data:` URIs, URLs verbatim); inconvertible
+blocks are dropped and counted. There is deliberately no reverse mapping:
+chat response bodies keep their text-only filter. In chat and response modes, error responses (non-2xx) pass through
 untransformed in the upstream format.
 
 ### Admin page (`http://localhost:8080/admin/`)

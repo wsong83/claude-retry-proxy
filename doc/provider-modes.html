@@ -129,12 +129,36 @@ records a <code>transform_failure</code> event — so a transform bug degrades t
 <tr><th>Anthropic input</th><th>Becomes</th></tr>
 <tr><td><code>thinking</code> blocks</td><td><strong>nothing, by default.</strong> The echo is the learned per-pair <code>reasoning_field</code> selection — no field, <code>reasoning_content</code>, or <code>reasoning</code>. See <a href="compatibility.html#reasoning-field">compatibility.html</a></td></tr>
 <tr><td><code>redacted_thinking</code> with non-empty <code>data</code></td><td>the same learned selection decides whether a placeholder field is emitted at all; the <code>redacted_thinking_passthrough</code> event is unchanged</td></tr>
-<tr><td><code>image</code> and unknown blocks</td><td><strong>stripped</strong></td></tr>
+<tr><td><code>image</code></td><td>an OpenAI <code>image_url</code> part when the source is a valid base64 (<code>data:&lt;media_type&gt;;base64,&lt;data&gt;</code> URI) or url (verbatim); inconvertible — including the Files-API <code>file</code> source — is stripped and counted. The message becomes a parts array (merged text part first, images in block order) exactly when a valid image survives; text-only messages keep the string shape. See <a href="#image-content-blocks">Image content blocks</a></td></tr>
+<tr><td>unknown blocks</td><td><strong>stripped</strong></td></tr>
 <tr><td><code>tool_use</code></td><td><code>tool_calls</code>, with the input dict-validated</td></tr>
-<tr><td><code>tool_result</code></td><td>a <code>role: "tool"</code> message, paired by <code>tool_use_id</code></td></tr>
+<tr><td><code>tool_result</code></td><td>a <code>role: "tool"</code> message, paired by <code>tool_use_id</code>; image blocks inside its <code>content</code> become <code>image_url</code> parts on the <em>following</em> user message (OpenAI <code>role:tool</code> messages cannot carry images), independently of pairing</td></tr>
 <tr><td><code>cache_control</code> on kept blocks</td><td>stripped; one coalesced <code>cache_control_stripped</code> event per request</td></tr>
 <tr><td>tool definitions</td><td>function tools — <code>input_schema</code> → <code>parameters</code></td></tr>
 </table>
+
+<p id="image-content-blocks"><strong>Image content blocks.</strong> Anthropic image
+blocks map to OpenAI <code>image_url</code> parts in the request direction: a
+<code>source.type: "base64"</code> with non-empty string <code>media_type</code>
+and <code>data</code> becomes
+<code>data:&lt;media_type&gt;;base64,&lt;data&gt;</code> (the data is concatenated
+verbatim — never re-encoded, never validated); <code>source.type: "url"</code>
+passes the URL verbatim; anything else — including the Files-API
+<code>source.type: "file"</code>, which has no chat-completions equivalent —
+is stripped and counted in the <code>content_block_dropped</code> event's
+<code>dropped_counts.image</code> (which therefore now means
+<em>inconvertible</em> images only — a valid image is converted, not counted).
+This applies to top-level blocks in a user message and to images nested inside
+<code>tool_result</code> <code>content</code>; nested images ride the
+<em>following</em> user message because OpenAI <code>role:tool</code> messages
+cannot carry images, and the extraction is independent of
+<code>tool_use_id</code> pairing. When at least one valid image survives, the
+message content is a parts array: the merged text part first, then the images
+in block order; text-only messages keep the single-string shape
+byte-for-byte (a message whose text blocks carry no non-empty string
+<code>text</code> emits no message at all). <code>cache_control</code> on a converted (or nested) image is
+stripped and reported via the usual <code>cache_stripped_out</code> channel
+like any kept block.</p>
 
 <p id="pattern-normalization"><strong>Tool-schema pattern normalization.</strong> Every forwarded tool
 schema has its regexes normalized before the request leaves the proxy: each JSON-Schema
@@ -247,7 +271,12 @@ covers streams that delivered a <code>finish_reason</code>. A stream that delive
 mapped at all but <em>dispositioned</em>, so it has no row here: it is closed with a synthesised
 terminal sequence when <code>[DONE]</code> arrived, and with an <code>error</code> frame carrying
 no stop reason at all when the connection was cut. See
-<a href="#chat-sse">Chat mode SSE synthesis</a>.</p>
+<a href="#chat-sse">Chat mode SSE synthesis</a>. The conversion is
+request-direction-only by operator decision 2026-10-22: no chat provider emits
+<code>image_url</code> parts in a buffered response and the Messages response
+schema has no image block type, so provider image parts in a buffered response
+are filtered (<code>_chat_to_anthropic</code> keeps its text-only list
+filter).</p>
 
 <table>
 <tr><th>OpenAI <code>finish_reason</code></th><th>Anthropic <code>stop_reason</code></th></tr>

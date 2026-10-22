@@ -95,7 +95,11 @@ def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
     `reasoning_selection`: "reasoning_content" or "reasoning" emits that field
     only; anything else (the default "none", None, or an unrecognized value)
     emits no reasoning field at all — never both. redacted_thinking blocks with
-    non-empty data are converted to a placeholder; image / unknown blocks are
+    non-empty data are converted to a placeholder; a valid `image` block becomes
+    an OpenAI `image_url` part -- top-level blocks and those nested inside
+    `tool_result` content alike, the latter riding the following user message
+    because OpenAI `role:tool` messages cannot carry images; an inconvertible
+    image is counted as dropped rather than becoming a part; unknown blocks are
     stripped; tool_use and tool_result are converted to OpenAI tool_calls /
     role:tool messages; cache_control is stripped from kept blocks.
     cache_control_stripped is reported to the caller via the optional
@@ -243,6 +247,7 @@ def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
         elif role == "user":
             tool_messages = []
             text_parts = []
+            image_parts = []
             for block in content:
                 if not isinstance(block, dict):
                     dropped["unknown"] += 1
@@ -254,19 +259,53 @@ def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
                     t = _transform_tool_result_to_chat_tool(block, tool_use_ids)
                     if t is None:
                         dropped["tool_result"] += 1
-                        continue
-                    tool_messages.append(t)
+                    else:
+                        tool_messages.append(t)
+                    # OpenAI role:tool messages cannot carry images, so
+                    # image blocks nested in the tool_result's content ride
+                    # the following user message as image_url parts instead
+                    # -- the shape OpenAI's function-calling-image pattern
+                    # prescribes. Extraction is independent of the
+                    # tool_use_id pairing above: a result whose matching
+                    # call was never emitted still yields its images.
+                    nested = block.get("content")
+                    if isinstance(nested, list):
+                        for c in nested:
+                            if not isinstance(c, dict) or c.get("type") != "image":
+                                continue
+                            if "cache_control" in c:
+                                cache_stripped = True
+                            part = _anthropic_image_to_chat_part(c)
+                            if part is None:
+                                dropped["image"] += 1
+                            else:
+                                image_parts.append(part)
                     continue
                 if btype == "text":
                     text_parts.append(block.get("text"))
                     continue
                 if btype == "image":
-                    dropped["image"] += 1
+                    part = _anthropic_image_to_chat_part(block)
+                    if part is None:
+                        dropped["image"] += 1
+                    else:
+                        image_parts.append(part)
                     continue
                 dropped["unknown"] += 1
             out.extend(tool_messages)
-            if text_parts:
-                text = "\n".join(t for t in text_parts if isinstance(t, str))
+            text = "\n".join(t for t in text_parts if isinstance(t, str))
+            if image_parts:
+                # OpenAI content parts: the merged text run first, then the
+                # image parts in block order. The array shape is used only
+                # when at least one valid image survived the conversion; a
+                # text-only message keeps the string shape, and a message
+                # whose only content was inconvertible emits nothing.
+                parts = []
+                if text:
+                    parts.append({"type": "text", "text": text})
+                parts.extend(image_parts)
+                out.append({"role": role, "content": parts})
+            elif text:
                 out.append({"role": role, "content": text})
         else:
             out.append({"role": role, "content": content})
@@ -284,6 +323,38 @@ def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
             "tier": tier,
         })
     return out
+
+
+def _anthropic_image_to_chat_part(block):
+    """Convert one Anthropic image content block into an OpenAI image_url part.
+
+    Returns the part dict, or None when the block is inconvertible: `source`
+    must be a dict whose `type` is "base64" -- with `media_type` and `data`
+    both non-empty strings, emitted as `data:<media_type>;base64,<data>` -- or
+    "url", with a non-empty string passed through verbatim. Every other source
+    shape -- a missing or non-dict source, an unknown type, the Files-API
+    `file` source -- has no chat-completions equivalent and converts to None.
+    Callers count None as a dropped block; the data payload is copied verbatim
+    (no re-encoding: both APIs use standard base64), and `detail` is omitted
+    so the upstream applies its own default.
+    """
+    source = block.get("source")
+    if not isinstance(source, dict):
+        return None
+    stype = source.get("type")
+    if stype == "base64":
+        media_type = source.get("media_type")
+        data = source.get("data")
+        if isinstance(media_type, str) and media_type and isinstance(data, str) and data:
+            return {"type": "image_url",
+                    "image_url": {"url": "data:{};base64,{}".format(media_type, data)}}
+        return None
+    if stype == "url":
+        url = source.get("url")
+        if isinstance(url, str) and url:
+            return {"type": "image_url", "image_url": {"url": url}}
+        return None
+    return None
 
 
 def _transform_tool_result_to_chat_tool(block, known_ids):

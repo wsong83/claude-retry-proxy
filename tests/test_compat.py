@@ -2371,6 +2371,10 @@ def test_compat_single_retry_global():
     the feature's retry lock. The shared per-key credit is still drained by
     the episode, so a switch lands; the post-switch re-arm makes the exact
     end state interleaving-dependent, so the switch itself is the assertion.
+    How many of the five clients are served directly through the
+    already-advanced selection is interleaving-dependent by design, so the
+    rescue count is pinned to the complaints the mock actually received, never
+    to the served count.
     """
     print("\n--- Test: Compat Single Retry Global ---")
     state_dir, state_path = _make_state_dir()
@@ -2471,13 +2475,16 @@ def test_compat_single_retry_global():
             return
         pass_("all 5 concurrent complainers were served (no lock denial)")
 
+        complaints = [r for r in mock_servers["q"]["requests"]
+                      if _sent_reasoning_field(r) != "reasoning_content"]
         rescues = _rescue_trace_events(trace_file)
-        if len(rescues) < 5:
-            fail("expected at least one reasoning_rescue event per served "
-                 "complainer, got %d" % len(rescues))
+        if not complaints or len(rescues) != len(complaints):
+            fail("expected exactly one reasoning_rescue event per complaint "
+                 "the mock received, got %d for %d complaints"
+                 % (len(rescues), len(complaints)))
             return
-        pass_("per-request reasoning_rescue events appeared (%d)"
-              % len(rescues))
+        pass_("one reasoning_rescue event per complaint the mock received "
+              "(%d/%d)" % (len(rescues), len(complaints)))
 
         switch_events = [
             e for e in _compat_trace_events(trace_file)

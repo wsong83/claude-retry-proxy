@@ -18,11 +18,11 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>433 test functions across 19 files</strong>, but this number moves whenever
-tests are added. (It read <em>436 across 19</em> before this recount, <em>432 across 19</em> before that, <em>431 across 19</em> before that, <em>428 across 19</em> before that, <em>425 across 19</em> before that, <em>424 across 19</em> before that, <em>422 across 19</em> before that, <em>420 across 19</em> before that, <em>418 across 19</em> before that, <em>393 across 19</em> before that, <em>379 across 19</em> before that, <em>372 across 19</em> before that, <em>371 across 19</em> before that, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
+suite has <strong>437 test functions across 19 files</strong>, but this number moves whenever
+tests are added. (It read <em>433 across 19</em> before this recount, <em>436 across 19</em> before that, <em>432 across 19</em> before that, <em>431 across 19</em> before that, <em>428 across 19</em> before that, <em>425 across 19</em> before that, <em>424 across 19</em> before that, <em>422 across 19</em> before that, <em>420 across 19</em> before that, <em>418 across 19</em> before that, <em>393 across 19</em> before that, <em>379 across 19</em> before that, <em>372 across 19</em> before that, <em>371 across 19</em> before that, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
 before that, <em>334 across 19</em> before that, and <em>322 across 18</em> before an earlier
 one — the page has drifted behind the
-suite twenty-one times, and in each case the stale total disagreed with the page's own catalog table
+suite twenty-two times, and in each case the stale total disagreed with the page's own catalog table
 as well.)
 Re-count before quoting it:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
@@ -120,7 +120,7 @@ relative size, not as exact current figures.</p>
     <td>The compatibility learner — both features (<code>context_management</code>,
         <code>reasoning_field</code>): persistence, detection, state machine, concurrency.
         See <a href="compatibility.html">compatibility.html</a>.</td></tr>
-<tr><td><code>test_chat_transform.py</code></td><td class="num">51</td>
+<tr><td><code>test_chat_transform.py</code></td><td class="num">55</td>
     <td>Anthropic → Chat Completions request and response transforms</td></tr>
 <tr><td><code>test_response_transform.py</code></td><td class="num">38</td>
     <td>Anthropic → Responses request and response transforms</td></tr>
@@ -324,7 +324,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> The Anthropic↔Chat request and response conversions, including tool calls, thinking blocks, and cache control.</p>
 
-<h4><code>tests/test_chat_transform.py</code> (51 tests) — Anthropic → Chat request and response transforms</h4>
+<h4><code>tests/test_chat_transform.py</code> (55 tests) — Anthropic → Chat request and response transforms</h4>
 <ul>
 <li><code>test_anthropic_to_chat_messages_transform</code>: Full message array (thinking/text/tool_use/tool_result) -&gt; valid OpenAI Chat messages.</li>
 <li><code>test_anthropic_to_chat_messages_thinking_stripped</code>: At the default selection no reasoning field is emitted for a thinking block; the echo is the learned per-pair selection's call, not an always-on conversion.</li>
@@ -377,6 +377,10 @@ EOF</code></pre>
 <li><code>test_chat_to_anthropic_malformed_tool_args_text_block</code>: Malformed tool args degrade to a text block, not a tool_use with input {}.</li>
 <li><code>test_chat_to_anthropic_malformed_tool_args_mixed</code>: Mixed valid + malformed tool calls: valid tool_use kept, malformed degrades.</li>
 <li><code>test_chat_anthropic_to_chat_zero_arg_tool</code>: A zero-argument call (<code>arguments: &quot;{}&quot;</code>) is valid, not malformed — it emits a real <code>tool_use</code> block with <code>input: {}</code>, claims <code>tool_use</code>, and fires no <code>tool_args_parse_failure</code>; a genuinely unparseable arguments string still degrades to the placeholder and <code>null</code>.</li>
+<li><code>test_anthropic_to_chat_image_blocks_converted</code>: User-message image blocks become <code>image_url</code> parts — base64 as <code>data:</code> URIs, url sources verbatim, images after the merged text part in block order; the string shape is kept for text-only messages; inconvertible images are dropped and counted.</li>
+<li><code>test_anthropic_to_chat_tool_result_images_converted</code>: Images nested in <code>tool_result</code> content ride the following user message as parts (pairing-independent), while the tool text stays on the <code>role:tool</code> message; malformed nested images are counted.</li>
+<li><code>test_anthropic_to_chat_image_blocks_no_mutation</code>: <code>_transform_anthropic_messages_to_chat</code> conversion does not mutate the input messages or the image blocks' nested structures.</li>
+<li><code>test_chat_to_anthropic_image_parts_filtered</code>: Response direction stays text-only by design — a provider <code>image_url</code> part in a buffered chat response is filtered, never converted to an Anthropic image block.</li>
 </ul>
 
 <h3 id="cat-5">Category 5 — Responses API Transforms</h3>
@@ -554,7 +558,7 @@ EOF</code></pre>
 <li><code>test_compat_delist_after_two_successes</code>: A seeded probation entry earns two successful probes and is delisted; afterwards requests are no longer stripped.</li>
 <li><code>test_compat_inconclusive_reschedules</code>: An inconclusive probe (non-matching 500) resets the strip counter and reschedules at the current threshold without doubling.</li>
 <li><code>test_compat_probe_counter_semantics</code>: Repeated rejection from probation resets probation to zero but keeps (and further doubles) the threshold — it never resets to base.</li>
-<li><code>test_compat_single_retry_global</code>: Concurrent first-time requests. The <code>context_management</code> half: exactly one compatibility retry occurs globally; losers receive the original 400. The <code>reasoning_field</code> half (rewritten 2026-10-22 by this plan): five concurrent chat complainers <strong>all</strong> receive 2xx — each runs its own lock-free rescue — and the shared-key credit drained during the episode, so a switch happened (asserted through the switch event / the moved selection, never an exact end state).</li>
+<li><code>test_compat_single_retry_global</code>: Concurrent first-time requests. The <code>context_management</code> half: exactly one compatibility retry occurs globally; losers receive the original 400. The <code>reasoning_field</code> half (rewritten 2026-10-22 by this plan): five concurrent chat clients <strong>all</strong> receive 2xx (a client whose selection read lands after the credit switch is served directly, without complaining); the number of lock-free rescues equals the number of complaints the mock received, and the shared-key credit drained during the episode, so a switch happened (asserted through the switch event / the moved selection, never an exact end state).</li>
 <li><code>test_compat_retry_lock_released_on_exception</code>: An upstream failure during the compatibility retry releases the retry lock: later requests can still retry and learn.</li>
 <li><code>test_compat_config_swap_during_retry</code>: The compatibility retry uses the entry-time config snapshot: the in-flight request completes against its original provider, and the admin switch (drained afterwards)…</li>
 <li><code>test_compat_retry_stream_interaction</code>: Interaction with streaming and the existing retry loop: learning works from streamed 2xx (status-receipt evidence, no rollback on mid-stream failure), and the 429/503…</li>
