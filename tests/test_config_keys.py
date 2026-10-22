@@ -37,15 +37,17 @@ def _write_split_pair(dir_path, merged_config, config_name="config.json"):
 
     Only the tier mapping goes into config.json; the catalog and its
     riders (models, extra_request_headers,
-    disable_retry_claude_count_token) go into the sibling models.json the
-    loader resolves beside the config path. Returns the config path.
+    disable_retry_claude_count_token, reasoning_field_switch) go into the
+    sibling models.json the loader resolves beside the config path. Returns
+    the config path.
     """
     body = {"tiers": merged_config["tiers"]}
     cpath = os.path.join(dir_path, config_name)
     with open(cpath, "w") as f:
         json.dump(body, f)
     models_doc = {"models": merged_config.get("models", {})}
-    for rider in ("extra_request_headers", "disable_retry_claude_count_token"):
+    for rider in ("extra_request_headers", "disable_retry_claude_count_token",
+                  "reasoning_field_switch"):
         if rider in merged_config:
             models_doc[rider] = merged_config[rider]
     mpath = os.path.join(dir_path, "models.json")

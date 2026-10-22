@@ -3328,15 +3328,15 @@ def test_chat_retry_nudge_disabled_by_empty_env():
 def test_chat_sse_nudge_reentry_walk_stall_passthrough():
     """Step 10 pin (post-implementation mega-audit finding 1/21): a nudge
     recovery whose FIRST upstream attempt is rejected with a matched
-    reasoning-field complaint is re-entered by the candidate walk, and the
-    SERVED attempt (the walk's own forward) still carries the entry-time
+    reasoning-field complaint is re-entered by the reasoning_field rescue, and
+    the SERVED attempt (the rescue's own forward) still carries the entry-time
     marker decision. Asserts the served stream carries no error frame (the
     loop guard survives re-entry — without the entry-time threading the
     re-entry re-resolves an already-consumed marker to None and closes the
     turn with a second api_error) and the served upstream body contains the
     nudge text exactly once as its trailing user message (injection re-runs
-    on the inherited decision — without it the walk serves the client body
-    un-nudged). The 3-request upstream count pins that a walk step actually
+    on the inherited decision — without it the rescue serves the client body
+    un-nudged). The 3-request upstream count pins that a rescue pass actually
     happened, so neither assertion can pass vacuously.
     """
     print("\n--- Test: Chat SSE Nudge Reentry Walk Stall Passthrough ---")
@@ -3355,9 +3355,9 @@ def test_chat_sse_nudge_reentry_walk_stall_passthrough():
         served["n"] += 1
         if i == 1:
             # Recovery's first attempt: a matched reasoning-field complaint
-            # that drives _reasoning_outcome's candidate walk.
+            # that drives the reasoning_field rescue's candidate cycle.
             return 400, "application/json", complaint
-        # Request 1 and the walk candidate: the colon-ending stall.
+        # Request 1 and the rescue's first candidate: the colon-ending stall.
         return 200, "text/event-stream", stall
 
     temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
@@ -3446,10 +3446,10 @@ def test_chat_sse_nudge_reentry_walk_stall_passthrough():
         # The served stall also logs the detector (second event overall).
         unfinished2 = _wait_for_event_count(trace_file, "chat_sse_unfinished_turn", 2)
         if len(unfinished2) != 2:
-            fail("the walk-served stall must still log chat_sse_unfinished_turn; "
+            fail("the rescue-served stall must still log chat_sse_unfinished_turn; "
                  "expected 2, got {}".format(len(unfinished2)))
             return
-        pass_("re-entry walk serves the recovery: loop guard + nudge survive re-entry")
+        pass_("re-entry rescue serves the recovery: loop guard + nudge survive re-entry")
     finally:
         cleanup()
 

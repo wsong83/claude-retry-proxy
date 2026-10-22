@@ -363,12 +363,14 @@ def _models_for_vendors(tiers, vendors):
 
 
 
-def _create_test_config(temp_dir, tiers, models=None, extra_request_headers=None):
+def _create_test_config(temp_dir, tiers, models=None, extra_request_headers=None,
+                        reasoning_field_switch=None):
     """Create a temp config.json / models.json pair.
 
     Writes a tiers-only config.json and a sibling models.json carrying the
-    catalog (plus extra_request_headers when given), so sibling-path
-    resolution via the config path keeps every call site unchanged.
+    catalog (plus extra_request_headers / reasoning_field_switch when given),
+    so sibling-path resolution via the config path keeps every call site
+    unchanged.
 
     Args:
         temp_dir: Directory to create the pair in
@@ -379,6 +381,12 @@ def _create_test_config(temp_dir, tiers, models=None, extra_request_headers=None
         extra_request_headers: Optional provider-keyed extra_request_headers
             map to write into the config. When None the key is omitted
             entirely (matches existing behavior — the key is optional).
+        reasoning_field_switch: Optional {"saturation_max",
+            "saturation_on_switch"} policy object written into the sibling
+            models.json. None omits the key (the loader's 10/3 defaults then
+            apply). Threading the knob here is the established channel: the
+            document is read once at proxy startup, so editing models.json
+            after the spawn would not reach the running process.
 
     Returns:
         Path to created config.json
@@ -394,6 +402,8 @@ def _create_test_config(temp_dir, tiers, models=None, extra_request_headers=None
     models_doc = {"models": models}
     if extra_request_headers is not None:
         models_doc["extra_request_headers"] = extra_request_headers
+    if reasoning_field_switch is not None:
+        models_doc["reasoning_field_switch"] = reasoning_field_switch
     models_path = os.path.join(temp_dir, "models.json")
     with open(models_path, "w") as f:
         json.dump(models_doc, f)
@@ -1067,15 +1077,19 @@ def _start_admin_proxy(tiers, vendors, models=None, extra_env=None,
 # ===========================================================================
 
 def _create_test_config_with_flag(temp_dir, tiers, flag_value=None,
-                                  extra_request_headers=None):
+                                  extra_request_headers=None,
+                                  reasoning_field_switch=None):
     """Create a config.json / models.json pair with an optional
-    disable_retry_claude_count_token and/or extra_request_headers map.
+    disable_retry_claude_count_token, extra_request_headers map, and/or
+    reasoning_field_switch policy.
 
     flag_value: True/False to set, or None to omit the key entirely.
     extra_request_headers: provider-keyed map to set, or None to omit.
-    Both the flag and the header map land in the sibling models.json —
-    only the catalog and its riders live there now; config.json carries
-    tiers and nothing else.
+    reasoning_field_switch: {"saturation_max", "saturation_on_switch"} to set,
+    or None to omit (the loader defaults then apply).
+    The flag, the header map, and the switch policy all land in the sibling
+    models.json — only the catalog and its riders live there now; config.json
+    carries tiers and nothing else.
     """
     config = {"tiers": tiers}
     path = os.path.join(temp_dir, "config.json")
@@ -1086,6 +1100,8 @@ def _create_test_config_with_flag(temp_dir, tiers, flag_value=None,
         models_doc["disable_retry_claude_count_token"] = flag_value
     if extra_request_headers is not None:
         models_doc["extra_request_headers"] = extra_request_headers
+    if reasoning_field_switch is not None:
+        models_doc["reasoning_field_switch"] = reasoning_field_switch
     models_path = os.path.join(temp_dir, "models.json")
     with open(models_path, "w", encoding="utf-8") as f:
         json.dump(models_doc, f)
@@ -1187,7 +1203,8 @@ def _mode_default_responder(info):
 
 
 def _start_mode_proxy(tiers, vendors, responders=None, extra_env=None,
-                      extra_headers=None, streamers=None):
+                      extra_headers=None, streamers=None,
+                      reasoning_field_switch=None):
     """Start proxy + mode-aware mock upstreams (plain keys).
 
     vendors maps vendor -> {url, key, mode?}. responders maps vendor ->
@@ -1196,14 +1213,19 @@ def _start_mode_proxy(tiers, vendors, responders=None, extra_env=None,
     extra_headers: optional provider-keyed extra_request_headers map written
     into the config. streamers: optional vendor -> handler_fn(handler, info)
     map for a fixture-driven streaming upstream; it wins over `responders` for
-    the same vendor. Returns
+    the same vendor. reasoning_field_switch: optional
+    {"saturation_max", "saturation_on_switch"} policy object written into the
+    fixture's models.json before the proxy starts (the document is read at
+    startup, so a post-spawn edit would not reach the running process).
+    Returns
     (temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup).
     """
     temp_dir = tempfile.mkdtemp(prefix="proxy_mode_")
     proxy_port = find_free_port()
     config_path = _create_test_config(
         temp_dir, tiers, models=_models_for_vendors(tiers, vendors),
-        extra_request_headers=extra_headers)
+        extra_request_headers=extra_headers,
+        reasoning_field_switch=reasoning_field_switch)
     keys_path = _create_test_keys_plain(temp_dir, vendors)
 
     responders = responders or {}

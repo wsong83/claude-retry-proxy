@@ -111,7 +111,7 @@ looking for one exact format will fail on the other.</p>
 
 <h2 id="events">Event inventory</h2>
 
-<p>These are the events emitted outside the compatibility learner. The learner's twelve events
+<p>These are the events emitted outside the compatibility learner. The learner's eleven events
 are listed in <a href="compatibility.html#events">compatibility.html</a>; together the two lists
 are the complete set the proxy can write.</p>
 
@@ -122,7 +122,18 @@ are the complete set the proxy can write.</p>
 <tr><td><code>retry</code></td><td>a retry was scheduled. Carries <code>attempt</code>,
     <code>delay_s</code>, and a <code>reason</code> of <code>"429"</code>, <code>"503"</code>, or
     <code>"connection_error"</code>.</td></tr>
-<tr><td><code>mode_dispatch</code></td><td>a non-anthropic mode handled a request — emitted once per pass through the forward path, so a learned walk can produce up to three for one client request (see below)</td></tr>
+<tr><td><code>mode_dispatch</code></td><td>a non-anthropic mode handled a request — emitted once per pass through the forward path, so a request that runs a rescue can produce more than one for a single client request: attempt 1 plus up to two rescue passes (see below)</td></tr>
+<tr><td><code>reasoning_rescue</code></td>
+    <td>one per <code>reasoning_field</code> rescue pass — emitted when a matched
+    reasoning-field complaint triggers the lock-free rescue. Carries <code>request_id</code>,
+    <code>provider</code>, <code>mode</code>, <code>actual_model</code>, <code>tier</code>,
+    <code>feature</code>, <code>attempt</code> (1-based), <code>candidate</code>,
+    <code>outcome</code> (<code>"served"</code>, <code>"complaint"</code> or
+    <code>"other"</code>) and <code>http_status</code>. Metadata only: no content, no request or
+    response body, and no state change. <code>outcome</code> is a coarse bucket read from the
+    forwarded status, so a <code>2xx</code> that is later synthesized into a client-visible
+    failure (an unfinished turn, a size cap, a mid-stream death) still logs
+    <code>"served"</code> (see below)</td></tr>
 <tr><td><code>client_disconnect</code></td><td>the client went away before the response was fully sent</td></tr>
 <tr><td><code>response_size_cap_exceeded</code></td><td>a response was truncated at
     <code>PROXY_MAX_RESPONSE_SIZE</code></td></tr>
@@ -246,19 +257,23 @@ Behaviour, the store's bounds, and the kill switch:
 <a href="provider-modes.html#chat-sse-unfinished-turn">provider-modes.html</a>.</p>
 
 <div class="note">
-<strong>A learned walk re-emits the chat path's per-request events.</strong> When
-<code>reasoning_field</code> walks candidates, each step is a nested pass through the forward
-path, so <code>mode_dispatch</code> and the chat transform's events above
-(<code>cache_control_stripped</code>, <code>redacted_thinking_passthrough</code>,
-<code>tool_args_parse_failure</code>, <code>content_block_dropped</code>) fire once per step —
-up to three images for a single client request. The multiplicity is bounded by the feature's
-retry budget and occurs only while a pair is actively learning (a thinking block present, a
-complaint matched, not yet latched), so it is self-limiting.
+<strong>A rescue re-emits the chat path's per-request events.</strong> When
+<code>reasoning_field</code> answers a complaint with the rescue, each pass is a nested pass
+through the forward path, so <code>mode_dispatch</code>, one <code>reasoning_rescue</code> event
+and the chat transform's events above (<code>cache_control_stripped</code>,
+<code>redacted_thinking_passthrough</code>, <code>tool_args_parse_failure</code>,
+<code>content_block_dropped</code>) fire once per pass — up to three images for a single client
+request. The multiplicity is bounded by the feature's rescue budget (two passes), and it occurs
+whenever the upstream complains, so a complaint regime multiplies these event counts — not
+self-limiting the way the old walk was, which is why the per-pass
+<code>reasoning_rescue</code> event exists: it is what makes a multiplied trace legible.
 <p>Note what this does <em>not</em> affect. <code>request</code> entries are emitted once per
-client request, in the request handler, and a walk step never reaches that code — so
+client request, in the request handler, and a rescue pass never reaches that code — so
 per-request accounting such as <code>scripts/analyze_proxy_trace.py</code>, which counts
-<code>request</code> entries, is unaffected. It is the <code>mode_dispatch</code> and transform
-event counts that multiply, not the request counts.</p>
+<code>request</code> entries, is unaffected; the entry's <code>retries</code> field likewise
+keeps its 429/503-only meaning, because a rescue is not a retry. It is the
+<code>mode_dispatch</code>, <code>reasoning_rescue</code> and transform event counts that
+multiply, not the request counts.</p>
 </div>
 
 <h2 id="all">The <code>--all</code> flag</h2>

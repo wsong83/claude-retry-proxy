@@ -10,7 +10,7 @@
 
 <h1>Test Catalog<span class="sub">Suite layout, harness isolation, and testing patterns</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-21</p>
+<p><strong>Last updated:</strong> 2026-10-22</p>
 
 <p>The suite is a set of per-area modules merged by a single aggregator. It runs against
 <em>real</em> proxy processes and <em>real</em> mock upstream servers over loopback sockets —
@@ -18,11 +18,11 @@ there is very little mocking of the modules under test.</p>
 
 <div class="warn">
 <strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>436 test functions across 19 files</strong>, but this number moves whenever
-tests are added. (It read <em>432 across 19</em> before this recount, <em>431 across 19</em> before that, <em>428 across 19</em> before that, <em>425 across 19</em> before that, <em>424 across 19</em> before that, <em>422 across 19</em> before that, <em>420 across 19</em> before that, <em>418 across 19</em> before that, <em>393 across 19</em> before that, <em>379 across 19</em> before that, <em>372 across 19</em> before that, <em>371 across 19</em> before that, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
+suite has <strong>433 test functions across 19 files</strong>, but this number moves whenever
+tests are added. (It read <em>436 across 19</em> before this recount, <em>432 across 19</em> before that, <em>431 across 19</em> before that, <em>428 across 19</em> before that, <em>425 across 19</em> before that, <em>424 across 19</em> before that, <em>422 across 19</em> before that, <em>420 across 19</em> before that, <em>418 across 19</em> before that, <em>393 across 19</em> before that, <em>379 across 19</em> before that, <em>372 across 19</em> before that, <em>371 across 19</em> before that, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
 before that, <em>334 across 19</em> before that, and <em>322 across 18</em> before an earlier
 one — the page has drifted behind the
-suite twenty times, and in each case the stale total disagreed with the page's own catalog table
+suite twenty-one times, and in each case the stale total disagreed with the page's own catalog table
 as well.)
 Re-count before quoting it:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
@@ -116,7 +116,7 @@ relative size, not as exact current figures.</p>
 
 <table>
 <tr><th>Module</th><th class="num">Tests</th><th>Covers</th></tr>
-<tr><td><code>test_compat.py</code></td><td class="num">56</td>
+<tr><td><code>test_compat.py</code></td><td class="num">53</td>
     <td>The compatibility learner — both features (<code>context_management</code>,
         <code>reasoning_field</code>): persistence, detection, state machine, concurrency.
         See <a href="compatibility.html">compatibility.html</a>.</td></tr>
@@ -212,12 +212,12 @@ EOF</code></pre>
 <h4><code>tests/test_config_split.py</code> (10 tests) — the two-document config loader</h4>
 <ul>
 <li><code>test_models_path_for_sibling_resolution</code>: <code>models.json</code> resolves as the sibling of the configured config path, not from a default location.</li>
-<li><code>test_merged_load_with_optional_keys</code>: config.json's tiers plus the sibling's models / extra_request_headers / count-tokens flag merge into one dict.</li>
+<li><code>test_merged_load_with_optional_keys</code>: config.json's tiers plus the sibling's models / extra_request_headers / count-tokens flag / <code>reasoning_field_switch</code> policy merge into one dict; an absent <code>reasoning_field_switch</code> is <em>not</em> synthesized into the merged result (the resolver defaults apply), so an explicit policy can be told apart from a defaulted one (extended 2026-10-22).</li>
 <li><code>test_missing_models_json_is_value_error_naming_path</code>: A missing catalog raises <code>ValueError</code> naming the resolved path — deliberately not <code>FileNotFoundError</code>, which the server would report against the wrong file.</li>
-<li><code>test_models_doc_bad_shapes_collapse_to_value_error</code>: Malformed catalog shapes (invalid JSON, non-object, missing <code>models</code>, non-object <code>models</code>) each raise <code>ValueError</code> naming <code>models.json</code>.</li>
+<li><code>test_models_doc_bad_shapes_collapse_to_value_error</code>: Malformed catalog shapes (invalid JSON, non-object, missing <code>models</code>, non-object <code>models</code>, and — extended 2026-10-22 — a non-object <code>reasoning_field_switch</code>, a string field, or a boolean field) each raise <code>ValueError</code> naming <code>models.json</code>.</li>
 <li><code>test_config_doc_bad_shapes</code>: config.json's own structural checks — non-object document, missing <code>tiers</code>, non-object <code>tiers</code>.</li>
 <li><code>test_models_json_unreadable_permissions_shape</code>: The unreadable-by-permissions shape; self-verifies the chmod first and reports the shape as inexpressible on Windows rather than asserting it. The directory-in-place shape carries the same OSError → ValueError conversion.</li>
-<li><code>test_leftover_keys_warn_and_lose</code>: A catalog key left behind in config.json warns on stderr and the <code>models.json</code> value wins.</li>
+<li><code>test_leftover_keys_warn_and_lose</code>: A catalog key left behind in config.json warns on stderr and the <code>models.json</code> value wins — the rider tuple now includes <code>reasoning_field_switch</code> (extended 2026-10-22), covering both the dropped form and the models-wins form.</li>
 <li><code>test_leftover_key_dropped_warning</code>: When the catalog does <em>not</em> carry the leftover key, the warning names the drop instead of claiming the value is read elsewhere.</li>
 <li><code>test_leftover_key_no_models_json_still_fails</code>: The warning path is not a bypass — a leftover key with no catalog beside it still fails.</li>
 <li><code>test_load_config_for_validation</code>: The CLI path is exactly as strict as the server path, and retains the <code>path=None</code> fallback to <code>SETTINGS.config_path</code>.</li>
@@ -268,7 +268,7 @@ EOF</code></pre>
 <li><code>test_disable_retry_count_tokens_normal_path_unaffected</code>: Flag=true, /v1/messages still retries normally (503 then 200).</li>
 <li><code>test_disable_retry_count_tokens_false_retries</code>: Flag=false, count_tokens still retries (503 then 200).</li>
 <li><code>test_disable_retry_count_tokens_path_anchoring</code>: Flag=true: only /v1/messages/count_tokens* is affected; /v1/messages, /v1/messages?x=count_tokens, /v1/messages/count_tokens_batch retry normally.</li>
-<li><code>test_disable_retry_count_tokens_invalid_type</code>: validate_config rejects non-boolean disable_retry_claude_count_token.</li>
+<li><code>test_disable_retry_count_tokens_invalid_type</code>: validate_config rejects non-boolean disable_retry_claude_count_token — and, beside it (extended 2026-10-22), the <code>reasoning_field_switch</code> rejection surface: non-object, non-int/bool field values, values below 1, unknown inner keys, and the <em>effective</em> pair <code>{"saturation_max": 2}</code> against the defaulted <code>saturation_on_switch</code> 3 (refused, not clamped), with a valid 4/2 pair accepted.</li>
 <li><code>test_buffered_response_size_cap</code>: Buffered 2xx-JSON and non-2xx response paths cap the upstream body at PROXY_MAX_RESPONSE_SIZE: the body is truncated, a response_size_cap_exceeded trace event fires, and…</li>
 <li><code>test_retry_stability_extra_header</code>: A 429-retried request to a ruled provider carries the SAME x-opencode-session value on every attempt.</li>
 <li><code>test_trace_write_failure_does_not_duplicate_upstream_request</code>: A trace-write failure inside the retry loop must not be misread as a connection error and re-issue the upstream POST.</li>
@@ -493,7 +493,7 @@ EOF</code></pre>
 <li><code>test_chat_sse_unfinished_turn_predicate_ignores_degraded_tool</code>: (a) A tool call seen on the wire but never started (id, no name) is proxy-side degradation: no error frame, no <code>chat_sse_unfinished_turn</code>, and the existing degradation event still fires — the inherited <code>unfinished-turn-detector-ignores-degraded-tool</code> pin. (b) A late empty <code>tool_calls: []</code> sentinel is not a tool call (the truthiness-based drain seen-test), so a genuine prose-only stall in a sentinel-bearing stream still errors.</li>
 <li><code>test_chat_sse_no_nudge_without_marker</code>: Request B — a different conversation sent after request A stalled and was errored — gets no <code>chat_retry_nudge</code> event, an unchanged upstream body, and a normal terminal: no marker, no nudge.</li>
 <li><code>test_chat_retry_nudge_disabled_by_empty_env</code>: <code>PROXY_CHAT_RETRY_NUDGE=&quot;&quot;</code> is the kill switch: the unfinished-turn stream terminals exactly as before (no error frame), the detector still logs (a pure measurement), and no marker or nudge machinery fires.</li>
-<li><code>test_chat_sse_nudge_reentry_walk_stall_passthrough</code>: A nudge recovery whose first upstream attempt is rejected with a matched reasoning-field complaint is re-entered by the candidate walk, and the <em>served</em> attempt still carries the entry-time marker decision: the served stream has no error frame (the loop guard survives re-entry) and the served upstream body contains the nudge text exactly once as its trailing user message (injection re-runs on the inherited decision). The three-request upstream count pins that a walk step actually happened, so neither assertion can pass vacuously.</li>
+<li><code>test_chat_sse_nudge_reentry_walk_stall_passthrough</code>: A nudge recovery whose first upstream attempt is rejected with a matched reasoning-field complaint is re-entered by the rescue, and the <em>served</em> attempt still carries the entry-time marker decision: the served stream has no error frame (the loop guard survives re-entry) and the served upstream body contains the nudge text exactly once as its trailing user message (injection re-runs on the inherited decision). The three-request upstream count pins that a rescue pass actually happened (the first pass serves, so the count holds under the two-pass budget), so neither assertion can pass vacuously.</li>
 <li><code>test_chat_retry_nudge_sweep_expires_armed_only</code>: Store level: an <em>unarmed</em> entry backdated past the TTL survives another request's sweep — arm still returns True (the TTL is anchored at arm) and the recovery still matches it — while an <em>armed</em> entry backdated past the TTL is expired by the same sweep. Pins the sweep ordering that keeps a generation longer than the TTL from losing its own marker to a concurrent eligible request.</li>
 <li><code>test_chat_retry_nudge_ineligible_request_does_not_consume</code>: The marker check runs only inside the eligibility gate (chat mode <em>and</em> tools declared), so an <em>ineligible</em> request whose body strict-extends an armed entry is served un-nudged with an unchanged upstream body and leaves the single-use marker intact; the following eligible recovery then fires <code>chat_retry_nudge</code> naming the errored request.</li>
 <li><code>test_chat_retry_nudge_large_conversation_is_nudgeable</code>: A conversation whose serialized <code>messages</code> exceed the removed 1&nbsp;MiB cap is still remembered, armed, and matched (added 2026-10-18) — the regression for the size skip that silently killed the feature on every real chat-mode body. Store level: the fixture serializes to 1,500,086 bytes, 451,510 bytes over the old 1,048,576-byte cap; the stored <code>messages_bytes</code> equals that serialized size, and the strict extension of the large conversation matches. Measured load-bearing: run against <code>server.py</code> at the preceding commit, this test FAILS.</li>
@@ -511,9 +511,9 @@ EOF</code></pre>
 
 <h3 id="cat-7">Category 7 — Compatibility Learner</h3>
 
-<p><strong>Scope:</strong> Both learner features — the <code>context_management</code> probe ladder, probation, suppression, and its persistence file, and the <code>reasoning_field</code> candidate walk, switch rule, and latch.</p>
+<p><strong>Scope:</strong> Both learner features — the <code>context_management</code> probe ladder, probation, suppression, and its persistence file, and the <code>reasoning_field</code> credit rule (saturate, drain, edge-switch) with its lock-free rescue.</p>
 
-<h4><code>tests/test_compat.py</code> (56 tests) — the compatibility learner</h4>
+<h4><code>tests/test_compat.py</code> (53 tests) — the compatibility learner</h4>
 <ul>
 <li><code>test_compat_state_load_missing_file</code>: Missing state file means empty state: discovery still works and no startup failure occurs.</li>
 <li><code>test_compat_state_load_corrupt_fails_open</code>: A corrupt (non-JSON) state file warns and fails open with empty state: requests forward unchanged and the proxy does not crash.</li>
@@ -554,23 +554,20 @@ EOF</code></pre>
 <li><code>test_compat_delist_after_two_successes</code>: A seeded probation entry earns two successful probes and is delisted; afterwards requests are no longer stripped.</li>
 <li><code>test_compat_inconclusive_reschedules</code>: An inconclusive probe (non-matching 500) resets the strip counter and reschedules at the current threshold without doubling.</li>
 <li><code>test_compat_probe_counter_semantics</code>: Repeated rejection from probation resets probation to zero but keeps (and further doubles) the threshold — it never resets to base.</li>
-<li><code>test_compat_single_retry_global</code>: Concurrent first-time requests: exactly one compatibility retry occurs globally; losers receive the original 400.</li>
+<li><code>test_compat_single_retry_global</code>: Concurrent first-time requests. The <code>context_management</code> half: exactly one compatibility retry occurs globally; losers receive the original 400. The <code>reasoning_field</code> half (rewritten 2026-10-22 by this plan): five concurrent chat complainers <strong>all</strong> receive 2xx — each runs its own lock-free rescue — and the shared-key credit drained during the episode, so a switch happened (asserted through the switch event / the moved selection, never an exact end state).</li>
 <li><code>test_compat_retry_lock_released_on_exception</code>: An upstream failure during the compatibility retry releases the retry lock: later requests can still retry and learn.</li>
 <li><code>test_compat_config_swap_during_retry</code>: The compatibility retry uses the entry-time config snapshot: the in-flight request completes against its original provider, and the admin switch (drained afterwards)…</li>
 <li><code>test_compat_retry_stream_interaction</code>: Interaction with streaming and the existing retry loop: learning works from streamed 2xx (status-receipt evidence, no rollback on mid-stream failure), and the 429/503…</li>
 <li><code>test_compat_trace_metadata_only</code>: All compatibility_* trace events are metadata-only: no field values, no prompt text, no raw upstream error text.</li>
-<li><code>test_reasoning_switch_needs_three_consecutive_complaints</code>: The <code>reasoning_field</code> selection advances only on the third consecutive matched complaint against it; an intervening 2xx-ended request resets the ladder, and after a persisted switch two further complaints do not advance it again.</li>
-<li><code>test_reasoning_transient_complaint_does_not_switch</code>: One matched complaint followed by 2xx-ended requests leaves the persisted selection unchanged — the pin for "the default never settles".</li>
-<li><code>test_reasoning_success_serves_client_during_learning</code>: Below the threshold a complaint is absorbed by an in-request walk and the client still receives a 200, with the persisted selection unchanged.</li>
-<li><code>test_reasoning_walk_sends_advanced_candidate</code>: Each walk step sends exactly the advanced candidate's field, including the wrap step whose candidate is the literal <code>"none"</code>.</li>
-<li><code>test_reasoning_full_walk_latches</code>: One full walk does not latch; the immediately consecutive one does; a successful request in between clears the accumulated evidence.</li>
-<li><code>test_reasoning_non_complaint_errors_are_not_counted</code>: A 401/403/500, an unparseable body, and a 400 naming no field neither increment nor latch, and a walk step returning one stops the walk with the original result returned.</li>
+<li><code>test_reasoning_walk_sends_advanced_candidate</code>: Each rescue pass sends exactly the advanced candidate's field, including the wrap pass whose candidate is the literal <code>"none"</code>.</li>
+<li><code>test_reasoning_non_complaint_errors_are_not_counted</code>: A 401/403/500, an unparseable body, and a 400 naming no field change no credit and start no rescue; a rescue pass returning one stops the rescue, with attempt 1's original error returned to the client.</li>
 <li><code>test_reasoning_matcher_shapes</code>: The reasoning matcher's accept/reject contract — message form, structured <code>loc</code> form, sentence-final form; rejects the dotted prose path, an echoed request payload, and every non-400.</li>
-<li><code>test_reasoning_delist_on_none_success</code>: A walk whose advanced candidate is <code>"none"</code> and which succeeds removes the entry rather than writing <code>selection: "none"</code>.</li>
-<li><code>test_reasoning_persist_via_second_candidate</code>: The walk's second candidate returning 2xx at or above the threshold persists that candidate — the persist path both earlier persistence tests skip.</li>
-<li><code>test_reasoning_walk_success_clears_full_walks</code>: A walk candidate's own 2xx clears the full-walk counter while leaving the strike ladder untouched, so a full walk before and after a walk-served request does not latch.</li>
-<li><code>test_reasoning_threshold_reads_module_binding</code>: The strike-ladder threshold is read from <code>compat</code>'s module binding at the decision point, so a monkeypatch — or the startup clamp — changes the persist outcome; a by-value copy of the constant anywhere on that path fails the test.</li>
-<li><code>test_reasoning_latched_outcome_issues_no_retry</code>: A latched pair entered directly — bypassing the dispatch-site check, which is the interleaving this pins — returns the original top-level result and issues no upstream call.</li>
+<li><code>test_reasoning_delist_on_none_success</code>: A credit-driven switch whose next candidate is <code>"none"</code> removes the entry rather than writing <code>selection: "none"</code> — the switch, not a served candidate, is what delists (rewritten 2026-10-22 to the credit model).</li>
+<li><code>test_reasoning_credit_saturates_and_drains</code> (added 2026-10-22): With <code>reasoning_field_switch</code> set small (4/2), the credit saturates at <code>saturation_max</code> under gate-true successes (many successes never exceed the cap) and drains one step per matched complaint; a switch persists exactly on the edge where a decrement reaches zero — asserted through the persisted selection and the switch event — the credit is re-armed to <code>saturation_on_switch</code>, so the next switch needs exactly that many further complaints, and the advance moves one step from the <em>entry's current</em> selection.</li>
+<li><code>test_reasoning_rescued_success_does_not_teach</code> (added 2026-10-22): The attempt-1-only pin — a rescued 2xx must not refill the credit, so <code>saturation_on_switch</code> consecutive episodes in which attempt 1 complains and the rescue serves still drain the credit to zero and switch.</li>
+<li><code>test_reasoning_rescue_runs_without_thinking</code> (added 2026-10-22): A matched complaint on a body with <strong>no</strong> thinking block is still rescued — the gate-false case, where the rescue is the only thing that can serve. A mock that 400s the first call and 200s the second yields a client 200 plus a <code>reasoning_rescue</code> event, and the persisted selection is unchanged after several such episodes: gate-false complaints are not learning evidence.</li>
+<li><code>test_reasoning_rescue_events_and_merge</code> (added 2026-10-22): The rescue's trace and merge contract — one <code>reasoning_rescue</code> event per pass with the documented key set <em>exactly</em> (the data-exposure invariant pinned as a contract); on exhaustion the client receives attempt 1's original error (status and shape); a 429/503 on a rescue pass stops the rescue and serves attempt 1's error; the entry's <code>retries</code> still counts 429/503 retries only.</li>
+<li><code>test_reasoning_switch_params_carried_across_admin</code> (added 2026-10-22): A non-default <code>reasoning_field_switch</code> in the fixture's <code>models.json</code> survives both admin paths — <code>/admin/api/switch</code> and <code>/admin/api/reload</code> keep the effective policy, observable through drain/threshold behaviour — and a reload whose <code>reasoning_field_switch</code> is structurally invalid is refused with a 400 and installs nothing.</li>
 </ul>
 
 <h3 id="cat-8">Category 8 — Admin API</h3>
@@ -753,15 +750,20 @@ hand-rolling setup. The ones you are most likely to need:</p>
 
 <table>
 <tr><th>Helper</th><th>Purpose</th></tr>
-<tr><td><code>_create_test_config(temp_dir, tiers, models, extra_request_headers)</code></td>
+<tr><td><code>_create_test_config(temp_dir, tiers, models, extra_request_headers, reasoning_field_switch)</code></td>
     <td>Write the <code>config.json</code> / <code>models.json</code> <strong>pair</strong> — a
         tiers-only config plus a sibling catalog — and return the config path. The signature is
         unchanged from the single-file era, which is what made the call-site migration a no-op
         for every caller that already passed <code>--config-path &lt;tempdir&gt;/config.json</code>;
-        the keyword values now land in the sibling document instead of the config body.</td></tr>
-<tr><td><code>_create_test_config_with_flag(temp_dir, tiers, flag_value, extra_request_headers)</code></td>
+        the keyword values now land in the sibling document instead of the config body. The
+        <code>reasoning_field_switch</code> rider (added 2026-10-22) sets the
+        <code>models.json</code> policy object, or omits the key when <code>None</code> so the
+        loader defaults apply — the rider is threaded in at spawn time, never edited into
+        <code>models.json</code> after the proxy starts, because the document is read at startup.</td></tr>
+<tr><td><code>_create_test_config_with_flag(temp_dir, tiers, flag_value, extra_request_headers, reasoning_field_switch)</code></td>
     <td>As above, with <code>disable_retry_claude_count_token</code> set in the
-        <code>models.json</code> half (<code>flag_value=None</code> omits the key)</td></tr>
+        <code>models.json</code> half (<code>flag_value=None</code> omits the key), and the same
+        optional <code>reasoning_field_switch</code> rider</td></tr>
 <tr><td><code>_create_test_keys(temp_dir, vendors, passphrase)</code></td>
     <td>Write an <em>encrypted</em> keys file</td></tr>
 <tr><td><code>_create_test_keys_plain(temp_dir, vendors)</code></td>

@@ -6,8 +6,9 @@ The config family lives here extracted verbatim from server.py:
 plus the extra_request_headers safety constants that move with them.
 The load is two-document: config.json carries the tier mapping (``tiers`` and
 nothing else), the sibling models.json — resolved beside the resolved config
-path — carries ``models``, ``extra_request_headers``, and
-``disable_retry_claude_count_token``, and the two are merged at load
+path — carries ``models``, ``extra_request_headers``,
+``disable_retry_claude_count_token``, and ``reasoning_field_switch``, and the
+two are merged at load
 (``models_path_for`` / ``load_models_document`` / ``_load_config_documents``).
 A leftover catalog key still in config.json warns on stderr and is ignored.
 ``parse_upstream`` and ``resolve_api_key`` stay in server.py (request-path
@@ -48,9 +49,18 @@ EXTRA_FROM_FORBIDDEN = {"authorization", "x-api-key"}
 MODELS_FILENAME = "models.json"
 
 # Top-level keys a config.json document may still carry besides "tiers" —
-# all three are catalog-era leftovers ignored with a warning; their home is
-# the sibling models.json document.
-_LEFTOVER_KEYS = ("models", "extra_request_headers", "disable_retry_claude_count_token")
+# all of them are ignored with a warning; their home is the sibling
+# models.json document. The first three are catalog-era leftovers; the last
+# is the reasoning_field_switch policy object (its home is models.json).
+_LEFTOVER_KEYS = ("models", "extra_request_headers",
+                  "disable_retry_claude_count_token", "reasoning_field_switch")
+
+# reasoning_field_switch policy defaults (models.json). The credit saturates
+# at saturation_max and a switch re-arms it at saturation_on_switch.
+REASONING_SATURATION_MAX_DEFAULT = 10
+REASONING_SATURATION_ON_SWITCH_DEFAULT = 3
+
+_REASONING_SWITCH_FIELDS = ("saturation_max", "saturation_on_switch")
 
 
 def models_path_for(config_path):
@@ -67,8 +77,9 @@ def models_path_for(config_path):
 def load_models_document(models_path):
     """Read and structurally check the models.json catalog document alone.
 
-    Returns a dict with ``models``, plus ``extra_request_headers`` and
-    ``disable_retry_claude_count_token`` when the document carries them.
+    Returns a dict with ``models``, plus ``extra_request_headers``,
+    ``disable_retry_claude_count_token`` and ``reasoning_field_switch`` when
+    the document carries them.
 
     Every read or structure failure becomes a ValueError naming models.json
     and its resolved path — FileNotFoundError, IsADirectoryError,
@@ -108,13 +119,59 @@ def load_models_document(models_path):
         raise ValueError(
             "models.json 'disable_retry_claude_count_token' must be a boolean: "
             "{}".format(models_path))
+    if "reasoning_field_switch" in doc:
+        switch = doc["reasoning_field_switch"]
+        if not isinstance(switch, dict):
+            raise ValueError(
+                "models.json 'reasoning_field_switch' must be an object: "
+                "{}".format(models_path))
+        for field in _REASONING_SWITCH_FIELDS:
+            if field not in switch:
+                continue
+            value = switch[field]
+            # isinstance(True, int) is True — bool is rejected explicitly.
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(
+                    "models.json 'reasoning_field_switch.{}' must be an "
+                    "integer: {}".format(field, models_path))
     out = {"models": doc["models"]}
     if "extra_request_headers" in doc:
         out["extra_request_headers"] = doc["extra_request_headers"]
     if "disable_retry_claude_count_token" in doc:
         out["disable_retry_claude_count_token"] = \
             doc["disable_retry_claude_count_token"]
+    if "reasoning_field_switch" in doc:
+        out["reasoning_field_switch"] = doc["reasoning_field_switch"]
     return out
+
+
+def reasoning_switch_params(config):
+    """Resolve the reasoning_field_switch policy to ``(s_max, s_sw)``.
+
+    Total and never raising: absent key, non-object value, or a field that is
+    not a non-bool int resolves to the module default; an int below 1 clamps
+    to 1; an effective ``saturation_on_switch`` above ``saturation_max``
+    clamps to ``saturation_max`` (defensive only — validate_config rejects
+    that pair, so a mid-flight hand-edit can never crash a request).
+    """
+    raw = {}
+    if isinstance(config, dict):
+        candidate = config.get("reasoning_field_switch")
+        if isinstance(candidate, dict):
+            raw = candidate
+
+    def _field(name, default):
+        value = raw.get(name)
+        if not isinstance(value, int) or isinstance(value, bool):
+            return default
+        return value if value >= 1 else 1
+
+    s_max = _field("saturation_max", REASONING_SATURATION_MAX_DEFAULT)
+    s_sw = _field("saturation_on_switch",
+                  REASONING_SATURATION_ON_SWITCH_DEFAULT)
+    if s_sw > s_max:
+        s_sw = s_max
+    return s_max, s_sw
 
 
 def _load_config_documents(config_path):
@@ -174,8 +231,9 @@ def load_config(path):
     """Load the config.json + sibling models.json pair, merged.
 
     Reads 'tiers' from config.json and the catalog ('models',
-    'extra_request_headers', 'disable_retry_claude_count_token') from the
-    sibling models.json resolved beside it. Leftover catalog keys still in
+    'extra_request_headers', 'disable_retry_claude_count_token',
+    'reasoning_field_switch') from the sibling models.json resolved beside
+    it. Leftover catalog keys still in
     config.json warn on stderr and are ignored.
 
     Raises ValueError on invalid JSON or missing required structure in
@@ -403,6 +461,56 @@ def validate_config(config, providers, provider_keys=None):
             errors.append(
                 "disable_retry_claude_count_token must be a boolean "
                 "(true/false), got {}".format(type(flag).__name__))
+
+    # Validate the optional reasoning_field_switch policy object. The loader's
+    # structural check already rejects a non-object value and non-int fields;
+    # this is the canonical semantic policy (the admin reload path validates
+    # its candidate through here too). The ordering rule is evaluated on the
+    # EFFECTIVE pair — defaults applied first — so {"saturation_max": 2}
+    # against the defaulted saturation_on_switch 3 is rejected rather than
+    # silently clamped.
+    if "reasoning_field_switch" in config:
+        switch = config["reasoning_field_switch"]
+        if not isinstance(switch, dict):
+            errors.append(
+                "reasoning_field_switch must be an object, got {}".format(
+                    type(switch).__name__))
+        else:
+            unknown = sorted(
+                k for k in switch if k not in _REASONING_SWITCH_FIELDS)
+            if unknown:
+                errors.append(
+                    "reasoning_field_switch has unknown key(s): {} "
+                    "(expected: {})".format(
+                        ", ".join(repr(k) for k in unknown),
+                        ", ".join(_REASONING_SWITCH_FIELDS)))
+            effective = {}
+            for field, default in (
+                    ("saturation_max", REASONING_SATURATION_MAX_DEFAULT),
+                    ("saturation_on_switch",
+                     REASONING_SATURATION_ON_SWITCH_DEFAULT)):
+                if field not in switch:
+                    effective[field] = default
+                    continue
+                value = switch[field]
+                if not isinstance(value, int) or isinstance(value, bool):
+                    errors.append(
+                        "reasoning_field_switch '{}' must be an integer, "
+                        "got {}".format(field, type(value).__name__))
+                elif value < 1:
+                    errors.append(
+                        "reasoning_field_switch '{}' must be >= 1, "
+                        "got {}".format(field, value))
+                else:
+                    effective[field] = value
+            if (len(effective) == 2
+                    and effective["saturation_on_switch"]
+                    > effective["saturation_max"]):
+                errors.append(
+                    "reasoning_field_switch 'saturation_on_switch' ({}) must "
+                    "not exceed 'saturation_max' ({})".format(
+                        effective["saturation_on_switch"],
+                        effective["saturation_max"]))
 
     # Validate optional extra_request_headers (provider-keyed map of header
     # rules). Absent key is valid (defaults to {} on resolution). Every check

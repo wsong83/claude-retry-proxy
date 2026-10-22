@@ -28,7 +28,7 @@ rationale, mechanisms, and edge cases — and is indexed by
 src/claude_retry_proxy/
   __init__.py           __version__
   server.py             the HTTP retry gateway server (ThreadingHTTPServer, tier routing, model rewriting, admin API, retry/backoff)
-  compat.py             the compatibility learner: the `COMPAT_FEATURES` registry (two features — `context_management` in anthropic mode, `reasoning_field` in chat mode) whose descriptors own their mode, presence test, matcher, field set, retry budget and retry lock; COMPAT_* policy constants; the owned `_CompatState` state object (default-param `state=` injection); the `context_management` state machine with its 400-shape matchers, and the `reasoning_field` selection walk, matcher and latch (extracted from server.py; the probe-outcome + retry orchestration slice stays in server.py)
+  compat.py             the compatibility learner: the `COMPAT_FEATURES` registry (two features — `context_management` in anthropic mode, `reasoning_field` in chat mode) whose descriptors own their mode, presence test, matcher, field set and retry budget; COMPAT_* policy constants; the owned `_CompatState` state object (default-param `state=` injection); the `context_management` state machine with its 400-shape matchers and its retry lock, and the `reasoning_field` credit learner (a per-key in-memory credit; the switch thresholds are `models.json` policy, `reasoning_field_switch`) with its lock-free, key-free rescue and matcher (extracted from server.py; the probe-outcome + retry orchestration slice stays in server.py)
   sanitize.py           error-text redaction leaf: `sanitize_error`, the chokepoint for text reaching stderr, trace `error` fields and client-facing error bodies
   sinks.py              sink class family: private `_Sink` base, `TraceSink` (JSONL append + counters + markers), `StateSink` (atomic state document), shared `_SinkHealth` failure reporter, process-wide pair + `configure()`
   settings.py           env-derived settings singleton: `SETTINGS` value object (the `PROXY_*` limits/flags, runtime paths incl. state/compat files, mode values) + `resolve_trace_file` — built at import from env, adjusted by `main()` at startup; imported by both the server and the CLI
@@ -135,8 +135,8 @@ for the rest.
      jittered exponential backoff. **The outgoing body is built once, before
      the retry loop, and never re-transformed** — the loop re-sends the same
      bytes. (Two compatibility retries are the exception — the
-     `context_management` stripped retry and the `reasoning_field` candidate
-     walk: both re-enter the forward path from the *client* body, so those do
+     `context_management` stripped retry and the `reasoning_field` rescue
+     passes: both re-enter the forward path from the *client* body, so those do
      re-run the transform.) See
      [doc/architecture.html#retry](doc/architecture.html#retry).
   6. **Response model rewriting.** The tier name is resolved from the request
@@ -365,8 +365,8 @@ what you need in context, and the link has the rest.
     API and CSRF, shutdown, runtime artifacts
   - [compatibility.html](doc/compatibility.html) — the learner registry: the
     `context_management` state machine (constants, states, transitions,
-    suppression) and the `reasoning_field` selection (model, walk, matcher,
-    latch), plus the shared persistence and events
+    suppression) and the `reasoning_field` credit learner (selection, credit
+    rule, rescue), plus the shared persistence and events
   - [trace-log.html](doc/trace-log.html) — entry schema, event inventory,
     `--all`, permissions, pruning, analysis
   - [test-catalog.html](doc/test-catalog.html) — suite layout, the per-test

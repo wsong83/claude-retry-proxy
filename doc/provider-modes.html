@@ -696,19 +696,20 @@ transform it belongs to, and neither runs in response mode:</p>
   <li>Each feature declares its own retry budget, so the attempt count is not one global figure:
       <code>context_management</code> retries a <strong>single</strong> time, with the stripped
       variant derived from the original client body and re-sent through the normal forward path
-      — one upstream attempt, but a fresh transform pass. <code>reasoning_field</code> may walk
-      up to <strong>two</strong> further candidates, because reaching a third candidate is what
-      makes the full-walk outcome observable.</li>
-  <li>Each feature holds its <strong>own</strong> retry lock, acquired non-blockingly, so one
-      feature's in-flight retry cannot deny another's. Under <code>context_management</code> at
-      most one probe runs proxy-wide, and a request that cannot take that lock strips rather than
-      probes.</li>
+      — one upstream attempt, but a fresh transform pass. <code>reasoning_field</code>
+      <strong>rescues</strong>: up to <strong>two</strong> further candidate passes after
+      attempt 1, cycled from the selection attempt 1 sent, each emitting a
+      <code>reasoning_rescue</code> event.</li>
+  <li>Only <code>context_management</code> holds a retry lock, acquired non-blockingly: at most
+      one probe runs proxy-wide, and a request that cannot take that lock strips rather than
+      probes. The <code>reasoning_field</code> rescue is lock-free and takes no key, so
+      concurrent complainers are all served rather than one being silently denied.</li>
 </ul>
 
 <p>The state machine, the probe ladder, and the suppression rules are documented in
 <a href="compatibility.html">compatibility.html</a>, as is the
 <a href="compatibility.html#reasoning-field">reasoning-field selection</a>.</p>
 
-<footer>Last updated: 2026-10-18</footer>
+<footer>Last updated: 2026-10-22</footer>
 </body>
 </html>

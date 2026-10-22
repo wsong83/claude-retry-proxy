@@ -2499,8 +2499,13 @@ def test_disable_retry_count_tokens_path_anchoring():
 
 
 def test_disable_retry_count_tokens_invalid_type():
-    """validate_config rejects non-boolean disable_retry_claude_count_token."""
-    print("\n--- Test: Disable Retry Count Tokens (invalid type rejected) ---")
+    """validate_config rejects the two models.json riders' invalid shapes:
+    a non-boolean disable_retry_claude_count_token, and an invalid
+    reasoning_field_switch policy — non-int/bool field values, values below
+    1, unknown inner keys, a non-object value, and the effective-pair
+    ordering rule (defaults applied first, so {"saturation_max": 2} against
+    the defaulted saturation_on_switch 3 is rejected, not silently clamped)."""
+    print("\n--- Test: Config Riders (invalid types rejected) ---")
 
     from claude_retry_proxy.server import validate_config
 
@@ -2527,6 +2532,48 @@ def test_disable_retry_count_tokens_invalid_type():
         fail(f"validate_config rejected valid boolean True: {errors}")
     else:
         pass_("validate_config accepted boolean True")
+
+    # --- reasoning_field_switch: the second rider's rejection surface ------
+    def switch_errors(switch):
+        cfg = {"tiers": valid_tiers,
+               "models": _derive_models_from_tiers(valid_tiers),
+               "reasoning_field_switch": switch}
+        return validate_config(cfg, set(vendors.keys()))
+
+    # Effective-pair rejection: the defaulted saturation_on_switch (3) exceeds
+    # the explicit saturation_max 2 — rejected, not silently clamped to 2/2.
+    errors = switch_errors({"saturation_max": 2})
+    if any("saturation_on_switch" in e for e in errors):
+        pass_("validate_config rejected the effective pair "
+              "{'saturation_max': 2} against the defaulted 3")
+    else:
+        fail("validate_config accepted saturation_max 2 against the "
+             f"defaulted saturation_on_switch 3: {errors}")
+
+    for bad, label in ((True, "a non-object policy"),
+                       ({"saturation_max": True}, "boolean saturation_max"),
+                       ({"saturation_on_switch": False},
+                        "boolean saturation_on_switch"),
+                       ({"saturation_max": "4"}, "string saturation_max"),
+                       ({"saturation_max": 0}, "zero saturation_max"),
+                       ({"saturation_on_switch": -1},
+                        "negative saturation_on_switch"),
+                       ({"saturation_max": 4, "saturation_on_switch": 5},
+                        "saturation_on_switch above saturation_max"),
+                       ({"saturation_maxx": 4}, "unknown inner key")):
+        errors = switch_errors(bad)
+        if any("reasoning_field_switch" in e for e in errors):
+            pass_(f"validate_config rejected {label}")
+        else:
+            fail(f"validate_config accepted {label} ({bad!r}): {errors}")
+
+    # A valid non-default pair is accepted.
+    errors = switch_errors({"saturation_max": 4, "saturation_on_switch": 2})
+    if errors:
+        fail(f"validate_config rejected a valid reasoning_field_switch pair: "
+             f"{errors}")
+    else:
+        pass_("validate_config accepted a valid reasoning_field_switch pair (4/2)")
 
 
 def test_buffered_response_size_cap():

@@ -3,5 +3,9 @@
     "example-provider": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]
   },
   "disable_retry_claude_count_token": true,
+  "reasoning_field_switch": {
+    "saturation_max": 10,
+    "saturation_on_switch": 3
+  },
   "extra_request_headers": {}
 }

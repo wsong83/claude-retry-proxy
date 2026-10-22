@@ -100,7 +100,8 @@ When you run `claude-retry-proxy start`:
 3. It validates the config with the same canonical rules the server enforces
    (one shared policy, housed in the source package's `config.py`/`keys.py`):
    required tiers, valid provider references, models-catalog shape, tier key
-   selectors, extra-header rules, and the count-token flag.
+   selectors, extra-header rules, the count-token flag, and the
+   `reasoning_field_switch` policy.
    See `doc/configuration.html#validation` for the full rule list.
 4. It checks the trace log and prunes entries older than 5 days.
 5. It launches the proxy server, piping the passphrase via stdin.
@@ -177,8 +178,9 @@ catalog, not the tier mapping.
 
 The sibling of `config.json`, resolved from the same directory — so
 `--config-path /tmp/x/config.json` reads `/tmp/x/models.json`. It carries `models`,
-`extra_request_headers`, and `disable_retry_claude_count_token`, and **both files must exist**: a
-missing `models.json` stops the proxy from starting rather than degrading it.
+`extra_request_headers`, `disable_retry_claude_count_token`, and `reasoning_field_switch`, and
+**both files must exist**: a missing `models.json` stops the proxy from starting rather than
+degrading it.
 
 It is normally written by `update-claude-env`, or by hand. The proxy never writes it, with one
 exception: provisioning the template on a first install, and only when the file is absent. Because
@@ -201,7 +203,8 @@ stricter than startup here: startup only requires a tier's provider to have *som
     "provider-b": ["claude-sonnet-5", "model-y"],
     "provider-c": ["claude-opus-5", "model-z"]
   },
-  "disable_retry_claude_count_token": true
+  "disable_retry_claude_count_token": true,
+  "reasoning_field_switch": { "saturation_max": 10, "saturation_on_switch": 3 }
 }
 ```
 
@@ -236,6 +239,28 @@ shipped config template sets it to `true`.
 ```json
 "disable_retry_claude_count_token": true
 ```
+
+### `reasoning_field_switch` (optional, object)
+
+Tunes the `reasoning_field` learner's credit — how much evidence the proxy needs
+before it switches a provider/model pair to the next reasoning-echo candidate
+(`reasoning_content`, `reasoning`, or none). Optional; defaults to
+`{ "saturation_max": 10, "saturation_on_switch": 3 }`.
+
+```json
+"reasoning_field_switch": { "saturation_max": 10, "saturation_on_switch": 3 }
+```
+
+`saturation_on_switch` is the credit a selection *arrives* with — first sight,
+post-switch and post-restart alike — and the value it is re-armed to after a
+switch: a low value makes the learner switch quickly, a high one makes it
+stubborn. `saturation_max` caps how much credit quiet successes can bank. The
+credit lives in memory, per provider/model pair, and is shared by every session
+routing through that pair — the evidence is about the pair, not the session. A
+`reasoning_field_switch` placed in `config.json` by mistake is warned about and
+dropped, like the count-token flag. See
+[doc/configuration.html#reasoning-field-switch](doc/configuration.html#reasoning-field-switch)
+for the semantics and the validation rules.
 
 ### `extra_request_headers` (optional, object)
 
@@ -611,7 +636,7 @@ While the proxy runs, it creates (all under `~/.claude/`):
 | Path | Purpose |
 |------|---------|
 | `proxy/config.json` | Tier→provider mapping (written by "Apply Config" in the admin page) |
-| `proxy/models.json` | Provider catalog, header rules, and the count-tokens flag (written by `update-claude-env` or by hand — never by the proxy) |
+| `proxy/models.json` | Provider catalog, header rules, the count-tokens flag, and the reasoning-switch policy (written by `update-claude-env` or by hand — never by the proxy) |
 | `proxy/proxy-state.json` | Runtime state (PID, port, heartbeat); removed on clean shutdown |
 | `proxy/proxy-stderr.log` | Server stderr (startup messages, retry notices); append-only across runs — `start`'s failure diagnostics read only the current attempt's window |
 | `logs/proxy-trace.jsonl` | The JSONL request trace (pruned of entries >5 days on each `start`) |
@@ -645,7 +670,7 @@ detailed reference, indexed by [doc/content.html](doc/content.html):
 | [doc/provider-modes.html](doc/provider-modes.html) | The `anthropic` / `chat` / `response` modes: auth headers, path rewriting, request and response transforms, SSE, tool-call degradation |
 | [doc/configuration.html](doc/configuration.html) | the `config.json`, `models.json`, and `keys-index.json` documents, environment variables, validation rules |
 | [doc/operations.html](doc/operations.html) | CLI commands, readiness protocol, passphrase handling, admin API and CSRF, shutdown, runtime artifacts |
-| [doc/compatibility.html](doc/compatibility.html) | The compatibility learner's registry: the `context_management` state machine (states, transitions, suppression) and the `reasoning_field` selection (walk, matcher, latch), plus shared persistence |
+| [doc/compatibility.html](doc/compatibility.html) | The compatibility learner's registry: the `context_management` state machine (states, transitions, suppression) and the `reasoning_field` selection (credit rule, lock-free rescue), plus shared persistence |
 | [doc/trace-log.html](doc/trace-log.html) | Trace entry schema, event inventory, `--all`, file permissions, pruning, analysis |
 | [doc/test-catalog.html](doc/test-catalog.html) | Test suite layout, harness helpers, isolation, patterns, anti-patterns |
 

@@ -31,7 +31,7 @@ from urllib.parse import urlparse
 
 from . import sinks
 from .config import (load_config, load_models_document, models_path_for,
-                     validate_config, write_config)
+                     reasoning_switch_params, validate_config, write_config)
 from .keys import load_keys_file, read_passphrase_from_stdin, vendor_key_entries, vendor_key_names
 from .sanitize import sanitize_error
 from .compat import (COMPAT_FEATURE, COMPAT_FEATURES,
@@ -46,11 +46,9 @@ from .compat import (COMPAT_FEATURE, COMPAT_FEATURES,
                      _compat_suppressed, _compat_validate_constants,
                      _feature_for_mode, _load_compat_state,
                      _compat_normalize_threshold, _persist_compat_state_locked,
-                     _reasoning_entry_selection, _reasoning_is_latched,
-                     _reasoning_latch_notice, _reasoning_next_candidate,
-                     _reasoning_note_complaint, _reasoning_note_full_walk,
-                     _reasoning_persist_switch, _reasoning_reset_full_walks,
-                     _reasoning_reset_on_success)
+                     _reasoning_advance_selection, _reasoning_credit_on_2xx,
+                     _reasoning_credit_on_complaint, _reasoning_entry_selection,
+                     _reasoning_next_candidate)
 from .sinks import (log_trace, write_state, increment_total, increment_retried,
                     write_start_marker, write_stop_marker)
 from .transforms_chat import (_anthropic_to_chat, _chat_to_anthropic,
@@ -798,67 +796,64 @@ def _compat_probe_outcome(result, key, request_id, tier, method, path,
     return result
 
 
-def _reasoning_outcome(result, key, selection, request_id, tier, method, path,
-                       headers, body, handler, config, vendors, epoch,
-                       retry_original_id=None):
-    """Drive the reasoning_field walk for one client request.
+def _reasoning_rescue(result, selection, request_id, tier, provider_name,
+                      actual_model, mode, method, path, headers, body, handler,
+                      config, vendors, epoch, retry_original_id=None):
+    """Re-roll a matched reasoning_field complaint, lock-free and key-free.
 
-    Lock first: the feature's own retry lock is acquired non-blocking before
-    any counter is touched, so a contended walk mutates nothing and returns the
-    upstream error. On a matched complaint the counter advances and each next
-    candidate is tried in-request from the ORIGINAL client body; the client is
-    served by whichever candidate returns 2xx, and a switch persists only if
-    the strike ladder still stands at that moment (delisted when the candidate
-    is "none"). A candidate's outcome never touches the strike ladder; its 2xx
-    does clear the full-walk counter. A non-complaint failure stops the walk.
-    When every candidate complains that is one full walk; two consecutive full
-    walks latch the pair until restart.
+    Every rescue pass re-enters the forward path from the ORIGINAL client body
+    with the feature suppressed, so it is a single upstream attempt that can
+    never recurse into this function. Up to the descriptor's budget of passes
+    cycle the candidate from the selection the request actually sent, and each
+    pass emits one metadata-only ``reasoning_rescue`` event.
 
-    The client receives the ORIGINAL top-level result on every failure exit.
-    retry_original_id rides along unchanged to each walk forward, so the
-    entry-time marker decision (loop guard + nudge) survives the walk; epoch
-    rides along with it, so the walk stays on one logical snapshot.
+    Merge semantics: ``_compat_merge_retries(A, B)`` returns B's fields with
+    the two retry counts summed, so a 2xx pass is served as
+    ``_compat_merge_retries(result, pass_result)`` while a non-complaint pass
+    and budget exhaustion hand the client attempt 1's ORIGINAL error as
+    ``_compat_merge_retries(pass_result, result)``. A rescue pass that hits
+    429/503 is such a non-complaint (one attempt under suppress_compat): the
+    rescue stops and attempt 1's error is served. Rescues teach nothing and
+    persist nothing; ``selection`` may be None (an unparseable body never
+    resolved), in which case the first candidate is "none" — a same-body
+    re-roll — and nothing else special happens.
     """
     feature = COMPAT_FEATURES["reasoning_field"]
-    if not feature.retry_lock.acquire(blocking=False):
-        return result
-    try:
-        if _reasoning_is_latched(key):
-            # A concurrent request can latch the pair between the dispatch-site
-            # check and this acquire. The latch is terminal — no retries, no
-            # counter mutation — so honour it here, where counters are about to
-            # be touched, and hand the client its original top-level result.
-            return result
-        _reasoning_note_complaint(key, selection)
-        walk_result = result
-        candidate = selection
-        for _step in range(feature.max_retries_per_request):
-            candidate = _reasoning_next_candidate(candidate)
-            walk_result = _forward_request_impl(
-                method, path, headers, body, handler, request_id,
-                config, vendors, epoch, suppress_compat=True,
-                reasoning_selection=candidate,
-                retry_original_id=retry_original_id)
-            walk_status = walk_result[0]
-            if 200 <= walk_status < 300:
-                # A candidate's own 2xx is positive evidence that a selection
-                # works: it clears the full-walk counter (never the ladder).
-                # The switch then persists only if the ladder still stands —
-                # re-read under the state lock inside the persist function.
-                _reasoning_reset_full_walks(key)
-                _reasoning_persist_switch(key, candidate, request_id, tier)
-                return _compat_merge_retries(result, walk_result)
-            if not feature.complaint_match(walk_status, walk_result[2]):
-                # A non-complaint result stops the walk; hand the client its
-                # own original error rather than the walk's.
-                return _compat_merge_retries(walk_result, result)
-        # Budget exhausted with the last candidate still complaining: one full
-        # walk observed. The second consecutive one latches the pair.
-        if _reasoning_note_full_walk(key):
-            _reasoning_latch_notice(key, request_id, tier)
-        return _compat_merge_retries(walk_result, result)
-    finally:
-        feature.retry_lock.release()
+    rescue_result = result
+    candidate = selection
+    for attempt in range(1, feature.max_retries_per_request + 1):
+        candidate = _reasoning_next_candidate(candidate)
+        rescue_result = _forward_request_impl(
+            method, path, headers, body, handler, request_id,
+            config, vendors, epoch, suppress_compat=True,
+            reasoning_selection=candidate,
+            retry_original_id=retry_original_id)
+        rescue_status = rescue_result[0]
+        if 200 <= rescue_status < 300:
+            outcome = "served"
+        elif feature.complaint_match(rescue_status, rescue_result[2]):
+            outcome = "complaint"
+        else:
+            outcome = "other"
+        log_trace({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "reasoning_rescue",
+            "request_id": request_id,
+            "provider": provider_name,
+            "mode": mode,
+            "actual_model": actual_model,
+            "tier": tier,
+            "feature": feature.name,
+            "attempt": attempt,
+            "candidate": candidate,
+            "outcome": outcome,
+            "http_status": rescue_status,
+        })
+        if outcome == "served":
+            return _compat_merge_retries(result, rescue_result)
+        if outcome == "other":
+            return _compat_merge_retries(rescue_result, result)
+    return _compat_merge_retries(rescue_result, result)
 
 
 def _resolve_extra_request_headers(headers, provider_name, config, request_id):
@@ -996,8 +991,8 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
 
     reasoning_selection is the chat-mode reasoning echo field. None means
     "unresolved — resolve it from the learned entry at request entry"; every
-    other value (including the literal "none" the walk wraps to) is used
-    as-is, so the walk's explicit candidate is never re-resolved.
+    other value (including the literal "none") is used as-is, so a rescue
+    pass's explicit candidate is never re-resolved.
 
     retry_original_id is the marker decision resolved once by the
     eligibility gate below — the single resolution point, which runs only
@@ -1145,6 +1140,9 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     active_feature = _feature_for_mode(mode)
     reasoning_key = None
     reasoning_active = False
+    # Reasoning-field_switch policy, resolved once from this request's config
+    # snapshot (the same snapshot every forwarding pass below uses).
+    s_max, s_sw = reasoning_switch_params(config)
     if body:
         try:
             body_json["model"] = actual_model
@@ -1186,20 +1184,25 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                             "feature": COMPAT_FEATURE,
                         })
                         compat_decision = ("strip", _ck)
-            # The active feature's presence test gates the mode-scoped
-            # dispatch below and the reasoning selection. None-safe: a mode
-            # with no registered feature is inert.
+            # The active feature's presence test gates learning eligibility
+            # (reasoning_active) and the anthropic discovery below. None-safe:
+            # a mode with no registered feature is inert.
             compat_outbound_present = (
                 active_feature is not None
                 and active_feature.present(body_json))
             if mode == "chat":
+                # Gate-free selection: the rescue needs the sent selection even
+                # when the body carries no thinking block, so presence gates
+                # learning only. Re-entry safety is structural — a re-entry
+                # always carries an explicit selection, and suppress_compat
+                # excludes the block as well.
                 if (reasoning_selection is None and active_feature is not None
-                        and not suppress_compat and not _is_count_tokens
-                        and compat_outbound_present):
+                        and not suppress_compat and not _is_count_tokens):
                     reasoning_key = _compat_key(
                         provider_name, mode, actual_model, active_feature.name)
-                    reasoning_selection, reasoning_active = \
+                    reasoning_selection = \
                         _reasoning_entry_selection(reasoning_key)
+                    reasoning_active = compat_outbound_present
                 if reasoning_selection is None:
                     reasoning_selection = "none"
                 # Nudge injection: this request matched an armed marker, so
@@ -1250,6 +1253,9 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                 "tier": tier,
                 "mode": mode,
             })
+            # The fallback forwards the untransformed client body, so this
+            # request is learning-ineligible (no credit, no key use).
+            reasoning_active = False
             rewritten_body = body  # Keep original body if transform/parse fails
 
     # Build headers for forwarding
@@ -1317,36 +1323,43 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     if compat_decision is not None:
         return result
 
-    # Reasoning-field reset: this request's OWN forwarding pass ended 2xx, so
-    # the sent selection works — zero both counters. "Own pass" is the whole
-    # top-level chain, so an upstream 429/503 that the retry loop carried to a
-    # 2xx counts (the served response is the evidence the reset captures). A
-    # walk candidate's 2xx is a nested call and never reaches here; it clears
-    # only the full-walk counter, inside _reasoning_outcome.
-    if reasoning_active and 200 <= result[0] < 300:
-        _reasoning_reset_on_success(reasoning_key, reasoning_selection)
-
     # Mode-scoped dispatch on the active feature. The suppress_compat clause
-    # leads: every compatibility/walk retry calls this function with the flag
-    # set, so re-entry (and any nested walk) is structurally impossible.
-    # compat_outbound_present already folds in the feature's mode scope and
-    # presence test, so it is written once.
-    if suppress_compat or not compat_outbound_present or _is_count_tokens:
+    # leads: every compatibility/rescue retry calls this function with the
+    # flag set, so re-entry (and any nested rescue) is structurally
+    # impossible. count_tokens never participates. active_feature is None for
+    # a mode with no registered feature (response mode) — it must stay inert.
+    if suppress_compat or active_feature is None or _is_count_tokens:
         return result
 
-    if active_feature.name == "reasoning_field":
-        # reasoning_field: a matched complaint walks the candidate cycle.
-        if reasoning_key is None or _reasoning_is_latched(reasoning_key):
-            return result
+    # Attempt-1 scorekeeping (learning evidence). Sitting BELOW the guard is
+    # load-bearing: a re-entry returns above and can never feed the credit.
+    # reasoning_active is a second, independent belt — it is set only inside
+    # the resolution block, whose conditions include `not suppress_compat`.
+    # A success credits +1 (saturating); a matched complaint drains −1 and, on
+    # the edge to 0, advances the entry one step and re-arms the credit.
+    if reasoning_active:
+        if 200 <= result[0] < 300:
+            _reasoning_credit_on_2xx(reasoning_key, s_max, s_sw)
+        elif active_feature.complaint_match(result[0], result[2]):
+            _credit, switch_due = _reasoning_credit_on_complaint(
+                reasoning_key, s_max, s_sw)
+            if switch_due:
+                _reasoning_advance_selection(reasoning_key, request_id, tier)
+
+    if active_feature is not None and active_feature.name == "reasoning_field":
+        # Any matched complaint is rescued, gate or no gate — a body with no
+        # thinking block is exactly where the rescue is the only thing that
+        # can serve.
         if not active_feature.complaint_match(result[0], result[2]):
             return result
-        return _reasoning_outcome(
-            result, reasoning_key, reasoning_selection, request_id, tier,
-            method, path, headers, body, handler, config, vendors, epoch,
-            retry_original_id=retry_original_id)
+        return _reasoning_rescue(
+            result, reasoning_selection, request_id, tier, provider_name,
+            actual_model, mode, method, path, headers, body, handler,
+            config, vendors, epoch, retry_original_id=retry_original_id)
 
-    if active_feature.name != COMPAT_FEATURE:
-        # A registered feature this dispatch does not handle stays inert, so a
+    if not compat_outbound_present or active_feature.name != COMPAT_FEATURE:
+        # Presence gates the anthropic discovery below byte-identically, and a
+        # registered feature this dispatch does not handle stays inert, so a
         # future third feature is never mis-routed into the paths below.
         return result
 
@@ -3589,7 +3602,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         "models": _current_config.get("models", {}),
                     }
                     for _key in ("extra_request_headers",
-                                 "disable_retry_claude_count_token",):
+                                 "disable_retry_claude_count_token",
+                                 "reasoning_field_switch",):
                         if _key in _current_config:
                             new_config[_key] = _current_config[_key]
                     if response_status is None:
@@ -3672,7 +3686,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     "models": models_doc.get("models", {}),
                 }
                 for _key in ("extra_request_headers",
-                             "disable_retry_claude_count_token",):
+                             "disable_retry_claude_count_token",
+                             "reasoning_field_switch",):
                     if _key in models_doc:
                         candidate[_key] = models_doc[_key]
 

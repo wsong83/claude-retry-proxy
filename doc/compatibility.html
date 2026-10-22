@@ -61,34 +61,35 @@ top of the compatibility learner module, <code>src/claude_retry_proxy/compat.py<
     <td>Consecutive probe successes required to delist</td></tr>
 <tr><td><code>COMPAT_MAX_RETRIES_PER_REQUEST</code></td><td class="num">1</td>
     <td>Compatibility retries per client request for <code>context_management</code>. The budget
-        is per-feature: <code>reasoning_field</code> declares 2, because its walk may need to
-        reach a third candidate</td></tr>
+        is per-feature: <code>reasoning_field</code> declares 2 — its rescue may re-roll up to
+        two further candidates after attempt 1</td></tr>
 <tr><td><code>COMPAT_FAILED_CONFIRMATION_SUPPRESSION</code></td><td class="num">3</td>
     <td>Failed confirmations before the key is suppressed</td></tr>
-<tr><td><code>COMPAT_REASONING_SWITCH_THRESHOLD</code></td><td class="num">3</td>
-    <td>Consecutive complaints before <code>reasoning_field</code> moves to the next candidate</td></tr>
 </table>
 
 <p>Startup validates the relationships between these rather than trusting them. Each violation
 prints a warning on stderr and <strong>clamps</strong> the value — it does not refuse to start:
 <code>COMPAT_BACKOFF_MULTIPLIER</code> is raised to at least 2,
-<code>COMPAT_DELISTING_SUCCESSES</code> to at least 2,
+<code>COMPAT_DELISTING_SUCCESSES</code> to at least 2, and
 <code>COMPAT_INITIAL_THRESHOLD</code> is lowered to <code>COMPAT_MAX_THRESHOLD</code> if it
-exceeds it, and <code>COMPAT_REASONING_SWITCH_THRESHOLD</code> is raised to at least 2 (a value
-of 0 or 1 would collapse the three-strike rule to a single strike).</p>
+exceeds it.</p>
 
-<p>That last clamp is worth a note, because it was the one clamped constant whose consumption
-crossed a module boundary. The threshold is compared inside the learner module — at the persist
-site, under the state lock — but an earlier arrangement imported the constant <em>by value</em>
-into <code>server.py</code> and compared it there. The clamp rebinding the learner's global then
-had no effect on the decision, so the warning printed and the un-clamped value was used anyway.
-The comparison now reads the learner's own binding, which is what makes the guard a guard.</p>
+<p><code>reasoning_field</code>'s two switch thresholds are deliberately <strong>not</strong> in
+this table. They are operator policy rather than maintainer constants: they live in
+<code>models.json</code> as <code>reasoning_field_switch</code> (defaults
+<code>saturation_max: 10</code>, <code>saturation_on_switch: 3</code>, defined in
+<code>config.py</code>), are validated at startup and on an admin reload, and are read per
+request from the config snapshot — see
+<a href="configuration.html#reasoning-field-switch">configuration.html</a>.</p>
 
 <p>The registry itself is <code>COMPAT_FEATURES</code>, a name → descriptor mapping; each
 descriptor carries its mode, its presence test, its complaint matcher, its learning policy, its
-entry field set, its retry budget and its own retry lock. <code>COMPAT_FEATURE</code> remains as
-the <code>"context_management"</code> name constant, and <code>COMPAT_SCHEMA_VERSION</code> is
-<code>1</code>.</p>
+entry field set and its retry budget. Only <code>context_management</code> holds a
+<strong>retry lock</strong>, and it lives on the state object rather than on the descriptor: the
+reasoning rescue is lock-free by design, so there is nothing for it to serialize (see
+<a href="#reasoning-rescue">the rescue</a>). <code>COMPAT_FEATURE</code>
+remains as the <code>"context_management"</code> name constant, and
+<code>COMPAT_SCHEMA_VERSION</code> is <code>1</code>.</p>
 
 <h2 id="scope-and-state">Scope and states</h2>
 
@@ -99,15 +100,17 @@ different capabilities.</p>
 
 <p>In memory the learned set is a single owned <code>_CompatState</code> object
 (<code>_state</code> in <code>compat.py</code>): its <code>entries</code> dict holds the keyed
-entries and its <code>lock</code> serializes access and persistence. The learner functions take
-the state by default parameter (<code>state=_state</code>), so tests can inject a fresh
-instance. Each feature owns its <strong>own</strong> retry lock — a descriptor property rather
-than a module-global — so one feature's slow retry can never deny another feature its retry.
-For <code>context_management</code> the forward path in <code>server.py</code> reaches that lock
-through the module-level aliases <code>_compat_state_lock</code> / <code>_compat_retry_lock</code>,
-which remain importable for the tests that assert the alias identity. The retry lock's
-acquire/release discipline belongs to its caller, which holds it across the unstripped probe's
-upstream HTTP call.</p>
+entries, its <code>reasoning_credit</code> dict the per-key in-memory credit, and its
+<code>lock</code> serializes access and persistence. The learner functions take the state by
+default parameter (<code>state=_state</code>), so tests can inject a fresh instance. Only
+<code>context_management</code> holds a <strong>retry lock</strong>, and it lives on the state
+object (<code>_CompatState.retry_lock</code>) rather than on its descriptor or a module global;
+the forward path in <code>server.py</code> reaches it through the module-level aliases
+<code>_compat_state_lock</code> / <code>_compat_retry_lock</code>, which remain importable for the
+tests that assert the alias identity. The retry lock's acquire/release discipline belongs to its caller, which holds it
+across the unstripped probe's upstream HTTP call. The <code>reasoning_field</code> rescue holds
+<strong>no</strong> lock at all: it shares no counter, persists nothing and takes no key, so
+concurrent complainers each run their own rescue rather than one denying the others.</p>
 
 <h3 id="context-management-states">The <code>context_management</code> states</h3>
 
@@ -244,82 +247,103 @@ always serialized the reasoning text twice.</p>
 <p>The proxy no longer guesses. It sends one field, learns which one a pair wants from the
 upstream's own complaints, and defaults to sending <strong>nothing</strong>.</p>
 
-<h3 id="reasoning-model">Three pieces of state, one rule</h3>
+<h3 id="reasoning-model">One stored selection, one credit, one rule</h3>
 
 <table>
 <tr><th>State</th><th>Where</th><th>Meaning</th></tr>
 <tr><td><code>selection</code></td><td>persisted</td>
     <td><code>reasoning_content</code> or <code>reasoning</code>. An <em>absent</em> entry means
         <code>none</code> — the default is never written, because it requires no entry</td></tr>
-<tr><td><code>complaints</code></td><td>in memory</td>
-    <td>The pair <code>(for_selection, count)</code> — consecutive matched complaints counted
-        against that one selection</td></tr>
-<tr><td><code>latched</code></td><td>in memory</td>
-    <td>Set once the full-walk outcome has been seen on two consecutive requests</td></tr>
+<tr><td><code>credit</code></td><td>in memory, per key</td>
+    <td>The saturating learning credit, moving between <code>saturation_on_switch</code> and
+        <code>saturation_max</code>. An absent key <em>reads</em> as
+        <code>saturation_on_switch</code>: a selection arrives with the arrival credit, never
+        saturated</td></tr>
 </table>
 
-<p>The rule in one paragraph: <strong>send the selection; on a complaint, count it and try the
-next candidate inside the same request so the client is still served; persist a switch only once
-the count reaches three; and if all three candidates complain within one request — a
-<em>full walk</em> — on two consecutive requests, latch the pair to <code>none</code> until the
-process restarts.</strong></p>
+<p>The rule in one paragraph: <strong>send the selection; attempt 1's own outcome moves the
+credit — a gate-true <code>2xx</code> raises it by one (capped at <code>saturation_max</code>), a
+matched complaint lowers it by one; when a decrement reaches zero the selection advances one step
+in the cycle <code>none → reasoning_content → reasoning → none</code> (advancing to
+<code>none</code> removes the entry) and the credit is re-armed at
+<code>saturation_on_switch</code>; and every matched complaint — thinking block or not — is
+answered inside the same client request by a lock-free <a href="#reasoning-rescue">rescue</a>
+that re-rolls up to two further candidates.</strong></p>
 
 <p>Four details are load-bearing:</p>
 
 <ul>
-<li><strong>The counter belongs to a selection.</strong> It is the pair <code>(for_selection,
-    count)</code>, compared against the selection the request actually sent — never against the
-    entry's current value. That is what makes a persisted switch reset the count implicitly (the
-    next complaint carries a different selection, so it is the first complaint against the new
-    one), and what keeps a complaint attached to the selection it was aimed at when a switch
-    lands concurrently.</li>
-<li><strong>The reset is the request's own outcome.</strong> A request whose forwarding pass ends
-    2xx sets the count to zero — an upstream <code>429</code>/<code>503</code> that the retry
-    loop carried to a 2xx counts, because it was served. A walk candidate's own success neither
-    resets nor increments the strike count.</li>
-<li><strong>A request with no thinking block is inert.</strong> It neither exercises the
-    selection nor proves anything about it, so it mutates nothing. Letting such a request reset
-    the ladder would make the threshold unreachable for any pair that interleaves ordinary chat
-    with thinking-bearing turns.</li>
-<li><strong>Absent means <code>none</code>.</strong> The default needs no entry, so there is
-    nothing to settle on a plain success — and the same one rule protects a settled
-    <code>reasoning_content</code>, a settled <code>reasoning</code>, and the default alike.</li>
+<li><strong>Only attempt 1 teaches.</strong> The credit is fed by the top-level request's own
+    forwarding pass alone: a rescue pass re-enters the forward path with
+    <code>suppress_compat</code> set, and re-entries structurally cannot reach the scorekeeping.
+    A rescued <code>2xx</code> must not refill the credit — it is a re-roll, not evidence that
+    the sent selection works.</li>
+<li><strong>The switch is edge-triggered and atomic.</strong> The decrement, the "reached zero"
+    decision and the re-arm all happen in one hold of the state lock, and each decrement fires
+    only from a positive value it alone consumed — so two concurrent complainers cannot both
+    advance off the same pre-decrement credit. At the default <code>saturation_on_switch</code> of
+    3, one drain of the pooled credit therefore yields exactly one advance; at
+    <code>saturation_on_switch: 1</code> (legal, and what the tests exercise) each queued
+    decrement starts from the re-armed 1 and fires its own. The advance re-reads the
+    entry's <em>current</em> selection under the lock and moves one step from it — never from the
+    selection a slow in-flight request happened to send.</li>
+<li><strong>The evidence is the upstream status.</strong> A chat-mode response the proxy later
+    synthesizes into a failure (an unfinished-turn synthesis, a size-cap truncation, a mid-stream
+    death) still credits, because the forwarding pass reported <code>2xx</code>. That bias toward
+    not switching a working selection is accepted; it is bounded by the refill margin, which is
+    <code>saturation_on_switch</code> complaints wide.</li>
+<li><strong>Absent means <code>none</code>, and the credit is in-memory only.</strong> The
+    default needs no entry; a restart forgets the credit and re-arms every selection at
+    <code>saturation_on_switch</code> — the fail-safe direction, evidence restarting from the
+    arrival credit rather than a remembered high value.</li>
 </ul>
 
-<h3 id="reasoning-walk">The in-request walk</h3>
+<h3 id="reasoning-rescue">The rescue</h3>
 
-<p>A complaint is answered inside the same client request: the proxy advances to the next
-candidate in the cycle <code>none → reasoning_content → reasoning → none</code> and re-sends it,
-up to the feature's budget of <strong>2</strong> extra attempts. The client is therefore served
-transparently while a pair is learning, and the third candidate is reachable within one request.
-Each step re-enters the forward path with the <em>original</em> client body and
-<code>suppress_compat</code> set, so the chat transform re-runs with the new candidate.</p>
+<p>Every matched complaint is answered inside the same client request by a <strong>lock-free,
+key-free rescue</strong>: the proxy cycles to the next candidate — starting from the selection
+attempt 1 actually sent — and re-sends it, up to the feature's budget of <strong>2</strong>
+further passes. The client is therefore served transparently while the upstream is complaining,
+and the systematic case is served on attempt 2 rather than after the credit drains. Each pass
+re-enters the forward path with the <em>original</em> client body and
+<code>suppress_compat</code> set, so the chat transform re-runs with the new candidate; a pass
+that hits <code>429</code>/<code>503</code> is a single-shot attempt (no backoff chain) and ends
+the rescue.</p>
+
+<p>The rescue is deliberately <strong>gate-free</strong>: a body with no thinking block is
+exactly where the rescue is the only thing that can serve, so such a complaint is rescued too —
+with byte-identical re-rolls (no candidate can emit an echo without a thinking block) and with
+no learning effect. Each pass emits one <code>reasoning_rescue</code> trace event (a
+server-emitted event, catalogued in <a href="trace-log.html">trace-log.html</a>), so a rescued
+request's story is visible in the trace without any content being recorded.</p>
 
 <table>
-<tr><th>Walk step result</th><th>Effect</th></tr>
+<tr><th>Rescue pass result</th><th>Effect</th></tr>
 <tr><td><strong>2xx</strong></td>
-    <td>The client is served. A switch is persisted <em>only</em> if the count has reached the
-        threshold, and the persisted candidate is the one that just succeeded — or, when that
-        candidate is <code>none</code>, the entry is <em>removed</em> (absent means none).</td></tr>
+    <td>The client is served — the rescue pass's result, merged so the request's retry count
+        still reads correctly. Nothing is persisted and nothing is learned: rescues teach
+        nothing.</td></tr>
 <tr><td><strong>matching complaint</strong></td><td>Advance to the next candidate.</td></tr>
-<tr><td><strong>anything else</strong></td>
-    <td>Stop the walk, change nothing, and return the client its <em>original</em> error rather
-        than the walk's. A <code>401</code>, a <code>500</code>, a connection error or a
-        <code>429</code>/<code>503</code> is no evidence about the field, so nothing is counted
-        and nothing latches.</td></tr>
+<tr><td><strong>anything else</strong> (exhaustion included)</td>
+    <td>Stop the rescue and return the client attempt 1's <em>original</em> error — not the
+        rescue's. A <code>401</code>, a <code>403</code>, a <code>500</code>, an unrelated
+        <code>400</code> or a <code>429</code>/<code>503</code> is no evidence about the field,
+        so the rescue stops there.</td></tr>
 </table>
 
-<p>Only one walk runs at a time per feature, under the feature's own retry lock, acquired
-non-blockingly. When it is contended the request issues no retry, mutates no counter, and the
-upstream error reaches the client unchanged. Because the lock is per-feature rather than
-module-global, a chat-mode walk can never deny an <code>anthropic</code>-mode probe its retry.
-The cost is real but bounded: a walk is up to three upstream attempts, so a stuck chat upstream
-can hold one worker thread for several minutes. A concurrent admin switch's drain <em>waits</em>
-for that work rather than being bounded by it: a walk step is an immediate single-shot re-issue,
-not a backoff chain, so it is explicitly <em>not</em> abandoned at the press — what bounds the wait
-is the drain's own silence rule (a walk that stops producing upstream bytes is evicted retryably
-like anything else). A chain that is merely <em>sleeping</em> between retries is the case that does
-abandon at the press, returning <code>503 config_swap_restart</code>.</p>
+<p>Nothing about the rescue is serialized: it holds no lock, reads and writes no counter, and
+takes no key — so concurrent complainers on the same pair are all served, each by its own rescue,
+where a lock would silently deny all but one. The cost is the corresponding amplification: a
+rescue is up to two further upstream attempts per complaining request, so a complaining regime
+multiplies load by up to about three, scaled by client concurrency, until the credit's switch
+cadence moves the pair off the complaining selection. That exposure is accepted knowingly — the
+operator escape hatches are <code>stop</code> and <code>/admin/shutdown</code>. A concurrent
+admin switch's drain <em>waits</em> for rescue work rather than being bounded by it: a rescue
+pass is an immediate single-shot re-issue, not a backoff chain, so it is explicitly <em>not</em>
+abandoned at the press — what bounds the wait is the drain's own silence rule (a rescue that
+stops producing upstream bytes is evicted retryably like anything else). A chain that is merely
+<em>sleeping</em> between retries is the case that does abandon at the press, returning
+<code>503 config_swap_restart</code>.</p>
 
 <h3 id="reasoning-complaint">What counts as a complaint</h3>
 
@@ -343,36 +367,20 @@ therefore keyword-grade rather than field-reference-grade — the bare English n
 <code>reasoning</code> matches unrelated prose such as "max_tokens must be greater than the
 reasoning budget". That is the accepted cost of a deliberate bias toward recall: a
 <em>missed</em> complaint means the pair never learns, which is the pre-existing behaviour, while
-a false positive costs one increment and needs two more consecutive ones before anything moves.
+a false positive costs one credit decrement, which the successes refill long before a switch can
+drain it at any realistic complaint density.
 A field name buried in a message string that merely echoes the request would also match; that
 hole is recorded rather than closed, because closing it would mean matching on prose again.</p>
 
 <div class="warn">
 <strong>A 400 that names no field is not a complaint.</strong> A <code>401</code>/<code>403</code>
 (account disabled), a <code>500</code> (gateway blip), an unparseable body, or a
-<code>400</code> naming no field in either shape is <em>not</em> counted: nothing advances,
-nothing latches, and the error passes through untouched. The same is true of any status other
+<code>400</code> naming no field in either shape is <em>not</em> a complaint: no credit moves, no
+rescue runs, and the error passes through untouched. The same is true of any status other
 than <code>400</code> — a gateway reporting the condition as a <code>422</code> produces no
 complaint, so such a pair silently stays at <code>none</code>. That is a known limitation of the
 design, not an oversight.
 </div>
-
-<h3 id="reasoning-latch">Latching</h3>
-
-<p>A <em>full walk</em> — all three candidates complaining within one request — is one
-observation, not three: the same upstream condition, examined three times with only the field
-differing. A uniform <code>400</code> unrelated to the field repeats identically across all
-three, so one such request must not latch a pair for the process lifetime. The latch is earned
-the way a switch is, by repetition: <strong>the full walk must recur on two consecutive
-requests</strong>, where consecutive means any intervening feature-active success clears the
-evidence — a walk candidate's own 2xx included, since a working candidate is exactly the evidence
-that "no candidate works" is false.</p>
-
-<p>A latched pair sends <code>none</code>, issues no retries, mutates no counters, and leaves the
-<strong>persisted selection untouched</strong>: the latch is a decision about this process, not a
-rewrite of what was learned, so the next run starts from the last known-good state. It emits a
-<code>compatibility_latched</code> trace event and a stderr warning, both metadata-only, and a
-restart is its only reset.</p>
 
 <h2 id="persistence">Persistence</h2>
 
@@ -414,16 +422,21 @@ provider has accumulated and how many probe successes it had. The direction of t
 error is deliberate: the proxy will <em>over-strip</em> (harmless — the upstream simply never
 sees a field it did not want) rather than <em>under-strip</em> (which would surface as repeated
 client-visible failures). A restart therefore cannot delist a provider; it can only delay one.
+The <code>reasoning_field</code> credit is in-memory in the same way: a restart re-arms every
+selection at <code>saturation_on_switch</code>, so evidence restarts from the arrival credit
+rather than a remembered high value — the fail-safe direction.
 <p>If the state file is unreadable or malformed, the proxy <strong>fails open</strong> with empty
 state and a warning. It does not refuse to start.</p>
 </div>
 
 <h2 id="events">Trace events</h2>
 
-<p>All twelve events below are emitted by the learner. They are metadata-only: none carries
+<p>All eleven events below are emitted by the learner. They are metadata-only: none carries
 request or response content. The strip, probe and suppression events belong to
-<code>context_management</code> alone; the switch and latch events belong to
-<code>reasoning_field</code>.</p>
+<code>context_management</code> alone; the switch and delist events belong to
+<code>reasoning_field</code>. This table is learner-only: the rescue's own
+<code>reasoning_rescue</code> event is emitted by the server and is catalogued in
+<a href="trace-log.html">trace-log.html</a>.</p>
 
 <table>
 <tr><th>Event</th><th>Fires when</th></tr>
@@ -431,9 +444,8 @@ request or response content. The strip, probe and suppression events belong to
 <tr><td><code>compatibility_field_stripped</code></td><td>the feature was removed from an outbound request</td></tr>
 <tr><td><code>compatibility_probe_started</code></td><td>a probe was scheduled and the lock acquired</td></tr>
 <tr><td><code>compatibility_probe_succeeded</code></td><td>a probe returned 2xx; carries <code>probation_successes</code></td></tr>
-<tr><td><code>compatibility_delisted</code></td><td>an entry was removed — the final required probe success, or a <code>reasoning_field</code> walk whose <code>none</code> candidate succeeded</td></tr>
-<tr><td><code>compatibility_switched</code></td><td><code>reasoning_field</code> changed an existing entry's <code>selection</code></td></tr>
-<tr><td><code>compatibility_latched</code></td><td>two consecutive full walks latched a pair — no candidate works, so no retries until restart</td></tr>
+<tr><td><code>compatibility_delisted</code></td><td>an entry was removed — the final required probe success, or a <code>reasoning_field</code> credit-driven switch whose next candidate is <code>none</code></td></tr>
+<tr><td><code>compatibility_switched</code></td><td><code>reasoning_field</code> changed an existing entry's <code>selection</code> — fires on the credit's edge to zero, and persists the candidate the entry advanced to, not a rescued pass's candidate</td></tr>
 <tr><td><code>compatibility_probe_rejected</code></td><td>a probe was rejected; carries the doubled <code>threshold</code></td></tr>
 <tr><td><code>compatibility_probe_inconclusive</code></td><td>a probe returned neither 2xx nor a matching 400</td></tr>
 <tr><td><code>compatibility_rejection_detected</code></td><td>a recognised 400 was seen in the normal (non-probe) path</td></tr>
@@ -444,6 +456,6 @@ request or response content. The strip, probe and suppression events belong to
 <p>The full trace schema, including the fields common to every entry, is in
 <a href="trace-log.html">trace-log.html</a>.</p>
 
-<footer>Last updated: 2026-10-13</footer>
+<footer>Last updated: 2026-10-22</footer>
 </body>
 </html>

@@ -4,12 +4,17 @@ upstream incompatibilities behind a registry of features (`COMPAT_FEATURES`).
 Two features:
   - `context_management` (anthropic mode): strips the feature and retries on a
     confirmed rejection, doubling the strip threshold on repeated rejection.
-  - `reasoning_field` (chat mode): learns which assistant reasoning-echo field
-    (or none) a chat upstream accepts, walking the candidate cycle inside one
-    request and persisting a switch only at a run of consecutive complaints.
+    It holds the subsystem's only retry lock (`_compat_retry_lock`).
+  - `reasoning_field` (chat mode): a saturating per-key credit learner fed by
+    the top-level attempt-1 outcomes (a success credits +1 up to
+    `saturation_max`; a matched complaint drains −1, and the edge to 0
+    advances the entry one step in the candidate cycle and re-arms the credit
+    at `saturation_on_switch`), plus a lock-free, key-free rescue that re-rolls
+    the candidates for any matched complaint. Learning evidence is attempt 1
+    only — rescue outcomes teach nothing.
 
 Both share the storage envelope and the persistence/lock plumbing; each owns
-its own entry field set, state vocabulary, and retry lock. Persisted state is
+its own entry field set and state vocabulary. Persisted state is
 metadata-only; the 0o600 chmod is POSIX-only — Windows users must restrict the
 state directory ACL manually.
 """
@@ -39,9 +44,8 @@ COMPAT_DELISTING_SUCCESSES = 2     # successful probes to delist
 COMPAT_MAX_RETRIES_PER_REQUEST = 1 # maximum compatibility retries per client request
 COMPAT_FAILED_CONFIRMATION_SUPPRESSION = 3  # failed confirmations before suppression
 
-# reasoning_field policy: consecutive matched complaints before a persisted
-# switch; max in-request walk steps (the initial attempt plus up to two retries).
-COMPAT_REASONING_SWITCH_THRESHOLD = 3
+# reasoning_field policy: the rescue's candidate re-rolls per matched
+# complaint (the initial attempt plus up to two rescue passes).
 COMPAT_REASONING_MAX_RETRIES_PER_REQUEST = 2
 
 # The legacy singleton constant: server.py imports it and the existing trace
@@ -66,8 +70,8 @@ COMPAT_REASONING_SELECTIONS = ("reasoning_content", "reasoning")
 # `state=_state` default parameter so explicit injection isolates state.
 class _CompatState(object):
     """Learned state shared by every registered feature: the four
-    context_management dicts, the reasoning_field stores, and both per-feature
-    retry locks."""
+    context_management dicts, the reasoning_field stores, and the single
+    retry lock the anthropic feature holds."""
 
     def __init__(self):
         # In-memory learned state: {key_string: entry_dict}
@@ -81,14 +85,10 @@ class _CompatState(object):
         # Rate limiter for compatibility_persist_failed trace events:
         # {key_string: ts}
         self.persist_warned = {}
-        # reasoning_field: per-pair consecutive matched complaints as the pair
-        # (for_selection, count) — the selection the request actually sent.
-        self.reasoning_complaints = {}
-        # reasoning_field: per-pair count of consecutive full walks (all
-        # candidates complaining).
-        self.reasoning_full_walks = {}
-        # reasoning_field: per-pair session-scoped latch flag (restart clears).
-        self.reasoning_latched = {}
+        # reasoning_field: per-key in-memory learning credit (the saturating
+        # capacitor fed by attempt-1 outcomes). An absent key reads as the
+        # operator's saturation_on_switch (config.py policy).
+        self.reasoning_credit = {}
         # Fast lock: protects every dict above and serializes persistence I/O
         # (built under the lock).
         self.lock = threading.Lock()
@@ -97,9 +97,6 @@ class _CompatState(object):
         # duration of the upstream HTTP call; released in finally on every
         # outcome.
         self.retry_lock = threading.Lock()
-        # The reasoning_field feature's own retry lock: one feature's in-flight
-        # retry can never deny another feature a retry.
-        self.reasoning_retry_lock = threading.Lock()
 
 
 _state = _CompatState()
@@ -113,7 +110,7 @@ _compat_retry_lock = _state.retry_lock
 def _compat_validate_constants():
     """Validate tuning-constant relationships at startup; warn and clamp."""
     global COMPAT_INITIAL_THRESHOLD, COMPAT_BACKOFF_MULTIPLIER, \
-        COMPAT_DELISTING_SUCCESSES, COMPAT_REASONING_SWITCH_THRESHOLD
+        COMPAT_DELISTING_SUCCESSES
     if COMPAT_BACKOFF_MULTIPLIER < 2:
         print("[proxy] WARNING: COMPAT_BACKOFF_MULTIPLIER must be >= 2 — "
               "clamped to 2", file=sys.stderr)
@@ -126,12 +123,6 @@ def _compat_validate_constants():
         print("[proxy] WARNING: COMPAT_INITIAL_THRESHOLD exceeds "
               "COMPAT_MAX_THRESHOLD — clamped", file=sys.stderr)
         COMPAT_INITIAL_THRESHOLD = COMPAT_MAX_THRESHOLD
-    if (not isinstance(COMPAT_REASONING_SWITCH_THRESHOLD, int)
-            or isinstance(COMPAT_REASONING_SWITCH_THRESHOLD, bool)
-            or COMPAT_REASONING_SWITCH_THRESHOLD < 2):
-        print("[proxy] WARNING: COMPAT_REASONING_SWITCH_THRESHOLD must be an "
-              "int >= 2 — clamped to 2", file=sys.stderr)
-        COMPAT_REASONING_SWITCH_THRESHOLD = 2
     seen_modes = {}
     for descriptor in COMPAT_FEATURES.values():
         if descriptor.mode in seen_modes:
@@ -799,109 +790,82 @@ def _compat_stripped_body(body):
 # ---------------------------------------------------------------------------
 # reasoning_field policy
 #
-# State is three pieces: the persisted `selection` (absent means none), the
-# in-memory consecutive-complaint counter pair `(for_selection, count)`, and an
-# in-memory session latch. Every counter read-modify-write is taken under
-# state.lock.
+# State is two pieces: the persisted `selection` (absent means none) and an
+# in-memory per-key credit (absent reads as `saturation_on_switch`). The
+# credit is learning evidence at attempt 1 only — the rescue neither reads nor
+# writes it. Every credit read-modify-write runs in one state.lock hold; the
+# selection advance runs inside one _compat_update call.
 # ---------------------------------------------------------------------------
 
-def _reasoning_note_complaint(key, selection, state=_state):
-    """Record one matched complaint aimed at `selection`.
+def _reasoning_credit_on_2xx(key, s_max, s_sw, state=_state):
+    """One gate-true attempt-1 success: raise the key's credit by one.
 
-    If `selection` differs from the stored `for_selection` the count restarts
-    at 1 (a persisted switch therefore resets the counter implicitly), else it
-    increments.
+    The credit saturates at `s_max`, so a dense run of successes can never
+    bank more than one full refill. An absent key reads as `s_sw`: a selection
+    arrives with conservative credit, so sustained breakage still drains it
+    within ~`s_sw` complaint episodes. Returns the stored credit. Total.
     """
     with state.lock:
-        for_selection, count = state.reasoning_complaints.get(key, (None, 0))
-        if for_selection != selection:
-            new_pair = (selection, 1)
-        else:
-            new_pair = (for_selection, count + 1)
-        state.reasoning_complaints[key] = new_pair
+        credit = min(state.reasoning_credit.get(key, s_sw) + 1, s_max)
+        state.reasoning_credit[key] = credit
+        return credit
 
 
-def _reasoning_reset_on_success(key, selection, state=_state):
-    """The request's own forwarding pass ended 2xx: zero both counters.
+def _reasoning_credit_on_complaint(key, s_max, s_sw, state=_state):
+    """One gate-true attempt-1 matched complaint: drain the credit by one.
 
-    "Own pass" is the whole top-level attempt chain — an upstream 429/503 that
-    the retry loop carried to a 2xx counts, because the served response is the
-    positive evidence the reset exists to capture. A nested walk candidate's
-    2xx never reaches this function; it clears only the full-walk counter, via
-    _reasoning_reset_full_walks.
+    Edge-triggered and atomic: the read, the decrement, the
+    ``before > 0 and after == 0`` decision, and the ``s_sw`` reset happen in
+    ONE ``state.lock`` hold, so each decrement yields exactly one
+    ``switch_due`` — a per-decrement guarantee, not a per-burst one: at
+    ``s_sw == 1`` the reset re-arms the stored credit to 1, so every further
+    complaint of a sustained episode (concurrent or sequential) legitimately
+    fires its own edge. The stored credit is never left at 0 — the reset is
+    what makes the next switch cost ``s_sw`` further complaints. Returns
+    ``(credit, switch_due)``, ``credit`` being the stored value after the
+    episode (``s_sw`` on the switch edge). ``s_max`` is accepted for symmetry
+    with the 2xx function; the complaint path never needs a cap. Total.
     """
     with state.lock:
-        state.reasoning_complaints[key] = (selection, 0)
-        state.reasoning_full_walks[key] = 0
+        before = state.reasoning_credit.get(key, s_sw)
+        after = max(0, before - 1)
+        switch_due = before > 0 and after == 0
+        credit = s_sw if switch_due else after
+        state.reasoning_credit[key] = credit
+        return credit, switch_due
 
 
-def _reasoning_reset_full_walks(key, state=_state):
-    """A walk candidate's own 2xx: clear the full-walk evidence, nothing else.
+def _reasoning_advance_selection(key, request_id, tier, state=_state):
+    """Advance the entry's selection one step in the candidate cycle.
 
-    The success proves some selection works, which is exactly the evidence the
-    two-consecutive-full-walks rule requires — so the full-walk counter is
-    zeroed. The strike ladder (`reasoning_complaints`) is deliberately
-    untouched: a walk step neither increments nor resets it.
-    """
-    with state.lock:
-        state.reasoning_full_walks[key] = 0
+    The one learn-side write this model keeps: called on the edge where the
+    credit reaches 0. The ``mutate`` closure runs under ``state.lock`` inside
+    ONE ``_compat_update`` call — never a nested ``state.lock``, the lock is
+    not reentrant — and re-reads the entry's CURRENT selection under it, so a
+    slow in-flight request can never revert a newer switch. Every advance
+    changes the entry by cycle construction:
 
+      * next candidate ``"none"`` -> delist the existing entry
+        (``compatibility_delisted``)
+      * absent entry              -> create it (``compatibility_learned``)
+      * existing entry            -> rewrite its selection
+        (``compatibility_switched``)
 
-def _reasoning_note_full_walk(key, state=_state):
-    """Record one full walk; True when it is the second consecutive one."""
-    with state.lock:
-        n = state.reasoning_full_walks.get(key, 0) + 1
-        state.reasoning_full_walks[key] = n
-        return n >= 2
-
-
-def _reasoning_is_latched(key, state=_state):
-    with state.lock:
-        return bool(state.reasoning_latched.get(key))
-
-
-def _reasoning_entry_selection(key, state=_state):
-    """(selection, active) for one request, read under one lock.
-
-    selection is the learned value, or "none" when absent; active is False once
-    the pair is latched, in which case the selection is also "none". This is
-    the only place the persisted selection is read.
-    """
-    with state.lock:
-        if state.reasoning_latched.get(key):
-            return "none", False
-        entry = state.entries.get(key)
-        if (isinstance(entry, dict)
-                and entry.get("selection") in COMPAT_REASONING_SELECTIONS):
-            return entry["selection"], True
-        return "none", True
-
-
-def _reasoning_persist_switch(key, candidate, request_id, tier, state=_state):
-    """Persist a successful walk candidate, if the strike ladder still stands.
-
-    The ladder is re-read here, under the state lock, rather than trusted from
-    a value captured at walk entry: a walk runs for minutes, and a concurrent
-    feature-active request whose own forwarding pass ends 2xx zeroes the
-    counters in that window. A
-    reset landing mid-walk must win, so the threshold is compared at the
-    decision point — which also makes it the one comparison site, reading the
-    module's (possibly clamped) COMPAT_REASONING_SWITCH_THRESHOLD.
-
-    Emits compatibility_learned when the write creates the entry,
-    compatibility_switched when it changes an existing entry's selection, and
-    compatibility_delisted when the candidate is the literal "none" (the entry
-    is removed — absent means none).
+    Emits the same event shape the removed persist-switch helper used
+    (``selection`` only when the candidate is not ``"none"``). Returns the
+    outcome event name. Total.
     """
     outcome = [None]
+    advanced = [None]
 
     def mutate(entry):
-        _for_selection, count = state.reasoning_complaints.get(key, (None, 0))
-        if count < COMPAT_REASONING_SWITCH_THRESHOLD:
-            return entry, False
+        current = "none"
+        if (isinstance(entry, dict)
+                and entry.get("selection") in COMPAT_REASONING_SELECTIONS):
+            current = entry["selection"]
+        candidate = _reasoning_next_candidate(current)
+        advanced[0] = candidate
         if candidate == "none":
-            if entry is None:
-                return None, False
             outcome[0] = "compatibility_delisted"
             return None, True
         if entry is None:
@@ -914,15 +878,11 @@ def _reasoning_persist_switch(key, candidate, request_id, tier, state=_state):
                 "feature": key[3],
                 "selection": candidate,
             }, True)
-        if entry.get("selection") == candidate:
-            return entry, False
         entry["selection"] = candidate
         outcome[0] = "compatibility_switched"
         return entry, True
 
     _compat_update(key, mutate, state=state)
-    if outcome[0] is None:
-        return
     event = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "event": outcome[0],
@@ -933,53 +893,39 @@ def _reasoning_persist_switch(key, candidate, request_id, tier, state=_state):
         "feature": key[3],
         "tier": tier,
     }
-    if candidate != "none":
-        event["selection"] = candidate
+    if advanced[0] != "none":
+        event["selection"] = advanced[0]
     log_trace(event)
+    return outcome[0]
 
 
-def _reasoning_latch_notice(key, request_id, tier, state=_state):
-    """Set the session latch and emit its metadata-only notice.
+def _reasoning_entry_selection(key, state=_state):
+    """The learned selection for one request, read under one lock.
 
-    The stderr warning carries the same metadata set and nothing
-    upstream-derived. The notice needs no rate limiter: the dispatch path
-    returns early for a latched pair, so this runs at most once per key per
-    process.
+    Returns the entry's selection, or "none" when no usable entry exists or
+    its value is not a known selection. This is the only place the persisted
+    selection is read. Total.
     """
     with state.lock:
-        state.reasoning_latched[key] = True
-    log_trace({
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "event": "compatibility_latched",
-        "request_id": request_id,
-        "provider": key[0],
-        "mode": key[1],
-        "actual_model": key[2],
-        "feature": key[3],
-        "tier": tier,
-    })
-    try:
-        print("[proxy] WARNING: compatibility feature {!r} latched for "
-              "provider {!r} mode {!r} model {!r} — no further retries until "
-              "restart".format(key[3], key[0], key[1], key[2]),
-              file=sys.stderr)
-    except Exception:
-        pass
+        entry = state.entries.get(key)
+        if (isinstance(entry, dict)
+                and entry.get("selection") in COMPAT_REASONING_SELECTIONS):
+            return entry["selection"]
+        return "none"
 
 
 class _FeatureDescriptor(object):
     """One learnable feature: its mode scope, presence/complaint tests, entry
-    validator, retry budget, and its own retry lock."""
+    validator, and retry budget."""
 
     def __init__(self, name, mode, present, complaint_match, validate_entry,
-                 max_retries_per_request, retry_lock):
+                 max_retries_per_request):
         self.name = name
         self.mode = mode
         self.present = present
         self.complaint_match = complaint_match
         self.validate_entry = validate_entry
         self.max_retries_per_request = max_retries_per_request
-        self.retry_lock = retry_lock
 
 
 # The feature registry. At most one feature may claim a given mode: the
@@ -992,7 +938,6 @@ COMPAT_FEATURES = {
         complaint_match=_compat_rejection_match,
         validate_entry=_compat_validate_context_management_entry,
         max_retries_per_request=COMPAT_MAX_RETRIES_PER_REQUEST,
-        retry_lock=_state.retry_lock,
     ),
     "reasoning_field": _FeatureDescriptor(
         name="reasoning_field",
@@ -1001,7 +946,6 @@ COMPAT_FEATURES = {
         complaint_match=_reasoning_complaint_match,
         validate_entry=_compat_validate_reasoning_entry,
         max_retries_per_request=COMPAT_REASONING_MAX_RETRIES_PER_REQUEST,
-        retry_lock=_state.reasoning_retry_lock,
     ),
 }
 

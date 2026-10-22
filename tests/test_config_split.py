@@ -103,9 +103,10 @@ def test_models_path_for_sibling_resolution():
 
 
 def test_merged_load_with_optional_keys():
-    """A valid pair merges: tiers from config.json, models and
-    extra_request_headers from models.json; a flag set in models.json
-    survives the merge."""
+    """A valid pair merges: tiers from config.json, models, the count-tokens
+    flag, extra_request_headers, and the reasoning_field_switch policy from
+    models.json survive the merge; an absent policy key is left out of the
+    merged dict, so the resolver's 10/3 defaults apply."""
     print("\n--- Test: Merged Load ---")
     temp_dir = tempfile.mkdtemp(prefix="proxy_split_merge_")
     try:
@@ -113,7 +114,9 @@ def test_merged_load_with_optional_keys():
             temp_dir,
             models_doc={"models": {"p": ["claude-haiku-4-5", "claude-sonnet-5"]},
                         "extra_request_headers": {"p": {"X-Flag": {"from": "x-pl"}}},
-                        "disable_retry_claude_count_token": True})
+                        "disable_retry_claude_count_token": True,
+                        "reasoning_field_switch": {"saturation_max": 6,
+                                                   "saturation_on_switch": 2}})
         merged = config.load_config(cpath)
         _check(merged.get("tiers") == TIERS, "tiers merged from config.json",
                "got {!r}".format(merged.get("tiers")))
@@ -127,6 +130,24 @@ def test_merged_load_with_optional_keys():
         _check(merged.get("disable_retry_claude_count_token") is True,
                "flag present in the merged dict",
                "got {!r}".format(merged.get("disable_retry_claude_count_token")))
+        _check(merged.get("reasoning_field_switch") ==
+               {"saturation_max": 6, "saturation_on_switch": 2},
+               "reasoning_field_switch merged from models.json",
+               "got {!r}".format(merged.get("reasoning_field_switch")))
+        _check(config.reasoning_switch_params(merged) == (6, 2),
+               "the merged policy resolves to its explicit pair",
+               "got {!r}".format(config.reasoning_switch_params(merged)))
+
+        # Absent knob: no key in the merged dict, and the resolver defaults.
+        _write_pair(temp_dir, models_doc={"models": {"p": ["claude-haiku-4-5"]}})
+        merged = config.load_config(cpath)
+        _check("reasoning_field_switch" not in merged,
+               "an absent reasoning_field_switch is not synthesized into the "
+               "merged dict",
+               "got {!r}".format(merged.get("reasoning_field_switch")))
+        _check(config.reasoning_switch_params(merged) == (10, 3),
+               "the absent policy resolves to the 10/3 defaults",
+               "got {!r}".format(config.reasoning_switch_params(merged)))
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -170,7 +191,9 @@ def test_models_doc_bad_shapes_collapse_to_value_error():
     """Malformed JSON, a directory in place of models.json, and invalid
     UTF-8 bytes all collapse to ValueError naming models.json; so do the
     structural shapes (not an object, missing 'models', 'models' not an
-    object, non-object extra_request_headers)."""
+    object, non-object extra_request_headers, a non-object
+    reasoning_field_switch, and a non-integer or boolean
+    reasoning_field_switch field)."""
     print("\n--- Test: models.json Bad Shapes -> ValueError ---")
     temp_dir = tempfile.mkdtemp(prefix="proxy_split_shapes_")
     try:
@@ -238,6 +261,26 @@ def test_models_doc_bad_shapes_collapse_to_value_error():
             lambda: _dump(mpath, {"models": {},
                                   "disable_retry_claude_count_token": "yes"}),
             "non-boolean count-tokens flag", "'disable_retry_claude_count_token'")
+
+        expect_value_error(
+            lambda: _dump(mpath, {"models": {},
+                                  "reasoning_field_switch": ["x"]}),
+            "non-object reasoning_field_switch",
+            "'reasoning_field_switch'")
+
+        expect_value_error(
+            lambda: _dump(mpath, {"models": {},
+                                  "reasoning_field_switch":
+                                      {"saturation_max": "4"}}),
+            "string reasoning_field_switch field",
+            "reasoning_field_switch.saturation_max")
+
+        expect_value_error(
+            lambda: _dump(mpath, {"models": {},
+                                  "reasoning_field_switch":
+                                      {"saturation_on_switch": True}}),
+            "boolean reasoning_field_switch field",
+            "reasoning_field_switch.saturation_on_switch")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -366,10 +409,13 @@ def test_leftover_keys_warn_and_lose():
             config_doc={"tiers": TIERS,
                         "models": {"q": ["from-config-catalog"]},
                         "extra_request_headers": {"q": {"X-Old": {"from": "x-y"}}},
-                        "disable_retry_claude_count_token": False},
+                        "disable_retry_claude_count_token": False,
+                        "reasoning_field_switch": {"saturation_max": 2}},
             models_doc={"models": {"p": ["claude-haiku-4-5"]},
                         "extra_request_headers": {"p": {"X-New": {"from": "x-n"}}},
-                        "disable_retry_claude_count_token": True})
+                        "disable_retry_claude_count_token": True,
+                        "reasoning_field_switch": {"saturation_max": 6,
+                                                   "saturation_on_switch": 2}})
         mpath = config.models_path_for(cpath)
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
@@ -385,12 +431,17 @@ def test_leftover_keys_warn_and_lose():
         _check(merged.get("disable_retry_claude_count_token") is True,
                "models.json flag wins over the leftover",
                "got {!r}".format(merged.get("disable_retry_claude_count_token")))
+        _check(merged.get("reasoning_field_switch") ==
+               {"saturation_max": 6, "saturation_on_switch": 2},
+               "models.json reasoning_field_switch wins over the leftover",
+               "got {!r}".format(merged.get("reasoning_field_switch")))
         _check("WARNING" in out and "models" in out,
                "warnings on stderr", "stderr={!r}".format(out))
         _check(mpath in out, "warning names the models path",
                "stderr={!r}".format(out))
         for key in ("models", "extra_request_headers",
-                    "disable_retry_claude_count_token"):
+                    "disable_retry_claude_count_token",
+                    "reasoning_field_switch"):
             _check("carries a '{}' key".format(key) in out,
                    "warning names the leftover '{}' key".format(key),
                    "stderr={!r}".format(out))
@@ -401,14 +452,17 @@ def test_leftover_keys_warn_and_lose():
 def test_leftover_key_dropped_warning():
     """When models.json does NOT carry a key that config.json still has,
     the warning names the drop — a policy-bearing value silently discarded
-    must never be announced as being re-read from elsewhere."""
+    must never be announced as being re-read from elsewhere. Covered for the
+    catalog-era leftover and for the reasoning_field_switch policy object,
+    whose home is models.json."""
     print("\n--- Test: Dropped Leftover Key Warning ---")
     temp_dir = tempfile.mkdtemp(prefix="proxy_split_drop_")
     try:
         cpath, _ = _write_pair(
             temp_dir,
             config_doc={"tiers": TIERS,
-                        "disable_retry_claude_count_token": True},
+                        "disable_retry_claude_count_token": True,
+                        "reasoning_field_switch": {"saturation_max": 4}},
             models_doc={"models": {"p": ["claude-haiku-4-5"]}})
         mpath = config.models_path_for(cpath)
         err = io.StringIO()
@@ -418,8 +472,14 @@ def test_leftover_key_dropped_warning():
         _check("disable_retry_claude_count_token" not in merged,
                "dropped key absent from the merged dict",
                "merged={!r}".format(merged))
+        _check("reasoning_field_switch" not in merged,
+               "dropped reasoning_field_switch absent from the merged dict",
+               "merged={!r}".format(merged))
         _check("dropped" in out and mpath in out,
                "warning names the drop and the models path",
+               "stderr={!r}".format(out))
+        _check("reasoning_field_switch" in out,
+               "warning names the dropped reasoning_field_switch key",
                "stderr={!r}".format(out))
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)

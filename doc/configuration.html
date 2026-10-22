@@ -10,7 +10,7 @@
 
 <h1>Configuration<span class="sub">config.json, models.json, keys-index.json, and the environment</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-13</p>
+<p><strong>Last updated:</strong> 2026-10-22</p>
 
 <p>Three files configure the proxy, and the split between them is the important thing to
 understand: <strong><code>config.json</code> and <code>models.json</code> are safe to read, share,
@@ -31,7 +31,8 @@ your tuning.</p>
 <tr>
   <td><code>models.json</code></td>
   <td>The provider catalog; the <a href="#extra-headers">extra_request_headers</a> rules; the
-      <a href="#count-tokens-flag">disable_retry_claude_count_token</a> policy flag</td>
+      <a href="#count-tokens-flag">disable_retry_claude_count_token</a> policy flag; the
+      <a href="#reasoning-field-switch">reasoning_field_switch</a> policy object</td>
   <td><code>~/.claude/proxy/models.json</code> — beside <code>config.json</code></td>
 </tr>
 <tr>
@@ -95,7 +96,8 @@ name that an extra tier is pointed at resolves to that tier.</p>
     "example-provider": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]
   },
   "extra_request_headers": {},
-  "disable_retry_claude_count_token": true
+  "disable_retry_claude_count_token": true,
+  "reasoning_field_switch": { "saturation_max": 10, "saturation_on_switch": 3 }
 }</code></pre>
 
 <p>Always the <strong>sibling</strong> of the config file: the <code>models.json</code> in the same
@@ -149,6 +151,51 @@ document and are carried across a tier hot-switch by name, so switching a tier c
 discard your header rules. See <a href="operations.html#admin">operations.html#admin</a>. The flag
 also interacts with the compatibility learner, which excludes <code>count_tokens</code> from its
 probing — see <a href="compatibility.html">compatibility.html</a>.
+</div>
+
+<h3 id="reasoning-field-switch"><code>reasoning_field_switch</code></h3>
+
+<p>Optional. The two thresholds of the <code>reasoning_field</code> learner's credit, which
+decides when the proxy moves a provider/model pair to the next reasoning-echo candidate
+(the rule itself: <a href="compatibility.html#reasoning-model">compatibility.html</a>).</p>
+
+<pre><code>{
+  "reasoning_field_switch": { "saturation_max": 10, "saturation_on_switch": 3 }
+}</code></pre>
+
+<table>
+<tr><th>Field</th><th class="num">Default</th><th>Meaning</th></tr>
+<tr><td><code>saturation_max</code></td><td class="num">10</td>
+    <td>The credit's ceiling. Each gate-true <code>2xx</code> raises the credit by one, up to
+        this value — many successes never push it past the cap</td></tr>
+<tr><td><code>saturation_on_switch</code></td><td class="num">3</td>
+    <td>The credit a selection <em>arrives</em> with — first sight, post-switch and post-restart
+        alike — and the value it is re-armed to after a switch. Each matched complaint lowers the
+        credit by one; when a decrement reaches zero, the selection advances one step</td></tr>
+</table>
+
+<p><strong>Tuning.</strong> A low <code>saturation_on_switch</code> switches quickly — right for
+a pair whose echo field is genuinely wrong, at the cost of moving on a short complaint burst. A
+high one is stubborn: it takes that many complaint episodes to move, the right posture for a
+flaky upstream where successes refill the credit long before it can drain. With the default 10,
+even a fully saturated pair needs ten consecutive complaints — any interleaved success raises the
+bar again — and a fresh selection is never more than <code>saturation_on_switch</code> complaints
+from moving, because flakiness alone never settles a pair.</p>
+
+<p>The credit is <strong>in memory and per key</strong>, and the key is the pair
+(provider, mode, model, feature) — <em>shared</em> by every session routing through it, so one
+session's complaint burst can decrement the credit another session depends on. That pooling is
+intentional: the credit is evidence about the pair, not about a session. A restart forgets it and
+re-arms at <code>saturation_on_switch</code>.</p>
+
+<div class="note">
+The key is read per request from the config snapshot, so an edit takes effect on <strong>Reload
+Providers</strong>, and it is carried across a tier hot-switch like the header rules. Validation
+is strict and evaluates the <em>effective</em> pair — defaults applied first, then the ordering
+rule — so <code>{ "saturation_max": 2 }</code> against the defaulted
+<code>saturation_on_switch</code> of 3 is refused rather than silently clamped. A
+<code>reasoning_field_switch</code> misplaced in <code>config.json</code> is warned about and
+dropped, like the count-token flag above.
 </div>
 
 <h3 id="extra-headers"><code>extra_request_headers</code></h3>
@@ -412,6 +459,9 @@ after the spawn. The CLI's pre-spawn check prints the same aggregated error list
 <tr><td>A provider in <code>config.models</code> has no entry in <code>keys-index.json</code></td></tr>
 <tr><td>A tier's <code>key</code> is present but not a string, or names no key of its provider</td></tr>
 <tr><td><code>disable_retry_claude_count_token</code> is present but not a boolean</td></tr>
+<tr><td><code>reasoning_field_switch</code> is present but not an object, carries a non-integer or
+    boolean field value, a value below 1, an unknown inner key, or an <em>effective</em>
+    <code>saturation_on_switch</code> greater than <code>saturation_max</code></td></tr>
 <tr><td>Any <code>extra_request_headers</code> rule fails its type, charset, reserved-name, or
     duplicate check</td></tr>
 <tr><td>Any vendor carries both <code>key</code> and <code>keys</code>, or neither</td></tr>
@@ -429,6 +479,6 @@ common mistake: <strong>config is authoritative</strong>. Every provider named i
 <code>config.json</code> must exist in the keys file. Providers that exist only in the keys file
 are ignored.</p>
 
-<footer>Last updated: 2026-10-13</footer>
+<footer>Last updated: 2026-10-22</footer>
 </body>
 </html>
