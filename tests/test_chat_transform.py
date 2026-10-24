@@ -26,7 +26,11 @@ from claude_retry_proxy.transforms_common import (
 
 
 def test_anthropic_to_chat_messages_transform():
-    """Full message array (thinking/text/tool_use/tool_result) -> valid OpenAI Chat messages."""
+    """Full message array (thinking/text/tool_use/tool_result) -> valid OpenAI Chat messages.
+
+    One Anthropic assistant turn becomes ONE OpenAI assistant message: the
+    joined text and the tool_calls share the same message.
+    """
     print("\n--- Test: Anthropic To Chat Messages Transform ---")
     fn = _require_server_func("_transform_anthropic_messages_to_chat")
     if fn is None:
@@ -44,8 +48,7 @@ def test_anthropic_to_chat_messages_transform():
     ]
     out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
     expected = [
-        {"role": "assistant", "content": "Let me check."},
-        {"role": "assistant", "content": None, "tool_calls": [
+        {"role": "assistant", "content": "Let me check.", "tool_calls": [
             {"id": "toolu_1", "type": "function",
              "function": {"name": "get_weather", "arguments": '{"city": "SF"}'}}]},
         {"role": "tool", "tool_call_id": "toolu_1", "content": "60F"},
@@ -54,7 +57,7 @@ def test_anthropic_to_chat_messages_transform():
     if out != expected:
         fail("full transform mismatch, got {!r}".format(out))
     else:
-        pass_("full message array transformed correctly")
+        pass_("full message array transformed to the collapsed shape")
 
 
 
@@ -215,7 +218,12 @@ def test_anthropic_to_chat_messages_tool_result_to_role_tool():
 
 
 def test_anthropic_to_chat_messages_mixed_text_and_tool_use():
-    """Assistant with both text and tool_use -> text message first, then content:null + tool_calls."""
+    """Assistant with both text and tool_use -> ONE message carrying text + tool_calls.
+
+    The two-message split (text message, then content:null + tool_calls) is
+    gone: the reasoning field must ride the same message the vendor checks,
+    and the collapsed form is the ordinary OpenAI shape.
+    """
     print("\n--- Test: Anthropic To Chat Messages Mixed Text And Tool Use ---")
     fn = _require_server_func("_transform_anthropic_messages_to_chat")
     if fn is None:
@@ -228,14 +236,13 @@ def test_anthropic_to_chat_messages_mixed_text_and_tool_use():
     ]
     out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
     expected = [
-        {"role": "assistant", "content": "I'll look that up."},
-        {"role": "assistant", "content": None, "tool_calls": [
+        {"role": "assistant", "content": "I'll look that up.", "tool_calls": [
             {"id": "toolu_2", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
     ]
     if out != expected:
-        fail("text must be preserved as a separate message before tool_calls, got {!r}".format(out))
+        fail("text and tool_calls must share one assistant message, got {!r}".format(out))
     else:
-        pass_("text preserved + content:null tool_calls message when both present")
+        pass_("one assistant message carries both the text and the tool_calls")
 
 
 
@@ -271,7 +278,11 @@ def test_anthropic_to_chat_messages_mixed_text_and_tool_result():
 
 
 def test_anthropic_to_chat_messages_interleaved_thinking_tool_use():
-    """Real-world interleaved pattern: thinking, text, tool_use, text in one assistant turn."""
+    """Real-world interleaved pattern: thinking, text, tool_use, text in one assistant turn.
+
+    All text parts join into the single collapsed message; at the default
+    selection no reasoning field is emitted at all.
+    """
     print("\n--- Test: Anthropic To Chat Messages Interleaved Thinking Tool Use ---")
     fn = _require_server_func("_transform_anthropic_messages_to_chat")
     if fn is None:
@@ -290,16 +301,20 @@ def test_anthropic_to_chat_messages_interleaved_thinking_tool_use():
     out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
     expected = [
         {"role": "assistant",
-         "content": "Let me look up the weather for San Francisco.\nI found the forecast."},
-        {"role": "assistant", "content": None, "tool_calls": [
-            {"id": "toolu_weather", "type": "function",
-             "function": {"name": "get_weather", "arguments": '{"city": "San Francisco"}'}}]},
+         "content": "Let me look up the weather for San Francisco.\nI found the forecast.",
+         "tool_calls": [
+             {"id": "toolu_weather", "type": "function",
+              "function": {"name": "get_weather", "arguments": '{"city": "San Francisco"}'}}]},
         {"role": "tool", "tool_call_id": "toolu_weather", "content": "Sunny, 72F"},
     ]
     if out != expected:
         fail("interleaved pattern mismatch, got {!r}".format(out))
-    else:
-        pass_("interleaved thinking/text/tool_use pattern transformed with no reasoning echo at the default")
+        return
+    if any("reasoning_content" in m or "reasoning" in m for m in out
+           if m.get("role") == "assistant"):
+        fail("the default selection must emit no reasoning field, got {!r}".format(out))
+        return
+    pass_("interleaved thinking/text/tool_use pattern transformed with no reasoning echo at the default")
 
 
 
@@ -364,6 +379,268 @@ def test_chat_transform_emits_only_selected_field():
 
     pass_("selection matrix: only the two field names emit, never both, "
           "everything else (including omission) emits none")
+
+    # --- reasoning_always axis: the policy-scoped always-present field ------
+    # Two demanding turns: the first reasoned, the second bare. With
+    # `reasoning_always`, every assistant message carries the selected field —
+    # the real text where a thinking block exists, "" where none does.
+    demanded = [
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "hmm", "signature": "s"},
+            {"type": "tool_use", "id": "t1", "name": "f", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+        ]},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t2", "name": "f", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t2", "content": "ok"},
+        ]},
+    ]
+
+    def always(b, selection):
+        return fn(b, request_id="T-" + uuid.uuid4().hex[:8],
+                  mode="chat", provider="p", tier="sonnet",
+                  reasoning_selection=selection, reasoning_always=True)
+
+    for field in ("reasoning_content", "reasoning"):
+        got = [m for m in always(demanded, field) if m.get("role") == "assistant"]
+        if [m.get(field) for m in got] != ["hmm", ""]:
+            fail("reasoning_always with selection {!r} must carry the real "
+                 "text then \"\" on every assistant message, got {!r}".format(
+                     field, got))
+            return
+
+    # Inert when the conversation carries no tool call: the always-present
+    # pass fills nothing, so a bare assistant turn gets no `""` field. (A turn
+    # with a real thinking block still echoes it — that is the ordinary
+    # selection-driven path, not the injection.)
+    no_tool_turn = [{"role": "assistant", "content": [
+        {"type": "text", "text": "visible"},
+    ]}]
+    got = [m for m in always(no_tool_turn, "reasoning_content")
+           if m.get("role") == "assistant"]
+    if any("reasoning_content" in m or "reasoning" in m for m in got):
+        fail("reasoning_always must be inert without a tool-call turn, got "
+             "{!r}".format(got))
+        return
+
+    # Inert when the learned selection is "none": there is no field name to
+    # write, whatever the policy says.
+    got = [m for m in always(demanded, "none") if m.get("role") == "assistant"]
+    if any("reasoning_content" in m or "reasoning" in m for m in got):
+        fail("reasoning_always must be inert when the selection is none, got "
+             "{!r}".format(got))
+        return
+
+    pass_("reasoning_always axis: real text where a thinking block exists, "
+          "\"\" where none does, inert without a tool-call turn, inert at "
+          "selection none")
+
+
+def test_anthropic_to_chat_injection_trace_counts():
+    """reasoning_field_injected separates real / empty / placeholder counts.
+
+    Three demanding turns — real reasoning, a redacted-thinking placeholder,
+    and a bare one — yield real=1, empty=1, placeholder=1, and the event fires
+    because the blank/placeholder fill is non-zero. A conversation whose every
+    assistant turn carries real reasoning fills nothing, so it emits no event
+    and its trace cannot be mistaken for a masked-loss alarm.
+    """
+    print("\n--- Test: Anthropic To Chat Injection Trace Counts ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    placeholder_text = "[redacted_thinking: data not available]"
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "real one", "signature": "s"},
+            {"type": "tool_use", "id": "t1", "name": "f", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+        ]},
+        {"role": "assistant", "content": [
+            {"type": "redacted_thinking", "data": "enc", "signature": "s2"},
+            {"type": "tool_use", "id": "t2", "name": "f", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t2", "content": "ok"},
+        ]},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t3", "name": "f", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t3", "content": "ok"},
+        ]},
+    ]
+    rid = "T-" + uuid.uuid4().hex[:8]
+    out = fn(messages, request_id=rid, mode="chat", provider="p",
+             tier="sonnet", reasoning_selection="reasoning_content",
+             reasoning_always=True)
+    assistants = [m for m in out if m.get("role") == "assistant"]
+    sent = [m.get("reasoning_content") for m in assistants]
+    if sent != ["real one", placeholder_text, ""]:
+        fail("injection must fill real text, the redacted placeholder, then "
+             "\"\", got {!r}".format(sent))
+        return
+    evs = [e for e in _trace_events_for_request(rid)
+           if e.get("event") == "reasoning_field_injected"]
+    if len(evs) != 1:
+        fail("expected exactly ONE reasoning_field_injected event, got {!r}"
+             .format(evs))
+        return
+    ev = evs[0]
+    if (ev.get("real"), ev.get("empty"), ev.get("placeholder")) != (1, 1, 1):
+        fail("reasoning_field_injected counters must be real=1 empty=1 "
+             "placeholder=1 (a redacted placeholder is never real), got {!r}"
+             .format(ev))
+        return
+    if not (ev.get("mode") == "chat" and ev.get("provider") == "p"
+            and ev.get("tier") == "sonnet" and ev.get("request_id") == rid):
+        fail("reasoning_field_injected missing correlation fields, got {!r}"
+             .format(ev))
+        return
+
+    # All-real conversation: the fill count is zero, so no event fires.
+    rid2 = "T-" + uuid.uuid4().hex[:8]
+    all_real = [
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "real one", "signature": "s"},
+            {"type": "tool_use", "id": "t1", "name": "f", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+        ]},
+    ]
+    out2 = fn(all_real, request_id=rid2, mode="chat", provider="p",
+              tier="sonnet", reasoning_selection="reasoning_content",
+              reasoning_always=True)
+    got2 = [m for m in out2 if m.get("role") == "assistant"]
+    if got2 != [{"role": "assistant", "content": None,
+                 "reasoning_content": "real one",
+                 "tool_calls": [{"id": "t1", "type": "function",
+                                 "function": {"name": "f",
+                                              "arguments": "{}"}}]}]:
+        fail("the all-real case must still carry the real field, got {!r}"
+             .format(got2))
+        return
+    evs2 = [e for e in _trace_events_for_request(rid2)
+            if e.get("event") == "reasoning_field_injected"]
+    if evs2:
+        fail("an all-real injection fills nothing and must not emit the "
+             "event, got {!r}".format(evs2))
+        return
+    pass_("injection event counts real/empty/placeholder and fires only when "
+          "empty + placeholder > 0")
+
+
+def test_anthropic_to_chat_real_thinking_supersedes_placeholder():
+    """A real `thinking` block supersedes an earlier redacted placeholder on the
+    same turn, so the placeholder flag always describes the value actually kept.
+
+    A `[redacted_thinking, thinking, tool_use]` turn forwards the REAL text and
+    fires no `reasoning_field_injected` event: nothing blank was filled. When a
+    bare turn is present the event does fire, and the superseded turn is counted
+    `real=1, placeholder=0` — a real-text turn is never miscounted as a
+    placeholder.
+
+    Guard: a redacted-ONLY turn still forwards the placeholder and is counted
+    `placeholder=1, real=0`. A fix that merely dropped the placeholder (the
+    separately-deferred removal) could not pass both halves.
+    """
+    print("\n--- Test: Anthropic To Chat Real Thinking Supersedes Placeholder ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    placeholder_text = "[redacted_thinking: data not available]"
+
+    def superseded_turn(call_id):
+        return {"role": "assistant", "content": [
+            {"type": "redacted_thinking", "data": "enc", "signature": "s1"},
+            {"type": "thinking", "thinking": "REAL TEXT", "signature": "s2"},
+            {"type": "tool_use", "id": call_id, "name": "f", "input": {}},
+        ]}
+
+    def bare_turn(call_id):
+        return {"role": "assistant", "content": [
+            {"type": "tool_use", "id": call_id, "name": "f", "input": {}},
+        ]}
+
+    def tool_result(call_id):
+        return {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": call_id, "content": "ok"},
+        ]}
+
+    # (a) Superseded turn alone: real text forwarded, nothing blank filled, so
+    # no injection event fires.
+    rid = "T-" + uuid.uuid4().hex[:8]
+    out = fn([superseded_turn("t1"), tool_result("t1")], request_id=rid,
+             mode="chat", provider="p", tier="sonnet",
+             reasoning_selection="reasoning_content", reasoning_always=True)
+    assistants = [m for m in out if m.get("role") == "assistant"]
+    if [m.get("reasoning_content") for m in assistants] != ["REAL TEXT"]:
+        fail("a real thinking block must supersede the redacted placeholder, "
+             "got {!r}".format(assistants))
+        return
+    evs = [e for e in _trace_events_for_request(rid)
+           if e.get("event") == "reasoning_field_injected"]
+    if evs:
+        fail("nothing blank was filled, so no injection event may fire, got "
+             "{!r}".format(evs))
+        return
+
+    # (b) Superseded turn plus a bare turn: the event fires and counts the
+    # superseded turn as REAL, never as a placeholder.
+    rid2 = "T-" + uuid.uuid4().hex[:8]
+    out2 = fn([superseded_turn("t1"), tool_result("t1"),
+               bare_turn("t2"), tool_result("t2")], request_id=rid2,
+              mode="chat", provider="p", tier="sonnet",
+              reasoning_selection="reasoning_content", reasoning_always=True)
+    assistants2 = [m for m in out2 if m.get("role") == "assistant"]
+    if [m.get("reasoning_content") for m in assistants2] != ["REAL TEXT", ""]:
+        fail("the superseded turn must forward real text and the bare turn "
+             "\"\", got {!r}".format(assistants2))
+        return
+    evs2 = [e for e in _trace_events_for_request(rid2)
+            if e.get("event") == "reasoning_field_injected"]
+    if len(evs2) != 1:
+        fail("expected exactly ONE reasoning_field_injected event, got {!r}"
+             .format(evs2))
+        return
+    if (evs2[0].get("real"), evs2[0].get("empty"),
+            evs2[0].get("placeholder")) != (1, 1, 0):
+        fail("a superseded turn is counted real=1, placeholder=0, got {!r}"
+             .format(evs2[0]))
+        return
+
+    # (c) Guard: a redacted-only turn still forwards the placeholder and is
+    # counted as a placeholder, never as real.
+    rid3 = "T-" + uuid.uuid4().hex[:8]
+    redacted_only = {"role": "assistant", "content": [
+        {"type": "redacted_thinking", "data": "enc", "signature": "s1"},
+        {"type": "tool_use", "id": "t3", "name": "f", "input": {}},
+    ]}
+    out3 = fn([redacted_only, tool_result("t3")], request_id=rid3,
+              mode="chat", provider="p", tier="sonnet",
+              reasoning_selection="reasoning_content", reasoning_always=True)
+    assistants3 = [m for m in out3 if m.get("role") == "assistant"]
+    if [m.get("reasoning_content") for m in assistants3] != [placeholder_text]:
+        fail("a redacted-only turn must still forward the placeholder, got "
+             "{!r}".format(assistants3))
+        return
+    evs3 = [e for e in _trace_events_for_request(rid3)
+            if e.get("event") == "reasoning_field_injected"]
+    if len(evs3) != 1 or (evs3[0].get("placeholder"),
+                          evs3[0].get("real")) != (1, 0):
+        fail("a redacted-only turn is counted placeholder=1, real=0, got {!r}"
+             .format(evs3))
+        return
+    pass_("real thinking supersedes the redacted placeholder (real=1, "
+          "placeholder=0, no event when nothing blank was filled); a "
+          "redacted-only turn still counts as a placeholder")
 
 
 def test_anthropic_to_chat_messages_string_content_passthrough():
@@ -1078,8 +1355,7 @@ def test_anthropic_to_chat_integration():
     expected_messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "What's the weather in SF?"},
-        {"role": "assistant", "content": "Let me look it up."},
-        {"role": "assistant", "content": None, "tool_calls": [
+        {"role": "assistant", "content": "Let me look it up.", "tool_calls": [
             {"id": "toolu_1", "type": "function",
              "function": {"name": "get_weather", "arguments": '{"city": "SF"}'}}]},
         {"role": "tool", "tool_call_id": "toolu_1", "content": "Sunny, 72F"},
@@ -1255,7 +1531,13 @@ def test_anthropic_to_chat_tool_use_non_dict_input():
 
 
 def test_anthropic_to_chat_nan_placeholder_with_valid_tool_use():
-    """NaN tool_use + valid tool_use coexist -> placeholder as separate assistant message before tool_calls."""
+    """NaN tool_use + valid tool_use coexist -> ONE assistant message carrying
+    the placeholder text and the surviving tool_calls.
+
+    The placeholder path collapses like the normal path. A turn whose tool
+    calls were ALL degraded keeps the placeholder as plain text with no
+    ``tool_calls`` key at all — the collapse must not imply one survives.
+    """
     print("\n--- Test: Anthropic To Chat Nan Placeholder With Valid Tool Use ---")
     fn = _require_server_func("_transform_anthropic_messages_to_chat")
     if fn is None:
@@ -1271,13 +1553,14 @@ def test_anthropic_to_chat_nan_placeholder_with_valid_tool_use():
     expected = [
         {"role": "assistant",
          "content": ("[Tool call failed: arguments for 'f' (call toolu_nan) "
-                     "could not be serialized as JSON]")},
-        {"role": "assistant", "content": None, "tool_calls": [
-            {"id": "toolu_ok", "type": "function",
-             "function": {"name": "g", "arguments": '{"a": 1}'}}]},
+                     "could not be serialized as JSON]"),
+         "tool_calls": [
+             {"id": "toolu_ok", "type": "function",
+              "function": {"name": "g", "arguments": '{"a": 1}'}}]},
     ]
     if out != expected:
-        fail("NaN placeholder must be preserved before tool_calls, got {!r}".format(out))
+        fail("NaN placeholder must share one message with the surviving "
+             "tool_calls, got {!r}".format(out))
         return
     evs = [e for e in _trace_events_for_request(rid) if e.get("event") == "tool_args_parse_failure"]
     if not evs:
@@ -1286,7 +1569,22 @@ def test_anthropic_to_chat_nan_placeholder_with_valid_tool_use():
     if evs[0].get("tool_name") != "f" or evs[0].get("tool_id") != "toolu_nan":
         fail("tool_args_parse_failure missing tool_name/tool_id, got {!r}".format(evs[0]))
         return
-    pass_("NaN placeholder preserved as separate message before tool_calls")
+    # Every tool call in the turn degraded -> the placeholder stays plain text
+    # with no tool_calls key.
+    rid2 = "T-" + uuid.uuid4().hex[:8]
+    all_bad = fn([
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_nan2", "name": "f", "input": {"value": float("nan")}},
+        ]},
+    ], request_id=rid2, mode="chat", provider="p", tier="sonnet")
+    if (len(all_bad) != 1 or "tool_calls" in all_bad[0]
+            or not isinstance(all_bad[0].get("content"), str)
+            or not all_bad[0].get("content")):
+        fail("a fully degraded turn must stay placeholder text with no "
+             "tool_calls key, got {!r}".format(all_bad))
+        return
+    pass_("NaN placeholder shares one message with the surviving tool_calls; "
+          "an all-degraded turn keeps no tool_calls key")
 
 
 
@@ -2129,6 +2427,8 @@ ALL_TESTS = [
     ("anthropic-to-chat-messages-mixed-text-and-tool-result", test_anthropic_to_chat_messages_mixed_text_and_tool_result),
     ("anthropic-to-chat-messages-interleaved-thinking-tool-use", test_anthropic_to_chat_messages_interleaved_thinking_tool_use),
     ("chat-transform-emits-only-selected-field", test_chat_transform_emits_only_selected_field),
+    ("anthropic-to-chat-injection-trace-counts", test_anthropic_to_chat_injection_trace_counts),
+    ("anthropic-to-chat-real-thinking-supersedes-placeholder", test_anthropic_to_chat_real_thinking_supersedes_placeholder),
     ("anthropic-to-chat-messages-string-content-passthrough", test_anthropic_to_chat_messages_string_content_passthrough),
     ("anthropic-to-chat-messages-cache-control-stripped", test_anthropic_to_chat_messages_cache_control_stripped),
     ("anthropic-to-chat-messages-non-list-guarded", test_anthropic_to_chat_messages_non_list_guarded),

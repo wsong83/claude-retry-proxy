@@ -165,10 +165,19 @@ REASONING_MESSAGE_400 = json.dumps({
 }).encode()
 
 
-def _reasoning_request(model="sonnet", with_thinking=True, text="hello"):
+def _reasoning_request(model="sonnet", with_thinking=True, text="hello",
+                       demanding=False):
     """A chat-mode client request. `with_thinking` appends an assistant turn
-    carrying a thinking block — the presence gate that makes the reasoning
-    feature active for the request."""
+    carrying a thinking block — a presence signal for the reasoning feature.
+
+    `demanding=True` makes that turn a DEMANDING turn: it carries a tool_use
+    block, answered by a trailing user tool_result. The credit gate is
+    demanding-turn scoped (2026-10-22-reasoning-roundtrip-compliance Step 5),
+    so only a demanding turn feeds the learner; every credit/switch test must
+    opt in. The default shape (thinking + text, no tool_use) stays available
+    for the documented no-tool-call rescue case, whose passes remain same-body
+    re-rolls.
+    """
     body = {
         "model": model,
         "max_tokens": 16,
@@ -176,7 +185,20 @@ def _reasoning_request(model="sonnet", with_thinking=True, text="hello"):
             {"role": "user", "content": [{"type": "text", "text": text}]},
         ],
     }
-    if with_thinking:
+    if demanding:
+        content = []
+        if with_thinking:
+            content.append({"type": "thinking", "thinking": "hmm",
+                            "signature": "s"})
+        content.append({"type": "tool_use", "id": "toolu_demand",
+                        "name": "lookup", "input": {"q": text}})
+        body["messages"].append({"role": "assistant", "content": content})
+        body["messages"].append({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_demand",
+                         "content": "ok"}],
+        })
+    elif with_thinking:
         body["messages"].append({
             "role": "assistant",
             "content": [
@@ -204,6 +226,22 @@ def _sent_reasoning_field(info):
             if f in m:
                 return f
     return None
+
+
+def _forwarded_assistant_fields(info, field="reasoning_content"):
+    """Every assistant message's value for `field` in the body the proxy sent.
+
+    Returns (values, every_message_carries_it). Empty values + False when the
+    body is unparseable or carries no assistant message.
+    """
+    try:
+        body = json.loads(info["body"])
+    except Exception:
+        return [], False
+    msgs = [m for m in body.get("messages", [])
+            if isinstance(m, dict) and m.get("role") == "assistant"]
+    values = [m.get(field) for m in msgs]
+    return values, bool(msgs) and all(field in m for m in msgs)
 
 
 def _chat_ok_response(info):
@@ -2455,7 +2493,8 @@ def test_compat_single_retry_global():
         reasoning_results = []
 
         def reasoning_worker():
-            s, _ = _send(proxy_port, _reasoning_request(model="haiku"))
+            s, _ = _send(proxy_port, _reasoning_request(model="haiku",
+                                                        demanding=True))
             reasoning_results.append(s)
 
         threads = [threading.Thread(target=reasoning_worker)
@@ -2846,20 +2885,27 @@ def test_compat_trace_metadata_only():
 
 def test_reasoning_walk_sends_advanced_candidate():
     """A walk step from a persisted `reasoning_content` selection sends exactly
-    `reasoning`; from a persisted `reasoning` selection it sends no field at
-    all — the literal "none" candidate.
+    `reasoning`; from a persisted `reasoning` selection the first step wraps to
+    "none", which has no field name to write — the pass sends the entry's
+    current selection instead (the forced-repair fallback) and reports it as
+    `effective_field`, then advances to `reasoning_content`.
 
-    The wrap step is the pin for the sentinel collision: a resolver keyed on
-    the parameter's value rather than on None re-resolves there and re-sends
-    the body that just failed."""
+    The wrap step is still the pin for the sentinel collision: the pass re-sends
+    a field rather than re-resolving the request's selection from scratch (a
+    resolver keyed on the parameter's value rather than on None would forget
+    which selection this request started from).
+    """
     print("\n--- Test: Reasoning Walk Sends Advanced Candidate ---")
-    for seeded, accepted, expect_sent, label in (
+    for seeded, accepted, expect_sent, expect_candidates, \
+            expect_effective, label in (
             ("reasoning_content", "reasoning",
              ["reasoning_content", "reasoning"],
+             ["reasoning"], ["reasoning"],
              "reasoning_content -> reasoning"),
-            ("reasoning", "none",
-             ["reasoning", None],
-             "reasoning -> none (no field emitted)")):
+            ("reasoning", "reasoning_content",
+             ["reasoning", "reasoning", "reasoning_content"],
+             ["none", "reasoning_content"], ["reasoning", "reasoning_content"],
+             "reasoning -> none (entry selection sent) -> reasoning_content")):
         state_dir, state_path = _make_state_dir()
         _seed_reasoning_state(state_path, seeded)
         policy = {"accept": (accepted,)}
@@ -2872,15 +2918,23 @@ def test_reasoning_walk_sends_advanced_candidate():
             fail("Failed to set up test (%s)" % label)
             return
         try:
-            status, _ = _send(proxy_port, _reasoning_request())
+            status, _ = _send(proxy_port, _reasoning_request(demanding=True))
             if status != 200:
                 fail("%s: walk was not served (%s)" % (label, status))
                 return
             sent = [_sent_reasoning_field(i) for i in log]
             if sent != expect_sent:
                 fail("%s: expected %r, upstream saw %r — the wrap step "
-                     "re-resolved instead of using the advanced candidate"
+                     "re-resolved instead of using the fallback field"
                      % (label, expect_sent, sent))
+                return
+            events = _rescue_trace_events(trace_file)
+            pairs = [(e.get("candidate"), e.get("effective_field"))
+                     for e in events]
+            if pairs != list(zip(expect_candidates, expect_effective)):
+                fail("%s: expected (candidate, effective_field) %r, got %r"
+                     % (label, list(zip(expect_candidates, expect_effective)),
+                        pairs))
                 return
             pass_("walk advanced %s" % label)
         finally:
@@ -2937,7 +2991,8 @@ def test_reasoning_non_complaint_errors_are_not_counted():
     try:
         def send(model="sonnet"):
             before = len(mock_servers["p"]["requests"])
-            status, _ = _send(proxy_port, _reasoning_request(model=model))
+            status, _ = _send(proxy_port,
+                              _reasoning_request(model=model, demanding=True))
             return status, len(mock_servers["p"]["requests"]) - before
 
         # Every non-complaint shape passes straight through: no rescue.
@@ -3090,24 +3145,88 @@ def test_reasoning_delist_on_none_success():
     The trigger is the credit edge, not a served walk candidate: with
     saturation_on_switch 1 the seeded entry's absent credit reads as 1, so a
     single matched complaint drains it to 0 and advances one step —
-    "reasoning" -> "none" — which delists."""
+    "reasoning" -> "none" — which delists. The rescue's first pass then wraps
+    to the "none" candidate, which cannot inject a field name of its own: it
+    sends the entry's current selection ("reasoning", read at request entry)
+    and reports it as `effective_field`.
+
+    The conversation carries a trailing bare assistant turn, so attempt 1
+    leaves it without the field and the mock serves only a body that fills it:
+    the assertion is that the repaired bytes — not a same-body re-roll —
+    served the client. The trailing turn has no tool_use, so the demanding-turn
+    credit gate still sees the reasoned tool-call turn and the delist trigger
+    is unaffected."""
     print("\n--- Test: Reasoning Delist On None Success ---")
     state_dir, state_path = _make_state_dir()
     _seed_reasoning_state(state_path, "reasoning")
-    policy = {"accept": ("none",)}
-    responders = {"p": _reasoning_upstream(policy)}
+    log = []
+    calls = {"n": 0}
+
+    def upstream(info):
+        log.append(info)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return 400, "application/json", REASONING_MESSAGE_400
+        _values, every = _forwarded_assistant_fields(info, "reasoning")
+        if every:
+            return _chat_ok_response(info)
+        return 400, "application/json", REASONING_MESSAGE_400
+
     temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
         _start_reasoning_proxy(
-            responders, state_path,
+            {"p": upstream}, state_path,
             reasoning_field_switch={"saturation_on_switch": 1})
     if proc is None:
         shutil.rmtree(state_dir, ignore_errors=True)
         fail("Failed to set up test")
         return
     try:
-        status, _ = _send(proxy_port, _reasoning_request())
+        conversation = {
+            "model": "sonnet",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "hmm", "signature": "s"},
+                    {"type": "tool_use", "id": "toolu_demand",
+                     "name": "lookup", "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_demand",
+                     "content": "ok"}]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "done"}]},
+            ],
+        }
+        status, _ = _send(proxy_port, conversation)
         if status != 200:
             fail("the complaint was not served by the rescue (%s)" % status)
+            return
+        first_values, first_every = _forwarded_assistant_fields(
+            log[0], "reasoning")
+        if first_every:
+            fail("attempt 1 already carried the field on every assistant "
+                 "message, so the repair is not what served the client: %r"
+                 % (first_values,))
+            return
+        sent = [_sent_reasoning_field(i) for i in log]
+        if sent != ["reasoning", "reasoning"]:
+            fail("the wrap pass must send the entry's current selection when "
+                 "the candidate is 'none', upstream saw %r" % (sent,))
+            return
+        values, every = _forwarded_assistant_fields(log[1], "reasoning")
+        if not every or values != ["hmm", ""]:
+            fail("the repaired rescue body must carry the real text then \"\" "
+                 "on every assistant message, got %r (every=%r)"
+                 % (values, every))
+            return
+        events = _rescue_trace_events(trace_file)
+        if (len(events) != 1 or events[0].get("candidate") != "none"
+                or events[0].get("effective_field") != "reasoning"):
+            fail("expected one rescue event with candidate 'none' and "
+                 "effective_field 'reasoning', got %r"
+                 % ([(e.get("candidate"), e.get("effective_field"))
+                     for e in events],))
             return
         entry = _reasoning_entry(state_path)
         if entry is not None:
@@ -3152,7 +3271,7 @@ def test_reasoning_credit_saturates_and_drains():
     try:
         def send():
             before = len(mock_servers["p"]["requests"])
-            status, _ = _send(proxy_port, _reasoning_request())
+            status, _ = _send(proxy_port, _reasoning_request(demanding=True))
             return status, len(mock_servers["p"]["requests"]) - before
 
         def switch_events():
@@ -3239,6 +3358,135 @@ def test_reasoning_credit_saturates_and_drains():
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
+def test_reasoning_present_gates_on_demanding_turn():
+    """The reasoning presence gate is DEMANDING-TURN scoped.
+
+    It is True only when the LAST assistant message carrying a tool_use block
+    also carries non-empty reasoning (a thinking block, or a redacted_thinking
+    with non-empty data). A history full of reasoning does not rescue a bare
+    demanding turn; reasoning with no tool call anywhere is not learnable; and
+    an assistant message AFTER the tool-call turn (which carries no tool_use)
+    must not change the verdict — the scan past it is the divergence the
+    whole-body scan got wrong. Total: any shape it cannot interpret is False.
+    """
+    print("\n--- Test: Reasoning Present Gates On Demanding Turn ---")
+    import claude_retry_proxy.compat as compat
+    present = compat._reasoning_present
+
+    def text(t):
+        return {"type": "text", "text": t}
+
+    def thinking(t):
+        return {"type": "thinking", "thinking": t, "signature": ""}
+
+    def tool_use(call_id="t1"):
+        return {"type": "tool_use", "id": call_id, "name": "t", "input": {}}
+
+    def tool_result(call_id="t1"):
+        return {"type": "tool_result", "tool_use_id": call_id, "content": "ok"}
+
+    def body(messages):
+        return {"messages": messages}
+
+    bare_demanding = body([
+        {"role": "user", "content": [text("hi")]},
+        {"role": "assistant", "content": [thinking("old reasoning"),
+                                          tool_use("t1")]},
+        {"role": "user", "content": [tool_result("t1")]},
+        {"role": "assistant", "content": [text("now I write"),
+                                          tool_use("t2")]},
+        {"role": "user", "content": [tool_result("t2")]},
+    ])
+    if present(bare_demanding) is not False:
+        fail("a bare demanding turn over a reasoned history must be False "
+             "(a missing-field complaint says nothing about the field name), "
+             "got %r" % (present(bare_demanding),))
+        return
+    pass_("a bare demanding turn over a reasoned history is not learnable")
+
+    reasoned_demanding = body([
+        {"role": "user", "content": [text("hi")]},
+        {"role": "assistant", "content": [thinking("old reasoning"),
+                                          tool_use("t1")]},
+        {"role": "user", "content": [tool_result("t1")]},
+        {"role": "assistant", "content": [thinking("this turn reasoned"),
+                                          tool_use("t2")]},
+        {"role": "user", "content": [tool_result("t2")]},
+    ])
+    if present(reasoned_demanding) is not True:
+        fail("a reasoned demanding turn must be True, got %r"
+             % (present(reasoned_demanding),))
+        return
+    pass_("a reasoned demanding turn is learnable")
+
+    no_tool_call = body([
+        {"role": "user", "content": [text("hi")]},
+        {"role": "assistant", "content": [thinking("thinking, no tool"),
+                                          text("hello")]},
+    ])
+    if present(no_tool_call) is not False:
+        fail("reasoning with no tool-call turn anywhere must be False, got %r"
+             % (present(no_tool_call),))
+        return
+    pass_("reasoning without any tool call is not learnable")
+
+    # Divergence case: a later reasoned assistant turn without tool_use must
+    # not rescue the bare tool-call turn before it — the scan skips past it.
+    divergent = body([
+        {"role": "user", "content": [text("hi")]},
+        {"role": "assistant", "content": [tool_use("t1")]},
+        {"role": "user", "content": [tool_result("t1")]},
+        {"role": "assistant", "content": [thinking("later reasoning"),
+                                          text("no tool here")]},
+    ])
+    if present(divergent) is not False:
+        fail("a later reasoned assistant turn must not rescue a bare "
+             "tool-call turn, got %r" % (present(divergent),))
+        return
+    pass_("a later tool_use-less assistant turn does not change the verdict")
+
+    redacted = body([
+        {"role": "assistant", "content": [
+            {"type": "redacted_thinking", "data": "enc", "signature": "s"},
+            tool_use("t1")]},
+    ])
+    if present(redacted) is not True:
+        fail("a demanding turn with redacted_thinking data must be True, got "
+             "%r" % (present(redacted),))
+        return
+    empty_redacted = body([
+        {"role": "assistant", "content": [
+            {"type": "redacted_thinking", "data": "", "signature": "s"},
+            tool_use("t1")]},
+    ])
+    if present(empty_redacted) is not False:
+        fail("an empty redacted_thinking data block must not count as "
+             "reasoning, got %r" % (present(empty_redacted),))
+        return
+    empty_thinking = body([
+        {"role": "assistant", "content": [thinking(""), tool_use("t1")]},
+    ])
+    if present(empty_thinking) is not False:
+        fail("an empty thinking block must not count as reasoning, got %r"
+             % (present(empty_thinking),))
+        return
+    pass_("non-empty thinking or redacted_thinking data gates; empty does not")
+
+    for label, value in (
+            ("a non-dict body", None),
+            ("a body with no messages", {}),
+            ("messages not a list", {"messages": "nonsense"}),
+            ("uninterpretable message shapes",
+             {"messages": ["nonsense", 42, {"role": "assistant"}]}),
+            ("a string assistant content",
+             {"messages": [{"role": "assistant", "content": "hi"}]})):
+        if present(value) is not False:
+            fail("totality: %s must be False, got %r"
+                 % (label, present(value)))
+            return
+    pass_("totality guards: every uninterpretable shape is False")
+
+
 def test_reasoning_rescued_success_does_not_teach():
     """A rescue-served 2xx is not learning evidence: each episode's attempt 1
     complains (draining the credit) and the rescue serves the client, yet the
@@ -3261,7 +3509,8 @@ def test_reasoning_rescued_success_does_not_teach():
     try:
         for i in (1, 2):
             before = len(mock_servers["p"]["requests"])
-            status, _ = _send(proxy_port, _reasoning_request())
+            status, _ = _send(proxy_port,
+                              _reasoning_request(demanding=True))
             calls = len(mock_servers["p"]["requests"]) - before
             if status != 200:
                 fail("episode %d: the rescue did not serve the client (%s)"
@@ -3408,7 +3657,8 @@ def test_reasoning_rescue_events_and_merge():
             runner["n"] = 0
             before_ev = len(_rescue_trace_events(trace_file))
             before_req = len(mock_servers["p"]["requests"])
-            status, body = _send(proxy_port, _reasoning_request())
+            status, body = _send(proxy_port,
+                                 _reasoning_request(demanding=True))
             events = _rescue_trace_events(trace_file)[before_ev:]
             calls = len(mock_servers["p"]["requests"]) - before_req
             return status, body, events, calls
@@ -3434,7 +3684,8 @@ def test_reasoning_rescue_events_and_merge():
             return
         expected_keys = {"timestamp", "event", "request_id", "provider",
                          "mode", "actual_model", "tier", "feature", "attempt",
-                         "candidate", "outcome", "http_status"}
+                         "candidate", "effective_field", "outcome",
+                         "http_status"}
         for ev, attempt, candidate in zip(events, (1, 2),
                                           ("reasoning_content", "reasoning")):
             if set(ev) != expected_keys:
@@ -3449,6 +3700,14 @@ def test_reasoning_rescue_events_and_merge():
                     or ev.get("outcome") != "complaint"
                     or ev.get("http_status") != 400):
                 fail("rescue event %d is wrong: %r" % (attempt, ev))
+                return
+            # A non-"none" candidate is also the field actually sent; the two
+            # differ only on a "none" candidate, where the pass falls back to
+            # the entry's selection.
+            if ev.get("effective_field") != candidate:
+                fail("rescue event %d sent a different field than its "
+                     "candidate without an effective_field record: %r"
+                     % (attempt, ev))
                 return
             if (ev.get("provider") != "p" or ev.get("mode") != "chat"
                     or ev.get("tier") != "sonnet"
@@ -3507,6 +3766,115 @@ def test_reasoning_rescue_events_and_merge():
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
+def test_reasoning_rescue_repairs_forwarded_body():
+    """A rescue pass FORCES the always-present field on, so an UNFLAGGED
+    provider repairs itself without a models.json edit.
+
+    Two episodes, neither carrying a reasoning_roundtrip policy: (a) no
+    persisted entry, so the first candidate is `reasoning_content`; (b) a
+    seeded `reasoning` entry, so the first candidate wraps to "none" — which
+    has no field name to write, and the pass sends the entry's selection
+    instead, reporting it as `effective_field`.
+
+    The assertion is on the REPAIRED BYTES the proxy actually forwarded:
+    attempt 1 leaves at least one assistant message bare, the rescue pass
+    carries the field on EVERY assistant message — the real thinking text on
+    the reasoned turn, "" on the bare one.
+    """
+    print("\n--- Test: Reasoning Rescue Repairs Forwarded Body ---")
+
+    def demanding_conversation():
+        return {
+            "model": "sonnet",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user",
+                 "content": [{"type": "text", "text": "hi"}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "the real reasoning",
+                     "signature": "s"},
+                    {"type": "tool_use", "id": "t1", "name": "lookup",
+                     "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1",
+                     "content": "ok"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t2", "name": "lookup",
+                     "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t2",
+                     "content": "ok"}]},
+            ],
+        }
+
+    for seeded, field, expect_candidate, expect_effective, label in (
+            (None, "reasoning_content", "reasoning_content",
+             "reasoning_content", "no entry -> first candidate injects"),
+            ("reasoning", "reasoning", "none", "reasoning",
+             "seeded entry -> the 'none' candidate falls back to its selection")):
+        state_dir, state_path = _make_state_dir()
+        if seeded is not None:
+            _seed_reasoning_state(state_path, seeded)
+        log = []
+
+        def upstream(info, _field=field):
+            log.append(info)
+            if len(log) == 1:
+                return 400, "application/json", REASONING_MESSAGE_400
+            _values, every = _forwarded_assistant_fields(info, _field)
+            if every:
+                return _chat_ok_response(info)
+            return 400, "application/json", REASONING_MESSAGE_400
+
+        temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
+            _start_reasoning_proxy({"p": upstream}, state_path)
+        if proc is None:
+            shutil.rmtree(state_dir, ignore_errors=True)
+            fail("Failed to set up test (%s)" % label)
+            return
+        try:
+            status, _ = _send(proxy_port, demanding_conversation())
+            if status != 200:
+                fail("%s: the repair did not serve the client (%s)"
+                     % (label, status))
+                return
+            if len(log) != 2:
+                fail("%s: expected attempt 1 + one rescue pass, got %d "
+                     "upstream call(s)" % (label, len(log)))
+                return
+            first_values, first_every = _forwarded_assistant_fields(
+                log[0], field)
+            if first_every:
+                fail("%s: attempt 1 already carried the field on every "
+                     "assistant message, so the repair is not what served the "
+                     "client: %r" % (label, first_values))
+                return
+            values, every = _forwarded_assistant_fields(log[1], field)
+            if not every or values != ["the real reasoning", ""]:
+                fail("%s: the forwarded rescue body must carry the real text "
+                     "then \"\" on every assistant message, got %r (every=%r)"
+                     % (label, values, every))
+                return
+            events = _rescue_trace_events(trace_file)
+            if (len(events) != 1
+                    or events[0].get("candidate") != expect_candidate
+                    or events[0].get("effective_field") != expect_effective
+                    or events[0].get("outcome") != "served"):
+                fail("%s: expected one served rescue event with candidate %r "
+                     "and effective_field %r, got %r"
+                     % (label, expect_candidate, expect_effective,
+                        [(e.get("candidate"), e.get("effective_field"),
+                          e.get("outcome")) for e in events]))
+                return
+            pass_("%s: the repaired bytes carry %r on every assistant message"
+                  % (label, field))
+        finally:
+            cleanup()
+            shutil.rmtree(state_dir, ignore_errors=True)
+
+
 def test_reasoning_switch_params_carried_across_admin():
     """The reasoning_field_switch policy survives both admin swaps: after
     /admin/api/switch and after /admin/api/reload, a fresh key still switches
@@ -3532,7 +3900,8 @@ def test_reasoning_switch_params_carried_across_admin():
         def one_complaint_episode(model, label):
             """One gate-true complaint on a key with no credit yet: with
             saturation_on_switch 1 it must switch on that single complaint."""
-            status, _ = _send(proxy_port, _reasoning_request(model=model))
+            status, _ = _send(proxy_port,
+                              _reasoning_request(model=model, demanding=True))
             if status != 200:
                 fail("%s: the rescue did not serve the client (%s)"
                      % (label, status))
@@ -3653,11 +4022,13 @@ ALL_TESTS = [
     ("reasoning-walk-sends-advanced-candidate", test_reasoning_walk_sends_advanced_candidate),
     ("reasoning-non-complaint-errors-are-not-counted", test_reasoning_non_complaint_errors_are_not_counted),
     ("reasoning-matcher-shapes", test_reasoning_matcher_shapes),
+    ("reasoning-present-gates-on-demanding-turn", test_reasoning_present_gates_on_demanding_turn),
     ("reasoning-delist-on-none-success", test_reasoning_delist_on_none_success),
     ("reasoning-credit-saturates-and-drains", test_reasoning_credit_saturates_and_drains),
     ("reasoning-rescued-success-does-not-teach", test_reasoning_rescued_success_does_not_teach),
     ("reasoning-rescue-runs-without-thinking", test_reasoning_rescue_runs_without_thinking),
     ("reasoning-rescue-events-and-merge", test_reasoning_rescue_events_and_merge),
+    ("reasoning-rescue-repairs-forwarded-body", test_reasoning_rescue_repairs_forwarded_body),
     ("reasoning-switch-params-carried-across-admin", test_reasoning_switch_params_carried_across_admin),
 ]
 

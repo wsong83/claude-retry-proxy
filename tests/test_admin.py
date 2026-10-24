@@ -920,12 +920,14 @@ def test_admin_models_provider_keyed():
 
 
 def test_admin_switch_preserves_disable_retry_flag():
-    """Admin Apply preserves disable_retry_claude_count_token and
-    extra_request_headers (one switch flow, both top-level keys) in the
-    returned (in-memory) config. After the split the flag and the header
-    rules live in models.json, so the on-disk config.json is tiers-only
-    and the in-memory preservation is asserted instead (its replacement
-    for the former on-disk flag assertion is the loader-precedence case in
+    """Admin Apply preserves disable_retry_claude_count_token,
+    extra_request_headers, and the reasoning_roundtrip policy (one switch
+    flow, all top-level models.json keys) in the returned (in-memory) config,
+    and a following /admin/api/reload installs a CHANGED reasoning_roundtrip
+    value rather than keeping the stale one. After the split the flag and the
+    header rules live in models.json, so the on-disk config.json is tiers-only
+    and the in-memory preservation is asserted instead (its replacement for
+    the former on-disk flag assertion is the loader-precedence case in
     tests/test_config_split.py)."""
     print("\n--- Test: Admin Switch Preserves Top-Level Keys (flag + extra headers) ---")
 
@@ -939,11 +941,13 @@ def test_admin_switch_preserves_disable_retry_flag():
     }
     vendors = {"p": {"url": f"http://127.0.0.1:{upstream_port}", "key": "k"}}
     seeded_extra = {"p": [{"header": "x-opencode-session", "fallback": "request_id"}]}
+    seeded_roundtrip = {"p/claude-sonnet-5": "always"}
 
     temp_dir = tempfile.mkdtemp(prefix="proxy_drct_admin_test_")
     try:
         config_path = _create_test_config_with_flag(
-            temp_dir, tiers, True, extra_request_headers=seeded_extra)
+            temp_dir, tiers, True, extra_request_headers=seeded_extra,
+            reasoning_roundtrip=seeded_roundtrip)
         keys_path = _create_test_keys(temp_dir, vendors)
 
         proc, probe_ok = _start_proxy_server_directly(
@@ -993,6 +997,51 @@ def test_admin_switch_preserves_disable_retry_flag():
                 pass_("Returned config preserves extra_request_headers")
             else:
                 fail(f"Returned config missing/preserved extra_request_headers: "
+                     f"{config.get('extra_request_headers')}")
+
+            # The reasoning_roundtrip policy survives the switch. This is the
+            # regression test for the carried-key tuple: a switch that hardcodes
+            # only its three older siblings silently drops the policy.
+            if config.get("reasoning_roundtrip") == seeded_roundtrip:
+                pass_("Returned config preserves reasoning_roundtrip")
+            else:
+                fail(f"Returned config missing/preserved reasoning_roundtrip: "
+                     f"{config.get('reasoning_roundtrip')}")
+
+            # /admin/api/reload installs the candidate's CHANGED policy value,
+            # not the in-memory one it replaces.
+            models_path = os.path.join(temp_dir, "models.json")
+            with open(models_path) as f:
+                models_doc = json.load(f)
+            changed_roundtrip = {"p/claude-opus-5": "always"}
+            models_doc["reasoning_roundtrip"] = changed_roundtrip
+            with open(models_path, "w") as f:
+                json.dump(models_doc, f)
+            conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+            conn.request("POST", "/admin/api/reload", body="{}",
+                         headers={"Content-Type": "application/json",
+                                  "Origin": f"http://localhost:{proxy_port}"})
+            resp = conn.getresponse()
+            reload_status = resp.status
+            resp.read()
+            conn.close()
+            if reload_status != 200:
+                fail(f"Admin reload returned {reload_status}, expected 200")
+                return
+            conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+            conn.request("GET", "/admin/api/config")
+            resp = conn.getresponse()
+            config = json.loads(resp.read().decode())
+            conn.close()
+            if config.get("reasoning_roundtrip") == changed_roundtrip:
+                pass_("Reload installed the changed reasoning_roundtrip value")
+            else:
+                fail(f"Reload did not install the changed reasoning_roundtrip: "
+                     f"{config.get('reasoning_roundtrip')}")
+            if config.get("extra_request_headers") == seeded_extra:
+                pass_("Reload preserved extra_request_headers")
+            else:
+                fail(f"Reload dropped extra_request_headers: "
                      f"{config.get('extra_request_headers')}")
 
             # On-disk config.json is tiers-only: the flag and the header

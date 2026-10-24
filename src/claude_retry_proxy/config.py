@@ -7,8 +7,8 @@ plus the extra_request_headers safety constants that move with them.
 The load is two-document: config.json carries the tier mapping (``tiers`` and
 nothing else), the sibling models.json — resolved beside the resolved config
 path — carries ``models``, ``extra_request_headers``,
-``disable_retry_claude_count_token``, and ``reasoning_field_switch``, and the
-two are merged at load
+``disable_retry_claude_count_token``, ``reasoning_field_switch``, and
+``reasoning_roundtrip``; the two documents are merged at load
 (``models_path_for`` / ``load_models_document`` / ``_load_config_documents``).
 A leftover catalog key still in config.json warns on stderr and is ignored.
 ``parse_upstream`` and ``resolve_api_key`` stay in server.py (request-path
@@ -51,9 +51,11 @@ MODELS_FILENAME = "models.json"
 # Top-level keys a config.json document may still carry besides "tiers" —
 # all of them are ignored with a warning; their home is the sibling
 # models.json document. The first three are catalog-era leftovers; the last
-# is the reasoning_field_switch policy object (its home is models.json).
+# two are models.json policy objects (the reasoning_field_switch credit
+# thresholds and the reasoning_roundtrip always-present field policy).
 _LEFTOVER_KEYS = ("models", "extra_request_headers",
-                  "disable_retry_claude_count_token", "reasoning_field_switch")
+                  "disable_retry_claude_count_token", "reasoning_field_switch",
+                  "reasoning_roundtrip")
 
 # reasoning_field_switch policy defaults (models.json). The credit saturates
 # at saturation_max and a switch re-arms it at saturation_on_switch.
@@ -78,8 +80,8 @@ def load_models_document(models_path):
     """Read and structurally check the models.json catalog document alone.
 
     Returns a dict with ``models``, plus ``extra_request_headers``,
-    ``disable_retry_claude_count_token`` and ``reasoning_field_switch`` when
-    the document carries them.
+    ``disable_retry_claude_count_token``, ``reasoning_field_switch`` and
+    ``reasoning_roundtrip`` when the document carries them.
 
     Every read or structure failure becomes a ValueError naming models.json
     and its resolved path — FileNotFoundError, IsADirectoryError,
@@ -134,6 +136,17 @@ def load_models_document(models_path):
                 raise ValueError(
                     "models.json 'reasoning_field_switch.{}' must be an "
                     "integer: {}".format(field, models_path))
+    if "reasoning_roundtrip" in doc:
+        roundtrip = doc["reasoning_roundtrip"]
+        if not isinstance(roundtrip, dict):
+            raise ValueError(
+                "models.json 'reasoning_roundtrip' must be an object: "
+                "{}".format(models_path))
+        for pair, policy in roundtrip.items():
+            if policy != "always":
+                raise ValueError(
+                    "models.json 'reasoning_roundtrip' value for {!r} must be "
+                    "the string 'always': {}".format(pair, models_path))
     out = {"models": doc["models"]}
     if "extra_request_headers" in doc:
         out["extra_request_headers"] = doc["extra_request_headers"]
@@ -142,6 +155,8 @@ def load_models_document(models_path):
             doc["disable_retry_claude_count_token"]
     if "reasoning_field_switch" in doc:
         out["reasoning_field_switch"] = doc["reasoning_field_switch"]
+    if "reasoning_roundtrip" in doc:
+        out["reasoning_roundtrip"] = doc["reasoning_roundtrip"]
     return out
 
 
@@ -172,6 +187,22 @@ def reasoning_switch_params(config):
     if s_sw > s_max:
         s_sw = s_max
     return s_max, s_sw
+
+
+def reasoning_roundtrip_models(config):
+    """Resolve the reasoning_roundtrip policy to a frozenset of "provider/model".
+
+    Total and never raising: an absent key, a non-object value, a non-string
+    key, or a value other than "always" is skipped, so a mid-flight hand-edit
+    can never crash a request (validate_config is the strict gate).
+    """
+    if not isinstance(config, dict):
+        return frozenset()
+    raw = config.get("reasoning_roundtrip")
+    if not isinstance(raw, dict):
+        return frozenset()
+    return frozenset(pair for pair, policy in raw.items()
+                     if isinstance(pair, str) and policy == "always")
 
 
 def _load_config_documents(config_path):
@@ -232,8 +263,8 @@ def load_config(path):
 
     Reads 'tiers' from config.json and the catalog ('models',
     'extra_request_headers', 'disable_retry_claude_count_token',
-    'reasoning_field_switch') from the sibling models.json resolved beside
-    it. Leftover catalog keys still in
+    'reasoning_field_switch', 'reasoning_roundtrip') from the sibling
+    models.json resolved beside it. Leftover catalog keys still in
     config.json warn on stderr and are ignored.
 
     Raises ValueError on invalid JSON or missing required structure in
@@ -511,6 +542,43 @@ def validate_config(config, providers, provider_keys=None):
                     "not exceed 'saturation_max' ({})".format(
                         effective["saturation_on_switch"],
                         effective["saturation_max"]))
+
+    # Validate the optional reasoning_roundtrip policy (a "provider/model" ->
+    # "always" map). Absent key is valid. The loader's structural check already
+    # rejects a non-object value and a policy string other than "always"; this
+    # is the canonical semantic check that every key names a configured
+    # provider and one of that provider's catalog models.
+    if "reasoning_roundtrip" in config:
+        roundtrip = config.get("reasoning_roundtrip")
+        if not isinstance(roundtrip, dict):
+            errors.append(
+                "reasoning_roundtrip must be an object, got {}".format(
+                    type(roundtrip).__name__))
+        else:
+            for pair, policy in roundtrip.items():
+                if policy != "always":
+                    errors.append(
+                        "reasoning_roundtrip[{!r}] must be the string "
+                        "'always', got {!r}".format(pair, policy))
+                    continue
+                if not isinstance(pair, str) or "/" not in pair:
+                    errors.append(
+                        "reasoning_roundtrip entry {!r} must be a "
+                        "'provider/model' string".format(pair))
+                    continue
+                provider, _, model = pair.partition("/")
+                if provider not in models:
+                    errors.append(
+                        "reasoning_roundtrip references unknown provider "
+                        "'{}'".format(provider))
+                    continue
+                catalog_entry = models.get(provider)
+                if not isinstance(catalog_entry, list) \
+                        or model not in catalog_entry:
+                    errors.append(
+                        "reasoning_roundtrip entry '{}' names model '{}', "
+                        "which is not in the catalog for provider '{}'".format(
+                            pair, model, provider))
 
     # Validate optional extra_request_headers (provider-keyed map of header
     # rules). Absent key is valid (defaults to {} on resolution). Every check

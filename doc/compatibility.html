@@ -270,7 +270,19 @@ in the cycle <code>none → reasoning_content → reasoning → none</code> (adv
 answered inside the same client request by a lock-free <a href="#reasoning-rescue">rescue</a>
 that re-rolls up to two further candidates.</strong></p>
 
-<p>Four details are load-bearing:</p>
+<p><strong>What the gate reads.</strong> The gate is the presence test behind "gate-true": it
+looks at the <em>last</em> assistant message carrying a <code>tool_use</code> block — the turn
+that <em>demands</em> an echo — and asks whether that turn carries reasoning of its own (a
+non-empty <code>thinking</code> block, or a <code>redacted_thinking</code> with non-empty
+<code>data</code>). The scan runs from the end and skips past later assistant messages that carry
+no <code>tool_use</code>, and it is <code>False</code> when no assistant <code>tool_use</code>
+message exists at all. Two properties are deliberate. It reads the <strong>raw client body,
+before any chat transform runs</strong>, so it asks the same question the upstream will ask. And a
+body whose demanding turn carries no reasoning is gate-<em>false</em>: a complaint from it is a
+missing-field complaint, which says nothing about the field <em>name</em>, so it must not steer
+the selection — that evidence is unlearnable and would only pollute the credit.</p>
+
+<p>Four further details are load-bearing:</p>
 
 <ul>
 <li><strong>Only attempt 1 teaches.</strong> The credit is fed by the top-level request's own
@@ -310,12 +322,29 @@ re-enters the forward path with the <em>original</em> client body and
 that hits <code>429</code>/<code>503</code> is a single-shot attempt (no backoff chain) and ends
 the rescue.</p>
 
-<p>The rescue is deliberately <strong>gate-free</strong>: a body with no thinking block is
-exactly where the rescue is the only thing that can serve, so such a complaint is rescued too —
-with byte-identical re-rolls (no candidate can emit an echo without a thinking block) and with
-no learning effect. Each pass emits one <code>reasoning_rescue</code> trace event (a
-server-emitted event, catalogued in <a href="trace-log.html">trace-log.html</a>), so a rescued
-request's story is visible in the trace without any content being recorded.</p>
+<p><strong>A rescue pass repairs; it does not merely re-roll.</strong> Every pass forces the
+always-present behavior on for its forward, so a conversation containing a tool call leaves with
+the field written onto every assistant message — the real reasoning where one exists, and
+<code>""</code> where it does not — which is exactly what a gateway demanding the round-trip is
+complaining about. Two edges are worth naming. A <code>none</code> candidate has no field name to
+write, so the pass falls back to the field attempt 1 sent, or to <code>reasoning_content</code>
+when that was <code>none</code> too: a pass is never a same-body re-roll for <em>that</em> reason.
+And a conversation with no tool-calling turn takes no injection at all — there is no turn whose
+reasoning could be echoed — so those passes <em>are</em> byte-identical re-rolls. There is a
+<em>second</em> byte-identical case, and on a pair flagged in <code>reasoning_roundtrip</code> it is
+reachable: attempt 1 already sent the entry's selection with the forced behavior on, so a pass
+whose candidate is <code>none</code> resolves its fallback to that very selection and re-sends
+attempt 1's bytes exactly. Such a pass therefore spends one of the two budget slots on a body the
+upstream has already rejected.</p>
+
+<p>The rescue is deliberately <strong>gate-free</strong>: its invocation is driven by the matched
+complaint alone, never by the demanding-turn gate, so a body the gate would call unlearnable is
+still rescued — with no learning effect, per the rule above. Each pass emits one
+<code>reasoning_rescue</code> trace event (a server-emitted event, catalogued in
+<a href="trace-log.html">trace-log.html</a>) carrying both the <code>candidate</code> it advanced
+to and the <code>effective_field</code> it actually sent — the two differ precisely on a
+<code>none</code> candidate, which is normal rather than anomalous — so a rescued request's story
+is visible in the trace without any content being recorded.</p>
 
 <table>
 <tr><th>Rescue pass result</th><th>Effect</th></tr>

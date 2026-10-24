@@ -32,7 +32,8 @@ your tuning.</p>
   <td><code>models.json</code></td>
   <td>The provider catalog; the <a href="#extra-headers">extra_request_headers</a> rules; the
       <a href="#count-tokens-flag">disable_retry_claude_count_token</a> policy flag; the
-      <a href="#reasoning-field-switch">reasoning_field_switch</a> policy object</td>
+      <a href="#reasoning-field-switch">reasoning_field_switch</a> policy object; the
+      <a href="#reasoning-roundtrip">reasoning_roundtrip</a> always-present policy</td>
   <td><code>~/.claude/proxy/models.json</code> — beside <code>config.json</code></td>
 </tr>
 <tr>
@@ -97,7 +98,8 @@ name that an extra tier is pointed at resolves to that tier.</p>
   },
   "extra_request_headers": {},
   "disable_retry_claude_count_token": true,
-  "reasoning_field_switch": { "saturation_max": 10, "saturation_on_switch": 3 }
+  "reasoning_field_switch": { "saturation_max": 10, "saturation_on_switch": 3 },
+  "reasoning_roundtrip": { "example-provider/claude-sonnet-5": "always" }
 }</code></pre>
 
 <p>Always the <strong>sibling</strong> of the config file: the <code>models.json</code> in the same
@@ -196,6 +198,39 @@ rule — so <code>{ "saturation_max": 2 }</code> against the defaulted
 <code>saturation_on_switch</code> of 3 is refused rather than silently clamped. A
 <code>reasoning_field_switch</code> misplaced in <code>config.json</code> is warned about and
 dropped, like the count-token flag above.
+</div>
+
+<h3 id="reasoning-roundtrip"><code>reasoning_roundtrip</code></h3>
+
+<p>Optional. Names the <code>provider/model</code> pairs whose chat-mode bodies must always carry
+a reasoning field, for gateways that reject a request whose tool-calling turns omit one. Absent —
+the shipped default — leaves every pair on the learned behavior alone.</p>
+
+<pre><code>{
+  "reasoning_roundtrip": { "some-provider/some-model": "always" }
+}</code></pre>
+
+<p>For a listed pair, every assistant message of a conversation that contains a tool call carries
+the pair's <em>learned echo field</em>: the real reasoning where one exists, and <code>""</code>
+where it does not. <code>""</code> is what makes the behavior safe — those gateways check that the
+field is <em>present</em>, not that it carries content, so an empty string satisfies the contract
+while a missing key is refused. The fill is reported by the <code>reasoning_field_injected</code>
+event. Request-side detail: <a href="provider-modes.html#chat-request">provider-modes.html</a>;
+the learner that supplies the field:
+<a href="compatibility.html#reasoning-field">compatibility.html</a>.</p>
+
+<p>Only the flag is configuration; the field is learned per pair, so a flagged pair whose selection
+is still <code>none</code> sees no change until an on-demand rescue teaches it one. Like the header
+rules, the key is carried across a tier hot-switch and installed by a reload.</p>
+
+<div class="note">
+<strong>Activation is a deploy step.</strong> The flag takes effect only once the <em>running</em>
+proxy has loaded a <code>models.json</code> carrying it — and this document is deploy-owned (see
+above), so an edit made only on this machine is replaced wholesale by the next
+<code>update-claude-env</code>. A reload re-runs the pair check in
+<a href="#validation">Validation rules</a>, so a typo'd pair is refused at reload rather than
+installed as a silently inert policy: the pair must name a provider in the catalog and one of that
+provider's model names.
 </div>
 
 <h3 id="extra-headers"><code>extra_request_headers</code></h3>
@@ -462,6 +497,10 @@ after the spawn. The CLI's pre-spawn check prints the same aggregated error list
 <tr><td><code>reasoning_field_switch</code> is present but not an object, carries a non-integer or
     boolean field value, a value below 1, an unknown inner key, or an <em>effective</em>
     <code>saturation_on_switch</code> greater than <code>saturation_max</code></td></tr>
+<tr><td><code>reasoning_roundtrip</code> is present but not an object, carries a value other than
+    the string <code>"always"</code>, or names a <code>provider/model</code> pair the catalog does
+    not offer — each error names the key, and the pair check re-runs at
+    <a href="#reasoning-roundtrip">reload</a></td></tr>
 <tr><td>Any <code>extra_request_headers</code> rule fails its type, charset, reserved-name, or
     duplicate check</td></tr>
 <tr><td>Any vendor carries both <code>key</code> and <code>keys</code>, or neither</td></tr>

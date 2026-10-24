@@ -31,11 +31,13 @@ from urllib.parse import urlparse
 
 from . import sinks
 from .config import (load_config, load_models_document, models_path_for,
-                     reasoning_switch_params, validate_config, write_config)
+                     reasoning_roundtrip_models, reasoning_switch_params,
+                     validate_config, write_config)
 from .keys import load_keys_file, read_passphrase_from_stdin, vendor_key_entries, vendor_key_names
 from .sanitize import sanitize_error
 from .compat import (COMPAT_FEATURE, COMPAT_FEATURES,
                      COMPAT_MAX_RETRIES_PER_REQUEST,
+                     COMPAT_REASONING_SELECTIONS,
                      _compat_get, _compat_key, _compat_learn,
                      _compat_merge_retries, _compat_note_suppressed_request,
                      _compat_probe_inconclusive, _compat_probe_rejected,
@@ -66,6 +68,16 @@ from .settings import SETTINGS, resolve_trace_file
 _config_lock = threading.RLock()
 _current_config = None  # Set at startup after validation
 _config_path = None  # Path to config.json, set at startup
+
+# models.json catalog keys the admin paths carry over: /admin/api/switch takes
+# them from the current in-memory config and /admin/api/reload from the
+# reloaded document. Neither path writes them, so a key missing here is
+# silently dropped from the in-memory document on every admin press — the one
+# definition both sites read.
+_CARRIED_MODELS_KEYS = ("extra_request_headers",
+                        "disable_retry_claude_count_token",
+                        "reasoning_field_switch",
+                        "reasoning_roundtrip")
 
 # Drain-and-swap state for config changes (prevents race with in-flight requests)
 _inflight_count = 0  # Number of requests currently in-flight
@@ -815,18 +827,33 @@ def _reasoning_rescue(result, selection, request_id, tier, provider_name,
     429/503 is such a non-complaint (one attempt under suppress_compat): the
     rescue stops and attempt 1's error is served. Rescues teach nothing and
     persist nothing; ``selection`` may be None (an unparseable body never
-    resolved), in which case the first candidate is "none" — a same-body
-    re-roll — and nothing else special happens.
+    resolved), in which case the first candidate is "none".
+
+    Every pass forces the always-present field on, so a complaining provider
+    that is not flagged in models.json repairs itself without a config edit.
+    The candidate cycle still lands on "none", which has no field name to
+    write: such a pass sends the entry's current selection for its field (or
+    ``reasoning_content`` when that is also none) and reports the field it
+    actually used as ``effective_field`` beside ``candidate``.
     """
     feature = COMPAT_FEATURES["reasoning_field"]
     rescue_result = result
     candidate = selection
     for attempt in range(1, feature.max_retries_per_request + 1):
         candidate = _reasoning_next_candidate(candidate)
+        effective_field = candidate
+        if candidate == "none":
+            # A "none" candidate has no field name to write. Fall back to the
+            # selection this request sent (the entry's current selection, read
+            # at request entry — keeps this path lock-free and key-free), or
+            # reasoning_content when that is also none.
+            effective_field = (selection
+                               if selection in COMPAT_REASONING_SELECTIONS
+                               else "reasoning_content")
         rescue_result = _forward_request_impl(
             method, path, headers, body, handler, request_id,
             config, vendors, epoch, suppress_compat=True,
-            reasoning_selection=candidate,
+            reasoning_selection=effective_field, reasoning_always=True,
             retry_original_id=retry_original_id)
         rescue_status = rescue_result[0]
         if 200 <= rescue_status < 300:
@@ -846,6 +873,7 @@ def _reasoning_rescue(result, selection, request_id, tier, provider_name,
             "feature": feature.name,
             "attempt": attempt,
             "candidate": candidate,
+            "effective_field": effective_field,
             "outcome": outcome,
             "http_status": rescue_status,
         })
@@ -977,7 +1005,8 @@ def _client_user_agent(headers):
 
 def _forward_request_impl(method, path, headers, body, handler, request_id,
                           config, vendors, epoch, suppress_compat=False,
-                          reasoning_selection=None, retry_original_id=None):
+                          reasoning_selection=None, retry_original_id=None,
+                          reasoning_always=False):
     """Internal implementation of forward_request with snapshot config.
 
     epoch is the config generation snapshotted at admission. It is required
@@ -993,6 +1022,10 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     "unresolved — resolve it from the learned entry at request entry"; every
     other value (including the literal "none") is used as-is, so a rescue
     pass's explicit candidate is never re-resolved.
+
+    reasoning_always forces the always-present field behavior on for this
+    pass (the reasoning_roundtrip policy at the top level, the repair on a
+    rescue pass).
 
     retry_original_id is the marker decision resolved once by the
     eligibility gate below — the single resolution point, which runs only
@@ -1141,8 +1174,10 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
     reasoning_key = None
     reasoning_active = False
     # Reasoning-field_switch policy, resolved once from this request's config
-    # snapshot (the same snapshot every forwarding pass below uses).
+    # snapshot (the same snapshot every forwarding pass below uses), plus the
+    # reasoning_roundtrip policy's flagged provider/model pairs.
     s_max, s_sw = reasoning_switch_params(config)
+    roundtrip_pairs = reasoning_roundtrip_models(config)
     if body:
         try:
             body_json["model"] = actual_model
@@ -1220,10 +1255,15 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
                         "content": [{"type": "text",
                                      "text": SETTINGS.chat_retry_nudge}],
                     })
+                # The OR is load-bearing: the policy flags this (provider,
+                # model) pair, and a rescue pass flags itself. A literal
+                # policy lookup would make every rescue pass inert.
+                _pair = "{}/{}".format(provider_name, actual_model)
                 rewritten_body = json.dumps(_anthropic_to_chat(
                     body_json, request_id=request_id, mode=mode,
                     provider=provider_name, tier=tier,
-                    reasoning_selection=reasoning_selection)).encode("utf-8")
+                    reasoning_selection=reasoning_selection,
+                    reasoning_always=reasoning_always or _pair in roundtrip_pairs)).encode("utf-8")
                 if retry_original_id is not None:
                     # Post-transform, inside the successful-build branch: a
                     # transform failure falls back to the client's original
@@ -3601,9 +3641,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         "tiers": disk_config["tiers"],
                         "models": _current_config.get("models", {}),
                     }
-                    for _key in ("extra_request_headers",
-                                 "disable_retry_claude_count_token",
-                                 "reasoning_field_switch",):
+                    for _key in _CARRIED_MODELS_KEYS:
                         if _key in _current_config:
                             new_config[_key] = _current_config[_key]
                     if response_status is None:
@@ -3685,9 +3723,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     "tiers": _current_config.get("tiers", {}),
                     "models": models_doc.get("models", {}),
                 }
-                for _key in ("extra_request_headers",
-                             "disable_retry_claude_count_token",
-                             "reasoning_field_switch",):
+                for _key in _CARRIED_MODELS_KEYS:
                     if _key in models_doc:
                         candidate[_key] = models_doc[_key]
 

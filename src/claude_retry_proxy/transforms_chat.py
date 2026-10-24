@@ -4,6 +4,7 @@ import json
 import time
 import uuid
 
+from .compat import COMPAT_REASONING_FIELDS
 from .sinks import log_trace
 
 from .transforms_common import _request_transform_timestamp, _sanitize_schema_patterns
@@ -15,14 +16,17 @@ __all__ = ["_anthropic_to_chat", "_transform_anthropic_messages_to_chat",
 
 
 def _anthropic_to_chat(body_json, request_id=None, mode=None, provider=None,
-                       tier=None, reasoning_selection="none"):
+                       tier=None, reasoning_selection="none",
+                       reasoning_always=False):
     """Transform an Anthropic Messages request into OpenAI Chat Completions.
 
     Builds `out` without mutating `body_json`. messages / tools / tool_choice
     are transformed via the _transform_anthropic_*_to_chat helpers; thinking /
     metadata / top_k are Anthropic-specific request config and are dropped.
     `reasoning_selection` is forwarded to the messages transform to choose the
-    echo field (see _transform_anthropic_messages_to_chat).
+    echo field (see _transform_anthropic_messages_to_chat), and
+    `reasoning_always` forces that field onto every assistant message once the
+    conversation contains a tool call.
     """
     out = {}
     if "model" in body_json:
@@ -32,7 +36,8 @@ def _anthropic_to_chat(body_json, request_id=None, mode=None, provider=None,
         out["messages"] = _transform_anthropic_messages_to_chat(
             body_json.get("messages", []), request_id=request_id, mode=mode,
             provider=provider, tier=tier, cache_stripped_out=cache_locations,
-            reasoning_selection=reasoning_selection)
+            reasoning_selection=reasoning_selection,
+            reasoning_always=reasoning_always)
 
     system = body_json.get("system")
     system_text = None
@@ -87,21 +92,29 @@ def _anthropic_to_chat(body_json, request_id=None, mode=None, provider=None,
 def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
                                           provider=None, tier=None,
                                           cache_stripped_out=None,
-                                          reasoning_selection="none"):
+                                          reasoning_selection="none",
+                                          reasoning_always=False):
     """Convert an Anthropic messages array into OpenAI Chat messages.
 
-    Always returns a new list (never mutates the input). A thinking block's
-    text is echoed on the assistant message under exactly one field, chosen by
-    `reasoning_selection`: "reasoning_content" or "reasoning" emits that field
-    only; anything else (the default "none", None, or an unrecognized value)
-    emits no reasoning field at all — never both. redacted_thinking blocks with
-    non-empty data are converted to a placeholder; a valid `image` block becomes
-    an OpenAI `image_url` part -- top-level blocks and those nested inside
-    `tool_result` content alike, the latter riding the following user message
-    because OpenAI `role:tool` messages cannot carry images; an inconvertible
-    image is counted as dropped rather than becoming a part; unknown blocks are
-    stripped; tool_use and tool_result are converted to OpenAI tool_calls /
-    role:tool messages; cache_control is stripped from kept blocks.
+Always returns a new list (never mutates the input). One Anthropic
+    assistant turn becomes ONE OpenAI assistant message: `content` carries the
+    joined text parts (or null when the turn has none), and `tool_calls` rides
+    on that same message. A thinking block's text is echoed on that message
+    under exactly one field, chosen by `reasoning_selection`:
+    "reasoning_content" or "reasoning" emits that field only; anything else
+    (the default "none", None, or an unrecognized value) emits no reasoning
+    field at all — never both. `reasoning_always` additionally sets the
+    selected field on EVERY assistant message once the transformed list
+    contains a tool call: the real reasoning text where one exists, "" where
+    none does (a redacted-thinking placeholder counts as a placeholder, never
+    as real). redacted_thinking blocks with non-empty data are converted to a
+    placeholder; a valid `image` block becomes an OpenAI `image_url` part --
+    top-level blocks and those nested inside `tool_result` content alike, the
+    latter riding the following user message because OpenAI `role:tool`
+    messages cannot carry images; an inconvertible image is counted as dropped
+    rather than becoming a part; unknown blocks are stripped; tool_use and
+    tool_result are converted to OpenAI tool_calls / role:tool messages;
+    cache_control is stripped from kept blocks.
     cache_control_stripped is reported to the caller via the optional
     cache_stripped_out list rather than logged here, so _anthropic_to_chat can
     coalesce one event per request.
@@ -114,6 +127,11 @@ def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
     cache_stripped = False
     tool_use_ids = set()
     out = []
+    # Per-assistant-message reasoning material, keyed by message identity:
+    # {id(message): (text or None, is_redacted_placeholder)}. The always-present
+    # pass below runs over the built list and needs this to tell a real block
+    # from the redacted placeholder and from a message with none at all.
+    reasoning_by_msg = {}
     for msg in messages:
         if not isinstance(msg, dict):
             continue
@@ -131,6 +149,7 @@ def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
             text_parts = []
             tool_calls = []
             reasoning_text = None
+            reasoning_is_placeholder = False
             for block in content:
                 if not isinstance(block, dict):
                     dropped["unknown"] += 1
@@ -142,6 +161,9 @@ def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
                     thinking = block.get("thinking")
                     if isinstance(thinking, str) and thinking:
                         reasoning_text = thinking
+                        # Real text supersedes an earlier redacted placeholder,
+                        # so the flag must describe the value actually kept.
+                        reasoning_is_placeholder = False
                     else:
                         dropped["thinking"] += 1
                     continue
@@ -149,6 +171,7 @@ def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
                     data = block.get("data")
                     if isinstance(data, str) and data and reasoning_text is None:
                         reasoning_text = "[redacted_thinking: data not available]"
+                        reasoning_is_placeholder = True
                         passthrough["redacted_thinking"] += 1
                         log_trace({
                             "timestamp": _request_transform_timestamp(),
@@ -223,27 +246,26 @@ def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
                 dropped["unknown"] += 1
             def _assistant_msg(content):
                 m = {"role": "assistant", "content": content}
-                if reasoning_text is not None and reasoning_selection in (
-                        "reasoning_content", "reasoning"):
+                if (reasoning_text is not None
+                        and reasoning_selection in COMPAT_REASONING_FIELDS):
                     m[reasoning_selection] = reasoning_text
                 return m
 
-            if tool_calls and text_parts:
-                # Split structure: reasoning_content rides on the text message;
-                # the content:null tool_calls message stays clean.
-                out.append(_assistant_msg("\n".join(
-                    t for t in text_parts if isinstance(t, str))))
-                out.append({"role": "assistant", "content": None,
-                            "tool_calls": tool_calls})
-            elif tool_calls:
-                m = _assistant_msg(None)
+            # One assistant message per Anthropic assistant turn: the text (null
+            # when the turn has none) and the tool_calls share one message, so
+            # the reasoning field can ride on the same message the vendor checks.
+            if tool_calls:
+                m = _assistant_msg("\n".join(
+                    t for t in text_parts if isinstance(t, str))
+                    if text_parts else None)
                 m["tool_calls"] = tool_calls
-                out.append(m)
             elif text_parts:
-                out.append(_assistant_msg("\n".join(
-                    t for t in text_parts if isinstance(t, str))))
+                m = _assistant_msg("\n".join(
+                    t for t in text_parts if isinstance(t, str)))
             else:
-                out.append(_assistant_msg(""))
+                m = _assistant_msg("")
+            out.append(m)
+            reasoning_by_msg[id(m)] = (reasoning_text, reasoning_is_placeholder)
         elif role == "user":
             tool_messages = []
             text_parts = []
@@ -309,6 +331,36 @@ def _transform_anthropic_messages_to_chat(messages, request_id=None, mode=None,
                 out.append({"role": role, "content": text})
         else:
             out.append({"role": role, "content": content})
+    # Always-present pass, over the fully built list: the predicate is global
+    # (does the conversation contain a tool call?), so it cannot live in the
+    # per-message loop. Inert with no field name to write (selection "none").
+    if reasoning_always and reasoning_selection in COMPAT_REASONING_FIELDS:
+        assistant_msgs = [m for m in out if m.get("role") == "assistant"]
+        if any(m.get("tool_calls") for m in assistant_msgs):
+            real_count = empty_count = placeholder_count = 0
+            for m in assistant_msgs:
+                text, is_placeholder = reasoning_by_msg.get(id(m), (None, False))
+                if isinstance(text, str) and text:
+                    m[reasoning_selection] = text
+                    if is_placeholder:
+                        placeholder_count += 1
+                    else:
+                        real_count += 1
+                else:
+                    m[reasoning_selection] = ""
+                    empty_count += 1
+            if empty_count or placeholder_count:
+                log_trace({
+                    "timestamp": _request_transform_timestamp(),
+                    "event": "reasoning_field_injected",
+                    "request_id": request_id,
+                    "mode": mode,
+                    "provider": provider,
+                    "tier": tier,
+                    "real": real_count,
+                    "empty": empty_count,
+                    "placeholder": placeholder_count,
+                })
     if cache_stripped and cache_stripped_out is not None:
         cache_stripped_out.append("messages")
     if sum(dropped.values()) > 0:
