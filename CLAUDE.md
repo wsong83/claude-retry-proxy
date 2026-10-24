@@ -28,7 +28,7 @@ rationale, mechanisms, and edge cases — and is indexed by
 src/claude_retry_proxy/
   __init__.py           __version__
   server.py             the HTTP retry gateway server (ThreadingHTTPServer, tier routing, model rewriting, admin API, retry/backoff)
-  compat.py             the compatibility learner: the `COMPAT_FEATURES` registry (two features — `context_management` in anthropic mode, `reasoning_field` in chat mode) whose descriptors own their mode, presence test, matcher, field set and retry budget; COMPAT_* policy constants; the owned `_CompatState` state object (default-param `state=` injection); the `context_management` state machine with its 400-shape matchers and its retry lock, and the `reasoning_field` credit learner (a per-key in-memory credit; the switch thresholds are `models.json` policy, `reasoning_field_switch`) with its lock-free, key-free rescue and matcher (extracted from server.py; the probe-outcome + retry orchestration slice stays in server.py)
+  compat.py             the compatibility learner: the `COMPAT_FEATURES` registry (two features — `context_management` in anthropic mode, `reasoning_field` in chat mode) whose descriptors own their mode, presence test, matcher, field set and retry budget; COMPAT_* policy constants; the owned `_CompatState` state object (default-param `state=` injection); the `context_management` state machine with its 400-shape matchers and its retry lock, and the `reasoning_field` credit learner (a per-key in-memory credit; the switch thresholds are `models.json` policy, `reasoning_field_switch`) with its lock-free, key-free rescue (its passes repair the forwarded body rather than re-rolling) and matcher, plus its demanding-turn-scoped presence gate (`_reasoning_present`: reasoning on the last `tool_use`-bearing assistant turn, read from the raw client body) (extracted from server.py; the probe-outcome + retry orchestration slice stays in server.py)
   sanitize.py           error-text redaction leaf: `sanitize_error`, the chokepoint for text reaching stderr, trace `error` fields and client-facing error bodies
   sinks.py              sink class family: private `_Sink` base, `TraceSink` (JSONL append + counters + markers), `StateSink` (atomic state document), shared `_SinkHealth` failure reporter, process-wide pair + `configure()`
   settings.py           env-derived settings singleton: `SETTINGS` value object (the `PROXY_*` limits/flags, runtime paths incl. state/compat files, mode values) + `resolve_trace_file` — built at import from env, adjusted by `main()` at startup; imported by both the server and the CLI
@@ -36,7 +36,7 @@ src/claude_retry_proxy/
   keys.py               keys-index pipeline: `vendor_key_entries`/`vendor_key_names`, `_validate_vendor_keys_shape`, `load_keys_file` (encrypted or plain), `read_passphrase_from_stdin`
   safety.py             task-shaped utility leaf: string-emission-safety predicates (`_validate_admin_name` charset allowlist); docstring indexes the stay-behind safety idioms
   transforms_common.py  shared endpoint-mode transform mechanism: `_transform_and_guard` (passthrough-on-failure response guard) + `_request_transform_timestamp` helper + the tool-schema pattern sanitizers `_strip_regex_identity_escapes` / `_sanitize_schema_patterns` / `_sanitize_body_tools` (see doc/provider-modes.html#pattern-normalization)
-  transforms_chat.py    Anthropic↔Chat (OpenAI chat-completions) body transforms, both directions
+  transforms_chat.py    Anthropic↔Chat (OpenAI chat-completions) body transforms, both directions; each assistant turn collapses to one message (its text and `tool_calls` together), and the policy-scoped always-present field (`reasoning_roundtrip`) is written here
   transforms_response.py Anthropic↔Responses body transforms, both directions
   cli.py                the claude-retry-proxy CLI: start / stop / status / reload (passphrase prompt, two-file template provisioning, canonical validation shared with config.py/keys.py, no URL swap; `reload` refreshes the provider catalog only)
   vimcrypt.py           vim blowfish2 (VimCrypt~03!) decryption (derived from claude-config bin/vimcrypt.py)
@@ -44,7 +44,7 @@ src/claude_retry_proxy/
   templates/            shipped inside the package, so they survive a wheel install
     config.json     template for ~/.claude/proxy/config.json (copied on first start)
     models.json     template for ~/.claude/proxy/models.json (catalog + header rules
-                    + the count-tokens flag)
+                    + the count-tokens flag + the reasoning policies)
     keys-index.json template for ~/.claude/keys-index.json (single-key `key` string
                     or multi-key `keys` name→payload object)
 tests/            per-area test modules + aggregator; see doc/test-catalog.html

@@ -104,9 +104,11 @@ def test_models_path_for_sibling_resolution():
 
 def test_merged_load_with_optional_keys():
     """A valid pair merges: tiers from config.json, models, the count-tokens
-    flag, extra_request_headers, and the reasoning_field_switch policy from
-    models.json survive the merge; an absent policy key is left out of the
-    merged dict, so the resolver's 10/3 defaults apply."""
+    flag, extra_request_headers, the reasoning_field_switch policy, and the
+    reasoning_roundtrip map from models.json survive the merge; an absent
+    policy key is left out of the merged dict, so the resolvers' defaults
+    apply. The reasoning_roundtrip resolver resolves a flagged
+    "provider/model" pair and returns empty for a malformed value."""
     print("\n--- Test: Merged Load ---")
     temp_dir = tempfile.mkdtemp(prefix="proxy_split_merge_")
     try:
@@ -116,7 +118,8 @@ def test_merged_load_with_optional_keys():
                         "extra_request_headers": {"p": {"X-Flag": {"from": "x-pl"}}},
                         "disable_retry_claude_count_token": True,
                         "reasoning_field_switch": {"saturation_max": 6,
-                                                   "saturation_on_switch": 2}})
+                                                   "saturation_on_switch": 2},
+                        "reasoning_roundtrip": {"p/claude-sonnet-5": "always"}})
         merged = config.load_config(cpath)
         _check(merged.get("tiers") == TIERS, "tiers merged from config.json",
                "got {!r}".format(merged.get("tiers")))
@@ -137,6 +140,16 @@ def test_merged_load_with_optional_keys():
         _check(config.reasoning_switch_params(merged) == (6, 2),
                "the merged policy resolves to its explicit pair",
                "got {!r}".format(config.reasoning_switch_params(merged)))
+        _check(merged.get("reasoning_roundtrip") ==
+               {"p/claude-sonnet-5": "always"},
+               "reasoning_roundtrip merged from models.json",
+               "got {!r}".format(merged.get("reasoning_roundtrip")))
+        _check(config.reasoning_roundtrip_models(merged) ==
+               frozenset({"p/claude-sonnet-5"}),
+               "the merged reasoning_roundtrip resolves to its flagged "
+               "'provider/model' pair",
+               "got {!r}".format(
+                   config.reasoning_roundtrip_models(merged)))
 
         # Absent knob: no key in the merged dict, and the resolver defaults.
         _write_pair(temp_dir, models_doc={"models": {"p": ["claude-haiku-4-5"]}})
@@ -148,6 +161,23 @@ def test_merged_load_with_optional_keys():
         _check(config.reasoning_switch_params(merged) == (10, 3),
                "the absent policy resolves to the 10/3 defaults",
                "got {!r}".format(config.reasoning_switch_params(merged)))
+        _check("reasoning_roundtrip" not in merged,
+               "an absent reasoning_roundtrip is not synthesized into the "
+               "merged dict",
+               "got {!r}".format(merged.get("reasoning_roundtrip")))
+        _check(config.reasoning_roundtrip_models(merged) == frozenset(),
+               "the absent reasoning_roundtrip resolves to the empty set",
+               "got {!r}".format(
+                   config.reasoning_roundtrip_models(merged)))
+        # A malformed value (the loader's strict gate is bypassed by a
+        # mid-flight hand-edit) resolves defensively to empty, never raising.
+        _check(config.reasoning_roundtrip_models(
+                   {"reasoning_roundtrip": ["p/m"]}) == frozenset(),
+               "a non-object reasoning_roundtrip resolves to the empty set")
+        _check(config.reasoning_roundtrip_models(
+                   {"reasoning_roundtrip": {"p/m": "sometimes"}}) ==
+               frozenset(),
+               "a value other than 'always' does not flag its pair")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -193,7 +223,8 @@ def test_models_doc_bad_shapes_collapse_to_value_error():
     structural shapes (not an object, missing 'models', 'models' not an
     object, non-object extra_request_headers, a non-object
     reasoning_field_switch, and a non-integer or boolean
-    reasoning_field_switch field)."""
+    reasoning_field_switch field, a non-object reasoning_roundtrip, and a
+    reasoning_roundtrip value other than the string 'always')."""
     print("\n--- Test: models.json Bad Shapes -> ValueError ---")
     temp_dir = tempfile.mkdtemp(prefix="proxy_split_shapes_")
     try:
@@ -281,6 +312,18 @@ def test_models_doc_bad_shapes_collapse_to_value_error():
                                       {"saturation_on_switch": True}}),
             "boolean reasoning_field_switch field",
             "reasoning_field_switch.saturation_on_switch")
+
+        expect_value_error(
+            lambda: _dump(mpath, {"models": {},
+                                  "reasoning_roundtrip": ["p/m"]}),
+            "non-object reasoning_roundtrip",
+            "'reasoning_roundtrip'")
+
+        expect_value_error(
+            lambda: _dump(mpath, {"models": {},
+                                  "reasoning_roundtrip": {"p/m": "sometimes"}}),
+            "reasoning_roundtrip value other than always",
+            "'reasoning_roundtrip'")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -288,6 +331,56 @@ def test_models_doc_bad_shapes_collapse_to_value_error():
 def _dump(path, body):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(body, f)
+
+
+def test_reasoning_roundtrip_validate_config():
+    """validate_config rejects a reasoning_roundtrip entry naming an unknown
+    provider, a known provider with an unknown catalog model, or a key that
+    is not a "provider/model" string — mirroring the extra_request_headers
+    unknown-provider rule. A valid pair leaves the clean baseline green."""
+    print("\n--- Test: reasoning_roundtrip validate_config ---")
+    base = {
+        "tiers": TIERS,
+        "models": {"p": ["claude-haiku-4-5", "claude-sonnet-5",
+                         "claude-opus-5"]},
+    }
+    providers = {"p"}
+
+    def errors_with(roundtrip):
+        cfg = dict(base)
+        cfg["reasoning_roundtrip"] = roundtrip
+        return config.validate_config(cfg, providers)
+
+    clean = config.validate_config(dict(base), providers)
+    _check(clean == [], "clean baseline config has no errors",
+           "got {!r}".format(clean))
+
+    good = errors_with({"p/claude-sonnet-5": "always"})
+    _check(good == [], "a valid provider/model pair is accepted",
+           "got {!r}".format(good))
+
+    unknown_provider = errors_with({"ghost/model": "always"})
+    _check(any("reasoning_roundtrip" in e for e in unknown_provider),
+           "an unknown provider is rejected naming reasoning_roundtrip",
+           "got {!r}".format(unknown_provider))
+
+    unknown_model = errors_with({"p/not-in-catalog": "always"})
+    _check(any("reasoning_roundtrip" in e for e in unknown_model),
+           "a known provider's unknown catalog model is rejected naming "
+           "reasoning_roundtrip",
+           "got {!r}".format(unknown_model))
+
+    bad_shape = errors_with({"p": "always"})
+    _check(any("reasoning_roundtrip" in e and "'provider/model'" in e
+               for e in bad_shape),
+           "a key without the 'provider/model' shape is rejected",
+           "got {!r}".format(bad_shape))
+
+    bad_value = errors_with({"p/claude-sonnet-5": "sometimes"})
+    _check(any("reasoning_roundtrip" in e and "always" in e
+               for e in bad_value),
+           "a value other than 'always' is rejected",
+           "got {!r}".format(bad_value))
 
 
 def test_config_doc_bad_shapes():
@@ -576,6 +669,8 @@ ALL_TESTS = [
      test_missing_models_json_is_value_error_naming_path),
     ("models-doc-bad-shapes-collapse-to-value-error",
      test_models_doc_bad_shapes_collapse_to_value_error),
+    ("reasoning-roundtrip-validate-config",
+     test_reasoning_roundtrip_validate_config),
     ("config-doc-bad-shapes", test_config_doc_bad_shapes),
     ("models-doc-unreadable-permissions",
      test_models_json_unreadable_permissions_shape),

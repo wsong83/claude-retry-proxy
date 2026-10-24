@@ -127,8 +127,8 @@ records a <code>transform_failure</code> event — so a transform bug degrades t
 
 <table>
 <tr><th>Anthropic input</th><th>Becomes</th></tr>
-<tr><td><code>thinking</code> blocks</td><td><strong>nothing, by default.</strong> The echo is the learned per-pair <code>reasoning_field</code> selection — no field, <code>reasoning_content</code>, or <code>reasoning</code>. See <a href="compatibility.html#reasoning-field">compatibility.html</a></td></tr>
-<tr><td><code>redacted_thinking</code> with non-empty <code>data</code></td><td>the same learned selection decides whether a placeholder field is emitted at all; the <code>redacted_thinking_passthrough</code> event is unchanged</td></tr>
+<tr><td><code>thinking</code> blocks</td><td><strong>nothing, by default.</strong> The echo is the learned per-pair <code>reasoning_field</code> selection — no field, <code>reasoning_content</code>, or <code>reasoning</code>. See <a href="compatibility.html#reasoning-field">compatibility.html</a>. <strong>Policy exception:</strong> when the pair is flagged <code>"always"</code> in <a href="configuration.html#reasoning-roundtrip"><code>reasoning_roundtrip</code></a>, the selected field is forced onto <em>every</em> assistant message of a conversation that contains a tool call — the real reasoning where one exists, and <code>""</code> where it does not, because the gateways that demand the round-trip check <em>presence</em>, not content. The fill is recorded by the <code>reasoning_field_injected</code> event. The behavior forces <em>the learned selection</em>, so a pair whose selection is still <code>none</code> is unaffected until an on-demand rescue teaches one</td></tr>
+<tr><td><code>redacted_thinking</code> with non-empty <code>data</code></td><td>the same learned selection decides whether a placeholder field is emitted at all; the <code>redacted_thinking_passthrough</code> event is unchanged. A real <code>thinking</code> block on the same turn supersedes the placeholder — the field then carries the real text. When the injection event fires at all (some message was blank or carried a placeholder — see the event table below), that turn is counted <code>real</code>, never <code>placeholder</code>; a conversation whose only filled turn is that superseded one fires no event, because nothing blank was filled</td></tr>
 <tr><td><code>image</code> and unknown blocks</td><td><strong>stripped</strong></td></tr>
 <tr><td><code>tool_use</code></td><td><code>tool_calls</code>, with the input dict-validated</td></tr>
 <tr><td><code>tool_result</code></td><td>a <code>role: "tool"</code> message, paired by <code>tool_use_id</code></td></tr>
@@ -629,9 +629,11 @@ all, so this rule is about the protocol-complete case only.</p>
 <code>input</code> that is <code>NaN</code>, <code>Infinity</code>, or otherwise not
 <code>json.dumps</code>-serialisable cannot be sent. Those emit a placeholder reading
 <code>… could not be serialized as JSON</code> and a <code>tool_args_parse_failure</code>
-event. When a failed <code>tool_use</code> sits alongside valid ones in the same assistant
-message, the placeholder is emitted as a separate assistant message placed <em>before</em> the
-message carrying the <code>tool_calls</code>, so the ordering the upstream expects is preserved.</p>
+event. Each assistant turn becomes <em>one</em> assistant message — the turn's text and its
+<code>tool_calls</code> together — so a degraded call's placeholder text simply joins that
+message's <code>content</code> alongside the surviving calls. When <em>every</em> call in the
+turn was degraded, the message stays plain text with no <code>tool_calls</code> key at all,
+rather than implying that a call survived.</p>
 
 <h2 id="degradation">Degradation and trace events</h2>
 
@@ -643,6 +645,7 @@ message carrying the <code>tool_calls</code>, so the ordering the upstream expec
 <tr><td><code>transform_failure</code></td><td>a transform raised; the original body was used instead</td></tr>
 <tr><td><code>cache_control_stripped</code></td><td><code>cache_control</code> was removed from blocks (coalesced per request)</td></tr>
 <tr><td><code>redacted_thinking_passthrough</code></td><td>a <code>redacted_thinking</code> block became a placeholder</td></tr>
+<tr><td><code>reasoning_field_injected</code></td><td>the always-present policy filled a blank reasoning field on one or more assistant messages; fires only when at least one blank or placeholder was filled, and carries <code>real</code>, <code>empty</code> and <code>placeholder</code> counts so a filled placeholder is never counted as real</td></tr>
 <tr><td><code>content_block_dropped</code></td><td>an unrepresentable content block was removed</td></tr>
 <tr><td><code>tool_args_parse_failure</code></td><td>tool arguments could not be parsed or serialised</td></tr>
 <tr><td><code>chat_sse_tool_degradation</code></td><td>one or more streaming tool calls degraded (metadata only, once per stream)</td></tr>

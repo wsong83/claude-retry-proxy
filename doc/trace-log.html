@@ -128,6 +128,9 @@ are the complete set the proxy can write.</p>
     reasoning-field complaint triggers the lock-free rescue. Carries <code>request_id</code>,
     <code>provider</code>, <code>mode</code>, <code>actual_model</code>, <code>tier</code>,
     <code>feature</code>, <code>attempt</code> (1-based), <code>candidate</code>,
+    <code>effective_field</code> (the field the pass actually sent — on a <code>"none"</code>
+    candidate it is the fallback field, so <code>candidate</code> differing from
+    <code>effective_field</code> is the normal case, not an anomaly),
     <code>outcome</code> (<code>"served"</code>, <code>"complaint"</code> or
     <code>"other"</code>) and <code>http_status</code>. Metadata only: no content, no request or
     response body, and no state change. <code>outcome</code> is a coarse bucket read from the
@@ -140,6 +143,7 @@ are the complete set the proxy can write.</p>
 <tr><td><code>transform_failure</code></td><td>a body transform raised; the original body was used instead</td></tr>
 <tr><td><code>cache_control_stripped</code></td><td><code>cache_control</code> was removed while converting to chat format</td></tr>
 <tr><td><code>redacted_thinking_passthrough</code></td><td>a <code>redacted_thinking</code> block became a placeholder</td></tr>
+<tr><td><code>reasoning_field_injected</code></td><td>the always-present policy filled a blank reasoning field on one or more assistant messages. Fires only when at least one blank or placeholder was filled, and carries <code>real</code>, <code>empty</code> and <code>placeholder</code> counts — a filled placeholder is never counted as <code>real</code>. Metadata only, and it is the evidence that the policy acted on a request whose body would otherwise have omitted the field</td></tr>
 <tr><td><code>content_block_dropped</code></td><td>an unrepresentable content block was removed</td></tr>
 <tr><td><code>tool_args_parse_failure</code></td><td>tool arguments could not be parsed or serialised</td></tr>
 <tr><td><code>chat_sse_tool_degradation</code></td><td>one or more streaming tool calls degraded (once per stream)</td></tr>
@@ -261,7 +265,8 @@ Behaviour, the store's bounds, and the kill switch:
 <code>reasoning_field</code> answers a complaint with the rescue, each pass is a nested pass
 through the forward path, so <code>mode_dispatch</code>, one <code>reasoning_rescue</code> event
 and the chat transform's events above (<code>cache_control_stripped</code>,
-<code>redacted_thinking_passthrough</code>, <code>tool_args_parse_failure</code>,
+<code>redacted_thinking_passthrough</code>, <code>reasoning_field_injected</code> — when it
+filled anything, <code>tool_args_parse_failure</code>,
 <code>content_block_dropped</code>) fire once per pass — up to three images for a single client
 request. The multiplicity is bounded by the feature's rescue budget (two passes), and it occurs
 whenever the upstream complains, so a complaint regime multiplies these event counts — not

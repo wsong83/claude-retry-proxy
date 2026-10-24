@@ -100,8 +100,8 @@ When you run `claude-retry-proxy start`:
 3. It validates the config with the same canonical rules the server enforces
    (one shared policy, housed in the source package's `config.py`/`keys.py`):
    required tiers, valid provider references, models-catalog shape, tier key
-   selectors, extra-header rules, the count-token flag, and the
-   `reasoning_field_switch` policy.
+   selectors, extra-header rules, the count-token flag, the
+   `reasoning_field_switch` policy, and the `reasoning_roundtrip` policy.
    See `doc/configuration.html#validation` for the full rule list.
 4. It checks the trace log and prunes entries older than 5 days.
 5. It launches the proxy server, piping the passphrase via stdin.
@@ -178,7 +178,8 @@ catalog, not the tier mapping.
 
 The sibling of `config.json`, resolved from the same directory — so
 `--config-path /tmp/x/config.json` reads `/tmp/x/models.json`. It carries `models`,
-`extra_request_headers`, `disable_retry_claude_count_token`, and `reasoning_field_switch`, and
+`extra_request_headers`, `disable_retry_claude_count_token`, `reasoning_field_switch`, and
+`reasoning_roundtrip`, and
 **both files must exist**: a missing `models.json` stops the proxy from starting rather than
 degrading it.
 
@@ -204,7 +205,8 @@ stricter than startup here: startup only requires a tier's provider to have *som
     "provider-c": ["claude-opus-5", "model-z"]
   },
   "disable_retry_claude_count_token": true,
-  "reasoning_field_switch": { "saturation_max": 10, "saturation_on_switch": 3 }
+  "reasoning_field_switch": { "saturation_max": 10, "saturation_on_switch": 3 },
+  "reasoning_roundtrip": { "provider-b/model-y": "always" }
 }
 ```
 
@@ -260,6 +262,30 @@ routing through that pair — the evidence is about the pair, not the session. A
 `reasoning_field_switch` placed in `config.json` by mistake is warned about and
 dropped, like the count-token flag. See
 [doc/configuration.html#reasoning-field-switch](doc/configuration.html#reasoning-field-switch)
+for the semantics and the validation rules.
+
+### `reasoning_roundtrip` (optional, object)
+
+Names the provider/model pairs whose chat-mode requests must always carry a
+reasoning field, for gateways that reject a request whose tool-calling turns
+omit one. Optional; the shipped default is empty, which leaves every pair on the
+learned behavior alone.
+
+```json
+"reasoning_roundtrip": { "some-provider/some-model": "always" }
+```
+
+For a listed pair, every assistant message of a conversation that contains a
+tool call carries the pair's learned echo field — the real reasoning where one
+exists, and `""` where it does not. Those gateways check that the field is
+*present*, not that it carries content, so an empty string satisfies the
+contract while a missing key is refused. Only the flag is configuration; the
+field is learned per pair, so a flagged pair whose selection is still `none` is
+unaffected until an on-demand rescue teaches it one. The key must name a
+provider in the catalog and one of that provider's models — a typo'd pair is
+refused at startup and again at `reload` — and it is carried across an admin
+Apply like the header rules. See
+[doc/configuration.html#reasoning-roundtrip](doc/configuration.html#reasoning-roundtrip)
 for the semantics and the validation rules.
 
 ### `extra_request_headers` (optional, object)
@@ -400,7 +426,9 @@ converts the full conversation history including text, tools, tool_use, and
 tool_result items to the Responses API format. Chat-mode
 non-streaming requests correctly transform tool_use/tool_result in both
 directions (thinking blocks echo the learned per-pair `reasoning_field` — nothing by default,
-`reasoning_content` or `reasoning` once learned — tool_use→tool_calls, tool_result→role:tool).
+`reasoning_content` or `reasoning` once learned, and always present on every assistant message of
+a tool-calling conversation for a pair flagged in `reasoning_roundtrip`, with `""` where no
+reasoning exists — tool_use→tool_calls, tool_result→role:tool).
 Chat-mode streaming correctly converts tool-call SSE deltas to Anthropic
 `tool_use` content blocks (per-index state, parallel/interleaved support,
 argument fragments forwarded verbatim, count-only diagnostics on malformed
@@ -636,7 +664,7 @@ While the proxy runs, it creates (all under `~/.claude/`):
 | Path | Purpose |
 |------|---------|
 | `proxy/config.json` | Tier→provider mapping (written by "Apply Config" in the admin page) |
-| `proxy/models.json` | Provider catalog, header rules, the count-tokens flag, and the reasoning-switch policy (written by `update-claude-env` or by hand — never by the proxy) |
+| `proxy/models.json` | Provider catalog, header rules, the count-tokens flag, and the reasoning policies (the switch threshold and the always-present field) (written by `update-claude-env` or by hand — never by the proxy) |
 | `proxy/proxy-state.json` | Runtime state (PID, port, heartbeat); removed on clean shutdown |
 | `proxy/proxy-stderr.log` | Server stderr (startup messages, retry notices); append-only across runs — `start`'s failure diagnostics read only the current attempt's window |
 | `logs/proxy-trace.jsonl` | The JSONL request trace (pruned of entries >5 days on each `start`) |

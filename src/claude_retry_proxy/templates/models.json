@@ -7,5 +7,6 @@
     "saturation_max": 10,
     "saturation_on_switch": 3
   },
+  "reasoning_roundtrip": {},
   "extra_request_headers": {}
 }

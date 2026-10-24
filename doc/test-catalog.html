@@ -17,14 +17,10 @@
 there is very little mocking of the modules under test.</p>
 
 <div class="warn">
-<strong>The test count is a snapshot, not a fixed figure.</strong> At the time of writing the
-suite has <strong>433 test functions across 19 files</strong>, but this number moves whenever
-tests are added. (It read <em>436 across 19</em> before this recount, <em>432 across 19</em> before that, <em>431 across 19</em> before that, <em>428 across 19</em> before that, <em>425 across 19</em> before that, <em>424 across 19</em> before that, <em>422 across 19</em> before that, <em>420 across 19</em> before that, <em>418 across 19</em> before that, <em>393 across 19</em> before that, <em>379 across 19</em> before that, <em>372 across 19</em> before that, <em>371 across 19</em> before that, <em>364 across 19</em> before that, <em>362 across 19</em> before that, <em>361 across 19</em> before that, <em>360 across 19</em> before that, <em>347 across 19</em> before that, <em>345 across 19</em>
-before that, <em>334 across 19</em> before that, and <em>322 across 18</em> before an earlier
-one — the page has drifted behind the
-suite twenty-one times, and in each case the stale total disagreed with the page's own catalog table
-as well.)
-Re-count before quoting it:
+<strong>This page no longer quotes a test count.</strong> The figure moves whenever tests are
+added, and the running total this box used to carry fell behind the suite twenty-one times — each
+time disagreeing with the page's own catalog table as well, which carried a second copy of every
+count. Neither is maintained here any more. Measure on demand instead:
 <code>grep -cE 'def (test_|doc_)' tests/*.py</code> (names may carry a module-local prefix
 such as <code>doc_</code>). The aggregator's own tally is the authoritative figure — the
 recipe only approximates it, so a <code>doc_</code>-prefixed function must be a test case,
@@ -111,51 +107,51 @@ checking its own proxy, not yours.</p>
 
 <h2 id="catalog">The catalog</h2>
 
-<p>Counts below are from the same snapshot as the total above — treat them as indicative of
-relative size, not as exact current figures.</p>
+<p>The catalog below describes what each module covers. Per-module test counts are deliberately
+not carried — recount on demand with the command above, or read the aggregator's own tally.</p>
 
 <table>
-<tr><th>Module</th><th class="num">Tests</th><th>Covers</th></tr>
-<tr><td><code>test_compat.py</code></td><td class="num">53</td>
+<tr><th>Module</th><th>Covers</th></tr>
+<tr><td><code>test_compat.py</code></td>
     <td>The compatibility learner — both features (<code>context_management</code>,
         <code>reasoning_field</code>): persistence, detection, state machine, concurrency.
         See <a href="compatibility.html">compatibility.html</a>.</td></tr>
-<tr><td><code>test_chat_transform.py</code></td><td class="num">51</td>
+<tr><td><code>test_chat_transform.py</code></td>
     <td>Anthropic → Chat Completions request and response transforms</td></tr>
-<tr><td><code>test_response_transform.py</code></td><td class="num">38</td>
+<tr><td><code>test_response_transform.py</code></td>
     <td>Anthropic → Responses request and response transforms</td></tr>
-<tr><td><code>test_chat_sse.py</code></td><td class="num">76</td>
+<tr><td><code>test_chat_sse.py</code></td>
     <td>Chat-mode SSE synthesis, tool-call deltas, post-finish drain, drain telemetry, truncation, degradation, the unfinished-turn retry nudge, and eviction across a config swap</td></tr>
-<tr><td><code>test_mode_dispatch.py</code></td><td class="num">29</td>
+<tr><td><code>test_mode_dispatch.py</code></td>
     <td>Mode dispatch, auth headers, path rewriting</td></tr>
-<tr><td><code>test_admin.py</code></td><td class="num">37</td>
+<tr><td><code>test_admin.py</code></td>
     <td>Admin API endpoints, CSRF origin rules, switch and reload, and the config-swap drain — single-flight presses, silence-based eviction, retry-chain abandonment, the swap-status endpoint, and the page's own swap-time lockout: the attach watcher and its per-attach generation guards, the select-inclusive control lock, and the completion's tier-row re-render</td></tr>
-<tr><td><code>test_retry_streaming.py</code></td><td class="num">24</td>
+<tr><td><code>test_retry_streaming.py</code></td>
     <td>Retry behaviour, streaming, response-size caps</td></tr>
-<tr><td><code>test_config_keys.py</code></td><td class="num">18</td>
+<tr><td><code>test_config_keys.py</code></td>
     <td>Config validation, key decryption, multi-key shapes</td></tr>
-<tr><td><code>test_config_split.py</code></td><td class="num">10</td>
+<tr><td><code>test_config_split.py</code></td>
     <td>The two-document loader: merged load, the required sibling, leftover-key warnings, sibling
         resolution, and the unreadable-shape conversion</td></tr>
-<tr><td><code>test_cli.py</code></td><td class="num">23</td>
+<tr><td><code>test_cli.py</code></td>
     <td>CLI lifecycle: start, stop, status, reload</td></tr>
-<tr><td><code>test_trace.py</code></td><td class="num">16</td>
+<tr><td><code>test_trace.py</code></td>
     <td>Trace logging and trace analysis</td></tr>
-<tr><td><code>test_tier_routing.py</code></td><td class="num">19</td>
+<tr><td><code>test_tier_routing.py</code></td>
     <td>Tier resolution, model resolution, reverse lookup</td></tr>
-<tr><td><code>test_unit.py</code></td><td class="num">2</td>
+<tr><td><code>test_unit.py</code></td>
     <td>Unit-level helpers: jitter, delay computation, small utilities</td></tr>
-<tr><td><code>test_sinks.py</code></td><td class="num">12</td>
+<tr><td><code>test_sinks.py</code></td>
     <td>The sink class family: write contract, health reporting, counters, chmod mode, temp-file hygiene</td></tr>
-<tr><td><code>test_docs.py</code></td><td class="num">11</td>
+<tr><td><code>test_docs.py</code></td>
     <td>The committed doc-anchor checker — anchor resolution for CLAUDE.md / README.md / doc pages, credential-shape scan, exit-code mapping</td></tr>
-<tr><td><code>test_sanitize.py</code></td><td class="num">10</td>
+<tr><td><code>test_sanitize.py</code></td>
     <td>The <code>sanitize_error</code> redaction chokepoint — path and IP redaction, case variants, boundary cases, linear-time bound</td></tr>
-<tr><td><code>test_settings.py</code></td><td class="num">4</td>
+<tr><td><code>test_settings.py</code></td>
     <td>The settings module: env fallback branches, singleton shape, trace-path resolver chain</td></tr>
-<tr><td><code>_harness.py</code></td><td class="num">—</td>
+<tr><td><code>_harness.py</code></td>
     <td><strong>Not a test module.</strong> Shared helpers, isolation setup, proxy lifecycle.</td></tr>
-<tr><td><code>test_claude_proxy.py</code></td><td class="num">—</td>
+<tr><td><code>test_claude_proxy.py</code></td>
     <td><strong>Not a test module.</strong> The aggregator and CLI entry point.</td></tr>
 </table>
 
@@ -186,7 +182,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> How a request's model name becomes a tier, and how a config is validated against the keys file before the proxy will start.</p>
 
-<h4><code>tests/test_tier_routing.py</code> (19 tests) — tier and model resolution</h4>
+<h4><code>tests/test_tier_routing.py</code> — tier and model resolution</h4>
 <ul>
 <li><code>test_tier_routing_basic</code>: Send request with model &quot;sonnet&quot;, verify correct upstream receives the configured model name and API key.</li>
 <li><code>test_tier_routing_all_tiers</code>: Send haiku/sonnet/opus requests, verify each routes to its configured provider.</li>
@@ -209,21 +205,22 @@ EOF</code></pre>
 <li><code>test_get_v1_models_404_envelope</code>: <code>do_GET</code>'s default branch answers any non-admin GET, and that response is not an admin surface — so <code>GET /v1/models</code> is an Anthropic-surface 404 carrying the envelope (<code>not_found_error</code> / <code>not_found</code>).</li>
 </ul>
 
-<h4><code>tests/test_config_split.py</code> (10 tests) — the two-document config loader</h4>
+<h4><code>tests/test_config_split.py</code> — the two-document config loader</h4>
 <ul>
 <li><code>test_models_path_for_sibling_resolution</code>: <code>models.json</code> resolves as the sibling of the configured config path, not from a default location.</li>
-<li><code>test_merged_load_with_optional_keys</code>: config.json's tiers plus the sibling's models / extra_request_headers / count-tokens flag / <code>reasoning_field_switch</code> policy merge into one dict; an absent <code>reasoning_field_switch</code> is <em>not</em> synthesized into the merged result (the resolver defaults apply), so an explicit policy can be told apart from a defaulted one (extended 2026-10-22).</li>
+<li><code>test_merged_load_with_optional_keys</code>: config.json's tiers plus the sibling's models / extra_request_headers / count-tokens flag / <code>reasoning_field_switch</code> policy merge into one dict; the <code>reasoning_roundtrip</code> pair map passes through and resolves to a set of <code>provider/model</code> pairs, with a malformed value resolving defensively to empty (extended 2026-10-23); an absent <code>reasoning_field_switch</code> is <em>not</em> synthesized into the merged result (the resolver defaults apply), so an explicit policy can be told apart from a defaulted one (extended 2026-10-22).</li>
 <li><code>test_missing_models_json_is_value_error_naming_path</code>: A missing catalog raises <code>ValueError</code> naming the resolved path — deliberately not <code>FileNotFoundError</code>, which the server would report against the wrong file.</li>
-<li><code>test_models_doc_bad_shapes_collapse_to_value_error</code>: Malformed catalog shapes (invalid JSON, non-object, missing <code>models</code>, non-object <code>models</code>, and — extended 2026-10-22 — a non-object <code>reasoning_field_switch</code>, a string field, or a boolean field) each raise <code>ValueError</code> naming <code>models.json</code>.</li>
+<li><code>test_models_doc_bad_shapes_collapse_to_value_error</code>: Malformed catalog shapes (invalid JSON, non-object, missing <code>models</code>, non-object <code>models</code>, and — extended 2026-10-22 — a non-object <code>reasoning_field_switch</code>, a string field, or a boolean field, and — extended 2026-10-23 — a non-object <code>reasoning_roundtrip</code> or a policy value other than <code>"always"</code>) each raise <code>ValueError</code> naming <code>models.json</code>.</li>
 <li><code>test_config_doc_bad_shapes</code>: config.json's own structural checks — non-object document, missing <code>tiers</code>, non-object <code>tiers</code>.</li>
 <li><code>test_models_json_unreadable_permissions_shape</code>: The unreadable-by-permissions shape; self-verifies the chmod first and reports the shape as inexpressible on Windows rather than asserting it. The directory-in-place shape carries the same OSError → ValueError conversion.</li>
 <li><code>test_leftover_keys_warn_and_lose</code>: A catalog key left behind in config.json warns on stderr and the <code>models.json</code> value wins — the rider tuple now includes <code>reasoning_field_switch</code> (extended 2026-10-22), covering both the dropped form and the models-wins form.</li>
 <li><code>test_leftover_key_dropped_warning</code>: When the catalog does <em>not</em> carry the leftover key, the warning names the drop instead of claiming the value is read elsewhere.</li>
 <li><code>test_leftover_key_no_models_json_still_fails</code>: The warning path is not a bypass — a leftover key with no catalog beside it still fails.</li>
 <li><code>test_load_config_for_validation</code>: The CLI path is exactly as strict as the server path, and retains the <code>path=None</code> fallback to <code>SETTINGS.config_path</code>.</li>
+<li><code>test_reasoning_roundtrip_validate_config</code>: The canonical <code>validate_config</code> refuses a <code>reasoning_roundtrip</code> entry that names an unknown provider, a known provider's unknown model, a pair that is not a <code>provider/model</code> string, or a policy value other than <code>"always"</code> — the check the reload path re-runs.</li>
 </ul>
 
-<h4><code>tests/test_config_keys.py</code> (18 tests) — config validation and key handling</h4>
+<h4><code>tests/test_config_keys.py</code> — config validation and key handling</h4>
 <ul>
 <li><code>test_config_validation_missing_tier</code>: Config with empty provider → server refuses to start.</li>
 <li><code>test_config_validation_unknown_provider</code>: Config references provider not in keys-index.json → server refuses to start.</li>
@@ -249,7 +246,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> The retry ladder, the streaming and buffered response paths, and the body/response size limits that cut them short.</p>
 
-<h4><code>tests/test_retry_streaming.py</code> (24 tests) — retry, streaming, size caps</h4>
+<h4><code>tests/test_retry_streaming.py</code> — retry, streaming, size caps</h4>
 <ul>
 <li><code>test_concurrent_requests</code>: 10+ parallel requests complete successfully.</li>
 <li><code>test_retry_logic</code>: Start proxy; mock upstream returns 503 3x then 200; verify exponential backoff.</li>
@@ -277,7 +274,7 @@ EOF</code></pre>
 <li><code>test_response_mode_swap_aborts_sse_fallback</code>: In response mode, the SSE-fallback drain's epoch check stops the drain and closes once a swap completes — the client never receives old-routing bytes after the swap, and a <code>swap_abort</code> event fires with phase <code>stream</code>.</li>
 </ul>
 
-<h4><code>tests/test_unit.py</code> (2 tests) — delay and header helpers</h4>
+<h4><code>tests/test_unit.py</code> — delay and header helpers</h4>
 <ul>
 <li><code>test_compute_jittered_delay_bounds</code>: Unit-test compute_jittered_delay: bounds, rounding, de-sync pattern, guards, thread-local RNG.</li>
 <li><code>test_crlf_header_filter</code>: In-process unit test of _crlf_safe: clean headers pass through; a header VALUE containing CR/LF is omitted; a header NAME containing CR/LF is omitted; None → {}; a mixed…</li>
@@ -287,7 +284,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> Provider mode selection (<code>anthropic</code> / <code>chat</code> / <code>response</code>) and the auth header and path each one sends.</p>
 
-<h4><code>tests/test_mode_dispatch.py</code> (29 tests) — mode dispatch and auth headers</h4>
+<h4><code>tests/test_mode_dispatch.py</code> — mode dispatch and auth headers</h4>
 <ul>
 <li><code>test_mode_defaults_to_anthropic</code>: Vendor without a mode field is treated as anthropic (x-api-key used).</li>
 <li><code>test_mode_null_defaults_to_anthropic</code>: Vendor with mode: null is treated as anthropic.</li>
@@ -318,22 +315,23 @@ EOF</code></pre>
 <li><code>test_retry_does_not_double_transform</code>: A 429 retry sends the same single-transformed body, not double-encoded.</li>
 <li><code>test_extra_request_headers_attach_matrix</code>: Resolved extra header emission for a ruled vs unruled provider.</li>
 <li><code>test_user_agent_forwarded_all_modes</code>: Inbound User-Agent forwarded upstream for anthropic/chat/response modes, exactly one User-Agent line reaching upstream.</li>
+<li><code>test_chat_mode_reasoning_roundtrip_e2e</code>: End-to-end chat-mode request whose provider/model pair is flagged in <code>reasoning_roundtrip</code> carries the echo field on every assistant message of the forwarded body. An unflagged model of the same provider carries its learned echo field only where real reasoning exists — its bare turn gets no always-present fill, so a policy that leaked to provider scope would be visible as one.</li>
 </ul>
 
 <h3 id="cat-4">Category 4 — Chat Completions Transforms</h3>
 
 <p><strong>Scope:</strong> The Anthropic↔Chat request and response conversions, including tool calls, thinking blocks, and cache control.</p>
 
-<h4><code>tests/test_chat_transform.py</code> (51 tests) — Anthropic → Chat request and response transforms</h4>
+<h4><code>tests/test_chat_transform.py</code> — Anthropic → Chat request and response transforms</h4>
 <ul>
-<li><code>test_anthropic_to_chat_messages_transform</code>: Full message array (thinking/text/tool_use/tool_result) -&gt; valid OpenAI Chat messages.</li>
+<li><code>test_anthropic_to_chat_messages_transform</code>: Full message array (thinking/text/tool_use/tool_result) -&gt; valid OpenAI Chat messages, with each assistant turn collapsed to <em>one</em> message carrying its text and its <code>tool_calls</code> together.</li>
 <li><code>test_anthropic_to_chat_messages_thinking_stripped</code>: At the default selection no reasoning field is emitted for a thinking block; the echo is the learned per-pair selection's call, not an always-on conversion.</li>
 <li><code>test_anthropic_to_chat_messages_redacted_thinking_trace</code>: A placeholder reasoning field is emitted only for the <code>reasoning_content</code> / <code>reasoning</code> selections; the redacted_thinking passthrough trace event is unchanged.</li>
 <li><code>test_anthropic_to_chat_messages_tool_use_to_tool_calls</code>: tool_use block converts to tool_calls with JSON-stringified arguments.</li>
 <li><code>test_anthropic_to_chat_messages_tool_result_to_role_tool</code>: tool_result block in a user message becomes a separate role:tool message.</li>
-<li><code>test_anthropic_to_chat_messages_mixed_text_and_tool_use</code>: Assistant with both text and tool_use -&gt; text message first, then content:null + tool_calls.</li>
+<li><code>test_anthropic_to_chat_messages_mixed_text_and_tool_use</code>: Assistant with both text and tool_use -&gt; <em>one</em> assistant message carrying the text and the <code>tool_calls</code> together.</li>
 <li><code>test_anthropic_to_chat_messages_mixed_text_and_tool_result</code>: User with both text and tool_result -&gt; tool message first, then user text message.</li>
-<li><code>test_anthropic_to_chat_messages_interleaved_thinking_tool_use</code>: Real-world interleaved pattern: thinking, text, tool_use, text in one assistant turn.</li>
+<li><code>test_anthropic_to_chat_messages_interleaved_thinking_tool_use</code>: Real-world interleaved pattern: thinking, text, tool_use, text in one assistant turn, collapsed to one message; also pins the default-selection no-echo behavior.</li>
 <li><code>test_anthropic_to_chat_messages_string_content_passthrough</code>: String content passes through unchanged in a NEW message dict (input not reused).</li>
 <li><code>test_anthropic_to_chat_messages_cache_control_stripped</code>: Block-level cache_control removed from blocks; cache_control_stripped trace event logged.</li>
 <li><code>test_anthropic_to_chat_messages_non_list_guarded</code>: Non-list messages input returns [].</li>
@@ -355,15 +353,17 @@ EOF</code></pre>
 <li><code>test_anthropic_to_chat_tool_choice_none_omitted</code>: None/absent tool_choice is omitted from output.</li>
 <li><code>test_anthropic_to_chat_tool_choice_malformed_omitted</code>: Malformed/unknown tool_choice maps to None (omitted, defensive).</li>
 <li><code>test_anthropic_to_chat_tool_choice_only_with_tools</code>: tool_choice is omitted when the tools array is empty or absent.</li>
-<li><code>test_anthropic_to_chat_integration</code>: Full Anthropic request (system, tools, tool_choice, multi-turn) -&gt; valid OpenAI Chat request.</li>
+<li><code>test_anthropic_to_chat_integration</code>: Full Anthropic request (system, tools, tool_choice, multi-turn) -&gt; valid OpenAI Chat request, end to end, on the collapsed assistant shape.</li>
 <li><code>test_anthropic_to_chat_content_block_dropped_trace</code>: Coalesced content_block_dropped trace event with dropped_counts (not per-block).</li>
 <li><code>test_anthropic_to_chat_cache_control_stripped_trace</code>: cache_control_stripped logged once per request (coalesced), not per block.</li>
 <li><code>test_anthropic_to_chat_nan_infinity_arguments_rejected</code>: NaN/Infinity tool_use.input degrades to a text placeholder, not silently dropped.</li>
 <li><code>test_anthropic_to_chat_tool_use_non_dict_input</code>: tool_use.input with non-dict value (string/None/number) degrades to placeholder, no non-object arguments.</li>
-<li><code>test_anthropic_to_chat_nan_placeholder_with_valid_tool_use</code>: NaN tool_use + valid tool_use coexist -&gt; placeholder as separate assistant message before tool_calls.</li>
+<li><code>test_anthropic_to_chat_nan_placeholder_with_valid_tool_use</code>: NaN tool_use alongside a valid one -&gt; <em>one</em> assistant message whose <code>content</code> carries the placeholder and whose <code>tool_calls</code> carries the surviving call; a turn in which <em>every</em> call was degraded stays plain text with no <code>tool_calls</code> key at all.</li>
 <li><code>test_anthropic_to_chat_tool_result_list_content</code>: tool_result.content as a list of text blocks is joined with newlines.</li>
 <li><code>test_anthropic_to_chat_no_input_mutation</code>: _anthropic_to_chat does not mutate the input dict or its nested structures.</li>
-<li><code>test_chat_transform_emits_only_selected_field</code>: The request-direction selection matrix — no reasoning field for <code>none</code> (default, explicit, <code>None</code>, or an unrecognized value); exactly <code>reasoning_content</code> or exactly <code>reasoning</code> for those selections; never both.</li>
+<li><code>test_chat_transform_emits_only_selected_field</code>: The request-direction selection matrix — no reasoning field for <code>none</code> (default, explicit, <code>None</code>, or an unrecognized value); exactly <code>reasoning_content</code> or exactly <code>reasoning</code> for those selections; never both. Extended 2026-10-23 with the <code>reasoning_always</code> axis: the selected field forced onto <em>every</em> assistant message once the conversation contains a tool call — the real reasoning where a thinking block exists, <code>""</code> where none does — and inert without any tool-call turn and inert for the <code>none</code> selection.</li>
+<li><code>test_anthropic_to_chat_injection_trace_counts</code> (added 2026-10-23): The injection event's <code>real</code> / <code>empty</code> / <code>placeholder</code> counters — it fires only when <code>empty + placeholder &gt; 0</code>, and a redacted-thinking placeholder is counted as <code>placeholder</code>, never as <code>real</code>.</li>
+<li><code>test_anthropic_to_chat_real_thinking_supersedes_placeholder</code> (added 2026-10-24): A real <code>thinking</code> block supersedes an earlier redacted-thinking placeholder on the same turn, so the forwarded field carries the real text and the injection event counts the turn <code>real=1, placeholder=0</code> — and does not fire at all when nothing blank was filled. Guard: a redacted-only turn still forwards the placeholder and is counted <code>placeholder=1, real=0</code>.</li>
 <li><code>test_chat_to_anthropic_basic</code>: content, model, stop_reason, usage mapped correctly.</li>
 <li><code>test_chat_to_anthropic_reasoning_content_to_thinking</code>: reasoning_content in the chat message becomes a thinking block first in content.</li>
 <li><code>test_chat_to_anthropic_reasoning_field_compat</code>: vLLM &#x27;reasoning&#x27; field is also recognized; reasoning_content wins when both present.</li>
@@ -383,7 +383,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> The Anthropic↔Responses conversions — input items, instructions, and the streaming path.</p>
 
-<h4><code>tests/test_response_transform.py</code> (38 tests) — Anthropic → Responses request and response transforms</h4>
+<h4><code>tests/test_response_transform.py</code> — Anthropic → Responses request and response transforms</h4>
 <ul>
 <li><code>test_anthropic_to_response_basic</code>: model, input items, instructions, max_output_tokens, stream mapped.</li>
 <li><code>test_anthropic_to_response_system_list</code>: system content block list concatenates into instructions.</li>
@@ -429,7 +429,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> Synthesising Anthropic SSE events from a chat provider's stream: framing, tool-call deltas, and every degradation path.</p>
 
-<h4><code>tests/test_chat_sse.py</code> (76 tests) — chat-mode SSE synthesis, post-finish drain, drain telemetry, and framing</h4>
+<h4><code>tests/test_chat_sse.py</code> — chat-mode SSE synthesis, post-finish drain, drain telemetry, and framing</h4>
 <ul>
 <li><code>test_chat_sse_basic_streaming</code>: Simulated OpenAI SSE chunks produce valid Anthropic SSE events.</li>
 <li><code>test_chat_sse_finish_reason_mapping</code>: finish_reason maps to stop_reason in the terminal message_delta.</li>
@@ -513,7 +513,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> Both learner features — the <code>context_management</code> probe ladder, probation, suppression, and its persistence file, and the <code>reasoning_field</code> credit rule (saturate, drain, edge-switch) with its lock-free rescue.</p>
 
-<h4><code>tests/test_compat.py</code> (53 tests) — the compatibility learner</h4>
+<h4><code>tests/test_compat.py</code> — the compatibility learner</h4>
 <ul>
 <li><code>test_compat_state_load_missing_file</code>: Missing state file means empty state: discovery still works and no startup failure occurs.</li>
 <li><code>test_compat_state_load_corrupt_fails_open</code>: A corrupt (non-JSON) state file warns and fails open with empty state: requests forward unchanged and the proxy does not crash.</li>
@@ -554,19 +554,21 @@ EOF</code></pre>
 <li><code>test_compat_delist_after_two_successes</code>: A seeded probation entry earns two successful probes and is delisted; afterwards requests are no longer stripped.</li>
 <li><code>test_compat_inconclusive_reschedules</code>: An inconclusive probe (non-matching 500) resets the strip counter and reschedules at the current threshold without doubling.</li>
 <li><code>test_compat_probe_counter_semantics</code>: Repeated rejection from probation resets probation to zero but keeps (and further doubles) the threshold — it never resets to base.</li>
-<li><code>test_compat_single_retry_global</code>: Concurrent first-time requests. The <code>context_management</code> half: exactly one compatibility retry occurs globally; losers receive the original 400. The <code>reasoning_field</code> half (rewritten 2026-10-22 by this plan): five concurrent chat complainers <strong>all</strong> receive 2xx — each runs its own lock-free rescue — and the shared-key credit drained during the episode, so a switch happened (asserted through the switch event / the moved selection, never an exact end state).</li>
+<li><code>test_compat_single_retry_global</code>: Concurrent first-time requests. The <code>context_management</code> half: exactly one compatibility retry occurs globally; losers receive the original 400. The <code>reasoning_field</code> half (rewritten 2026-10-22 by this plan): five concurrent chat complainers <strong>all</strong> receive 2xx — each runs its own lock-free rescue — and the shared-key credit drained during the episode, so a switch happened (asserted through the switch event / the moved selection, never an exact end state — and since 2026-10-23 the rescue events are asserted as "at least one, every one scoped to the <code>reasoning_field</code> feature" rather than one per served client: a worker entering after the shared entry has been learned sends the field on its first attempt and is served with no complaint, so the count is interleaving-dependent and is not pinned).</li>
 <li><code>test_compat_retry_lock_released_on_exception</code>: An upstream failure during the compatibility retry releases the retry lock: later requests can still retry and learn.</li>
 <li><code>test_compat_config_swap_during_retry</code>: The compatibility retry uses the entry-time config snapshot: the in-flight request completes against its original provider, and the admin switch (drained afterwards)…</li>
 <li><code>test_compat_retry_stream_interaction</code>: Interaction with streaming and the existing retry loop: learning works from streamed 2xx (status-receipt evidence, no rollback on mid-stream failure), and the 429/503…</li>
 <li><code>test_compat_trace_metadata_only</code>: All compatibility_* trace events are metadata-only: no field values, no prompt text, no raw upstream error text.</li>
-<li><code>test_reasoning_walk_sends_advanced_candidate</code>: Each rescue pass sends exactly the advanced candidate's field, including the wrap pass whose candidate is the literal <code>"none"</code>.</li>
+<li><code>test_reasoning_present_gates_on_demanding_turn</code> (added 2026-10-23): The demanding-turn gate — a bare demanding turn over a reasoned history is not learnable; a reasoned demanding turn is; reasoning with no tool-call turn anywhere is not; a later assistant turn carrying no <code>tool_use</code> does not change the verdict (the scan runs from the end and skips past it); totality guards hold.</li>
+<li><code>test_reasoning_rescue_repairs_forwarded_body</code> (added 2026-10-23): The repair contract on the wire — a rescue pass's <em>forwarded body</em> carries the injected field on every assistant message (the real reasoning where available, <code>""</code> otherwise), for both a real field candidate and a <code>"none"</code> candidate.</li>
+<li><code>test_reasoning_walk_sends_advanced_candidate</code>: Each rescue pass sends the advanced candidate's field, including the wrap pass whose candidate is the literal <code>"none"</code> — where the field <em>actually sent</em> is the resolved <code>effective_field</code>, since a <code>"none"</code> candidate has no field name to write (revised 2026-10-23 to the fallback and <code>effective_field</code>).</li>
 <li><code>test_reasoning_non_complaint_errors_are_not_counted</code>: A 401/403/500, an unparseable body, and a 400 naming no field change no credit and start no rescue; a rescue pass returning one stops the rescue, with attempt 1's original error returned to the client.</li>
 <li><code>test_reasoning_matcher_shapes</code>: The reasoning matcher's accept/reject contract — message form, structured <code>loc</code> form, sentence-final form; rejects the dotted prose path, an echoed request payload, and every non-400.</li>
-<li><code>test_reasoning_delist_on_none_success</code>: A credit-driven switch whose next candidate is <code>"none"</code> removes the entry rather than writing <code>selection: "none"</code> — the switch, not a served candidate, is what delists (rewritten 2026-10-22 to the credit model).</li>
+<li><code>test_reasoning_delist_on_none_success</code>: A credit-driven switch whose next candidate is <code>"none"</code> removes the entry rather than writing <code>selection: "none"</code> — the switch, not a served candidate, is what delists (rewritten 2026-10-22 to the credit model; revised 2026-10-23 to assert the repaired bytes are served and the pass reports candidate <code>none</code> with its <code>effective_field</code>).</li>
 <li><code>test_reasoning_credit_saturates_and_drains</code> (added 2026-10-22): With <code>reasoning_field_switch</code> set small (4/2), the credit saturates at <code>saturation_max</code> under gate-true successes (many successes never exceed the cap) and drains one step per matched complaint; a switch persists exactly on the edge where a decrement reaches zero — asserted through the persisted selection and the switch event — the credit is re-armed to <code>saturation_on_switch</code>, so the next switch needs exactly that many further complaints, and the advance moves one step from the <em>entry's current</em> selection.</li>
 <li><code>test_reasoning_rescued_success_does_not_teach</code> (added 2026-10-22): The attempt-1-only pin — a rescued 2xx must not refill the credit, so <code>saturation_on_switch</code> consecutive episodes in which attempt 1 complains and the rescue serves still drain the credit to zero and switch.</li>
 <li><code>test_reasoning_rescue_runs_without_thinking</code> (added 2026-10-22): A matched complaint on a body with <strong>no</strong> thinking block is still rescued — the gate-false case, where the rescue is the only thing that can serve. A mock that 400s the first call and 200s the second yields a client 200 plus a <code>reasoning_rescue</code> event, and the persisted selection is unchanged after several such episodes: gate-false complaints are not learning evidence.</li>
-<li><code>test_reasoning_rescue_events_and_merge</code> (added 2026-10-22): The rescue's trace and merge contract — one <code>reasoning_rescue</code> event per pass with the documented key set <em>exactly</em> (the data-exposure invariant pinned as a contract); on exhaustion the client receives attempt 1's original error (status and shape); a 429/503 on a rescue pass stops the rescue and serves attempt 1's error; the entry's <code>retries</code> still counts 429/503 retries only.</li>
+<li><code>test_reasoning_rescue_events_and_merge</code> (added 2026-10-22): The rescue's trace and merge contract — one <code>reasoning_rescue</code> event per pass with the documented key set <em>exactly</em> (the data-exposure invariant pinned as a contract; the set gained <code>effective_field</code> 2026-10-23); on exhaustion the client receives attempt 1's original error (status and shape); a 429/503 on a rescue pass stops the rescue and serves attempt 1's error; the entry's <code>retries</code> still counts 429/503 retries only.</li>
 <li><code>test_reasoning_switch_params_carried_across_admin</code> (added 2026-10-22): A non-default <code>reasoning_field_switch</code> in the fixture's <code>models.json</code> survives both admin paths — <code>/admin/api/switch</code> and <code>/admin/api/reload</code> keep the effective policy, observable through drain/threshold behaviour — and a reload whose <code>reasoning_field_switch</code> is structurally invalid is refused with a 400 and installs nothing.</li>
 </ul>
 
@@ -574,7 +576,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> The admin page and its endpoints, including the Origin check and hot-switch behaviour.</p>
 
-<h4><code>tests/test_admin.py</code> (37 tests) — admin page, API, CSRF, the config-swap drain</h4>
+<h4><code>tests/test_admin.py</code> — admin page, API, CSRF, the config-swap drain</h4>
 <ul>
 <li><code>test_admin_reload_non_dict_extra_tier</code>: A non-dict extra tier — which startup validation lets through — must not crash the reload gate; the reload still answers and never drops the connection with no response.</li>
 <li><code>test_admin_switch_validates_key_names</code>: Key-selector validation now lives on the switch path: the reload handler's candidate tiers come from in-memory state, so a bad key on disk is never seen by reload.</li>
@@ -590,7 +592,7 @@ EOF</code></pre>
 <li><code>test_admin_api_switch_missing_tier_rejected</code>: POST with only 2 tiers → 400 error listing missing tier.</li>
 <li><code>test_admin_api_reload</code>: Modify config.json on disk, POST /admin/api/reload, verify new mapping active.</li>
 <li><code>test_admin_models_provider_keyed</code>: Admin API serves models keyed by provider; admin.html model &lt;select&gt; is populated from config.models[provider] — no placeholder or custom options.</li>
-<li><code>test_admin_switch_preserves_disable_retry_flag</code>: Admin Apply preserves disable_retry_claude_count_token and extra_request_headers (one switch flow, both top-level keys) in the returned and on-disk config.</li>
+<li><code>test_admin_switch_preserves_disable_retry_flag</code>: Admin Apply preserves disable_retry_claude_count_token and extra_request_headers (one switch flow, both top-level keys) in the returned, in-memory config — the on-disk <code>config.json</code> is tiers-only, so these keys live in <code>models.json</code> and are asserted in memory rather than on disk. Extended 2026-10-23 to cover the <code>reasoning_roundtrip</code> policy: a switch preserves it and a reload installs a changed value — the regression test for a carried-models key that a tiers-only write could otherwise drop.</li>
 <li><code>test_admin_providers_detail</code>: providers-detail returns mode per provider without keys.</li>
 <li><code>test_admin_providers_detail_no_mode</code>: Providers without a mode return anthropic.</li>
 <li><code>test_admin_providers_detail_forbidden</code>: providers-detail is rejected for non-localhost clients.</li>
@@ -619,7 +621,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> Start, stop, status, and reload as the operator runs them — including the passphrase pipe and readiness probe.</p>
 
-<h4><code>tests/test_cli.py</code> (23 tests) — CLI lifecycle</h4>
+<h4><code>tests/test_cli.py</code> — CLI lifecycle</h4>
 <ul>
 <li><code>test_cli_status_shows_loader_error</code>: A deleted or malformed <code>models.json</code> makes <code>status</code> print the loader diagnostic rather than silently omitting the tier section.</li>
 <li><code>test_stop_cleans_proxy_state</code>: Start proxy, force-kill server, run stop, verify proxy-state.json deleted.</li>
@@ -650,7 +652,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> What the proxy records, and the write contract that keeps a failing sink from stopping it.</p>
 
-<h4><code>tests/test_trace.py</code> (16 tests) — trace log and analysis</h4>
+<h4><code>tests/test_trace.py</code> — trace log and analysis</h4>
 <ul>
 <li><code>test_trace_markers</code>: Start proxy, send requests, then stop it through <code>POST /admin/shutdown</code> — the <em>graceful</em> path, so the <code>proxy_stop</code> marker is actually written (changed 2026-10-16 by plan 2026-10-15-test-harness-robustness; it previously killed the proxy and merely warned when the marker was missing). Verify the trace has start/end markers with counters, plus the <code>proxy_ready</code> marker and its <code>pid</code>/<code>port</code> fields. A missing <code>proxy_stop</code> is now a hard <strong>failure</strong>, not a warning, so the marker is pinned rather than tolerated. This is the only <code>proxy_ready</code> pin that runs on Windows — the test's other reference lives inside the POSIX-gated SIGTERM test in <code>test_cli.py</code>, so without it a removal or rename of the event would go unnoticed by any runnable test.</li>
 <li><code>test_relative_log_path</code>: Start proxy server directly with &#x27;-l relative.jsonl&#x27; and cwd=temp dir.</li>
@@ -670,7 +672,7 @@ EOF</code></pre>
 <li><code>test_client_user_agent_duplicate_headers_match_forwarded</code>: When a request carries more than one <code>User-Agent</code> header, the traced value names the line the forwarding path actually sends — asserted against the mock upstream&#x27;s own record of the header lines it received, never against a restatement of the rule. Same-cased duplicates reach the upstream as <strong>one</strong> line carrying the second value (the pre-fix code recorded the first, which the upstream never received at all); differently-cased ones arrive as <strong>two</strong>; and the interleaved-casing case pins the forwarding path&#x27;s own dict collapse, which <em>reorders</em> — the request&#x27;s last UA line is <code>c</code> while the wire&#x27;s last line is <code>b</code>, so a later "simplification" to <code>get_all(...)[-1]</code> fails here. Duplicate headers cannot be sent by <code>http.client</code>, so the cases go over a raw socket.</li>
 </ul>
 
-<h4><code>tests/test_sinks.py</code> (12 tests) — the sink class family</h4>
+<h4><code>tests/test_sinks.py</code> — the sink class family</h4>
 <ul>
 <li><code>test_sink_warning_rate_limit</code>: The first failure of an episode warns immediately; further failures inside the interval are silent; the next failure after the interval warns once and reports how many…</li>
 <li><code>test_sink_recovery_notice</code>: The first successful write after a failure episode emits one line carrying the episode&#x27;s dropped-write count; later successes are silent; and a *new* episode after a…</li>
@@ -686,7 +688,7 @@ EOF</code></pre>
 <li><code>test_state_sink_concurrent_writes_last_writer_wins</code>: N ≥ 16 concurrent writers through one StateSink produce exactly one complete payload (unique-temp + atomic-replace needs no mutex) and no temp file survives.</li>
 </ul>
 
-<h4><code>tests/test_sanitize.py</code> (10 tests) — the redaction chokepoint</h4>
+<h4><code>tests/test_sanitize.py</code> — the redaction chokepoint</h4>
 <ul>
 <li><code>test_redaction_table_dotdirs_shapes</code>: Each of the seven sensitive dotdirs redacts fully in all three path shapes (POSIX, native Windows, forward-slash Windows).</li>
 <li><code>test_redaction_case_insensitive</code>: The dotdir alternation is compiled IGNORECASE — capitalized dotdirs still redact (Windows paths are case-insensitive).</li>
@@ -700,7 +702,7 @@ EOF</code></pre>
 <li><code>test_redaction_linear_time_bound</code>: ReDoS tripwire — sanitize_error on 64 slashes completes inside a hard subprocess timeout; a regression is a FAIL (timeout or nonzero exit), never a suite hang.</li>
 </ul>
 
-<h4><code>tests/test_settings.py</code> (4 tests) — the settings module</h4>
+<h4><code>tests/test_settings.py</code> — the settings module</h4>
 <ul>
 <li><code>test_env_int_fallback_semantics</code>: The five <code>_env_int</code> cases — valid in-range parses; unparseable, below-min, above-max and empty/unset each fall back to the default.</li>
 <li><code>test_env_str_fallback_semantics</code>: Set returns the value; set-but-empty falls back to the default.</li>
@@ -715,7 +717,7 @@ by the suite): every <code>doc/*.html#id</code> reference in <code>CLAUDE.md</co
 <code>README.md</code>, and the doc pages resolves to a real file and heading, and no
 credential-shaped string sits in a public doc page without a placeholder marker.</p>
 
-<h4><code>tests/test_docs.py</code> (11 tests) — the committed doc-anchor checker</h4>
+<h4><code>tests/test_docs.py</code> — the committed doc-anchor checker</h4>
 <ul>
 <li><code>doc_real_tree_success</code>: The committed checker passes on the real repo tree with a positive anchor count — a referrer wipe cannot silently green the suite.</li>
 <li><code>doc_missing_anchor_file</code>: A referrer anchor to a missing doc page is flagged.</li>

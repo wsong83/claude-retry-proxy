@@ -653,24 +653,35 @@ def _compat_rejection_match(status, resp_body):
 
 
 def _reasoning_present(body_json):
-    """True when the client body carries an assistant thinking block worth
-    echoing (non-empty `thinking`, or a `redacted_thinking` with non-empty
-    `data`). Total: any shape it cannot interpret is False."""
+    """True when the LAST assistant message carrying a ``tool_use`` block also
+    carries reasoning worth echoing (a non-empty ``thinking`` block, or a
+    ``redacted_thinking`` with non-empty ``data``).
+
+    The gate is demanding-turn scoped on purpose: a complaint about a turn
+    that performs a tool call but carries no reasoning of its own is a
+    missing-field complaint. It says nothing about the field NAME, so it must
+    not feed the credit learner. The scan runs from the end and skips past
+    later assistant messages that carry no ``tool_use``; False when no
+    assistant ``tool_use`` message exists at all. It reads the RAW client body
+    (before the chat transform's own keep rules), mirroring the client's
+    reasoning. Total: any shape it cannot interpret is False.
+    """
     try:
         if not isinstance(body_json, dict):
             return False
         messages = body_json.get("messages")
         if not isinstance(messages, list):
             return False
-        for msg in messages:
+        for msg in reversed(messages):
             if not isinstance(msg, dict) or msg.get("role") != "assistant":
                 continue
             content = msg.get("content")
             if not isinstance(content, list):
                 continue
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
+            blocks = [b for b in content if isinstance(b, dict)]
+            if not any(b.get("type") == "tool_use" for b in blocks):
+                continue
+            for block in blocks:
                 btype = block.get("type")
                 if btype == "thinking":
                     if isinstance(block.get("thinking"), str) and block["thinking"]:
@@ -678,6 +689,7 @@ def _reasoning_present(body_json):
                 elif btype == "redacted_thinking":
                     if isinstance(block.get("data"), str) and block["data"]:
                         return True
+            return False
         return False
     except Exception:
         return False

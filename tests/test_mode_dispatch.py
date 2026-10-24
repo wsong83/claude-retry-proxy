@@ -7,6 +7,8 @@ Part of the claude-retry-proxy suite; runnable standalone.
 
 import json
 import os
+import shutil
+import tempfile
 
 from _harness import (
     _mode_default_responder,
@@ -613,6 +615,140 @@ def test_chat_mode_e2e_json():
         cleanup()
 
 
+
+
+def test_chat_mode_reasoning_roundtrip_e2e():
+    """End-to-end: a reasoning_roundtrip-flagged (provider, model) pair sends
+    the always-present reasoning field on every assistant message of the
+    forwarded body — and an UNFLAGGED model of the same provider does not.
+
+    The policy is inert while the learner's selection is "none" (there is no
+    field name to write), so the compat state file is seeded with a learned
+    `reasoning_content` selection for BOTH models: the flagged one and the
+    same-provider unflagged one. The unflagged leg therefore genuinely emits
+    the learned field where real reasoning exists, so a policy that matched by
+    provider alone would fill the bare turn too and this test would catch it.
+    models.json is read at proxy startup, so the policy rides the fixture.
+    """
+    print("\n--- Test: Chat Mode reasoning_roundtrip E2E ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port),
+                     "key": "K", "mode": "chat"}}
+    chat_ok = json.dumps({
+        "id": "chatcmpl-1", "object": "chat.completion", "created": 1,
+        "model": "gpt-4o",
+        "choices": [{"index": 0,
+                     "message": {"role": "assistant", "content": "Hello"},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+    }).encode()
+    responders = {"p": lambda info: (200, "application/json", chat_ok)}
+
+    seed_dir = tempfile.mkdtemp(prefix="proxy_mode_seed_")
+    seed_path = os.path.join(seed_dir, "compat.json")
+
+    def seed_entry(actual_model):
+        return {
+            "schema_version": 1, "provider": "p", "mode": "chat",
+            "actual_model": actual_model, "feature": "reasoning_field",
+            "selection": "reasoning_content",
+        }
+    with open(seed_path, "w", encoding="utf-8") as f:
+        json.dump({"schema_version": 1,
+                   "entries": {
+                       "\x1f".join(("p", "chat", model, "reasoning_field")):
+                           seed_entry(model)
+                       for model in ("claude-sonnet-5", "claude-haiku-4-5")}},
+                  f)
+
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = \
+        _start_mode_proxy(
+            tiers, vendors, responders=responders,
+            extra_env={"PROXY_FEATURE_COMPAT_FILE": seed_path},
+            reasoning_roundtrip={"p/claude-sonnet-5": "always"})
+    if proc is None:
+        shutil.rmtree(seed_dir, ignore_errors=True)
+        fail("Failed to set up test")
+        return
+    try:
+        conversation = {
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "the real reasoning",
+                     "signature": "s"},
+                    {"type": "tool_use", "id": "t1", "name": "lookup",
+                     "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1",
+                     "content": "ok"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t2", "name": "lookup",
+                     "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t2",
+                     "content": "ok"}]},
+            ],
+        }
+
+        def send(tier):
+            body = dict(conversation)
+            body["model"] = tier
+            before = len(mock_servers["p"]["requests"])
+            status, _ = _send_proxy_request(proxy_port, body=json.dumps(body))
+            if status != 200:
+                return status, None, 0
+            reqs = mock_servers["p"]["requests"][before:]
+            if not reqs:
+                return status, None, 0
+            upstream = json.loads(reqs[0]["body"])
+            assistants = [m for m in upstream.get("messages", [])
+                          if isinstance(m, dict)
+                          and m.get("role") == "assistant"]
+            return status, assistants, len(reqs)
+
+        status, assistants, calls = send("sonnet")
+        if status != 200 or calls != 1:
+            fail("flagged chat request failed: status %s, %d upstream call(s)"
+                 % (status, calls))
+            return
+        values = [m.get("reasoning_content") for m in assistants]
+        if not assistants or not all("reasoning_content" in m
+                                     for m in assistants):
+            fail("the flagged pair must carry reasoning_content on EVERY "
+                 "assistant message, got %r" % (assistants,))
+            return
+        if values != ["the real reasoning", ""]:
+            fail("expected the real text then \"\" on the collapsed assistant "
+                 "messages, got %r" % (values,))
+            return
+        pass_("flagged pair: reasoning_content on every assistant message "
+              "(real text, then \"\")")
+
+        status, assistants, calls = send("haiku")
+        if status != 200 or calls != 1:
+            fail("unflagged chat request failed: status %s, %d upstream "
+                 "call(s)" % (status, calls))
+            return
+        values = [m.get("reasoning_content") for m in assistants]
+        # The seeded learned selection makes this leg able to observe a
+        # provider-scoped policy leak: the reasoned turn carries the field
+        # either way, but only the always-present fill would put it on the
+        # bare turn too.
+        if values != ["the real reasoning", None]:
+            fail("the policy must not reach an unflagged model of the same "
+                 "provider: expected the learned field on the reasoned turn "
+                 "only, got %r" % (values,))
+            return
+        pass_("unflagged model of the same provider: no always-present fill "
+              "(learned field on the reasoned turn only)")
+    finally:
+        cleanup()
+        shutil.rmtree(seed_dir, ignore_errors=True)
 
 
 def test_response_mode_e2e_json():
@@ -1457,6 +1593,7 @@ ALL_TESTS = [
     ("anthropic-to-chat-dropped-fields", test_anthropic_to_chat_dropped_fields),
     ("anthropic-to-chat-stop-sequences", test_anthropic_to_chat_stop_sequences),
     ("chat-mode-e2e-json", test_chat_mode_e2e_json),
+    ("chat-mode-reasoning-roundtrip-e2e", test_chat_mode_reasoning_roundtrip_e2e),
     ("response-mode-e2e-json", test_response_mode_e2e_json),
     ("response-mode-assistant-output-text-e2e", test_response_mode_assistant_output_text_e2e),
     ("response-mode-tool-loop-e2e", test_response_mode_tool_loop_e2e),
