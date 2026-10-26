@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 
+from .nesting import check_payload_nesting, nesting_event
 from .sanitize import sanitize_error
 from .sinks import log_trace
 from .settings import SETTINGS
@@ -627,8 +628,13 @@ def _compat_guarded_parse(resp_body):
     The shared total helper behind every complaint matcher: it catches
     Exception so a RecursionError (raised by json.loads on deeply nested
     input, and not a ValueError) degrades to None rather than escaping into
-    the unguarded call-site family.
+    the unguarded call-site family. A body past nesting.MAX_JSON_NESTING_DEPTH
+    returns None without being parsed at all (nesting_limit_exceeded event).
     """
+    _nesting = check_payload_nesting(resp_body)
+    if _nesting is not None:
+        log_trace(nesting_event("compat_error_body", _nesting))
+        return None
     try:
         return json.loads(resp_body)
     except Exception:

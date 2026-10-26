@@ -10,14 +10,19 @@
 
 <h1>Trace Log<span class="sub">What the proxy records, and what it deliberately does not</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-21</p>
+<p><strong>Last updated:</strong> 2026-10-26</p>
 
 <p>The trace log is a JSONL file — one JSON object per line — at
 <code>~/.claude/logs/proxy-trace.jsonl</code> by default, overridable with
 <code>PROXY_TRACE_FILE</code> or <code>--log</code>. Every request the proxy <em>forwards</em> appends
 one <code>request</code> entry, and the proxy's own lifecycle and internal events append their own
-entries alongside it. Requests rejected before forwarding — a malformed <code>Content-Length</code>,
-or any admin API call — write nothing.</p>
+entries alongside it. Requests rejected before forwarding write nothing when the rejection happens
+before the body is read — a malformed <code>Content-Length</code> — and admin API calls never write
+a <code>request</code> entry; the rejections decided <em>after</em> the body is read do write one:
+the oversized-body 413, the nesting-limit 400, and the pre-routing 400s for an unrecognised model,
+method or path, each with the shape noted under the entry schema above. Over-deep <em>upstream</em>
+payloads are not rejections at all — they are forwarded or skipped, with a
+<code>nesting_limit_exceeded</code> event.</p>
 
 <p>It is append-only and line-oriented on purpose: a partially written final line costs you one
 entry, not the file.</p>
@@ -51,9 +56,12 @@ entry, not the file.</p>
 
 <div class="warn">
 <strong>The "present on every entry" invariant above has two exceptions.</strong> The oversized-body
-rejection writes its entry <em>before</em> routing, so it carries no <code>tier</code> and no
-<code>provider</code> — and, for the same reason, no <code>client_user_agent</code> either: that
-entry is written before the request is routed, and a client's User-Agent cannot cause a 413.
+rejection <em>and</em> the nesting-limit rejection write their entries <em>before</em> routing, so
+they carry no <code>tier</code> and no <code>provider</code> — and, for the same reason, no
+<code>client_user_agent</code> either: both are written before the request is routed, and a client's
+User-Agent cannot cause a 413 or a nesting rejection. Their <code>error</code> fields differ in
+kind: the 413's message is a literal, while the nesting 400's carries the offset and the
+locator path — client-derived key text — into the entry.
 Separately, on the pre-routing 400 paths — an unrecognised model, a
 disallowed method, a disallowed path — the entry carries <code>provider: null</code>, even though the
 table above types <code>provider</code> as a string. Both follow from where the entry is written: at
@@ -146,6 +154,33 @@ are the complete set the proxy can write.</p>
 <tr><td><code>reasoning_field_injected</code></td><td>the always-present policy filled a blank reasoning field on one or more assistant messages. Fires only when at least one blank or placeholder was filled, and carries <code>real</code>, <code>empty</code> and <code>placeholder</code> counts — a filled placeholder is never counted as <code>real</code>. Metadata only, and it is the evidence that the policy acted on a request whose body would otherwise have omitted the field</td></tr>
 <tr><td><code>content_block_dropped</code></td><td>an unrepresentable content block was removed</td></tr>
 <tr><td><code>tool_args_parse_failure</code></td><td>tool arguments could not be parsed or serialised</td></tr>
+<tr><td><code>nesting_limit_exceeded</code></td>
+    <td>a payload exceeded <code>MAX_JSON_NESTING_DEPTH</code> (500) and was never parsed — the
+    client and admin bodies are refused, the <code>--all</code> response-body capture falls back,
+    and upstream bodies, SSE frames, compatibility error bodies and tool-argument strings degrade
+    — see <a href="architecture.html#nesting-limit">architecture.html#nesting-limit</a>. Carries
+    <code>site</code> (<code>request_body</code>, <code>admin_body</code>,
+    <code>response_transform</code>, <code>response_rewrite</code>, <code>sse_first_event</code>,
+    <code>chat_frame</code>, <code>compat_error_body</code>, <code>tool_args</code>,
+    <code>response_body_capture</code>), <code>depth</code> (the crossing level, a lower bound),
+    <code>offset</code> (a character index into the decoded payload; the byte offset for ASCII)
+    and <code>path</code> (the first structure over the limit, or <code>null</code> when the
+    scanner could not repair-and-locate it), and <code>degrade</code> (why a
+    <code>null</code> path is <code>null</code> — <code>&quot;cap&quot;</code> for a crossing past
+    the 1&nbsp;MiB repair bound, <code>&quot;budget&quot;</code> for a walk past the node budget,
+    <code>&quot;parse&quot;</code> for a repaired prefix that would not parse; itself
+    <code>null</code> whenever a path <em>was</em> produced, so the field is present on every
+    event). Every site builds its event through one shared builder, so the fixed field set above is
+    identical at all eleven emission points; only the routing identity a site attaches varies.
+    <code>tier</code> is on the response, SSE, frame, tool-argument and <code>--all</code> capture
+    events; the three sites inside the mode transforms also carry <code>mode</code> and
+    <code>provider</code>. The two pre-routing rejections carry none of these (they run before any
+    routing decision), and neither does the compatibility matcher — as do, today, the
+    <code>chat_frame</code> and server-side <code>tool_args</code> events, which have a provider in
+    scope but do not pass it (an inconsistency of the same kind as the one that once left
+    <code>tier</code> off the <code>--all</code> capture). Metadata only, and not gated by
+    <code>--all</code> —
+    the <code>path</code> is client-derived text, see <a href="#all">below</a></td></tr>
 <tr><td><code>chat_sse_tool_degradation</code></td><td>one or more streaming tool calls degraded (once per stream)</td></tr>
 <tr><td><code>chat_sse_truncated</code></td>
     <td>a chat-mode stream ended with <strong>no <code>finish_reason</code> at all</strong> — a
@@ -316,8 +351,10 @@ User-Agent are recorded regardless.</p>
 </div>
 
 <div class="note">
-<strong>Two fields are not gated by <code>--all</code>: <code>extra_request_headers</code> and
-<code>client_user_agent</code>.</strong> Resolved header values — for example a client's
+<strong>Two entry fields are not gated by <code>--all</code>: <code>extra_request_headers</code> and
+<code>client_user_agent</code>.</strong> The <code>nesting_limit_exceeded</code> event is not gated
+either: its <code>path</code> is client-derived key text and is written whether or not
+<code>--all</code> is on. Resolved header values — for example a client's
 per-conversation session identifier — are recorded on every request for a provider that has
 rules; if you configure such a rule, assume that identifier is in the trace log. The
 <code>client_user_agent</code> field is ungated for the same reason it exists: a User-Agent
@@ -384,6 +421,6 @@ directory means every request loses its entry until the condition is fixed. See
 <a href="architecture.html#sinks">architecture.html</a> for the full policy.</p>
 </div>
 
-<footer>Last updated: 2026-10-21</footer>
+<footer>Last updated: 2026-10-26</footer>
 </body>
 </html>

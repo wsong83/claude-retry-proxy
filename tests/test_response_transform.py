@@ -5,6 +5,9 @@ Part of the claude-retry-proxy suite; runnable standalone.
 """
 
 import json
+import os
+import unittest.mock
+import uuid
 
 from _harness import (
     _require_server_func,
@@ -12,6 +15,8 @@ from _harness import (
     pass_,
     run_cli,
 )
+
+from claude_retry_proxy.nesting import MAX_JSON_NESTING_DEPTH
 
 
 
@@ -1105,6 +1110,120 @@ def test_response_to_anthropic_malformed_args_degrade():
 
 
 
+def test_response_to_anthropic_nesting_limit_tool_args():
+    """A function-call arguments string past the limit degrades to the placeholder.
+
+    The arguments ride inside a JSON *string*, so no outer body scan sees
+    their depth — _response_to_anthropic checks the string before parsing it.
+    The degrade is the existing visible placeholder (never a tool_use with
+    input {}), stop_reason is forced to None, and the trace carries the
+    nesting_limit_exceeded event at site "tool_args" alongside the
+    pre-existing tool_args_parse_failure event.
+    """
+    print("\n--- Test: Response To Anthropic Nesting-Limit Tool Args ---")
+    fn = _require_server_func("_response_to_anthropic")
+    if fn is None:
+        return
+    limit = MAX_JSON_NESTING_DEPTH
+    deep_args = "[" * (limit + 1) + "]" * (limit + 1)
+    resp = {"id": "r", "status": "completed",
+            "output": [{"type": "function_call", "call_id": "c1", "name": "f",
+                        "arguments": deep_args}]}
+    rid = "R-nesting-response-" + uuid.uuid4().hex[:8]
+    out = fn(resp, "sonnet", request_id=rid, mode="response", provider="p")
+    content = out.get("content") if isinstance(out.get("content"), list) else []
+    if [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]:
+        fail(">limit arguments must not produce tool_use blocks, got {!r}".format(content))
+        return
+    placeholder = "[Tool call failed: arguments for 'f' (call c1) could not be parsed as JSON]"
+    texts = [b.get("text") for b in content
+             if isinstance(b, dict) and b.get("type") == "text"]
+    if placeholder not in texts:
+        fail("expected the visible placeholder, got {!r}".format(texts))
+        return
+    if out.get("stop_reason") is not None:
+        fail("all-malformed completed response must force stop_reason null, got {!r}".format(
+            out.get("stop_reason")))
+        return
+
+    trace_file = os.environ.get("PROXY_TRACE_FILE")
+    if not trace_file or not os.path.exists(trace_file):
+        fail("expected PROXY_TRACE_FILE to be set to an existing temp path, got {!r}".format(
+            trace_file))
+        return
+    events = []
+    with open(trace_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("request_id") == rid:
+                events.append(ev)
+    nesting = [e for e in events if e.get("event") == "nesting_limit_exceeded"]
+    if len(nesting) != 1:
+        fail("expected exactly one nesting_limit_exceeded event for {!r}, got "
+             "{!r}".format(rid, [e.get("event") for e in events]))
+        return
+    ev = nesting[0]
+    if ev.get("site") != "tool_args":
+        fail("expected site tool_args, got {!r}".format(ev.get("site")))
+        return
+    if ev.get("depth", 0) < limit + 1:
+        fail("event depth {} is not past the limit {}".format(ev.get("depth"), limit))
+        return
+    if (ev.get("mode"), ev.get("provider"), ev.get("tier")) != ("response", "p", "sonnet"):
+        fail("nesting event missing mode/provider/tier: {!r}".format(ev))
+        return
+    if not [e for e in events if e.get("event") == "tool_args_parse_failure"]:
+        fail("the user-facing degrade must still fire tool_args_parse_failure")
+        return
+    pass_(">limit arguments -> placeholder, null stop_reason, tool_args nesting "
+          "event alongside tool_args_parse_failure")
+
+
+def test_response_to_anthropic_nesting_guard_total():
+    """A RecursionError from the arguments parse degrades identically.
+
+    Pins the widened catch in _response_to_anthropic: under the pre-plan
+    narrow ``except json.JSONDecodeError`` a RecursionError escaped the
+    function. The total idiom converts it to the same placeholder degrade.
+    Proven with a patched json.loads, so it holds on any interpreter.
+    """
+    print("\n--- Test: Response To Anthropic Nesting Guard Total ---")
+    fn = _require_server_func("_response_to_anthropic")
+    if fn is None:
+        return
+    resp = {"id": "r", "status": "completed",
+            "output": [{"type": "function_call", "call_id": "c1", "name": "f",
+                        "arguments": '{"city": "SF"}'}]}
+    try:
+        with unittest.mock.patch("json.loads", side_effect=RecursionError):
+            out = fn(resp, "sonnet", request_id="R-nesting-total-" + uuid.uuid4().hex[:8],
+                     mode="response", provider="p")
+    except Exception as e:
+        fail("a RecursionError escaped _response_to_anthropic: {!r}".format(e))
+        return
+    content = out.get("content") if isinstance(out.get("content"), list) else []
+    if [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]:
+        fail("a parse fault must not produce tool_use blocks, got {!r}".format(content))
+        return
+    texts = [b.get("text") for b in content
+             if isinstance(b, dict) and b.get("type") == "text"]
+    placeholder = "[Tool call failed: arguments for 'f' (call c1) could not be parsed as JSON]"
+    if placeholder not in texts:
+        fail("expected the placeholder degrade, got {!r}".format(texts))
+        return
+    if out.get("stop_reason") is not None:
+        fail("all-malformed completed response must force stop_reason null, got {!r}".format(
+            out.get("stop_reason")))
+        return
+    pass_("patched json.loads RecursionError -> same placeholder degrade, no raise")
+
+
 def test_response_to_anthropic_missing_id_name():
     """Missing call_id or name degrades to a placeholder, not a fake empty tool."""
     print("\n--- Test: Response To Anthropic Missing Id Name ---")
@@ -1197,6 +1316,8 @@ ALL_TESTS = [
     ("response-to-anthropic-mixed-text-calls", test_response_to_anthropic_mixed_text_calls),
     ("response-to-anthropic-valid-args-dict-and-string", test_response_to_anthropic_valid_args_dict_and_string),
     ("response-to-anthropic-malformed-args-degrade", test_response_to_anthropic_malformed_args_degrade),
+    ("response-to-anthropic-nesting-limit-tool-args", test_response_to_anthropic_nesting_limit_tool_args),
+    ("response-to-anthropic-nesting-guard-total", test_response_to_anthropic_nesting_guard_total),
     ("response-to-anthropic-missing-id-name", test_response_to_anthropic_missing_id_name),
     ("response-to-anthropic-unsupported-items-ignored", test_response_to_anthropic_unsupported_items_ignored),
 ]

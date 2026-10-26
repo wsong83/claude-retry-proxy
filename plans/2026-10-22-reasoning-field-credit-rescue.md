@@ -344,7 +344,7 @@ Planned doc surfaces (executed by the planner per Guidance for Planner; reconcil
 
 **Deferred issues (enumerated — presence on disk is the open state).**
 
-- **Python 3.14 `json` recursion profile** — [defer-issue-suite-json-recursion-profile-py314](./tmp/reports/defer-issue-suite-json-recursion-profile-py314.json): the 8 frozen suite failures this plan's runs reproduce; unchanged, unowned by this plan, and the sole cause of every round's non-SUCCESS verdict.
+- ~~**Python 3.14 `json` recursion profile** — [defer-issue-suite-json-recursion-profile-py314](./tmp/reports/defer-issue-suite-json-recursion-profile-py314.json): the 8 frozen suite failures this plan's runs reproduce; unchanged, unowned by this plan, and the sole cause of every round's non-SUCCESS verdict.~~ Resolved 2026-10-26 by plan 2026-10-25-json-nesting-limit: the proxy now enforces its own 500-level nesting limit, which makes the interpreter's json/recursion ceilings unreachable by construction — the eight interpreter-profile tests were rewritten, re-fixtured or retired, the stale 16,920/15,501 ceiling figures were replaced with the limit policy, and the suite is green at 475/0/475 on Python 3.14.7.
 - **`analyze_proxy_trace.py` model-field terminal escapes** — [defer-issue-analyze-trace-model-terminal-escape](./tmp/reports/defer-issue-analyze-trace-model-terminal-escape.json): untouched by this plan.
 - **Proxy's own `Date`/`Server` headers** — [defer-issue-proxy-own-server-date-headers](./tmp/reports/defer-issue-proxy-own-server-date-headers.json): untouched by this plan.
 

@@ -47,6 +47,8 @@ from _harness import (
     run_cli,
 )
 
+from claude_retry_proxy.nesting import MAX_JSON_NESTING_DEPTH
+
 # A post-finish drain that has not terminated by this point is a failure: the
 # drain is bounded by MAX_DRAIN_SECONDS (5s) and must leave ample headroom
 # under its own socket pin, which is the mode's drain bound rather than any
@@ -4036,65 +4038,30 @@ def test_chat_sse_empty_revision_does_not_downgrade():
 
 
 
-def _loads_fail_depth():
-    """Smallest nesting depth at which json.loads raises RecursionError, +10%.
+def test_chat_sse_nesting_limit_frame_skipped():
+    """A chat frame past the nesting limit is skipped, and the stream completes.
 
-    handle_frame's guard is decode-side only (json.loads of the frame), so the
-    test payload must sit PAST the loads ceiling, not in the encode band.
-    Measured on the running interpreter (a hardcoded 17,214 only approximates
-    CPython's ceiling and drifts across versions).
+    The boundary check runs before handle_frame's json.loads: a frame nested
+    past MAX_JSON_NESTING_DEPTH is refused unparsed (site "chat_frame") rather
+    than raising out of the request path, and the rest of the stream flows
+    normally. It deliberately does NOT emit chat_sse_malformed_json — the
+    frame is well formed, just too deep — so this test also carries a shallow
+    UNPARSEABLE frame and pins that the pre-existing malformed-JSON skip still
+    fires for it. That event's only remaining coverage is here; a rewrite that
+    asserted the nesting case only through chat_sse_malformed_json would leave
+    the distinction unpinned.
     """
-    def parses(depth):
-        try:
-            json.loads(b"[" * depth + b"]" * depth)
-            return True
-        except RecursionError:
-            return False
+    print("\n--- Test: Chat SSE Nesting-Limit Frame Skipped ---")
 
-    lo, hi = 0, 60000
-    if parses(hi):
-        return None
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if parses(mid):
-            lo = mid + 1
-        else:
-            hi = mid
-    # lo is the first failing depth; +10% keeps it robustly past the ceiling.
-    return lo + lo // 10
-
-
-def test_chat_sse_deep_frame_skipped():
-    """A chat frame deeper than the decode ceiling is skipped, not fatal.
-
-    Pins handle_frame's widened guard (review-2 finding review2-handle-frame-guard,
-    confirmed H1 hunch): json.loads there caught only json.JSONDecodeError, and
-    no fence exists between it and do_POST, so a deep frame raised RecursionError
-    out of the request path -> HTTP 200 with ZERO bytes and no trace entry.
-    Post-fix the frame degrades to a logged chat_sse_malformed_json skip and
-    the rest of the stream completes normally.
-    """
-    print("\n--- Test: Chat SSE Deep Frame Skipped ---")
-
-    depth = _loads_fail_depth()
-    if depth is None:
-        fail("could not locate a loads-failure depth on this interpreter")
-        return
-    try:
-        json.loads(b"[" * depth + b"]" * depth)
-    except RecursionError:
-        pass
-    else:
-        fail("chosen depth {} still parses — not past the decode ceiling".format(depth))
-        return
-
-    # A bare deep array frame: data lines present, json.loads raises.
-    deep_frame = b"data: " + b"[" * depth + b"]" * depth + b"\n\n"
-    sse_body = deep_frame + _sse_stream_chunks([
-        _cc({"role": "assistant"}),
-        _cc({"content": "ok"}),
-        _cc({}, finish="stop"),
-    ]) + b"data: [DONE]\n\n"
+    limit = MAX_JSON_NESTING_DEPTH
+    deep_frame = b"data: " + b"[" * (limit + 1) + b"]" * (limit + 1) + b"\n\n"
+    malformed_frame = b"data: {not json\n\n"
+    sse_body = (deep_frame + malformed_frame
+                + _sse_stream_chunks([
+                    _cc({"role": "assistant"}),
+                    _cc({"content": "ok"}),
+                    _cc({}, finish="stop"),
+                ]) + b"data: [DONE]\n\n")
 
     upstream_port = find_free_port()
     tiers = _mode_tiers()
@@ -4109,53 +4076,54 @@ def test_chat_sse_deep_frame_skipped():
     try:
         frames = _chat_sse_fetch_frames(proxy_port)
         if frames is None:
-            fail("deep frame (depth {}) dropped the connection or non-200 — "
-                 "the handle_frame guard regressed".format(depth))
+            fail("the >limit frame dropped the connection or returned non-200")
             return
         types = _sse_types(frames)
         if "message_stop" not in types:
-            fail("stream did not complete after a skipped deep frame: {}".format(types))
+            fail("stream did not complete after a skipped >limit frame: {}".format(types))
             return
         if _sse_stop_reason(frames) != "end_turn":
             fail("expected end_turn after recovery, got {!r}".format(
                 _sse_stop_reason(frames)))
             return
-        events = _wait_for_trace_events(trace_file, "chat_sse_malformed_json")
-        if not events:
-            fail("no chat_sse_malformed_json trace event for the skipped deep frame")
+        events = _wait_for_trace_events(trace_file, "nesting_limit_exceeded")
+        frame_events = [e for e in events if e.get("site") == "chat_frame"]
+        if len(frame_events) != 1:
+            fail("expected one nesting event with site chat_frame, got {!r}".format(events))
             return
-        pass_("depth-{} frame skipped, stream completed, malformed_json logged".format(depth))
+        if frame_events[0].get("depth", 0) < limit + 1:
+            fail("chat_frame event depth {} is not past the limit {}".format(
+                frame_events[0].get("depth"), limit))
+            return
+        if frame_events[0].get("tier") != "sonnet":
+            fail("the chat_frame event must carry the tier, got {!r}".format(
+                frame_events[0].get("tier")))
+            return
+        malformed = _wait_for_trace_events(trace_file, "chat_sse_malformed_json")
+        if len(malformed) != 1:
+            fail("expected exactly one chat_sse_malformed_json event for the "
+                 "shallow unparseable frame, got {!r}".format(malformed))
+            return
+        pass_(">limit frame skipped (site chat_frame); the shallow malformed frame "
+              "still logs chat_sse_malformed_json; stream completed")
     finally:
         cleanup()
 
 
+def test_chat_sse_nesting_limit_tool_args_at_close():
+    """Tool arguments nested past the limit degrade at close, not fatal.
 
-
-def test_chat_sse_deep_tool_args_at_close():
-    """Deep tool arguments inside a shallow frame degrade at close, not fatal.
-
-    Pins close_open_tool_blocks' widened guard (review-2 finding
-    review2-close-open-tool-blocks-guard, confirmed H1 hunch): its json.loads
-    caught only ValueError, and the deep content rides inside a JSON *string*
-    so the frame itself parses — the arguments parse at close then raised
-    RecursionError out of the unfenced post-read-loop path -> HTTP 200 with
-    ZERO bytes. Post-fix the arguments count as unparseable and the stream
-    completes with the emitted tool block.
+    The deep content rides inside a JSON *string*, so the frame itself is
+    shallow and no outer body scan can see it: the check lives at the
+    accumulated-arguments parse in close_open_tool_blocks. Post-fix the call
+    counts as unparseable (the existing placeholder/stop-reason path) and the
+    stream completes with the emitted tool block, plus the nesting event at
+    site "tool_args".
     """
-    print("\n--- Test: Chat SSE Deep Tool Args At Close ---")
+    print("\n--- Test: Chat SSE Nesting-Limit Tool Args At Close ---")
 
-    depth = _loads_fail_depth()
-    if depth is None:
-        fail("could not locate a loads-failure depth on this interpreter")
-        return
-    deep_args = "[" * depth + "]" * depth
-    try:
-        json.loads(deep_args)
-    except RecursionError:
-        pass
-    else:
-        fail("chosen depth {} still parses — not past the decode ceiling".format(depth))
-        return
+    limit = MAX_JSON_NESTING_DEPTH
+    deep_args = "[" * (limit + 1) + "]" * (limit + 1)
 
     chunks = [
         _cc({"role": "assistant"}),
@@ -4169,12 +4137,12 @@ def test_chat_sse_deep_tool_args_at_close():
     try:
         frames = _chat_sse_fetch_frames(proxy_port)
         if frames is None:
-            fail("deep tool args (depth {}) dropped the connection — "
-                 "the close_open_tool_blocks guard regressed".format(depth))
+            fail(">limit tool arguments dropped the connection")
             return
         blocks = _sse_tool_use_blocks(frames)
         if len(blocks) != 1 or not blocks[0]["closed"]:
-            fail("deep-args tool block should still be emitted and closed, got {!r}".format(blocks))
+            fail("a >limit-args tool block should still be emitted and closed, "
+                 "got {!r}".format(blocks))
             return
         if _sse_stop_reason(frames) != "tool_use":
             fail("expected tool_use, got {!r}".format(_sse_stop_reason(frames)))
@@ -4184,133 +4152,62 @@ def test_chat_sse_deep_tool_args_at_close():
             fail("expected one degradation event with unparseable_arg_count 1, "
                  "got {!r}".format(events))
             return
-        pass_("depth-{} args unparseable at close; block emitted, tool_use, "
-              "count diagnostic".format(depth))
+        nesting = [e for e in _wait_for_trace_events(trace_file, "nesting_limit_exceeded")
+                   if e.get("site") == "tool_args"]
+        if len(nesting) != 1:
+            fail("expected one nesting event with site tool_args, got {!r}".format(
+                _wait_for_trace_events(trace_file, "nesting_limit_exceeded")))
+            return
+        if nesting[0].get("depth", 0) < limit + 1:
+            fail("tool_args event depth {} is not past the limit {}".format(
+                nesting[0].get("depth"), limit))
+            return
+        if nesting[0].get("tier") != "sonnet":
+            fail("the tool_args event must carry the tier, got {!r}".format(
+                nesting[0].get("tier")))
+            return
+        pass_(">limit args unparseable at close; block emitted, tool_use, "
+              "degradation + tool_args nesting event")
     finally:
         cleanup()
 
 
 
 
-def _band_depth(load_bytes, dump_payload):
-    """Midpoint of the decode-succeeds/encode-fails band between two probes.
 
-    json.loads holds to a greater recursion depth than json.dumps, leaving a
-    band of depths in which a payload parses and then raises RecursionError on
-    re-serialize — RecursionError is not a ValueError, so a narrow guard lets
-    it escape. Measured on the running interpreter (never hardcoded).
+def _inband_usage_frame_bytes():
+    """Finish-frame JSON built as BYTES with a non-int usage value.
 
-    Args:
-        load_bytes: callable depth -> bytes that must still parse (the frame
-            as handle_frame's guarded json.loads sees it).
-        dump_payload: callable depth -> object whose json.dumps must still
-            raise (the payload as the pre-fix encode saw it).
-
-    Returns the band's midpoint depth, or None if no band exists.
-    """
-
-    def loads_ok(depth):
-        try:
-            json.loads(load_bytes(depth))
-            return True
-        except RecursionError:
-            return False
-
-    def dumps_ok(depth):
-        try:
-            json.dumps(dump_payload(depth))
-            return True
-        except RecursionError:
-            return False
-
-    lo, hi = 0, 60000
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if loads_ok(mid):
-            lo = mid
-        else:
-            hi = mid - 1
-    loads_max = lo
-    if loads_max == 0:
-        return None
-    lo, hi = 0, loads_max
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if dumps_ok(mid):
-            lo = mid
-        else:
-            hi = mid - 1
-    dumps_max = lo
-    if dumps_max >= loads_max:
-        return None
-    return (dumps_max + loads_max) // 2
-
-
-def _inband_usage_frame_bytes(depth):
-    """Finish-frame JSON built as BYTES with `depth` nested lists at
-    usage.prompt_tokens.
-
-    Bytes, not json.dumps: the test process shares the interpreter's encode
-    ceiling, so a frame in the band cannot be serialized by the very dumps
-    that the band proves to fail.
+    A dict at usage.prompt_tokens is the shape that used to be copied
+    verbatim into the message_delta payload; it is shallow, so the fixture
+    keeps the coverage independent of any interpreter recursion profile.
     """
     return (
         b'{"id": "c1", "object": "chat.completion.chunk", "created": 1, '
         b'"model": "gpt-4o", '
         b'"choices": [{"index": 0, "delta": {"content": "hi"}, '
         b'"finish_reason": "stop"}], '
-        b'"usage": {"prompt_tokens": '
-        + b"[" * depth + b"]" * depth + b', "completion_tokens": 7}}')
-
-
-def _prefix_message_delta_payload(depth):
-    """The message_delta payload terminal() WOULD build pre-fix: the deep
-    structure copied verbatim into usage.input_tokens by the unchecked copy."""
-    deep = None
-    for _ in range(depth):
-        deep = [deep]
-    return {"type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-            "usage": {"input_tokens": deep, "output_tokens": 7}}
+        b'"usage": {"prompt_tokens": {"nested": 1}, "completion_tokens": 7}}')
 
 
 def test_chat_sse_inband_usage_terminal():
-    """An in-band upstream usage value still yields a full terminal sequence.
+    """A non-int upstream usage value still yields a full terminal sequence.
 
-    Pins terminal()'s int-only usage copy (review-3 finding
-    review3-sse-event-encode-usage): usage is stored unvalidated from the
-    upstream frame, so a nested structure at encode-band depth parses under
-    handle_frame's guarded json.loads but used to be copied verbatim into the
-    message_delta payload — the re-encode raised RecursionError and escaped as
-    a SILENT clean EOF: no message_delta, no message_stop, no error event,
-    bypassing 8c1b57b's cut-stream machinery. Post-fix only ints (bools
-    excluded) enter the payload: the deep prompt_tokens falls back to 0 while
-    the int completion_tokens passes through, and the stream completes.
+    Pins terminal()'s int-only usage copy: usage is stored unvalidated from
+    the upstream frame, so a non-int value used to be copied verbatim into
+    the message_delta payload — the re-encode raised RecursionError and
+    escaped as a SILENT clean EOF: no message_delta, no message_stop, no
+    error event, bypassing the cut-stream machinery. Post-fix only ints
+    (bools excluded) enter the payload: the non-int prompt_tokens falls back
+    to 0 while the int completion_tokens passes through, and the stream
+    completes. Re-fixtured shallow (plan 2026-10-25-json-nesting-limit): the
+    subject was never the interpreter's recursion profile.
     """
     print("\n--- Test: Chat SSE In-Band Usage Terminal ---")
 
-    depth = _band_depth(_inband_usage_frame_bytes, _prefix_message_delta_payload)
-    if depth is None:
-        fail("could not locate a decode-succeeds/encode-fails band on this interpreter")
-        return
-    # Prove in-band membership before asserting on the proxy: the frame parses
-    # (handle_frame must accept it) and the pre-fix delta payload re-encode
-    # raises (the encode the type check now prevents).
-    try:
-        json.loads(_inband_usage_frame_bytes(depth))
-    except RecursionError:
-        fail("chosen depth {} does not parse — not in band".format(depth))
-        return
-    try:
-        json.dumps(_prefix_message_delta_payload(depth))
-    except RecursionError:
-        pass
-    else:
-        fail("chosen depth {} re-serializes locally — not in band".format(depth))
-        return
-
+    usage_frame = _inband_usage_frame_bytes()
     sse_body = (_sse_stream_chunks([_cc({"role": "assistant"})])
-                + b"data: " + _inband_usage_frame_bytes(depth) + b"\n\n"
+                + b"data: " + usage_frame + b"\n\n"
                 + b"data: [DONE]\n\n")
 
     upstream_port = find_free_port()
@@ -4326,16 +4223,16 @@ def test_chat_sse_inband_usage_terminal():
     try:
         frames = _chat_sse_fetch_frames(proxy_port)
         if frames is None:
-            fail("in-band usage frame (depth {}) dropped the connection — "
-                 "the terminal()/_sse_event guards regressed".format(depth))
+            fail("the non-int usage frame dropped the connection — "
+                 "the terminal()/_sse_event guards regressed")
             return
         types = _sse_types(frames)
         if "message_delta" not in types:
-            fail("no message_delta after an in-band usage value (silent-EOF "
+            fail("no message_delta after a non-int usage value (silent-EOF "
                  "class): {}".format(types))
             return
         if "message_stop" not in types:
-            fail("no message_stop after an in-band usage value: {}".format(types))
+            fail("no message_stop after a non-int usage value: {}".format(types))
             return
         if "error" in types:
             fail("unexpected error frame: the copy-site type check should keep "
@@ -4346,7 +4243,7 @@ def test_chat_sse_inband_usage_terminal():
             fail("no usage on message_delta")
             return
         if usage.get("input_tokens") != 0:
-            fail("in-band prompt_tokens must fall back to input_tokens 0, "
+            fail("non-int prompt_tokens must fall back to input_tokens 0, "
                  "got {!r}".format(usage))
             return
         if usage.get("output_tokens") != 7:
@@ -4356,10 +4253,11 @@ def test_chat_sse_inband_usage_terminal():
         if _sse_stop_reason(frames) != "end_turn":
             fail("expected end_turn, got {!r}".format(_sse_stop_reason(frames)))
             return
-        pass_("in-band usage (depth {}): message_delta(input 0, output 7) + "
-              "message_stop, no error frame".format(depth))
+        pass_("non-int usage: message_delta(input 0, output 7) + "
+              "message_stop, no error frame")
     finally:
         cleanup()
+
 
 
 
@@ -4367,51 +4265,29 @@ def test_chat_sse_inband_usage_terminal():
 def test_sse_event_unserializable_payload_degrades():
     """A payload _sse_event cannot serialize degrades to an SSE error frame.
 
-    Pins the _sse_event encode fence (review-3 finding
-    review3-sse-event-encode-usage): its json.dumps was the only
-    request/response-path encode with no enclosing try, so an in-band
-    upstream-typed value that survived every copy-site check raised
-    RecursionError out of the write path and the client saw a silent clean
-    EOF. Post-fix the encode degrades to a standard SSE error event carrying
-    error.code == "response_frame_encode_failure" with request_id threaded —
-    preserving 8c1b57b's close-with-an-error property — instead of raising.
+    Pins the _sse_event encode fence: its json.dumps was the only
+    request/response-path encode with no enclosing try, so an upstream-typed
+    value that survived every copy-site check raised out of the write path
+    and the client saw a silent clean EOF. Post-fix the encode degrades to a
+    standard SSE error event carrying error.code ==
+    "response_frame_encode_failure" with request_id threaded — preserving the
+    close-with-an-error property — instead of raising.
+
+    Re-fixtured shallow (plan 2026-10-25-json-nesting-limit): a set is
+    unserializable by json.dumps at any depth, so the coverage no longer
+    depends on locating an interpreter-specific encode band.
     """
     print("\n--- Test: SSE Event Unserializable Payload Degrades ---")
     import claude_retry_proxy.server as srv
 
-    def payload_bytes(depth):
-        return (b'{"type": "message_delta", "usage": {"input_tokens": '
-                + b"[" * depth + b"]" * depth + b"}}")
-
-    def payload(depth):
-        deep = None
-        for _ in range(depth):
-            deep = [deep]
-        return {"type": "message_delta",
-                "usage": {"input_tokens": deep, "output_tokens": 7}}
-
-    depth = _band_depth(payload_bytes, payload)
-    if depth is None:
-        fail("could not locate a decode-succeeds/encode-fails band on this interpreter")
-        return
-    try:
-        json.loads(payload_bytes(depth))
-    except RecursionError:
-        fail("chosen depth {} does not parse — not in band".format(depth))
-        return
-    try:
-        json.dumps(payload(depth))
-    except RecursionError:
-        pass
-    else:
-        fail("chosen depth {} re-serializes locally — not in band".format(depth))
-        return
+    payload = {"type": "message_delta",
+               "usage": {"input_tokens": {1, 2}, "output_tokens": 7}}
 
     handler = object.__new__(srv.ProxyHandler)
     try:
-        out = handler._sse_event(payload(depth), request_id="req-band-test")
+        out = handler._sse_event(payload, request_id="req-unserializable-test")
     except Exception as e:
-        fail("_sse_event raised {!r} on a band-depth payload — the encode "
+        fail("_sse_event raised {!r} on an unserializable payload — the encode "
              "fence regressed".format(e))
         return
     if not isinstance(out, bytes):
@@ -4441,12 +4317,12 @@ def test_sse_event_unserializable_payload_degrades():
     if err.get("type") != "api_error":
         fail("expected error.type api_error, got {!r}".format(err))
         return
-    if env.get("request_id") != "req-band-test":
+    if env.get("request_id") != "req-unserializable-test":
         fail("request_id not threaded into the degraded frame, got {!r}".format(
             env.get("request_id")))
         return
-    pass_("band-depth payload (depth {}) -> event: error with "
-          "response_frame_encode_failure".format(depth))
+    pass_("unserializable payload -> event: error with "
+          "response_frame_encode_failure")
 
 
 
@@ -5081,8 +4957,8 @@ ALL_TESTS = [
      test_chat_retry_nudge_evicts_at_sixty_four_entries),
     ("chat-sse-drain-late-tool-call-time-budget", test_chat_sse_drain_late_tool_call_time_budget),
     ("chat-sse-tool-degradation-on-cut-stream", test_chat_sse_tool_degradation_on_cut_stream),
-    ("chat-sse-deep-frame-skipped", test_chat_sse_deep_frame_skipped),
-    ("chat-sse-deep-tool-args-at-close", test_chat_sse_deep_tool_args_at_close),
+    ("chat-sse-nesting-limit-frame-skipped", test_chat_sse_nesting_limit_frame_skipped),
+    ("chat-sse-nesting-limit-tool-args-at-close", test_chat_sse_nesting_limit_tool_args_at_close),
     ("chat-sse-inband-usage-terminal", test_chat_sse_inband_usage_terminal),
     ("sse-event-unserializable-payload-degrades", test_sse_event_unserializable_payload_degrades),
     # Config-swap drain (plan 2026-10-12-swap-silence-drain)

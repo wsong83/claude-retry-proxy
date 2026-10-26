@@ -10,7 +10,7 @@
 
 <h1>Provider Modes<span class="sub">anthropic, chat, and response — and what each one rewrites</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-18</p>
+<p><strong>Last updated:</strong> 2026-10-26</p>
 
 <p>The proxy speaks Anthropic Messages to its clients. What it speaks <em>upstream</em> is
 configurable per provider, because not every provider implements the Anthropic API. A
@@ -456,12 +456,13 @@ field carries the discriminator:</p>
       actually finished: the client would record a completed message, report no error and never
       re-issue the request.</li>
   <li><strong>A frame that cannot be serialized</strong> — the proxy built a frame that
-      <code>json.dumps</code> rejects. This is reachable because the decoder and the encoder have
-      different ceilings: <code>json.loads</code> survives to roughly 16,920 nesting levels while
-      <code>json.dumps</code> already fails at roughly 15,501, leaving a band of payloads that
-      parse and then fail to re-encode. Instead of aborting the stream with no terminal event —
-      which the client reads as a truncated <em>success</em> — the frame is replaced by an SSE
-      <code>error</code> frame carrying
+      <code>json.dumps</code> rejects, for example because it carries a value the encoder has no
+      representation for. This is no longer about depth: a payload nested past the proxy's own
+      limit is never parsed at all (see
+      <a href="architecture.html#nesting-limit">architecture.html#nesting-limit</a>), so the
+      interpreter's decode/encode band is unreachable by construction. Instead of aborting the
+      stream with no terminal event — which the client reads as a truncated <em>success</em> — the
+      frame is replaced by an SSE <code>error</code> frame carrying
       <code>error.code: "response_frame_encode_failure"</code>. See
       <a href="architecture.html#error-envelope">architecture.html#error-envelope</a>.</li>
 </ul>
@@ -583,16 +584,19 @@ JSON <em>string</em> the model wrote, and models write invalid JSON.</p>
 <h3 id="sse-tool-bounds">Chat SSE tool-call bounds</h3>
 
 <p>Streaming tool calls arrive as fragments spread across many deltas, so the converter
-accumulates per-index state. Three bounds keep a misbehaving upstream from exhausting memory:</p>
+accumulates per-index state. Four bounds keep a misbehaving upstream from exhausting memory:</p>
 
 <table>
 <tr><th>Bound</th><th class="num">Value</th><th>Applies to</th></tr>
 <tr><td><code>MAX_CHAT_TOOL_PENDING_BYTES</code></td><td class="num">64 KiB</td><td>buffered argument fragments per tool call</td></tr>
+<tr><td><code>MAX_JSON_NESTING_DEPTH</code></td><td class="num">500</td><td>nesting levels in any parsed payload — including the accumulated tool-argument string, whose depth no outer body scan can see</td></tr>
 <tr><td><code>MAX_CHAT_TRACKED_TOOL_INDEXES</code></td><td class="num">32</td><td>distinct tool-call indices tracked at once</td></tr>
 <tr><td><code>MAX_CHAT_OPEN_TOOL_BLOCKS</code></td><td class="num">32</td><td>Anthropic tool blocks left open simultaneously</td></tr>
 </table>
 
-<p>Overflow in any of these does not error the stream. The affected tool call degrades, the
+<p>Overflow in any of these does not error the stream. The affected tool call degrades
+(a nesting overflow takes the same unparseable-arguments path, and additionally logs
+<code>nesting_limit_exceeded</code> with <code>site: "tool_args"</code>), the
 rest of the stream continues, and the stream is reported once via a single bounded,
 metadata-only <code>chat_sse_tool_degradation</code> event. That event deliberately carries no
 tool names, ids, or arguments — only counts — so a degraded stream does not write model output
@@ -617,7 +621,11 @@ legible in the transcript rather than invisible:</p>
 
 <pre><code>[Tool call failed: arguments for '&lt;name&gt;' (call &lt;id&gt;) could not be parsed as JSON]</code></pre>
 
-<p>A <code>tool_args_parse_failure</code> trace event is recorded alongside it.</p>
+<p>A <code>tool_args_parse_failure</code> trace event is recorded alongside it. A tool-arguments
+string nested past the proxy's JSON nesting limit takes this same path — the placeholder block plus
+the event — and additionally logs <code>nesting_limit_exceeded</code> with
+<code>site: "tool_args"</code>; see
+<a href="architecture.html#nesting-limit">architecture.html#nesting-limit</a>.</p>
 
 <p><strong><code>{}</code> is not malformed.</strong> An <code>arguments</code> string of
 <code>"{}"</code> is valid JSON and parses to a dict, so it produces a real
@@ -677,6 +685,7 @@ rather than implying that a call survived.</p>
 <tr><td><code>reasoning_field_injected</code></td><td>the always-present policy filled a blank reasoning field on one or more assistant messages; fires only when at least one blank or placeholder was filled, and carries <code>real</code>, <code>empty</code> and <code>placeholder</code> counts so a filled placeholder is never counted as real</td></tr>
 <tr><td><code>content_block_dropped</code></td><td>an unrepresentable content block was removed</td></tr>
 <tr><td><code>tool_args_parse_failure</code></td><td>tool arguments could not be parsed or serialised</td></tr>
+<tr><td><code>nesting_limit_exceeded</code></td><td>a payload exceeded <code>MAX_JSON_NESTING_DEPTH</code> and was never parsed: client and admin bodies are refused with a 400, upstream payloads degrade. Carries <code>site</code> (<code>request_body</code>, <code>admin_body</code>, <code>response_transform</code>, <code>response_rewrite</code>, <code>sse_first_event</code>, <code>chat_frame</code>, <code>compat_error_body</code>, <code>tool_args</code>, <code>response_body_capture</code>), <code>depth</code>, <code>offset</code>, <code>path</code> (or <code>null</code> when the scanner could not locate it) and <code>degrade</code> (which of the three reasons a <code>null</code> path is <code>null</code> — <code>&quot;cap&quot;</code>, <code>&quot;budget&quot;</code> or <code>&quot;parse&quot;</code> — itself <code>null</code> whenever a path was produced) — see <a href="architecture.html#nesting-limit">architecture.html#nesting-limit</a></td></tr>
 <tr><td><code>chat_sse_tool_degradation</code></td><td>one or more streaming tool calls degraded (metadata only, once per stream)</td></tr>
 <tr><td><code>chat_sse_post_finish_suppressed</code></td><td>the post-finish drain suppressed <code>content</code>/<code>reasoning</code> deltas (carries <code>count</code>, once per stream)</td></tr>
 <tr><td><code>response_sse_unexpected</code></td><td>a response-mode provider streamed despite <code>stream: false</code></td></tr>
@@ -742,6 +751,6 @@ transform it belongs to, and neither runs in response mode:</p>
 <a href="compatibility.html">compatibility.html</a>, as is the
 <a href="compatibility.html#reasoning-field">reasoning-field selection</a>.</p>
 
-<footer>Last updated: 2026-10-22</footer>
+<footer>Last updated: 2026-10-26</footer>
 </body>
 </html>

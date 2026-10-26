@@ -10,7 +10,7 @@
 
 <h1>Compatibility Learner<span class="sub">How the proxy learns, per provider-model pair, what an upstream will accept</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-13</p>
+<p><strong>Last updated:</strong> 2026-10-25</p>
 
 <p>Third-party providers that speak the Anthropic wire format do not always implement every
 field, and they disagree about how to echo an assistant turn's reasoning. Neither fact can be
@@ -403,7 +403,11 @@ hole is recorded rather than closed, because closing it would mean matching on p
 
 <div class="warn">
 <strong>A 400 that names no field is not a complaint.</strong> A <code>401</code>/<code>403</code>
-(account disabled), a <code>500</code> (gateway blip), an unparseable body, or a
+(account disabled), a <code>500</code> (gateway blip), an unparseable body — which includes an
+error body nested past the proxy's JSON nesting limit: it is refused <em>before</em> the parse and
+recorded with a <code>nesting_limit_exceeded</code> event carrying
+<code>site: "compat_error_body"</code> (<a href="architecture.html#nesting-limit">architecture.html#nesting-limit</a>)
+— or a
 <code>400</code> naming no field in either shape is <em>not</em> a complaint: no credit moves, no
 rescue runs, and the error passes through untouched. The same is true of any status other
 than <code>400</code> — a gateway reporting the condition as a <code>422</code> produces no
@@ -485,6 +489,6 @@ request or response content. The strip, probe and suppression events belong to
 <p>The full trace schema, including the fields common to every entry, is in
 <a href="trace-log.html">trace-log.html</a>.</p>
 
-<footer>Last updated: 2026-10-22</footer>
+<footer>Last updated: 2026-10-25</footer>
 </body>
 </html>

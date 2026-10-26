@@ -108,13 +108,27 @@ When you run `claude-retry-proxy start`:
 
 For each request from Claude Code:
 
-1. The model name is resolved to a tier (haiku/sonnet/opus)
-2. The config maps the tier to a specific provider and model name
-3. The request body's `model` field is rewritten to the actual model name
-4. The provider's API key is injected (replacing the client's dummy key) —
+1. The body is checked against the proxy's own JSON nesting limit (500 levels):
+   a body nested deeper is rejected with `400 nesting_limit_exceeded`. The
+   message always names the offset of the first excess, and names the offending
+   JSON path when the locator could derive one — a path being too deep to
+   locate (past the repair cap, or past the walk's node budget) leaves the
+   offset and says which of the two it was, rather than implying the body is
+   malformed.
+2. The model name is resolved to a tier (haiku/sonnet/opus)
+3. The config maps the tier to a specific provider and model name
+4. The request body's `model` field is rewritten to the actual model name
+5. The provider's API key is injected (replacing the client's dummy key) —
    the tier's selected key, when the provider holds several named keys
-5. The request is forwarded to the provider's URL with retry handling
-6. The response model name is rewritten back to the tier name
+6. The request is forwarded to the provider's URL with retry handling
+7. The response model name is rewritten back to the tier name
+
+500 levels is a deliberate outer bound, not a measured protocol limit: it sits
+~2× below the deepest nesting the proxy's own body walkers survive and ~80×
+deeper than real traffic reaches, so the interpreter's json and recursion
+ceilings stay unreachable by construction. The walker ceiling behind it was
+measured 2026-10-25 on Python 3.14.7; how to re-take that measurement lives in
+`doc/architecture.html#nesting-limit`.
 
 `settings.json` is never touched — it points at `localhost:8080` permanently.
 
@@ -553,8 +567,9 @@ map. Every routed request also logs `client_user_agent` — your client's inboun
 than once, the recorded value is the last `User-Agent` line the proxy sends
 upstream, so it still names the UA that produced the response; the field is
 omitted when that resolved value is empty (no header at all, or an empty last
-one). (The pre-routing 413 entry is the one exception: it is written before routing
-and carries no `client_user_agent`, no `tier` and no `provider`.) It is the
+one). (Two pre-routing rejections are the exception — the 413 for an oversized body
+and the 400 for a body past the nesting limit: both are written before routing
+and carry no `client_user_agent`, no `tier` and no `provider`.) It is the
 *inbound* value, the opposite of `extra_request_headers`, which records
 resolved *outbound* values.
 Lifecycle markers (`proxy_start`, `proxy_ready`, `proxy_stop`) and per-retry

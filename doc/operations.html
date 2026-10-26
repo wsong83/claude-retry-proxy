@@ -10,7 +10,7 @@
 
 <h1>Operations<span class="sub">Running, inspecting, and stopping the proxy</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-18</p>
+<p><strong>Last updated:</strong> 2026-10-25</p>
 
 <p>The <code>claude-retry-proxy</code> command manages a <em>background server process</em>. It
 does not run in the foreground. Understanding that split explains most of the command's
@@ -280,7 +280,12 @@ drive the admin API.</p>
 does not add one by default, so pass it explicitly —
 <code>-H "Origin: http://localhost:&lt;port&gt;"</code>. A missing header is rejected, not treated
 as trusted. The CLI's own <code>stop</code> and <code>reload</code> commands do supply it, so only
-hand-rolled requests need this. Admin request bodies are capped at <strong>64 KB</strong>.
+hand-rolled requests need this. Admin request bodies are capped at <strong>64 KB</strong>, and a
+body nested past the proxy's 500-level JSON nesting limit is refused with <code>400</code> (see
+<a href="architecture.html#nesting-limit">architecture.html#nesting-limit</a>). Both refusals keep
+the admin surface's flat body shape — <code>{"error": …}</code>, carrying
+<code>"code": "nesting_limit_exceeded"</code> on the nesting one — rather than the Anthropic error
+envelope the client-facing API uses.
 </div>
 
 <!-- Owns the shutdown fact: what is killed, what the client sees, which trace entry is lost.
@@ -378,6 +383,6 @@ server's memory and is rewritten every 30 seconds, so deleting the file is harml
 external edit is overwritten rather than merged. The mechanism is owned by
 <a href="architecture.html#heartbeat">architecture.html#heartbeat</a>.</p>
 
-<footer>Last updated: 2026-10-18</footer>
+<footer>Last updated: 2026-10-25</footer>
 </body>
 </html>

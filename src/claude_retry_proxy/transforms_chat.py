@@ -5,6 +5,7 @@ import time
 import uuid
 
 from .compat import COMPAT_REASONING_FIELDS
+from .nesting import check_payload_nesting, nesting_event
 from .sinks import log_trace
 
 from .transforms_common import _request_transform_timestamp, _sanitize_schema_patterns
@@ -580,10 +581,20 @@ def _chat_to_anthropic(chat_body, tier, request_id=None, mode=None, provider=Non
                 if isinstance(args, dict):
                     parsed_args = args
                 elif isinstance(args, str):
-                    try:
-                        parsed_args = json.loads(args)
-                    except json.JSONDecodeError:
+                    # The arguments ride inside a JSON string, so no outer
+                    # body scan can see their depth: bound them here.
+                    _nesting = check_payload_nesting(args)
+                    if _nesting is not None:
+                        log_trace(nesting_event("tool_args", _nesting,
+                                                request_id=request_id,
+                                                mode=mode,
+                                                provider=provider, tier=tier))
                         parsed_args = None
+                    else:
+                        try:
+                            parsed_args = json.loads(args)
+                        except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
+                            parsed_args = None
                     if not isinstance(parsed_args, dict):
                         parsed_args = None
                 else:

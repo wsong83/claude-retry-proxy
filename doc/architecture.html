@@ -10,7 +10,7 @@
 
 <h1>Architecture<span class="sub">How a request is routed, retried, and rewritten</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-15</p>
+<p><strong>Last updated:</strong> 2026-10-26</p>
 
 <p>This page describes the path a request takes from the moment it reaches the proxy to the
 moment a response leaves it. It is the reference the other pages link back into — in
@@ -291,6 +291,10 @@ must stay JSON-escaped.</p>
     <td>A <code>Content-Length</code> header is present but unparseable</td></tr>
 <tr><td><code>count_tokens_unsupported</code></td><td><code>invalid_request_error</code></td><td>400</td>
     <td><code>count_tokens</code> is called on a <code>chat</code> or <code>response</code> provider</td></tr>
+<tr><td><code>nesting_limit_exceeded</code></td><td><code>invalid_request_error</code></td><td>400</td>
+    <td>The client body nests deeper than <code>MAX_JSON_NESTING_DEPTH</code>; the message names the
+        offset of the first excess and, when the scanner could repair-and-locate it, the offending
+        JSON path. See <a href="#nesting-limit">JSON nesting limit</a></td></tr>
 <tr><td><code>payload_too_large</code></td><td><code>request_too_large</code></td><td>413</td>
     <td>The body exceeds <code>PROXY_MAX_BODY_SIZE</code></td></tr>
 <tr><td><code>invalid_provider_key</code></td><td><code>api_error</code></td><td>500</td>
@@ -338,6 +342,151 @@ changed from a literal <code>0</code> — not a valid HTTP status, and unparseab
 — to a real <code>502</code>. And the trace log's <code>error</code> field now carries this
 envelope, so <code>sanitize_error</code>'s 200-character cap truncates it; see
 <a href="trace-log.html#entry-schema">trace-log.html</a>.</p>
+
+<h2 id="nesting-limit">JSON nesting limit</h2>
+
+<p>The proxy bounds the nesting depth of the JSON it parses from a client or an upstream by its own
+policy rather than by the interpreter's limits:</p>
+
+<pre>MAX_JSON_NESTING_DEPTH = 500      # src/claude_retry_proxy/nesting.py</pre>
+
+<p>The interpreter's ceilings are neither a specification nor a stable one. <code>json</code>'s C
+decoder survives tens of thousands of levels, but the tool-schema walker
+(<code>_sanitize_schema_patterns</code>) spends one Python frame per schema level and is therefore
+the <em>binding</em> ceiling: measured 2026-10-25 on Python 3.14.7 it survives 997 levels at module
+level (998 raises), and fewer in situ with the request path's own frames on the stack — where the
+transform's total guard would swallow the <code>RecursionError</code> and forward an
+<em>untransformed</em> Anthropic body to a chat/response upstream, with no error and no path. 500
+sits about 2× below that walked-in-situ ceiling, ~20× below the json C ceiling, and ~80× deeper
+than real traffic reaches (deepest body observed: ~6 levels, over the trace retained on
+2026-10-25).</p>
+
+<p><code>check_payload_nesting</code> runs <em>before</em> every parse of untrusted JSON — the
+client body (before tier resolution), the admin body, buffered upstream bodies, the upstream SSE
+first event, chat SSE frames, the compatibility matchers' error bodies, and the JSON carried inside
+tool-call argument strings, which no outer body scan can see. A payload past the limit is never
+parsed:</p>
+
+<table>
+<tr><th>Direction</th><th>What happens</th></tr>
+<tr><td>Client body</td>
+    <td><code>400</code> in the error envelope with <code>error.code</code>
+        <code>nesting_limit_exceeded</code>, plus a <code>nesting_limit_exceeded</code> trace event
+        and a pre-routing <code>request</code> entry carrying no tier and no provider — the same
+        shape as the 413</td></tr>
+<tr><td>Admin body</td>
+    <td><code>400</code> in the admin surface's flat shape
+        (<code>{"error": …, "code": "nesting_limit_exceeded"}</code>); the envelope deliberately
+        does not apply there</td></tr>
+<tr><td>Upstream buffered body, SSE first event</td>
+    <td>Forwarded unchanged with a <code>nesting_limit_exceeded</code> event, and the model rewrite
+        is skipped — for the SSE first event the client therefore sees the upstream model name
+        rather than the tier</td></tr>
+<tr><td>Chat SSE frame, tool arguments, upstream error body</td>
+    <td>The frame is skipped, the tool call degrades to its visible placeholder, or the parse
+        returns nothing — each with the same event, reusing the existing malformed-input
+        paths</td></tr>
+</table>
+
+<p>The bound covers client- and upstream-derived JSON only. Operator-authored documents —
+<code>config.json</code>, <code>models.json</code>, <code>keys-index.json</code>, the compatibility
+state file — are not scanned: a nesting violation there is an authoring error, and their existing
+parse guards are unchanged.</p>
+
+<p>The 400 says <em>which</em> JSON, not merely that a limit was crossed. The scanner records the
+crossing offset and appends the matching close sequence to the text up to that point, which is
+valid JSON at exactly one level past the limit; walking that repaired prefix iteratively names the
+first structure over the limit — <code>$.messages[0].content[1].input.schema.a.a…</code> styles,
+with non-identifier keys quoted — truncated to head + <code>…</code> + tail past 200 characters.
+Keys are JSON-escaped, so the body stays valid JSON on the wire.</p>
+
+<p>Two bounds keep the diagnostic itself from becoming the attack. The repair is skipped when the
+crossing offset exceeds <strong>1 MiB</strong>, and the walk retains at most
+<code>_REPAIR_MAX_NODES</code> (<strong>20,000</strong>) nodes before it too gives up. Both
+matter, and for different reasons: the offset cap bounds the prefix the walk is handed, but the
+walk's cost is <em>nodes × path length</em>, so a count bound alone is not a memory bound. The walk
+therefore never builds a path string per node — it retains one small record per node
+(<code>depth</code>, a parent link, the component, dict-or-list) whose dict component <em>is</em>
+the parsed key object, a shared reference that is never copied, and assembles the single winning
+path at the end by walking those parent links. Retained memory is thus proportional to the record
+budget rather than to records times path length; a body that exhausts the budget degrades exactly
+as one past the cap does.</p>
+
+<p>The message names which degrade happened, because they mean different things: past the cap or
+past the node budget the <em>body</em> may be perfectly fine and only the locator is unavailable
+(the offset still names the crossing), whereas a repaired prefix that fails to parse really is
+unparseable. The same reason is on the trace event — every site builds its
+<code>nesting_limit_exceeded</code> event through one shared builder, so the field set is identical
+at all eleven emission points and <code>degrade</code> is there to read — which matters most for
+the upstream-derived sites, where no client message exists and the trace is the only record of why
+a path is missing. Measured 2026-10-26 on Python 3.14.7, the shapes that used to amplify peak at
+<strong>0.7 / 1.3 / 1.4 MiB</strong> for the three long-key fans below and <strong>10.3 MiB</strong>
+for a short-key fan filling a 1 MiB body at the cap — against 97.7 / 244.1 / 482.6 MiB and
+827.5 MiB before these bounds. Re-take them with:</p>
+
+<pre>python3 - &lt;&lt;'EOF'
+import tracemalloc, time
+from claude_retry_proxy.nesting import check_payload_nesting
+
+def fan(levels, key_len, fan_size):
+    """A scalar fan at depth, behind long-key objects — the shape that made the
+    walk's cost nodes x path length instead of a memory bound."""
+    unit = '{"%s":[' % ("k" * key_len)
+    return unit * (levels // 2) + "1," * fan_size + "[" + "]" + "]}" * (levels // 2)
+
+def shortkey_fan(levels, fan_size):        # fan one character wide, no long keys
+    return "[" * levels + "1," * fan_size + "[" + "]" * (levels + 1)
+
+shapes = [("long 54 KiB ", fan(500, 200, 2000)), ("long 60 KiB ", fan(500, 200, 5000)),
+          ("long 109 KiB", fan(500, 400, 5000)), ("short 1 MiB ", shortkey_fan(500, 520000))]
+for label, body in shapes:
+    tracemalloc.start(); t = time.perf_counter()
+    v = check_payload_nesting(body)
+    peak = tracemalloc.get_traced_memory()[1]; tracemalloc.stop()
+    print("%s %6.0f KiB  peak %6.1f MiB  %5.2fs  path=%s"
+          % (label, len(body) / 1024, peak / 2**20, time.perf_counter() - t,
+             "None" if v.path is None else "set"))
+EOF</pre>
+
+<p>The scan is cheap by construction: a fast path (<code>str.count</code> over <code>[</code> and
+<code>{</code>, taken on the <em>raw bytes</em> for a <code>bytes</code> or <code>bytearray</code>
+payload) skips any payload whose bracket count cannot exceed the limit — two counts, no decoding,
+and for bytes that is not an approximation: a bracket is a bracket <em>byte</em> in every encoding
+<code>json.detect_encoding</code> can return, so the byte count is an upper bound on the decoded
+count and the verdict cannot change, only the wasted decode disappears —
+and the slow path early-exits at the first excess, so a rejecting scan costs
+microseconds <em>when the crossing is early in the payload</em>. A crossing late in a large body is
+the other case: the early exit never fires before the scan has walked everything ahead of it, and
+that is the figure below. Measured 2026-10-25 on Python 3.14.7, a full slow-path scan costs 13 ms
+at 0.29 MiB, 131 ms at 2.9 MiB and 420 ms at the 9.65 MiB body cap — against 4 / 46 / 158 ms for
+the <code>json.loads</code> the same payload needs anyway, and only payloads that are about to be
+parsed are ever scanned. Re-take both measurements — the scan cost, and the walker ceiling that
+justifies the constant — with:</p>
+
+<pre>python3 - &lt;&lt;'EOF'
+import json, time
+from claude_retry_proxy.nesting import check_payload_nesting
+from claude_retry_proxy.transforms_common import _sanitize_schema_patterns
+
+body = b"[" + b",".join([b'{"a":{"b":"c"}}'] * 140000) + b"]"
+t = time.perf_counter(); check_payload_nesting(body)
+print("scan:  %5.0f ms for %.2f MiB" % ((time.perf_counter() - t) * 1e3, len(body) / 2**20))
+
+def survives(depth):
+    schema = json.loads('{"properties":{"x":' * depth + "{}" + "}}" * depth)
+    try:
+        _sanitize_schema_patterns(schema)
+        return True
+    except RecursionError:
+        return False
+
+lo, hi = 1, 4096
+while lo &lt; hi:                        # bisect the deepest surviving schema
+    mid = (lo + hi + 1) // 2
+    if survives(mid): lo = mid
+    else: hi = mid - 1
+print("walker ceiling: %d levels at module level (in situ it is lower)" % lo)
+EOF</pre>
 
 <h2 id="give-up">Give-up behaviour</h2>
 
@@ -644,6 +793,6 @@ readiness is two-phase and why the trace carries a marker of its own; see
 <a href="operations.html#readiness">operations.html#readiness</a> and
 <a href="trace-log.html#markers">trace-log.html#markers</a>.</p>
 
-<footer>Last updated: 2026-10-15</footer>
+<footer>Last updated: 2026-10-26</footer>
 </body>
 </html>

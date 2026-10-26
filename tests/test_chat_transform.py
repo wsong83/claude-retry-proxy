@@ -6,6 +6,7 @@ Part of the claude-retry-proxy suite; runnable standalone.
 
 import json
 import os
+import unittest.mock
 import uuid
 
 from _harness import (
@@ -15,6 +16,8 @@ from _harness import (
     pass_,
     run_cli,
 )
+
+from claude_retry_proxy.nesting import MAX_JSON_NESTING_DEPTH
 
 from claude_retry_proxy.transforms_common import (
     _sanitize_body_tools,
@@ -2060,6 +2063,128 @@ def test_chat_to_anthropic_malformed_tool_args_text_block():
 
 
 
+def test_chat_to_anthropic_nesting_limit_tool_args():
+    """A tool-args JSON string past the nesting limit degrades like malformed args.
+
+    The arguments ride inside a JSON *string*, so no outer body scan can see
+    their depth — _chat_to_anthropic checks the string itself before parsing
+    it. The degrade is the existing visible placeholder (never a tool_use with
+    input {}), stop_reason is forced to None, and the trace carries both the
+    pre-existing tool_args_parse_failure event and the new
+    nesting_limit_exceeded event at site "tool_args". Both firing is intended:
+    the first is the user-facing degrade, the second names its cause.
+    """
+    print("\n--- Test: Chat To Anthropic Nesting-Limit Tool Args ---")
+    fn = _require_server_func("_chat_to_anthropic")
+    if fn is None:
+        return
+    limit = MAX_JSON_NESTING_DEPTH
+    deep_args = "[" * (limit + 1) + "]" * (limit + 1)
+    chat = {"id": "x",
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": "",
+                                     "tool_calls": [
+                                         {"id": "call_1", "type": "function",
+                                          "function": {"name": "f",
+                                                       "arguments": deep_args}}]},
+                         "finish_reason": "tool_calls"}]}
+    rid = "R-nesting-chat-" + uuid.uuid4().hex[:8]
+    out = fn(chat, "sonnet", request_id=rid, mode="chat", provider="p")
+    content = out.get("content") if isinstance(out.get("content"), list) else []
+    if [b for b in content if b.get("type") == "tool_use"]:
+        fail(">limit arguments must not emit a tool_use block, content={!r}".format(content))
+        return
+    texts = [b.get("text") or "" for b in content if b.get("type") == "text"]
+    if not any("f" in t and "call_1" in t for t in texts):
+        fail("expected the visible placeholder naming 'f' and 'call_1', "
+             "content={!r}".format(content))
+        return
+    if out.get("stop_reason") is not None:
+        fail("a degraded call must force stop_reason None, got {!r}".format(
+            out.get("stop_reason")))
+        return
+
+    trace_file = os.environ.get("PROXY_TRACE_FILE")
+    if not trace_file or not os.path.exists(trace_file):
+        fail("expected PROXY_TRACE_FILE to be set to an existing temp path, got {!r}".format(
+            trace_file))
+        return
+    events = []
+    with open(trace_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("request_id") == rid:
+                events.append(ev)
+    nesting = [e for e in events if e.get("event") == "nesting_limit_exceeded"]
+    if len(nesting) != 1:
+        fail("expected exactly one nesting_limit_exceeded event for {!r}, got "
+             "{!r}".format(rid, [e.get("event") for e in events]))
+        return
+    ev = nesting[0]
+    if ev.get("site") != "tool_args":
+        fail("expected site tool_args, got {!r}".format(ev.get("site")))
+        return
+    if ev.get("depth", 0) < limit + 1:
+        fail("event depth {} is not past the limit {}".format(ev.get("depth"), limit))
+        return
+    if (ev.get("mode"), ev.get("provider"), ev.get("tier")) != ("chat", "p", "sonnet"):
+        fail("nesting event missing mode/provider/tier: {!r}".format(ev))
+        return
+    if not [e for e in events if e.get("event") == "tool_args_parse_failure"]:
+        fail("the user-facing degrade must still fire tool_args_parse_failure")
+        return
+    pass_(">limit args -> placeholder block, null stop_reason, tool_args nesting "
+          "event alongside tool_args_parse_failure")
+
+
+def test_chat_to_anthropic_nesting_guard_total():
+    """A RecursionError from the tool-args parse degrades identically.
+
+    Pins the widened catch in _chat_to_anthropic: under the pre-plan narrow
+    ``except json.JSONDecodeError`` a RecursionError (not a ValueError)
+    escaped the function. The total idiom converts it to the same placeholder
+    degrade. Proven with a patched json.loads, so it holds on any interpreter.
+    """
+    print("\n--- Test: Chat To Anthropic Nesting Guard Total ---")
+    fn = _require_server_func("_chat_to_anthropic")
+    if fn is None:
+        return
+    chat = {"id": "x",
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": "",
+                                     "tool_calls": [
+                                         {"id": "call_1", "type": "function",
+                                          "function": {"name": "f",
+                                                       "arguments": '{"city": "SF"}'}}]},
+                         "finish_reason": "tool_calls"}]}
+    try:
+        with unittest.mock.patch("json.loads", side_effect=RecursionError):
+            out = fn(chat, "sonnet", request_id="R-nesting-total-" + uuid.uuid4().hex[:8],
+                     mode="chat", provider="p")
+    except Exception as e:
+        fail("a RecursionError escaped _chat_to_anthropic: {!r}".format(e))
+        return
+    content = out.get("content") if isinstance(out.get("content"), list) else []
+    if [b for b in content if b.get("type") == "tool_use"]:
+        fail("a parse fault must not emit a tool_use block, content={!r}".format(content))
+        return
+    texts = [b.get("text") or "" for b in content if b.get("type") == "text"]
+    if not any("f" in t and "call_1" in t for t in texts):
+        fail("expected the placeholder degrade, content={!r}".format(content))
+        return
+    if out.get("stop_reason") is not None:
+        fail("a degraded call must force stop_reason None, got {!r}".format(
+            out.get("stop_reason")))
+        return
+    pass_("patched json.loads RecursionError -> same placeholder degrade, no raise")
+
+
 def test_chat_to_anthropic_malformed_tool_args_mixed():
     """Mixed valid + malformed tool calls: valid tool_use kept, malformed degrades.
 
@@ -2469,6 +2594,8 @@ ALL_TESTS = [
     ("chat-to-anthropic-usage-absent", test_chat_to_anthropic_usage_absent),
     ("chat-to-anthropic-content-array", test_chat_to_anthropic_content_array),
     ("chat-to-anthropic-malformed-tool-args-text-block", test_chat_to_anthropic_malformed_tool_args_text_block),
+    ("chat-to-anthropic-nesting-limit-tool-args", test_chat_to_anthropic_nesting_limit_tool_args),
+    ("chat-to-anthropic-nesting-guard-total", test_chat_to_anthropic_nesting_guard_total),
     ("chat-to-anthropic-malformed-tool-args-mixed", test_chat_to_anthropic_malformed_tool_args_mixed),
     ("chat-zero-arg-tool", test_chat_anthropic_to_chat_zero_arg_tool),
     ("anthropic-to-chat-image-blocks-converted", test_anthropic_to_chat_image_blocks_converted),

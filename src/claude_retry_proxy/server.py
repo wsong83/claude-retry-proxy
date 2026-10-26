@@ -34,6 +34,9 @@ from .config import (load_config, load_models_document, models_path_for,
                      reasoning_roundtrip_models, reasoning_switch_params,
                      validate_config, write_config)
 from .keys import load_keys_file, read_passphrase_from_stdin, vendor_key_entries, vendor_key_names
+from .nesting import (MAX_JSON_NESTING_DEPTH, _REPAIR_MAX_NODES,
+                      _REPAIR_MAX_OFFSET, check_payload_nesting,
+                      nesting_event)
 from .sanitize import sanitize_error
 from .compat import (COMPAT_FEATURE, COMPAT_FEATURES,
                      COMPAT_MAX_RETRIES_PER_REQUEST,
@@ -660,6 +663,32 @@ def _error_body(error_type, code, message, request_id=None):
     if request_id is not None:
         envelope["request_id"] = request_id
     return json.dumps(envelope).encode("utf-8")
+
+
+def _nesting_limit_message(violation):
+    """Build the rejection message for a payload that exceeds the nesting limit.
+
+    Always names the offset; names the offending structure when the scanner's
+    repaired-prefix diagnostic could locate it (nesting.NestingViolation).
+    When it could not, the tail names the degrade the scanner reported: a
+    crossing past the repair cap or a walk past the node locator budget (the
+    body itself may be fine, only the locator is unavailable) versus a
+    repaired prefix that failed to parse.
+    """
+    message = "Request body nesting depth exceeds the limit of {} levels".format(
+        MAX_JSON_NESTING_DEPTH)
+    message += " (first excess at offset {}".format(violation.offset)
+    if violation.path is not None:
+        message += ": {}".format(violation.path)
+    elif violation.degrade == "cap":
+        message += "; locator unavailable past the {} MiB repair cap".format(
+            _REPAIR_MAX_OFFSET // (1024 * 1024))
+    elif violation.degrade == "budget":
+        message += "; locator unavailable past the {} node scan budget".format(
+            _REPAIR_MAX_NODES)
+    else:
+        message += "; body may not be valid JSON"
+    return message + ")"
 
 
 def _read_capped(resp, max_bytes, request_id=None):
@@ -1935,6 +1964,13 @@ def _rewrite_sse_first_event(event_bytes, tier, request_id):
         return event_bytes
 
     json_text = "\n".join(data_lines)
+    _nesting = check_payload_nesting(json_text)
+    if _nesting is not None:
+        # Forward the event unchanged rather than parsing it: the client then
+        # sees the upstream model name, not the tier.
+        log_trace(nesting_event("sse_first_event", _nesting,
+                                request_id=request_id, tier=tier))
+        return event_bytes
     try:
         data = json.loads(json_text)
     except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
@@ -1970,11 +2006,11 @@ def _rewrite_sse_first_event(event_bytes, tier, request_id):
 
     # Rebuild SSE event - preserve original format. The re-serialize runs in
     # its own guard (mirroring transforms_common._transform_and_guard's
-    # decode/encode pair): json.dumps raises RecursionError at a lower
-    # nesting depth than json.loads, so a message_start payload in the
-    # decode-ok/encode-raise band must degrade to the original event rather
-    # than escape unfenced and abort the stream. Kept separate from the
-    # decode guard so an encode failure does not log
+    # decode/encode pair): an encode failure degrades to the original event
+    # rather than escape unfenced and abort the stream. Kept as
+    # defence-in-depth — check_payload_nesting bounds what json.loads is ever
+    # shown, so depth no longer reaches the encoder — and kept separate from
+    # the decode guard so an encode failure does not log
     # sse_rewrite_malformed_json — the JSON parsed fine.
     try:
         new_json = json.dumps(data)
@@ -2000,6 +2036,11 @@ def _rewrite_json_response(body_bytes, tier, request_id):
     Returns:
         bytes: possibly rewritten body
     """
+    _nesting = check_payload_nesting(body_bytes)
+    if _nesting is not None:
+        log_trace(nesting_event("response_rewrite", _nesting,
+                                request_id=request_id, tier=tier))
+        return body_bytes
     try:
         data = json.loads(body_bytes)
         if not isinstance(data, dict):
@@ -2008,10 +2049,12 @@ def _rewrite_json_response(body_bytes, tier, request_id):
         if not upstream_model or not isinstance(upstream_model, str):
             return body_bytes
         data["model"] = tier
-        # The re-serialize stays INSIDE this guard: json.dumps raises
-        # RecursionError at a lower nesting depth than json.loads, so a body
-        # can parse and then fail to re-encode (the decode-ok/encode-raise
-        # band) — raising here would escape unfenced and abort the response.
+        # The re-serialize stays INSIDE this guard: an encode failure must
+        # return the original body rather than escape unfenced and abort the
+        # response. Kept as defence-in-depth — check_payload_nesting bounds
+        # what json.loads is ever shown, so depth no longer reaches the
+        # encoder — and it still fences non-depth encode failures (e.g. an
+        # unserializable value type).
         return json.dumps(data).encode("utf-8")
     except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
         return body_bytes
@@ -2575,6 +2618,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 write({"type": "content_block_stop", "index": st["index"]})
                 st["closed"] = True
                 if validate and not st["dropped"]:
+                    # The arguments ride inside a JSON string, so no outer
+                    # body scan sees their depth: bound them here.
+                    _nesting = check_payload_nesting("".join(st["arg_parts"]))
+                    if _nesting is not None:
+                        log_trace(nesting_event("tool_args", _nesting,
+                                                request_id=request_id, tier=tier))
+                        unparseable_arg_count += 1
+                        continue
                     try:
                         parsed = json.loads("".join(st["arg_parts"]))
                     except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
@@ -2723,12 +2774,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             close_all_blocks()
             delta_usage = {"input_tokens": 0, "output_tokens": 0}
             # usage is stored unvalidated from the upstream frame, so the
-            # copy must type-check: a non-int (bools excluded) — e.g. a
-            # nested structure at encode-band depth — parses under
-            # handle_frame's guarded json.loads but raises RecursionError on
-            # the message_delta re-encode, which used to escape as a silent
-            # clean EOF with no terminal events. Only ints enter the
-            # payload; anything else keeps the 0 default.
+            # copy must type-check: only ints enter the payload, and anything
+            # else — bools included, despite isinstance(True, int) — keeps
+            # the 0 default. The rule dates from a nested structure deep
+            # enough to parse but not to re-encode raising RecursionError on
+            # the message_delta re-encode, which escaped as a silent clean EOF
+            # with no terminal events; check_payload_nesting now bounds what
+            # json.loads is ever shown, so that depth is unreachable, but the
+            # type rule still guards against malformed upstream usage.
             pt = usage.get("prompt_tokens")
             if isinstance(pt, int) and not isinstance(pt, bool):
                 delta_usage["input_tokens"] = pt
@@ -2855,6 +2908,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 return None  # comment/event-only frame — skip silently
             if raw == "[DONE]":
                 return "done"
+            _nesting = check_payload_nesting(raw)
+            if _nesting is not None:
+                # Same skip path the malformed-frame guard takes, but this is
+                # not a malformed frame: no chat_sse_malformed_json here.
+                log_trace(nesting_event("chat_frame", _nesting,
+                                        request_id=request_id, tier=tier))
+                return None
             try:
                 chunk = json.loads(raw)
             except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
@@ -3531,6 +3591,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             body = self.rfile.read(content_length) if content_length > 0 else b""
+            # The admin surface keeps its documented exclusion from the
+            # Anthropic envelope, so this branch owns its own request_id (the
+            # shared one is only assigned further down, on the client path).
+            request_id = str(uuid.uuid4())
+            _nesting = check_payload_nesting(body)
+            if _nesting is not None:
+                message = _nesting_limit_message(_nesting)
+                log_trace(nesting_event("admin_body", _nesting,
+                                        request_id=request_id))
+                self._send_response(400, json.dumps({
+                    "error": message,
+                    "code": "nesting_limit_exceeded",
+                }).encode("utf-8"))
+                return
             try:
                 data = json.loads(body)
             except json.JSONDecodeError:
@@ -3858,6 +3932,38 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
         body = self.rfile.read(content_length) if content_length > 0 else b""
 
+        # Ownership check before the body is parsed anywhere (extract_model,
+        # the forward path, and the --all capture all read these same bytes).
+        _nesting = check_payload_nesting(body)
+        if _nesting is not None:
+            message = _nesting_limit_message(_nesting)
+            log_trace(nesting_event("request_body", _nesting,
+                                    request_id=request_id))
+            # The fields mirror the pre-routing 413 entry above (no tier, no
+            # provider); the ordering follows the main request path — both
+            # entries are on disk before the client is answered.
+            log_trace({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "event": "request",
+                "request_id": request_id,
+                "method": self.command,
+                "path": self.path,
+                "model": "unknown",
+                "status": "failure",
+                "http_status": 400,
+                "retries": 0,
+                "total_latency_sec": 0,
+                "first_byte_latency_ms": None,
+                "error": message
+            })
+            try:
+                self._send_response(400, _error_body(
+                    "invalid_request_error", "nesting_limit_exceeded",
+                    message, request_id))
+            except _DISCONNECT_ERRORS:
+                self._log_client_disconnect(request_id, 400, 0)
+            return
+
         # request_id already generated above
         model, _body_error = extract_model(body)
 
@@ -3952,10 +4058,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 # Streamed 2xx bodies were consumed by the client in real time
                 # and are not captured — a deliberate reduction in data-at-rest
                 # exposure under --all.
-                try:
-                    trace_entry["response_body"] = json.loads(resp_body.decode("utf-8"))
-                except Exception:
+                _resp_nesting = check_payload_nesting(resp_body)
+                if _resp_nesting is not None:
+                    # A distinct payload from the request body: bound it here
+                    # too, and fall back to the non-JSON capture form.
+                    log_trace(nesting_event("response_body_capture",
+                                            _resp_nesting,
+                                            request_id=request_id, tier=tier))
                     trace_entry["response_body"] = resp_body.decode("utf-8", errors="replace") if resp_body else None
+                else:
+                    try:
+                        trace_entry["response_body"] = json.loads(resp_body.decode("utf-8"))
+                    except Exception:
+                        trace_entry["response_body"] = resp_body.decode("utf-8", errors="replace") if resp_body else None
 
         log_trace(trace_entry)
 

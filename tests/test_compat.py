@@ -31,6 +31,8 @@ from _harness import (
     _trace_events_named,
 )
 
+from claude_retry_proxy.nesting import MAX_JSON_NESTING_DEPTH
+
 STATE_ENV = "PROXY_FEATURE_COMPAT_FILE"
 
 # The exact 400 body observed from opencode-zen-claude (deferred issue
@@ -3063,11 +3065,92 @@ def test_reasoning_non_complaint_errors_are_not_counted():
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
+def test_compat_guarded_parse_nesting_limit():
+    """A >limit error body is refused unparsed and logged at compat_error_body.
+
+    Both complaint matchers route through _compat_guarded_parse, so one check
+    covers the whole family. The event carries the shared builder's full field
+    set — site, depth, offset, path, degrade (plus the shared timestamp) —
+    and deliberately no request_id/tier/mode/provider: the helper is called
+    from matcher contexts that do not thread one. ``degrade`` is null here
+    because the crossing is well-formed, so a path resolves. Asserted against
+    the trace bytes appended by this call alone, so a session-shared trace file
+    cannot satisfy it from another test's event.
+    """
+    print("\n--- Test: Compat Guarded Parse Nesting Limit ---")
+    # Importing server binds the process-wide trace sink to PROXY_TRACE_FILE
+    # (server.py's import-time sinks.configure); compat alone leaves the sink
+    # pathless, so the event under test would never reach the file.
+    import claude_retry_proxy.server as _srv  # noqa: F401
+    import claude_retry_proxy.compat as compat
+
+    trace_file = os.environ.get("PROXY_TRACE_FILE")
+    if not trace_file or not os.path.exists(trace_file):
+        fail("expected PROXY_TRACE_FILE to be set to an existing temp path, got {!r}".format(
+            trace_file))
+        return
+    start = os.path.getsize(trace_file)
+
+    limit = MAX_JSON_NESTING_DEPTH
+    body = (b'{"error":{"message":"invalid","deep":'
+            + b"[" * (limit + 1) + b"]" * (limit + 1) + b"}}")
+    got = compat._compat_guarded_parse(body)
+    if got is not None:
+        fail("a >limit error body was parsed instead of refused: {!r}".format(got))
+        return
+
+    appended = []
+    with open(trace_file) as f:
+        f.seek(start)
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                appended.append(json.loads(line))
+            except Exception:
+                continue
+    events = [e for e in appended if e.get("event") == "nesting_limit_exceeded"]
+    if len(events) != 1:
+        fail("expected exactly one nesting_limit_exceeded event for this call, "
+             "got {!r}".format([e.get("event") for e in appended]))
+        return
+    ev = events[0]
+    if ev.get("site") != "compat_error_body":
+        fail("expected site compat_error_body, got {!r}".format(ev.get("site")))
+        return
+    # The shared builder's field set, verbatim: an exact-set assertion is
+    # exactly what a single-sourced field set changes, so this is the one
+    # place the full shape is pinned.
+    expected_keys = {"timestamp", "event", "site", "depth", "offset", "path",
+                     "degrade"}
+    if set(ev) != expected_keys:
+        fail("compat_error_body event must carry exactly {}, got {!r}".format(
+            sorted(expected_keys), sorted(ev)))
+        return
+    if not isinstance(ev.get("path"), str):
+        fail("expected a resolved path for a well-formed crossing, got "
+             "{!r}".format(ev.get("path")))
+        return
+    if ev.get("degrade") is not None:
+        fail("expected degrade null when a path resolved, got {!r}".format(
+            ev.get("degrade")))
+        return
+    if ev.get("depth") != limit + 1:
+        fail("expected depth {}, got {!r}".format(limit + 1, ev.get("depth")))
+        return
+    if not isinstance(ev.get("offset"), int) or ev["offset"] <= 0:
+        fail("expected a positive crossing offset, got {!r}".format(ev.get("offset")))
+        return
+    pass_(">limit error body -> None with a compat_error_body event "
+          "(depth {}, offset {})".format(ev["depth"], ev["offset"]))
+
+
 def test_reasoning_matcher_shapes():
     """The reasoning complaint matcher accepts every shape that names a field
     and rejects everything else — including the echoed-request traversal — and
-    a body deep enough to make json.loads raise degrades to False for both
-    matchers."""
+    a body past the nesting limit is refused unparsed, degrading to False for
+    both matchers."""
     print("\n--- Test: Reasoning Matcher Shapes ---")
     import claude_retry_proxy.compat as compat
     match = compat._reasoning_complaint_match
@@ -3121,6 +3204,12 @@ def test_reasoning_matcher_shapes():
                  % (label, status, body[:120]))
             return
 
+    # A body far past the nesting limit is refused by the boundary check
+    # BEFORE json.loads runs: both matchers degrade to False through the same
+    # total helper, and the only thing exercised here is the nesting branch
+    # (no RecursionError is involved any more). The dedicated
+    # test_compat_guarded_parse_nesting_limit pins the helper's return and
+    # event; this case pins that both matchers inherit the verdict.
     deep = b"[" * 100000 + b"]" * 100000
     for name, fn in (("reasoning", match),
                      ("context_management", compat._compat_rejection_match)):
@@ -3133,7 +3222,7 @@ def test_reasoning_matcher_shapes():
             fail("%s matcher matched deeply nested input" % name)
             return
 
-    pass_("matcher shapes: %d accepted, %d rejected, deep nesting degrades "
+    pass_("matcher shapes: %d accepted, %d rejected, a >limit body degrades "
           "to False for both matchers" % (len(accepted), len(rejected)))
 
 
@@ -4022,6 +4111,7 @@ ALL_TESTS = [
     ("reasoning-walk-sends-advanced-candidate", test_reasoning_walk_sends_advanced_candidate),
     ("reasoning-non-complaint-errors-are-not-counted", test_reasoning_non_complaint_errors_are_not_counted),
     ("reasoning-matcher-shapes", test_reasoning_matcher_shapes),
+    ("compat-guarded-parse-nesting-limit", test_compat_guarded_parse_nesting_limit),
     ("reasoning-present-gates-on-demanding-turn", test_reasoning_present_gates_on_demanding_turn),
     ("reasoning-delist-on-none-success", test_reasoning_delist_on_none_success),
     ("reasoning-credit-saturates-and-drains", test_reasoning_credit_saturates_and_drains),

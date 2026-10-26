@@ -15,6 +15,7 @@ import threading
 import time
 
 from _harness import (
+    _admin_post,
     _create_test_config,
     _create_test_keys,
     _create_test_keys_plain,
@@ -24,11 +25,15 @@ from _harness import (
     _setup_tier_routing_test,
     _start_mode_proxy,
     _start_proxy_server_directly,
+    _trace_events_named,
+    _wait_for_trace_events,
     fail,
     find_free_port,
     pass_,
     run_cli,
 )
+
+from claude_retry_proxy.nesting import MAX_JSON_NESTING_DEPTH
 
 
 
@@ -807,193 +812,199 @@ def test_non_object_body_rejected():
         cleanup()
 
 
-def test_deep_nested_body_invalid_json():
-    """A deeply nested body returns 400 invalid_json, not a dropped connection.
+def test_nesting_limit_client_body():
+    """The client nesting boundary: accept at the limit, reject past it.
 
-    json.loads on ~20,000 nested arrays raises RecursionError, which is not a
-    ValueError — so the pre-plan guard missed it and the request aborted with
-    no HTTP response. The parse site is now total.
+    One parameterized test so the accept case is the same request shape (model,
+    route, tool schema) the reject cases refuse:
+
+      - at exactly MAX_JSON_NESTING_DEPTH, forced through the scanner's SLOW
+        path (two sibling chains push the total open count past the limit, so
+        the count fast path cannot decide) -> the request is served, and the
+        transform demonstrably ran: the tool-schema pattern reaches the
+        upstream normalized and no transform_failure event is logged. Without
+        that second half, a silent degrade to the untransformed body would
+        look green.
+      - at limit+1 -> 400 with error.code "nesting_limit_exceeded", the limit
+        and a $-rooted path in the message; the upstream receives nothing.
+      - far past the limit -> the same rejection (the scanner reports the
+        FIRST crossing, not the deepest).
     """
-    print("\n--- Test: Deep-Nested Body Rejected With invalid_json ---")
+    print("\n--- Test: Client Body Nesting Limit ---")
+
+    limit = MAX_JSON_NESTING_DEPTH
+    # A chain of limit-1 arrays under the root reaches exactly the limit.
+    chain = "[" * (limit - 1) + "]" * (limit - 1)
+    base = {
+        "model": "sonnet",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "mcp__exa__agent_run",
+                   "input_schema": {"type": "object",
+                                    "properties": {"query": {"type": "string",
+                                                             "pattern": r"^agent\_run\_"}}}}],
+    }
+    head = json.dumps(base)[:-1]
+    accept_body = head + ',"a":' + chain + ',"b":' + chain + "}"
+    if accept_body.count("[") + accept_body.count("{") <= limit:
+        fail("accept fixture does not force the slow path ({} opens, limit {})".format(
+            accept_body.count("[") + accept_body.count("{"), limit))
+        return
+    reject_body = head + ',"a":' + "[" * limit + "]" * limit + "}"
+    far_body = head + ',"a":' + "[" * (limit * 10) + "]" * (limit * 10) + "}"
 
     upstream_port = find_free_port()
-    tiers = {
-        "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
-        "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
-        "opus": {"provider": "p", "model": "claude-opus-5"},
-    }
-    vendors = {"p": {"url": f"http://127.0.0.1:{upstream_port}", "key": "k"}}
-
-    temp_dir, proxy_port, proc, mock_servers, cleanup = _setup_tier_routing_test(tiers, vendors)
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        _mode_tiers(), vendors)
     if proc is None:
         fail("Failed to set up test")
         return
-
-    # ~40 KB, far inside PROXY_MAX_BODY_SIZE (10 MiB).
-    deep = b"[" * 20000 + b"]" * 20000
     try:
-        status, resp_body = _send_proxy_request(proxy_port, body=deep)
-        if status == 400:
+        status, resp_body = _send_proxy_request(proxy_port, body=accept_body)
+        if status != 200:
+            fail("accept at the limit ({} levels) returned {}, expected 200: {!r}".format(
+                limit, status, resp_body[:200]))
+            return
+        reqs = mock_servers["p"]["requests"]
+        if len(reqs) != 1:
+            fail("accept at the limit: upstream received {} requests, expected 1".format(
+                len(reqs)))
+            return
+        try:
+            upstream_body = json.loads(reqs[0]["body"])
+        except Exception as e:
+            fail("upstream body is not JSON: {} ({!r})".format(e, reqs[0]["body"][:200]))
+            return
+        pattern = ((((upstream_body.get("tools") or [{}])[0].get("input_schema") or {})
+                    .get("properties") or {}).get("query") or {}).get("pattern")
+        if pattern != "^agent_run_":
+            fail("the accept case did not run the transform: upstream pattern "
+                 "{!r}, expected the sanitized '^agent_run_'".format(pattern))
+            return
+        if upstream_body.get("messages") != base["messages"]:
+            fail("verbatim forward altered the messages: {!r}".format(
+                upstream_body.get("messages")))
+            return
+        events = _trace_events_named(trace_file, "transform_failure")
+        if events:
+            fail("accept at the limit logged {} transform_failure event(s) — the "
+                 "body degraded instead of transforming".format(len(events)))
+            return
+        events = _trace_events_named(trace_file, "nesting_limit_exceeded")
+        if events:
+            fail("accept at the limit logged a nesting event: {!r}".format(events[0]))
+            return
+        pass_("accept at the limit (slow path, {} bytes): served, transform ran, "
+              "pattern normalized".format(len(accept_body)))
+
+        for label, body, expected_depth_floor in (
+                ("limit+1", reject_body, limit + 1),
+                ("far past the limit", far_body, limit + 1)):
+            status, resp_body = _send_proxy_request(proxy_port, body=body)
+            if status == 0:
+                fail("{}: connection dropped instead of a 400 ({!r})".format(
+                    label, resp_body[:120]))
+                return
+            if status != 400:
+                fail("{}: expected 400, got {}".format(label, status))
+                return
             try:
                 data = json.loads(resp_body)
             except Exception as e:
-                fail("deep-nested 400 is not valid JSON: {} ({!r})".format(
-                    e, resp_body[:200]))
+                fail("{}: 400 body is not JSON: {} ({!r})".format(
+                    label, e, resp_body[:200]))
                 return
-            code = (data.get("error") or {}).get("code")
-            if code == "invalid_json":
-                pass_("deep-nested body -> 400 invalid_json")
-            else:
-                fail("deep-nested body: expected error.code invalid_json, got {!r}".format(code))
-        elif status == 0:
-            fail("deep-nested body caused crash (connection error)")
-        else:
-            fail("deep-nested body should return 400, got {}".format(status))
+            err = data.get("error") or {}
+            if err.get("code") != "nesting_limit_exceeded":
+                fail("{}: expected error.code nesting_limit_exceeded, got {!r}".format(
+                    label, err.get("code")))
+                return
+            message = err.get("message") or ""
+            if "limit of {} levels".format(limit) not in message:
+                fail("{}: message does not name the limit: {!r}".format(label, message))
+                return
+            if ": $" not in message:
+                fail("{}: message carries no $-rooted path: {!r}".format(label, message))
+                return
+            pass_("{} -> 400 nesting_limit_exceeded with limit and path".format(label))
 
-        reqs = mock_servers["p"]["requests"]
-        if len(reqs) == 0:
-            pass_("Upstream received no requests for the deep-nested body")
-        else:
-            fail("Upstream received {} requests for the deep-nested body".format(len(reqs)))
-
+        if len(mock_servers["p"]["requests"]) != 1:
+            fail("a rejected body reached the upstream ({} requests)".format(
+                len(mock_servers["p"]["requests"])))
+            return
+        events = [e for e in _trace_events_named(trace_file, "nesting_limit_exceeded")
+                  if e.get("site") == "request_body"]
+        if len(events) != 2:
+            fail("expected 2 request_body nesting events (one per reject), got {}".format(
+                len(events)))
+            return
+        for ev in events:
+            if ev.get("depth", 0) < limit + 1:
+                fail("event depth {} is not past the limit {}".format(
+                    ev.get("depth"), limit))
+                return
+        entry = [e for e in _trace_events_named(trace_file, "request")
+                 if e.get("http_status") == 400 and e.get("model") == "unknown"]
+        if len(entry) != 2:
+            fail("each rejection must also write a pre-routing request entry "
+                 "(http_status 400, model unknown); found {}".format(len(entry)))
+            return
+        pass_("rejections: upstream untouched, 2 request_body events, 2 mirrored "
+              "request entries")
     finally:
         cleanup()
 
 
-def _band_depth_for(_body):
-    """Midpoint of the decode-succeeds/encode-fails band for a payload builder.
+def test_nesting_limit_leading_close_body():
+    """A ']'-prefixed deep body gets a 400, never a dropped connection.
 
-    json.loads and json.dumps have different recursion ceilings: the parser
-    holds to a greater depth than the encoder, leaving a band of depths in
-    which a payload parses successfully and then raises RecursionError on
-    the re-serialize. A depth inside that band exercises an encode-side
-    guard. Measured on the running interpreter (never a hardcoded 20,000,
-    which sits past BOTH ceilings and so exercises only the decode-side
-    fail-safe).
-
-    Args:
-        _body: callable depth -> bytes producing the payload to probe.
-
-    Returns the band's midpoint depth, or None if no band exists on this
-    interpreter.
+    The scanner ignores a close at depth 0, so leading stray closes must not
+    stop it from finding the crossing behind them. The body is not valid JSON,
+    so the repaired-prefix diagnostic fails and the message carries the
+    offset-only form — the same failure class (a zero-byte abort) the pre-plan
+    guards were added to remove.
     """
+    print("\n--- Test: Leading-Close Deep Body ---")
 
-    def loads_ok(depth):
-        try:
-            json.loads(_body(depth))
-            return True
-        except RecursionError:
-            return False
-
-    def dumps_ok(depth):
-        try:
-            json.dumps(json.loads(_body(depth)))
-            return True
-        except RecursionError:
-            return False
-
-    # Largest depth that still parses.
-    lo, hi = 0, 60000
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if loads_ok(mid):
-            lo = mid
-        else:
-            hi = mid - 1
-    loads_max = lo
-    if loads_max == 0:
-        return None
-    # Walk down to the largest depth whose re-serialize ALSO succeeds; the
-    # band is (dumps_max, loads_max].
-    lo, hi = 0, loads_max
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if dumps_ok(mid):
-            lo = mid
-        else:
-            hi = mid - 1
-    dumps_max = lo
-    if dumps_max >= loads_max:
-        return None
-    return (dumps_max + loads_max) // 2
-
-
-def _band_body_depth():
-    """Band midpoint for the canonical client-body shape (model + deep array)."""
-    return _band_depth_for(
-        lambda depth: b'{"model":"sonnet","x":' + b"[" * depth + b"]" * depth + b"}")
-
-
-def test_deep_nested_body_encode_band():
-    """A body inside the decode-succeeds/encode-fails band is answered, not dropped.
-
-    The existing test_deep_nested_body_invalid_json uses depth 20,000 — past
-    the json.loads ceiling AND the json.dumps ceiling — so it exercises only
-    the decode-side fail-safe. Between the two ceilings lies a band of
-    depths where the body parses and the #737 json.dumps re-serialize raises
-    RecursionError. Before the encode-side guard was widened that exception
-    escaped and the request aborted with ZERO bytes (RemoteDisconnected), the
-    exact failure class this plan exists to remove, and no test covered it.
-    This pins the boundary: the request must produce a real HTTP response
-    that json-parses, and the pre-fix path (a dropped connection) would fail
-    it.
-    """
-    print("\n--- Test: Deep-Nested Body Encode Band (decode-ok / encode-raise) ---")
-
-    depth = _band_body_depth()
-    if depth is None:
-        fail("could not locate a decode-succeeds/encode-fails band on this interpreter")
-        return
-
-    # Prove we are actually in the band before asserting on the proxy.
-    probe = b'{"model":"sonnet","x":' + b"[" * depth + b"]" * depth + b"}"
-    try:
-        parsed_probe = json.loads(probe)
-    except RecursionError:
-        fail("chosen depth {} does not parse — not in band".format(depth))
-        return
-    try:
-        json.dumps(parsed_probe)
-    except RecursionError:
-        pass
-    except Exception as e:
-        fail("chosen depth {}: unexpected encode error {!r}".format(depth, e))
-        return
-    else:
-        fail("chosen depth {} re-serializes locally — not in band".format(depth))
-        return
+    limit = MAX_JSON_NESTING_DEPTH
+    body = b"]" * 4 + b"[" * (limit + 1) + b"]" * (limit + 1)
 
     upstream_port = find_free_port()
-    tiers = {
-        "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
-        "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
-        "opus": {"provider": "p", "model": "claude-opus-5"},
-    }
-    vendors = {"p": {"url": f"http://127.0.0.1:{upstream_port}", "key": "k"}}
-
-    temp_dir, proxy_port, proc, mock_servers, cleanup = _setup_tier_routing_test(tiers, vendors)
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        _mode_tiers(), vendors)
     if proc is None:
         fail("Failed to set up test")
         return
-
     try:
-        status, resp_body = _send_proxy_request(proxy_port, body=probe)
+        status, resp_body = _send_proxy_request(proxy_port, body=body)
         if status == 0:
-            fail("band-depth {} ({} bytes) dropped the connection "
-                 "(zero-byte abort — the encode guard regressed)".format(depth, len(probe)))
+            fail("']'-prefixed deep body dropped the connection ({!r})".format(
+                resp_body[:120]))
             return
-        # The in-band shape is a valid object body, so the request is
-        # forwarded; the contract is only that a real, parseable HTTP
-        # response came back. Pre-fix there was no response at all.
+        if status != 400:
+            fail("expected 400, got {}".format(status))
+            return
         try:
-            json.loads(resp_body)
+            data = json.loads(resp_body)
         except Exception as e:
-            fail("band-depth {}: response body is not valid JSON: {} ({!r})".format(
-                depth, e, resp_body[:200]))
+            fail("400 body is not JSON: {} ({!r})".format(e, resp_body[:200]))
             return
-        pass_("band-depth {} ({} bytes) -> HTTP {} with a parseable body".format(
-            depth, len(probe), status))
-
+        err = data.get("error") or {}
+        if err.get("code") != "nesting_limit_exceeded":
+            fail("expected error.code nesting_limit_exceeded, got {!r}".format(
+                err.get("code")))
+            return
+        message = err.get("message") or ""
+        if "body may not be valid JSON" not in message:
+            fail("expected the offset-only diagnostic for an unrepairable prefix, "
+                 "got {!r}".format(message))
+            return
+        if mock_servers["p"]["requests"]:
+            fail("the rejected body reached the upstream ({} requests)".format(
+                len(mock_servers["p"]["requests"])))
+            return
+        pass_("']'-prefixed deep body -> 400 with the offset-only diagnostic")
     finally:
         cleanup()
 
@@ -1248,182 +1259,380 @@ def test_get_v1_models_404_envelope():
         cleanup()
 
 
-def test_response_json_encode_band():
-    """A buffered upstream JSON response in the encode band is returned, not dropped.
+def test_nesting_limit_buffered_response_body():
+    """A buffered upstream body past the limit is forwarded byte-identical.
 
-    Pins `_rewrite_json_response`'s encode side: the re-serialize must sit
-    INSIDE the widened try (review-2 finding review2-rewrite-json-response-encode).
-    The mock upstream returns a JSON body whose depth is in the
-    decode-succeeds/encode-fails band, so json.loads succeeds and json.dumps
-    raises RecursionError. Pre-fix the dumps sat outside the try and the
-    exception escaped unfenced (do_POST -> forward_request -> _forward_core
-    call sites were unfenced) -> the client got ZERO bytes. Post-fix the guard
-    returns the original body bytes: a real, client-parseable response whose
-    model field is NOT rewritten (the degrade path), never a dropped connection.
+    Degrade, not error: the client receives the upstream's own bytes (so the
+    model is NOT rewritten to the tier), and the trace records the event at
+    site "response_rewrite" — the site that carries the tier in scope. The
+    pre-plan behaviour for this shape was interpreter-dependent (a parse that
+    might raise with no fence); the boundary check makes it deterministic.
     """
-    print("\n--- Test: Response JSON Encode Band (upstream buffered) ---")
+    print("\n--- Test: Buffered Upstream Body Nesting Limit ---")
 
-    depth = _band_depth_for(_band_response_body)
-    if depth is None:
-        fail("could not locate a decode-succeeds/encode-fails band on this interpreter")
-        return
-
-    probe = _band_response_body(depth)
-    # Prove we are actually in the band before asserting on the proxy.
-    try:
-        parsed = json.loads(probe)
-    except RecursionError:
-        fail("chosen depth {} does not parse — not in band".format(depth))
-        return
-    try:
-        json.dumps(parsed)
-    except RecursionError:
-        pass
-    except Exception as e:
-        fail("chosen depth {}: unexpected encode error {!r}".format(depth, e))
-        return
-    else:
-        fail("chosen depth {} re-serializes locally — not in band".format(depth))
-        return
+    limit = MAX_JSON_NESTING_DEPTH
+    probe = (b'{"id":"msg_up","type":"message","model":"claude-sonnet-5",'
+             b'"content":[{"type":"text","text":"hi"}],"x":'
+             + b"[" * (limit + 1) + b"]" * (limit + 1) + b"}")
 
     upstream_port = find_free_port()
-    tiers = _mode_tiers()
     vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K"}}
     responders = {"p": lambda info: (200, "application/json", probe)}
-
     temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
-        tiers, vendors, responders=responders)
+        _mode_tiers(), vendors, responders=responders)
     if proc is None:
         fail("Failed to set up test")
         return
-
     try:
         status, resp_body = _send_proxy_request(proxy_port)
         if status == 0:
-            fail("band-depth {} response dropped the connection "
-                 "(zero-byte abort — the _rewrite_json_response encode guard regressed)".format(depth))
+            fail("a >limit buffered response dropped the connection ({!r})".format(
+                resp_body[:120]))
             return
         if status != 200:
-            fail("band-depth {}: expected 200, got {}".format(depth, status))
+            fail("expected 200, got {}".format(status))
             return
-        try:
-            json.loads(resp_body)
-        except Exception as e:
-            fail("band-depth {}: response body is not valid JSON: {} ({!r})".format(
-                depth, e, resp_body[:200]))
-            return
-        # Degrade path: the encode failed, so the original bytes are forwarded
-        # with the upstream's model intact — no rewrite, no abort.
         if resp_body != probe:
-            fail("band-depth {}: expected the original (unrewritten) body, "
-                 "got {} bytes differing from the {}-byte probe".format(
-                     depth, len(resp_body), len(probe)))
+            fail("expected the upstream bytes forwarded unchanged ({} bytes), "
+                 "got {} bytes".format(len(probe), len(resp_body)))
             return
-        pass_("band-depth {} ({} bytes) -> HTTP 200 with the original body forwarded".format(
-            depth, len(probe)))
+        events = [e for e in _trace_events_named(trace_file, "nesting_limit_exceeded")
+                  if e.get("site") == "response_rewrite"]
+        if len(events) != 1:
+            fail("expected exactly one nesting event with site response_rewrite, "
+                 "got {!r}".format(_trace_events_named(trace_file, "nesting_limit_exceeded")))
+            return
+        ev = events[0]
+        if ev.get("tier") != "sonnet":
+            fail("response_rewrite event must carry the tier, got {!r}".format(
+                ev.get("tier")))
+            return
+        if ev.get("depth", 0) < limit + 1:
+            fail("event depth {} is not past the limit {}".format(
+                ev.get("depth"), limit))
+            return
+        if [e for e in _trace_events_named(trace_file, "transform_failure")]:
+            fail("the degrade must not also log transform_failure")
+            return
+        pass_(">limit upstream body forwarded byte-identical; response_rewrite event "
+              "carries tier and depth {}".format(ev.get("depth")))
     finally:
         cleanup()
 
 
-def _band_response_body(depth):
-    """Upstream buffered-JSON shape at a measured depth: top-level model + deep array."""
-    return (b'{"id":"msg_up","type":"message","model":"claude-sonnet-5",'
-            b'"content":[{"type":"text","text":"hi"}],"x":'
-            + b"[" * depth + b"]" * depth + b"}")
+def test_nesting_limit_admin_body():
+    """An admin body past the limit is refused with the flat admin shape.
 
-
-def _band_sse_event(depth):
-    """Anthropic-mode message_start SSE first event at a measured depth.
-
-    Depth rides on an unused payload key so the event parses (loads ceiling)
-    but the model rewrite's json.dumps re-serialize raises (dumps ceiling).
+    The admin surface keeps its documented exclusion from the Anthropic
+    envelope: a flat {"error": <message>, "code": ...} object with no "type"
+    and no top-level "request_id". A normal admin body must still be served,
+    so the check cannot be passing by breaking the branch.
     """
-    data = (b'{"type":"message_start","message":{"id":"msg_up",'
-            b'"type":"message","role":"assistant","model":"claude-sonnet-5",'
-            b'"content":[],"x":' + b"[" * depth + b"]" * depth + b"}}")
-    return b"event: message_start\ndata: " + data + b"\n\n"
+    print("\n--- Test: Admin Body Nesting Limit ---")
+    import http.client as _hc
 
-
-def test_sse_first_event_encode_band():
-    """A message_start first event in the encode band still streams, not zero bytes.
-
-    Pins `_rewrite_sse_first_event`'s separate encode guard (review-2 finding
-    review-sse-first-event-narrow-guard, reopened): round 2 widened only the
-    decode try, leaving json.dumps outside it, so an in-band message_start
-    returned HTTP 200 with ZERO body bytes. Post-fix the re-serialize runs in
-    its own guard: an encode failure degrades to forwarding the ORIGINAL event
-    (model not rewritten) and the rest of the stream flows normally.
-    """
-    print("\n--- Test: SSE First Event Encode Band (message_start) ---")
-
-    depth = _band_depth_for(lambda d: _band_sse_event(d).split(b"data: ", 1)[1].rstrip(b"\n"))
-    if depth is None:
-        fail("could not locate a decode-succeeds/encode-fails band on this interpreter")
-        return
-
-    event_bytes = _band_sse_event(depth)
-    data_text = event_bytes.split(b"data: ", 1)[1].rstrip(b"\n")
-    # Prove the data payload is in band (parses, fails to re-encode).
-    try:
-        parsed = json.loads(data_text)
-    except RecursionError:
-        fail("chosen depth {} does not parse — not in band".format(depth))
-        return
-    try:
-        json.dumps(parsed)
-    except RecursionError:
-        pass
-    except Exception as e:
-        fail("chosen depth {}: unexpected encode error {!r}".format(depth, e))
-        return
-    else:
-        fail("chosen depth {} re-serializes locally — not in band".format(depth))
-        return
+    limit = MAX_JSON_NESTING_DEPTH
+    body = b'{"tiers":' + b"[" * (limit + 1) + b"]" * (limit + 1) + b"}"
 
     upstream_port = find_free_port()
-    tiers = _mode_tiers()
     vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K"}}
-    delta_event = b'event: content_block_delta\ndata: {"type":"content_block_delta",' \
-                  b'"delta":{"type":"text_delta","text":"Hi"}}\n\n'
-    stop_event = b'data: {"type":"message_stop"}\n\n'
-    sse_body = event_bytes + delta_event + stop_event
-    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
-
     temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
-        tiers, vendors, responders=responders)
+        _mode_tiers(), vendors)
     if proc is None:
         fail("Failed to set up test")
         return
+    try:
+        conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+        try:
+            conn.request("POST", "/admin/api/switch", body=body, headers={
+                "Content-Type": "application/json",
+                "Origin": "http://127.0.0.1:{}".format(proxy_port),
+            })
+            resp = conn.getresponse()
+            status = resp.status
+            raw = resp.read()
+        finally:
+            conn.close()
+        if status == 0:
+            fail("a >limit admin body dropped the connection")
+            return
+        if status != 400:
+            fail("expected 400, got {} ({!r})".format(status, raw[:200]))
+            return
+        try:
+            data = json.loads(raw)
+        except Exception as e:
+            fail("admin 400 is not JSON: {} ({!r})".format(e, raw[:200]))
+            return
+        if set(data) != {"error", "code"}:
+            fail("admin rejection must keep the flat shape {{'error','code'}}, "
+                 "got keys {!r}".format(sorted(data)))
+            return
+        if data.get("code") != "nesting_limit_exceeded":
+            fail("expected code nesting_limit_exceeded, got {!r}".format(data.get("code")))
+            return
+        message = data.get("error") or ""
+        if not isinstance(message, str) or "limit of {} levels".format(limit) not in message:
+            fail("admin message does not name the limit: {!r}".format(message))
+            return
+        events = [e for e in _trace_events_named(trace_file, "nesting_limit_exceeded")
+                  if e.get("site") == "admin_body"]
+        if len(events) != 1:
+            fail("expected one nesting event with site admin_body, got {!r}".format(
+                _trace_events_named(trace_file, "nesting_limit_exceeded")))
+            return
+        if not events[0].get("request_id"):
+            fail("the admin branch must own a request_id on its event: {!r}".format(
+                events[0]))
+            return
+        pass_(">limit admin body -> flat 400 with code nesting_limit_exceeded")
 
+        status, text = _admin_post(proxy_port, "/admin/api/reload", {})
+        if status != 200:
+            fail("a normal admin body must still be served, got {} ({!r})".format(
+                status, text[:200]))
+            return
+        pass_("normal admin body still served (200)")
+    finally:
+        cleanup()
+
+
+def test_nesting_limit_sse_first_event_forwarded():
+    """A >limit first SSE event is forwarded byte-identical, no model rewrite.
+
+    The anthropic-mode stream buffers its first event to rewrite the model to
+    the tier. When that event's JSON payload is nested past the limit the
+    rewrite is skipped and the event is forwarded verbatim, so the client sees
+    the UPSTREAM model name — the documented degrade. The trace records
+    ``nesting_limit_exceeded`` with ``site: "sse_first_event"`` carrying the
+    tier (that field was missing before Step 11) and the shared builder's
+    ``degrade`` field (null here, since the well-formed crossing resolves a
+    path), and the rest of the stream still flows (the second event and byte
+    equality prove it).
+
+    This branch had no behavioural coverage before Step 12; its own comment
+    claimed "documented and tested" while nothing reached it.
+    """
+    print("\n--- Test: SSE First Event Nesting Limit ---")
+
+    limit = MAX_JSON_NESTING_DEPTH
+    first_event = (b'data: {"type":"message_start","message":{"model":"claude-sonnet-5"},'
+                   b'"x":' + b"[" * (limit + 1) + b"]" * (limit + 1) + b"}\n\n")
+    second_event = b'data: {"type":"content_block_delta","delta":{"text":"Hi"}}\n\n'
+    sse_body = first_event + second_event
+
+    upstream_port = find_free_port()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K"}}
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        _mode_tiers(), vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
     try:
         status, content_type, raw = _send_proxy_request_stream(
-            proxy_port, body={"model": "sonnet",
-                              "messages": [{"role": "user", "content": "hi"}],
-                              "stream": True})
+            proxy_port,
+            body={"model": "sonnet",
+                  "messages": [{"role": "user", "content": "hi"}],
+                  "stream": True})
         if status != 200:
-            fail("band-depth {}: expected 200, got {}".format(depth, status))
+            fail("expected 200, got {} ({!r})".format(status, raw[:160]))
             return
-        if not raw:
-            fail("band-depth {} message_start: HTTP 200 with ZERO body bytes "
-                 "(the _rewrite_sse_first_event encode guard regressed)".format(depth))
+        if raw != sse_body:
+            fail("expected the whole stream byte-identical to upstream "
+                 "({} bytes), got {} bytes: {!r}".format(
+                     len(sse_body), len(raw), raw[:200]))
             return
-        text = raw.decode("utf-8", errors="replace")
-        if "message_start" not in text:
-            fail("band-depth {}: first event missing from stream: {!r}".format(
-                depth, text[:200]))
+        if b'"model":"claude-sonnet-5"' not in raw:
+            fail("the forwarded first event must keep the upstream model name, "
+                 "got {!r}".format(raw[:200]))
             return
-        if "content_block_delta" not in text or "message_stop" not in text:
-            fail("band-depth {}: stream truncated after the first event "
-                 "(got {} bytes)".format(depth, len(raw)))
+        if b'"model":"sonnet"' in raw:
+            fail("the first event was rewritten to the tier despite the "
+                 "nesting violation: {!r}".format(raw[:200]))
             return
-        # Degrade path: encode failed, original event forwarded unchanged —
-        # the upstream's model string survives because no rewrite happened.
-        if "claude-sonnet-5" not in text:
-            fail("band-depth {}: expected the unrewritten upstream model in "
-                 "the forwarded first event".format(depth))
+        events = [e for e in _wait_for_trace_events(trace_file,
+                                                    "nesting_limit_exceeded")
+                  if e.get("site") == "sse_first_event"]
+        if len(events) != 1:
+            fail("expected one nesting event with site sse_first_event, got "
+                 "{!r}".format(_trace_events_named(trace_file,
+                                                   "nesting_limit_exceeded")))
             return
-        pass_("band-depth {} ({} bytes): full stream forwarded, first event degraded".format(
-            depth, len(raw)))
+        ev = events[0]
+        if ev.get("tier") != "sonnet":
+            fail("the sse_first_event event must carry the tier, got {!r}".format(
+                ev.get("tier")))
+            return
+        if ev.get("degrade") is not None or not isinstance(ev.get("path"), str):
+            fail("the sse_first_event event must carry the shared degrade field "
+                 "(null here: the crossing is well-formed, so a path resolves), "
+                 "got path {!r} degrade {!r}".format(
+                     ev.get("path"), ev.get("degrade")))
+            return
+        if ev.get("depth", 0) < limit + 1:
+            fail("event depth {} is not past the limit {}".format(
+                ev.get("depth"), limit))
+            return
+        if not ev.get("request_id"):
+            fail("the sse_first_event event must carry a request_id: {!r}".format(ev))
+            return
+        pass_(">limit first event forwarded byte-identical (upstream model name "
+              "kept); sse_first_event event carries tier")
+    finally:
+        cleanup()
+
+
+def test_nesting_limit_response_transform():
+    """A >limit buffered chat-mode body degrades in _transform_and_guard.
+
+    Chat/response modes run the buffered upstream body through
+    ``_transform_and_guard``; a body past the limit is forwarded unchanged
+    with ``nesting_limit_exceeded`` at ``site: "response_transform"`` (mode,
+    provider and tier in scope) and WITHOUT a ``transform_failure`` — the
+    distinct site proves the nesting guard fired, not the total-parse guard.
+    """
+    print("\n--- Test: Response Transform Nesting Limit ---")
+
+    limit = MAX_JSON_NESTING_DEPTH
+    probe = (b'{"id":"chatcmpl-1","object":"chat.completion","model":"gpt-4o",'
+             b'"choices":[{"index":0,"message":{"role":"assistant","content":"hi"},'
+             b'"finish_reason":"stop"}],'
+             b'"usage":{"prompt_tokens":1,"completion_tokens":1},"x":'
+             + b"[" * (limit + 1) + b"]" * (limit + 1) + b"}")
+
+    upstream_port = find_free_port()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port),
+                     "key": "K", "mode": "chat"}}
+    responders = {"p": lambda info: (200, "application/json", probe)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        _mode_tiers(), vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, resp_body = _send_proxy_request(proxy_port)
+        if status == 0:
+            fail("a >limit chat-mode body dropped the connection ({!r})".format(
+                resp_body[:120]))
+            return
+        if status != 200:
+            fail("expected 200, got {} ({!r})".format(status, resp_body[:160]))
+            return
+        if resp_body != probe:
+            fail("expected the upstream bytes forwarded unchanged ({} bytes), "
+                 "got {} bytes".format(len(probe), len(resp_body)))
+            return
+        events = [e for e in _wait_for_trace_events(trace_file,
+                                                    "nesting_limit_exceeded")
+                  if e.get("site") == "response_transform"]
+        if len(events) != 1:
+            fail("expected one nesting event with site response_transform, got "
+                 "{!r}".format(_trace_events_named(trace_file,
+                                                   "nesting_limit_exceeded")))
+            return
+        ev = events[0]
+        if (ev.get("mode") != "chat" or ev.get("provider") != "p"
+                or ev.get("tier") != "sonnet"):
+            fail("response_transform event must carry mode/provider/tier, got "
+                 "{!r}".format(ev))
+            return
+        if ev.get("depth", 0) < limit + 1:
+            fail("event depth {} is not past the limit {}".format(
+                ev.get("depth"), limit))
+            return
+        if [e for e in _trace_events_named(trace_file, "transform_failure")]:
+            fail("the nesting degrade must not also log transform_failure")
+            return
+        pass_(">limit chat-mode body forwarded byte-identical; "
+              "response_transform event carries mode/provider/tier")
+    finally:
+        cleanup()
+
+
+def test_nesting_limit_response_body_capture():
+    """The --all response-body capture degrades past the limit.
+
+    Under ``PROXY_LOG_ALL`` the buffered upstream body is a SECOND parsed
+    payload (distinct from the request body), so it is bounded at its own
+    site: ``response_body_capture``. The trace entry then carries the raw
+    decoded text rather than a parsed object, and the client still receives
+    the upstream bytes unchanged. The event carries its routing identity —
+    ``tier``, which is in scope at this site and was the field Step 17's
+    single-sourced builder restored — plus the shared ``degrade`` field (null
+    here, since a well-formed crossing resolves a path). The anthropic-mode
+    rewrite fires its own ``response_rewrite`` event for the same body — both
+    are expected.
+    """
+    print("\n--- Test: Response Body Capture Nesting Limit ---")
+
+    limit = MAX_JSON_NESTING_DEPTH
+    probe = (b'{"id":"msg_up","type":"message","model":"claude-sonnet-5",'
+             b'"content":[{"type":"text","text":"hi"}],"x":'
+             + b"[" * (limit + 1) + b"]" * (limit + 1) + b"}")
+
+    upstream_port = find_free_port()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K"}}
+    responders = {"p": lambda info: (200, "application/json", probe)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        _mode_tiers(), vendors, responders=responders,
+        extra_env={"PROXY_LOG_ALL": "1"})
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, resp_body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200, got {} ({!r})".format(status, resp_body[:160]))
+            return
+        if resp_body != probe:
+            fail("expected the upstream bytes forwarded unchanged ({} bytes), "
+                 "got {} bytes".format(len(probe), len(resp_body)))
+            return
+        events = [e for e in _wait_for_trace_events(trace_file,
+                                                    "nesting_limit_exceeded")
+                  if e.get("site") == "response_body_capture"]
+        if len(events) != 1:
+            fail("expected one nesting event with site response_body_capture, "
+                 "got {!r}".format(_trace_events_named(trace_file,
+                                                       "nesting_limit_exceeded")))
+            return
+        ev = events[0]
+        if ev.get("depth", 0) < limit + 1:
+            fail("event depth {} is not past the limit {}".format(
+                ev.get("depth"), limit))
+            return
+        if not ev.get("request_id"):
+            fail("the response_body_capture event must carry a request_id: "
+                 "{!r}".format(ev))
+            return
+        if ev.get("tier") != "sonnet":
+            fail("the response_body_capture event must carry the tier — it is "
+                 "in scope here and was the field the single-sourced builder "
+                 "restored — got {!r}".format(ev.get("tier")))
+            return
+        if ev.get("degrade") is not None or not isinstance(ev.get("path"), str):
+            fail("the response_body_capture event must carry the shared degrade "
+                 "field (null here: a well-formed crossing resolves a path), "
+                 "got path {!r} degrade {!r}".format(
+                     ev.get("path"), ev.get("degrade")))
+            return
+        entries = [e for e in _wait_for_trace_events(trace_file, "request")
+                   if "response_body" in e]
+        if len(entries) != 1:
+            fail("expected one request entry carrying response_body, got "
+                 "{}".format(len(entries)))
+            return
+        captured = entries[0].get("response_body")
+        if not isinstance(captured, str):
+            fail("the capture must fall back to the decoded-text form (a str), "
+                 "got {!r}".format(type(captured).__name__))
+            return
+        if captured != probe.decode("utf-8"):
+            fail("the decoded-text capture does not match the upstream body")
+            return
+        pass_(">limit --all capture fell back to decoded text; "
+              "response_body_capture event logged")
     finally:
         cleanup()
 
@@ -1441,10 +1650,13 @@ ALL_TESTS = [
     ("response-model-rewrite-upstream-model", test_response_model_rewrite_upstream_model),
     ("two-tiers-same-model-same-provider", test_two_tiers_same_model_same_provider),
     ("non-object-body-rejected", test_non_object_body_rejected),
-    ("deep-nested-body-invalid-json", test_deep_nested_body_invalid_json),
-    ("deep-nested-body-encode-band", test_deep_nested_body_encode_band),
-    ("response-json-encode-band", test_response_json_encode_band),
-    ("sse-first-event-encode-band", test_sse_first_event_encode_band),
+    ("nesting-limit-client-body", test_nesting_limit_client_body),
+    ("nesting-limit-leading-close-body", test_nesting_limit_leading_close_body),
+    ("nesting-limit-buffered-response-body", test_nesting_limit_buffered_response_body),
+    ("nesting-limit-sse-first-event-forwarded", test_nesting_limit_sse_first_event_forwarded),
+    ("nesting-limit-response-transform", test_nesting_limit_response_transform),
+    ("nesting-limit-response-body-capture", test_nesting_limit_response_body_capture),
+    ("nesting-limit-admin-body", test_nesting_limit_admin_body),
     ("error-envelope-shape", test_error_envelope_shape),
     ("unrecognized-model-injection-safe", test_unrecognized_model_injection_safe),
     ("get-v1-models-404-envelope", test_get_v1_models_404_envelope),

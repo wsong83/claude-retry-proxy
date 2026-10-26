@@ -3,6 +3,7 @@
 import json
 import time
 
+from .nesting import check_payload_nesting, nesting_event
 from .sinks import log_trace
 
 __all__ = ["_transform_and_guard", "_request_transform_timestamp",
@@ -18,7 +19,16 @@ def _transform_and_guard(raw_body, tier, transform_fn, request_id, mode, provide
     transform_failure trace event (metadata only — never body content) and
     returns the original raw bytes unchanged. Mirrors the total-parse idiom
     of compat._compat_guarded_parse.
+    The nesting check runs before the parse: a body past
+    nesting.MAX_JSON_NESTING_DEPTH is forwarded unchanged with a
+    nesting_limit_exceeded event instead of being parsed.
     """
+    _nesting = check_payload_nesting(raw_body)
+    if _nesting is not None:
+        log_trace(nesting_event("response_transform", _nesting,
+                                request_id=request_id, mode=mode,
+                                provider=provider, tier=tier))
+        return raw_body
     try:
         parsed = json.loads(raw_body)
     except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
