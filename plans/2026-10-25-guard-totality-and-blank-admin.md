@@ -32,6 +32,17 @@ Rows ordered newest-first (latest issues at top). New issues are prepended; reso
 
 | Issue | Status | Found | Resolved | Resolved By |
 |-------|--------|-------|----------|-------------|
+| [step10-probe-breaks-step8-check-h](./tmp/reports/2026-10-25-guard-totality-and-blank-admin-step10-probe-breaks-step8-check-h.json) | Resolved | 2026-10-27 | 2026-10-27 | planner |
+| [step10-unreadable-count-auto-check](./tmp/reports/2026-10-25-guard-totality-and-blank-admin-step10-unreadable-count-auto-check.json) | Resolved | 2026-10-27 | 2026-10-27 | planner |
+| [step10-el-handle-breaks-admin-html-row-guard-pin](./tmp/reports/2026-10-25-guard-totality-and-blank-admin-step10-el-handle-breaks-admin-html-row-guard-pin.json) | Resolved | 2026-10-27 | 2026-10-27 | planner |
+| [immediate-actions-stale-after-iteration-3-audit](./tmp/reports/2026-10-25-guard-totality-and-blank-admin-immediate-actions-stale-after-iteration-3-audit.json) | Resolved | 2026-10-27 | 2026-10-27 | planner |
+
+<!-- ADDED 2026-10-27, post-commit. Four issue reports filed by coder round 5 had their
+     defects fixed in place but were never given Issue Log rows, so they sat on disk as
+     orphaned Open records — and a `tmp/reports/<plan-id>-*.json` sweep would have
+     deleted them as transient artifacts with nothing recording that they were resolved.
+     Caught while verifying the post-commit sweep glob, which is exactly the check the
+     sweep's own content-type guard exists to force. -->
 | [mega-audit-3-high-documentation-assigned-to-tester-lane](./tmp/reports/2026-10-25-guard-totality-and-blank-admin-mega-audit-2026-10-26-2.json) | Resolved | 2026-10-26 | 2026-10-26 | planner |
 | [mega-audit-3-medium-step1-gate-drifted-from-permanent-test](./tmp/reports/2026-10-25-guard-totality-and-blank-admin-mega-audit-2026-10-26-2.json) | Resolved | 2026-10-26 | 2026-10-26 | planner |
 | [mega-audit-3-medium-docs-maintain-an-exact-count](./tmp/reports/2026-10-25-guard-totality-and-blank-admin-mega-audit-2026-10-26-2.json) | Resolved | 2026-10-26 | 2026-10-26 | planner |
