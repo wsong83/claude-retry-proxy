@@ -582,7 +582,11 @@ def _chat_to_anthropic(chat_body, tier, request_id=None, mode=None, provider=Non
                 elif isinstance(args, str):
                     try:
                         parsed_args = json.loads(args)
-                    except json.JSONDecodeError:
+                    except Exception:
+                        # Total by design: RecursionError is a RuntimeError, so
+                        # a JSONDecodeError-only guard let a deeply nested
+                        # upstream arguments string escape and lose the
+                        # placeholder-block degradation that follows.
                         parsed_args = None
                     if not isinstance(parsed_args, dict):
                         parsed_args = None

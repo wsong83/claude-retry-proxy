@@ -104,6 +104,15 @@ def load_models_document(models_path):
     except OSError as e:
         raise ValueError(
             "models.json cannot be read: {} ({})".format(models_path, e)) from e
+    except Exception as e:
+        # Total by design: this function's contract (see the docstring) is that
+        # ANY unreadable or unparseable models.json becomes a clean ValueError,
+        # because the server's startup handler catches only
+        # (FileNotFoundError, json.JSONDecodeError, ValueError). A document
+        # nested deeper than the interpreter recurses raises RecursionError,
+        # which is none of those and escaped as a raw traceback.
+        raise ValueError(
+            "models.json cannot be parsed: {} ({})".format(models_path, e)) from e
     if not isinstance(doc, dict):
         raise ValueError("models.json must be a JSON object: {}".format(models_path))
     if "models" not in doc:
@@ -230,6 +239,12 @@ def _load_config_documents(config_path):
     except OSError as e:
         raise ValueError(
             "config cannot be read: {} ({})".format(config_path, e)) from e
+    except Exception as e:
+        # Total by design: see load_models_document. RecursionError is neither
+        # a JSONDecodeError nor an OSError, so a gravely over-nested config.json
+        # escaped the clauses above as a raw traceback.
+        raise ValueError(
+            "config cannot be parsed: {} ({})".format(config_path, e)) from e
     if not isinstance(doc, dict):
         raise ValueError("config must be a JSON object")
     if "tiers" not in doc:

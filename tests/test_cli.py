@@ -2165,6 +2165,121 @@ def test_start_failure_reports_only_this_attempts_stderr():
         _restore_proxy_state(state_backup)
 
 
+def test_cli_unreadable_state_file_distinct_from_absent():
+    """An unreadable `proxy-state.json` is not an absent one, and every call
+    site says so (plan 2026-10-25-guard-totality-and-blank-admin, Step 10 edit A
+    / Step 11 Part A).
+
+    Step 1 widened `_read_state`'s guard to a total `except Exception`, which is
+    right for the parse classes — but the function's old contract ("unreadable
+    -> None") then made `cmd_stop` print "Proxy: not running (no state file)"
+    and exit 0 over a state file that exists and whose proxy is alive, which
+    contradicts the documented stop contract. The path is reachable on Windows
+    without a corrupt file: the heartbeat rewrites the state every 30 s, so a
+    transient sharing violation lands in that clause.
+
+    WHAT IS PINNED, AND WHY BY IDENTITY. `_read_state` must return three
+    distinct outcomes — the parsed dict, `None` for a genuinely absent file, and
+    the `_UNREADABLE` sentinel for an existing-but-unreadable file. The
+    sentinel is asserted with `is`, not truthiness: the whole defect was that a
+    falsy result could not be told from `None`, so a truthiness assertion would
+    pass on exactly the broken implementation. A directory stands in for the
+    unreadable file because `open()` on it raises `IsADirectoryError` (an
+    `OSError`) on every platform, with no dependence on file permissions this
+    platform may not enforce.
+
+    All four call sites are driven through `main()` so the dispatcher is
+    exercised too (`cmd_start`'s branch sits behind config + keys validation,
+    so it is reached with a valid temporary pair — it returns before any spawn).
+    Each must exit 1 with the distinct diagnostic and must not fall through to
+    "not running (no state file)".
+    """
+    print("\n--- Test: CLI Unreadable State File Is Not Absent ---")
+    import io
+    from contextlib import redirect_stdout
+
+    import claude_retry_proxy.cli as cli_mod
+
+    temp_dir = tempfile.mkdtemp(prefix="proxy_cli_unreadable_state_")
+    orig_state = cli_mod.PROXY_STATE_FILE
+    orig_argv = list(sys.argv)
+    try:
+        unreadable = temp_dir
+        absent = os.path.join(temp_dir, "no-such-state.json")
+
+        cli_mod.PROXY_STATE_FILE = unreadable
+        got = cli_mod._read_state()
+        if got is cli_mod._UNREADABLE:
+            pass_("_read_state returns the _UNREADABLE sentinel (identity)")
+        else:
+            fail("_read_state returned {!r} for an existing-but-unreadable "
+                 "state file; expected the _UNREADABLE sentinel".format(got))
+        if cli_mod._UNREADABLE is not None and cli_mod._UNREADABLE is not False:
+            pass_("the sentinel is distinct from None and from False")
+        else:
+            fail("the sentinel is indistinguishable from a falsy absence "
+                 "marker — the distinction this guard exists for is gone")
+
+        cli_mod.PROXY_STATE_FILE = absent
+        got = cli_mod._read_state()
+        if got is None:
+            pass_("_read_state returns None for a genuinely absent file")
+        else:
+            fail("_read_state returned {!r} for an absent file; expected "
+                 "None".format(got))
+
+        # The four call sites, reached through main()'s dispatcher.
+        cli_mod.PROXY_STATE_FILE = unreadable
+        tiers = {
+            "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+            "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+            "opus": {"provider": "p", "model": "claude-opus-5"},
+        }
+        vendors = {"p": {"url": "http://127.0.0.1:1", "key": "K",
+                         "mode": "anthropic"}}
+        config_path = _create_test_config(temp_dir, tiers)
+        keys_path = _create_test_keys_plain(temp_dir, vendors)
+        argv_by_command = {
+            "start": ["start", "--config-path", config_path,
+                      "--keys-path", keys_path],
+            "stop": ["stop"],
+            "status": ["status"],
+            "reload": ["reload"],
+        }
+        for command in ("start", "stop", "status", "reload"):
+            sys.argv = ["claude-retry-proxy"] + argv_by_command[command]
+            buf = io.StringIO()
+            rc = None
+            with redirect_stdout(buf):
+                try:
+                    cli_mod.main()
+                except SystemExit as e:
+                    rc = e.code
+            out = buf.getvalue()
+            if rc == 1:
+                pass_("`{}` exits 1 on an unreadable state file".format(command))
+            else:
+                fail("`{}` exited {} on an unreadable state file; the stop "
+                     "contract requires 1".format(command, rc))
+            if "could not be read" in out:
+                pass_("`{}` reports that the state file could not be "
+                      "read".format(command))
+            else:
+                fail("`{}` output does not say the state file could not be "
+                     "read: {!r}".format(command, out[:400]))
+            if "not running (no state file)" in out:
+                fail("`{}` collapsed an unreadable state file into an absent "
+                     "one — the pre-change defect: {!r}".format(
+                         command, out[:400]))
+            else:
+                pass_("`{}` does not claim there is no state file".format(
+                    command))
+    finally:
+        cli_mod.PROXY_STATE_FILE = orig_state
+        sys.argv = orig_argv
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 ALL_TESTS = [
     ("cli-reload", test_cli_reload),
     ("start-rejects-uncatalogued-model-selector-at-cli", test_start_rejects_uncatalogued_model_selector_at_cli),
@@ -2189,6 +2304,7 @@ ALL_TESTS = [
     ("server-refuses-occupied-port-directly", test_server_refuses_occupied_port_directly),
     ("start-failure-reports-only-this-attempts-stderr", test_start_failure_reports_only_this_attempts_stderr),
     ("proxy-http-server-class-pins-platform-reuse", test_proxy_http_server_class_pins_platform_reuse),
+    ("cli-unreadable-state-file-distinct-from-absent", test_cli_unreadable_state_file_distinct_from_absent),
 ]
 
 

@@ -1510,6 +1510,219 @@ def test_admin_switch_validates_key_names():
         cleanup()
 
 
+# ===========================================================================
+# Switch input validation: every rejection in one table, plus the positive half
+# (plan 2026-10-25-guard-totality-and-blank-admin, Step 7)
+# ===========================================================================
+
+def _switch_tier_mapping(tiers):
+    """{tier: (provider, model)} — the mapping a refusal must leave untouched."""
+    return {name: (cfg.get("provider"), cfg.get("model"))
+            for name, cfg in tiers.items()}
+
+
+def _switch_rejection_rows():
+    """(label, bodies, expected_message_fragment) — the switch rejection table.
+
+    One row per validation rule; `bodies` is a tuple where one rule rejects
+    several VALUES of the same field (a non-string provider as dict/list/int, a
+    non-string model as int/null) — those are one rule, not three. Each fragment
+    is a substring of the server's real message, so a row fails if the message
+    stops naming what was rejected.
+    """
+    base = _mode_tiers("p")
+
+    def body(sonnet=None, extra=None):
+        tiers = {name: dict(cfg) for name, cfg in base.items()}
+        if sonnet is not None:
+            tiers["sonnet"] = sonnet
+        if extra:
+            tiers.update(extra)
+        return {"tiers": tiers}
+
+    return [
+        ("a tier carrying an unsupported per-tier key",
+         (body(sonnet=dict(base["sonnet"], x=[])),),
+         "has unsupported key(s): x"),
+        ("a two-tier body (a required tier absent)",
+         ({"tiers": {"haiku": dict(base["haiku"]),
+                     "sonnet": dict(base["sonnet"])}},),
+         "missing tiers: opus"),
+        ("a fourth tier with an invalid name",
+         (body(extra={"bad tier!": dict(base["opus"])}),),
+         "invalid tier name: bad tier!"),
+        ("a non-string provider (dict, list, int)",
+         tuple(body(sonnet=dict(base["sonnet"], provider=value))
+               for value in ({}, ["x"], 5)),
+         "invalid provider name"),
+        ("a non-string model (int, null)",
+         tuple(body(sonnet=dict(base["sonnet"], model=value))
+               for value in (5, None)),
+         "invalid model name"),
+        ("a model absent from the provider's catalog",
+         (body(sonnet=dict(base["sonnet"], model="model-not-in-catalog")),),
+         "unknown model 'model-not-in-catalog'"),
+    ]
+
+
+def _assert_switch_rejected(proxy_port, baseline, label, switch_body, fragment):
+    """POST one switch body; assert the refusal, its message, and no change.
+
+    THREE assertions, and the first one is load-bearing rather than decorative:
+    the response must ARRIVE. A non-string `provider`/`model` used to raise
+    inside the name validator and abort the handler, and `_admin_post` reports a
+    transport failure as status 0 — so a "not 200" assertion would pass on a
+    hung socket. A status-0 failure here names that pre-change failure mode.
+    """
+    status, data = _admin_post(proxy_port, "/admin/api/switch", switch_body)
+    if status == 0:
+        fail("{}: no HTTP response at all ({}) — the handler aborted".format(
+            label, data[:200]))
+        return
+    if status != 400:
+        fail("{}: expected 400, got {}: {}".format(label, status, data[:300]))
+        return
+    if fragment not in data:
+        fail("{}: 400 does not name the rejection (expected {!r}): {}".format(
+            label, fragment, data[:300]))
+        return
+    pass_("{}: refused with 400 naming {!r}".format(label, fragment))
+
+    status, body_bytes, _ = _admin_get(proxy_port, "/admin/api/config")
+    if status != 200:
+        fail("{}: GET /admin/api/config returned {} after the refusal".format(
+            label, status))
+        return
+    persisted = _switch_tier_mapping(json.loads(body_bytes).get("tiers", {}))
+    if persisted == baseline:
+        pass_("{}: persisted mapping untouched".format(label))
+    else:
+        fail("{}: persisted mapping CHANGED: {!r} (baseline {!r})".format(
+            label, persisted, baseline))
+
+
+def test_admin_switch_input_rejections():
+    """Every way `/admin/api/switch` refuses a body, over one started proxy.
+
+    The endpoint gained three rejection classes in this plan's Step 6 (a tier
+    name that is not a safe-charset string, a non-string provider/model, and a
+    model the provider's catalog does not list) in addition to the ones it
+    already had (an unsupported per-tier key from Step 3, and the required-tier
+    check). Each was, before it was checked, a body that made the endpoint
+    **answer nothing at all** — except the catalog rule, which was a
+    disagreement with Reload rather than an abort. One proxy and one table keeps
+    that whole surface in one place instead of four near-identical test bodies.
+
+    Driving one proxy is also what makes the last assertion per row meaningful:
+    the baseline is the mapping the page loaded, so a row that silently landed
+    would be caught by the NEXT row's comparison as well as its own.
+    """
+    print("\n--- Test: Admin Switch Input Rejections ---")
+    upstream = find_free_port()
+    tiers = _mode_tiers("p")
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream), "key": "K"}}
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(
+        tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body_bytes, _ = _admin_get(proxy_port, "/admin/api/config")
+        if status != 200:
+            fail("GET /admin/api/config expected 200, got {}".format(status))
+            return
+        baseline = _switch_tier_mapping(
+            json.loads(body_bytes).get("tiers", {}))
+        if baseline == _switch_tier_mapping(tiers):
+            pass_("baseline mapping loaded ({} tiers)".format(len(baseline)))
+        else:
+            fail("baseline tiers differ from the fixture: {!r}".format(baseline))
+            return
+
+        rows = _switch_rejection_rows()
+        cases = sum(len(bodies) for _label, bodies, _fragment in rows)
+        print("  ({} rejection rule(s) over {} request body/bodies)".format(
+            len(rows), cases))
+        for label, bodies, fragment in rows:
+            for switch_body in bodies:
+                _assert_switch_rejected(proxy_port, baseline, label,
+                                        switch_body, fragment)
+    finally:
+        cleanup()
+
+
+def test_admin_switch_extra_tier_persisted():
+    """A well-formed EXTRA tier is APPLIED and persisted — validation, not
+    prohibition.
+
+    Extra tier names are a documented, supported shape: `doc/configuration.html`
+    says so, `validate_config` iterates every tier "because resolve_tier's
+    reverse lookup can route to extra tiers", and the reload gate judges every
+    tier of its candidate. Step 6's first version forbade them, which the
+    Phase 5 audit caught as removing a capability rather than validating input;
+    this is the positive half of the rule that replaced it, and it has its own
+    slug because a regression pin that asserts a SUCCESS does not belong inside
+    a rejection table.
+
+    The counterpart is `test_admin_switch_input_rejections`' fourth-tier row: an
+    ill-formed NAME is refused, while a well-formed extra tier passes through.
+    """
+    print("\n--- Test: Admin Switch Extra Tier Persisted ---")
+    upstream = find_free_port()
+    tiers = _mode_tiers("p")
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream), "key": "K"}}
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(
+        tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        ghost = {"provider": "p", "model": "claude-opus-5"}
+        switch_tiers = {name: dict(cfg) for name, cfg in tiers.items()}
+        switch_tiers["ghost-tier"] = dict(ghost)
+        status, data = _admin_post(proxy_port, "/admin/api/switch",
+                                   {"tiers": switch_tiers})
+        if status != 200:
+            fail("switch carrying a well-formed extra tier expected 200, got "
+                 "{}: {}".format(status, data[:300]))
+            return
+        pass_("switch carrying a well-formed extra tier returned 200")
+
+        # The in-memory view the page reads.
+        status, body_bytes, _ = _admin_get(proxy_port, "/admin/api/config")
+        if status != 200:
+            fail("GET /admin/api/config expected 200, got {}".format(status))
+            return
+        served = json.loads(body_bytes).get("tiers", {}).get("ghost-tier")
+        if isinstance(served, dict) and (
+                served.get("provider") == ghost["provider"]
+                and served.get("model") == ghost["model"]):
+            pass_("/admin/api/config serves the extra tier")
+        else:
+            fail("extra tier missing from /admin/api/config: {!r}".format(served))
+
+        # The on-disk document a restart would read.
+        config_path = os.path.join(temp_dir, "config.json")
+        with open(config_path) as fh:
+            disk = json.load(fh)
+        disk_ghost = disk.get("tiers", {}).get("ghost-tier")
+        if isinstance(disk_ghost, dict) and (
+                disk_ghost.get("provider") == ghost["provider"]
+                and disk_ghost.get("model") == ghost["model"]):
+            pass_("extra tier reached the persisted config.json")
+        else:
+            fail("extra tier missing from the persisted config.json: {!r}".format(
+                disk_ghost))
+        missing = [t for t in ("haiku", "sonnet", "opus")
+                   if t not in disk.get("tiers", {})]
+        if missing:
+            fail("the switch dropped required tier(s): {}".format(missing))
+        else:
+            pass_("the three required tiers are still persisted")
+    finally:
+        cleanup()
+
+
 def test_admin_html_key_column():
     """admin.html gains a per-tier key <select>, a disabled-select style, a
     static column header row (Provider/Model/Key) above #tiers-container, and
@@ -2702,6 +2915,491 @@ def test_reload_does_not_revert_concurrent_switch():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def _drive_post_in_process(srv, path, body_bytes, client_port=55557):
+    """Invoke `do_POST` for an admin path with no socket, capturing the response.
+
+    The `object.__new__(srv.ProxyHandler)` pattern the reload-stale gate above
+    already uses: the handler's globals are module state, so these tests can put
+    the exact interleaving they need on it rather than racing a live server.
+    Returns the list of (status, body) tuples `_send_response` was called with.
+    """
+    captured = []
+    handler = object.__new__(srv.ProxyHandler)
+    handler.path = path
+    handler.client_address = ("127.0.0.1", client_port)
+    handler.headers = {
+        "Content-Length": str(len(body_bytes)),
+        "Origin": "http://127.0.0.1:{}".format(srv.SETTINGS.port),
+    }
+    handler.rfile = io.BytesIO(body_bytes)
+    handler.wfile = io.BytesIO()
+    handler._send_response = (
+        lambda status, body, headers=None: captured.append((status, body)))
+    handler.do_POST()
+    return captured
+
+
+def test_admin_reload_serialize_failure_500():
+    """The reload answers 500 — and installs nothing — when its success body
+    cannot be serialized (plan 2026-10-25, Step 8 coder edit 3).
+
+    The success body embeds `candidate`, whose `tiers` are the IN-MEMORY
+    document (`_current_config.get("tiers", {})`), so the branch needs no
+    deep-nesting fixture: a tier carrying an unknown per-tier key whose value is
+    a `set` passes the membership gate and `validate_config` (which ignores
+    unknown per-tier keys) and then raises `TypeError` inside `json.dumps`.
+    That is the same `except Exception:` a `RecursionError` would reach — the
+    property the guard exists for — and it measures this code rather than the
+    interpreter's stack, so it cannot go flaky across machines.
+
+    THREE assertions, each with a reachable failing branch on the pre-Step-8
+    tree: serializing after the install would leave the swap applied and the
+    epoch bumped while the client got NO response at all (the exception
+    propagates out of `do_POST`), so this test would error rather than pass; a
+    rebuilt-but-equal document fails the identity check (`is`, not `==`); and a
+    stray epoch bump fails the last one.
+    """
+    print("\n--- Test: Admin Reload Serialize Failure Is a 500 ---")
+    import claude_retry_proxy.server as srv
+
+    provider = "p1"
+    model = "claude-sonnet-5"
+    tiers = ("haiku", "sonnet", "opus")
+    temp_dir = tempfile.mkdtemp()
+    saved = {}
+    try:
+        with open(os.path.join(temp_dir, "models.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"models": {provider: [model]}}, f)
+        config_path = os.path.join(temp_dir, "config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump({"tiers": {t: {"provider": provider, "model": model}
+                                 for t in tiers}}, f)
+
+        # A document that JSON-decodes, validates, and then cannot re-encode.
+        poisoned = {
+            "tiers": {t: {"provider": provider, "model": model, "key": "",
+                          "poison": {1, 2}} for t in tiers},
+            "models": {provider: [model]},
+        }
+
+        saved = {name: getattr(srv, name) for name in (
+            "_config_path", "_current_config", "_config_epoch", "_vendors",
+            "_config_swapping", "_inflight_count", "_swap_evictions",
+            "_swap_started_at")}
+        srv._config_path = config_path
+        srv._current_config = poisoned
+        srv._config_epoch = 5
+        srv._vendors = {provider: {"url": "http://127.0.0.1:1", "key": "k-p1"}}
+        srv._config_swapping = False
+        srv._inflight_count = 0
+        srv._swap_evictions = 0
+
+        captured = _drive_post_in_process(srv, "/admin/api/reload", b"")
+        if not captured:
+            fail("the reload handler sent no response (the serialize failure "
+                 "escaped do_POST — the pre-Step-8 behaviour)")
+            return
+        status, body = captured[-1]
+        text = body.decode("utf-8", "replace")
+        if status != 500:
+            fail("a candidate that decodes but cannot re-encode must answer 500; "
+                 "got {} ({})".format(status, text[:300]))
+            return
+        pass_("reload of an unserializable candidate answered 500")
+        if "the configuration could not be serialized" not in text:
+            fail("the 500 does not carry the message: {}".format(text[:300]))
+            return
+        pass_("the 500 names the serialization failure")
+        if srv._current_config is not poisoned:
+            fail("the 500 branch installed a config — _current_config is no "
+                 "longer the poisoned document ({}); a truthful 500 installs "
+                 "nothing".format(type(srv._current_config).__name__))
+            return
+        pass_("nothing was installed (_current_config is still the poisoned doc)")
+        if srv._config_epoch != 5:
+            fail("a refused reload must not bump the epoch; got {}".format(
+                srv._config_epoch))
+            return
+        pass_("no epoch bump was taken")
+    finally:
+        for name, value in saved.items():
+            setattr(srv, name, value)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_admin_reload_serializability_probe_precedes_drain():
+    """The reload decides its success body is serializable BEFORE the press
+    (plan 2026-10-25, Step 10 coder edit B; Step 11 Part B).
+
+    Step 8's guard made the serialize failure answer `500` instead of aborting
+    with no response — but it did so AFTER `_drain_for_swap()`, which pauses
+    every new admission, waits with no wall-clock cap, and abandons retry
+    chains. A press that can never succeed therefore still performed a
+    disruptive press. The probe added ahead of the drain makes the refusal free.
+
+    The assertion that makes this a test of ORDERING rather than of the guard is
+    the invocation count: `_drain_for_swap` is called by global lookup, so
+    rebinding it to a counting stand-in measures whether the press happened at
+    all. The post-drain guard is still there and is pinned separately by
+    `test_admin_reload_serialize_failure_500` — this test would pass with the
+    probe present even if that guard were removed, and would FAIL on the
+    pre-Step-10 tree where the same 500 arrives after a drain (count 1).
+
+    The poisoned document is the same fixture the post-drain test uses: a tier
+    carrying an unknown per-tier key whose value is a `set` passes the
+    membership gate and `validate_config`, then raises `TypeError` in
+    `json.dumps`. `TypeError` and `RecursionError` both reach the same
+    `except Exception:`, so this measures the guard's property without a
+    stack-depth fixture that would go flaky across machines.
+    """
+    print("\n--- Test: Admin Reload Serializability Probe Precedes the Drain ---")
+    import claude_retry_proxy.server as srv
+
+    provider = "p1"
+    model = "claude-sonnet-5"
+    tiers = ("haiku", "sonnet", "opus")
+    temp_dir = tempfile.mkdtemp()
+    real_drain = srv._drain_for_swap
+    saved = {}
+    try:
+        with open(os.path.join(temp_dir, "models.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"models": {provider: [model]}}, f)
+        config_path = os.path.join(temp_dir, "config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump({"tiers": {t: {"provider": provider, "model": model}
+                                 for t in tiers}}, f)
+
+        poisoned = {
+            "tiers": {t: {"provider": provider, "model": model, "key": "",
+                          "poison": {1, 2}} for t in tiers},
+            "models": {provider: [model]},
+        }
+
+        saved = {name: getattr(srv, name) for name in (
+            "_config_path", "_current_config", "_config_epoch", "_vendors",
+            "_config_swapping", "_inflight_count", "_swap_evictions",
+            "_swap_started_at")}
+        srv._config_path = config_path
+        srv._current_config = poisoned
+        srv._config_epoch = 5
+        srv._vendors = {provider: {"url": "http://127.0.0.1:1", "key": "k-p1"}}
+        srv._config_swapping = False
+        srv._inflight_count = 0
+        srv._swap_evictions = 0
+
+        drain_calls = []
+
+        def counting_drain():
+            """Record the press, then run the real drain."""
+            drain_calls.append(1)
+            return real_drain()
+
+        srv._drain_for_swap = counting_drain
+
+        captured = _drive_post_in_process(srv, "/admin/api/reload", b"")
+        if not captured:
+            fail("the reload handler sent no response (the serialize failure "
+                 "escaped do_POST)")
+            return
+        status, body = captured[-1]
+        text = body.decode("utf-8", "replace")
+        if status != 500:
+            fail("an unserializable candidate must answer 500; got {} "
+                 "({})".format(status, text[:300]))
+            return
+        pass_("reload of an unserializable candidate answered 500")
+        if "the configuration could not be serialized" not in text:
+            fail("the 500 does not carry the message: {}".format(text[:300]))
+            return
+        pass_("the 500 names the serialization failure")
+        if drain_calls:
+            fail("the reload drained {} time(s) before refusing — a press that "
+                 "can never succeed must not pause admissions or abandon retry "
+                 "chains".format(len(drain_calls)))
+            return
+        pass_("no drain ran: the refusal happened before the press "
+              "(_drain_for_swap invocations = 0)")
+
+        # POSITIVE CONTROL. `len(drain_calls) == 0` means nothing unless the
+        # counting stand-in can ever observe a press. Drive the SAME handler,
+        # with the same rebinding, over a candidate that serializes: the drain
+        # must now run exactly once and the reload must succeed. Without this
+        # case a stand-in that silently never fires would pass the assertion
+        # above.
+        srv._current_config = {
+            "tiers": {t: {"provider": provider, "model": model, "key": ""}
+                      for t in tiers},
+            "models": {provider: [model]},
+        }
+        captured = _drive_post_in_process(srv, "/admin/api/reload", b"")
+        if not captured:
+            fail("positive control: the reload handler sent no response")
+            return
+        status, body = captured[-1]
+        if status != 200:
+            fail("positive control: a serializable candidate must reload 200; "
+                 "got {} ({})".format(
+                     status, body.decode("utf-8", "replace")[:300]))
+            return
+        pass_("positive control: a serializable candidate reloaded 200")
+        if len(drain_calls) == 1:
+            pass_("positive control: the counting stand-in observed exactly one "
+                  "press — the zero count above is a measurement")
+        else:
+            fail("positive control: the counting stand-in observed {} press(es); "
+                 "the zero-count assertion above cannot be trusted".format(
+                     len(drain_calls)))
+    finally:
+        srv._drain_for_swap = real_drain
+        for name, value in saved.items():
+            setattr(srv, name, value)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_admin_switch_apply_rewrites_tier_map():
+    """Apply rewrites the tier map to the three standard tiers — the documented
+    contract, pinned so a change to it fails loudly (plan 2026-10-25, Step 10
+    edit D; Step 11 Part C).
+
+    The page's `saveConfig` builds `newConfig.tiers` from `TIERS` — the three
+    standard tiers only — so a documented EXTRA tier present in the live config
+    is deleted by the next Apply press. That was measured during the
+    iteration-3 audit and the operator chose to DOCUMENT it rather than seed the
+    build from `config.tiers`, because seeding makes every Apply press 400
+    whenever a preserved extra names a model absent from the live catalog.
+
+    THIS PINS A DELIBERATE, DOCUMENTED BEHAVIOUR, NOT A BUG. If a later change
+    ever round-trips extras through the page (or otherwise makes Apply preserve
+    them), this test fails, and whoever made that change must update
+    `doc/operations.html`'s "Apply rewrites the tier map" paragraph in the same
+    change — update the doc, not this assertion, unless the contract itself is
+    being re-decided.
+
+    The contrast with `test_admin_switch_extra_tier_persisted` is deliberate and
+    they do not contradict: the API honours and persists a fourth tier when the
+    client SENDS one; the page sends only three. Do not "reconcile" them.
+    """
+    print("\n--- Test: Admin Switch Apply Rewrites the Tier Map ---")
+    import claude_retry_proxy.server as srv
+
+    provider = "p1"
+    model = "claude-sonnet-5"
+    standard = ("haiku", "sonnet", "opus")
+    temp_dir = tempfile.mkdtemp()
+    saved = {}
+    try:
+        four_tiers = {t: {"provider": provider, "model": model}
+                      for t in standard}
+        four_tiers["ghost-tier"] = {"provider": provider, "model": model}
+        config_path = os.path.join(temp_dir, "config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump({"tiers": four_tiers}, f)
+
+        saved = {name: getattr(srv, name) for name in (
+            "_config_path", "_current_config", "_config_epoch", "_vendors",
+            "_config_swapping", "_inflight_count", "_swap_evictions",
+            "_swap_started_at")}
+        srv._config_path = config_path
+        srv._current_config = {
+            "tiers": {t: dict(cfg) for t, cfg in four_tiers.items()},
+            "models": {provider: [model]},
+        }
+        srv._config_epoch = 5
+        srv._vendors = {provider: {"url": "http://127.0.0.1:1", "key": "k-p1"}}
+        srv._config_swapping = False
+        srv._inflight_count = 0
+        srv._swap_evictions = 0
+
+        # Page-identical: `saveConfig` builds exactly provider/model/key per
+        # standard tier, with `key: value || ''`.
+        page_body = {"tiers": {
+            t: {"provider": provider, "model": model, "key": ""}
+            for t in standard
+        }}
+        captured = _drive_post_in_process(
+            srv, "/admin/api/switch", json.dumps(page_body).encode("utf-8"))
+        if not captured:
+            fail("the switch handler sent no response")
+            return
+        status, resp = captured[-1]
+        text = resp.decode("utf-8", "replace")
+        if status != 200:
+            fail("a page-identical three-tier press must answer 200; got {} "
+                 "({})".format(status, text[:300]))
+            return
+        pass_("page-identical press returned 200")
+
+        expected = set(standard)
+        with open(config_path) as fh:
+            disk = json.load(fh).get("tiers", {})
+        if set(disk) == expected:
+            pass_("the persisted tier map is exactly the three standard tiers "
+                  "(the extra tier was rewritten away, as documented)")
+        else:
+            fail("the persisted tier map is {!r}, expected exactly {!r} — if "
+                 "Apply now preserves extra tiers, update doc/operations.html's "
+                 "'Apply rewrites the tier map' paragraph in the same "
+                 "change".format(sorted(disk), sorted(expected)))
+        if set(srv._current_config.get("tiers", {})) == expected:
+            pass_("the in-memory tier map is exactly the three standard tiers")
+        else:
+            fail("the in-memory tier map is {!r}, expected exactly {!r}".format(
+                sorted(srv._current_config.get("tiers", {})),
+                sorted(expected)))
+        if disk.get("haiku", {}).get("key") == "default":
+            pass_("the empty key selector resolved to the provider's first key")
+        else:
+            fail("the persisted key selector did not resolve: {!r}".format(
+                disk.get("haiku")))
+    finally:
+        for name, value in saved.items():
+            setattr(srv, name, value)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_admin_switch_rechecks_catalog_after_epoch_move():
+    """The switch re-checks the LIVE catalog when the epoch moves during its
+    drain (plan 2026-10-25, Step 8 coder edit 2).
+
+    The press validates against a catalog snapshot taken before it owns the
+    swap, while Phase 3 carries the LIVE catalog forward — so a reload that
+    completes in between can leave the switch persisting a tier the Reload path
+    then refuses. `_drain_for_swap` is called by global lookup between the two
+    (server.py:3680), so rebinding it puts this test exactly inside that window
+    with no scheduling race.
+
+    Two cases, and the second is what makes the first meaningful: refusing
+    whenever the epoch moved would pass case 1 and fail case 2, and would be
+    wrong — nothing about a catalog that still lists the model is stale.
+    """
+    print("\n--- Test: Admin Switch Re-checks the Catalog After an Epoch Move ---")
+    import claude_retry_proxy.server as srv
+
+    provider = "p1"
+    model = "claude-sonnet-5"
+    tiers = ("haiku", "sonnet", "opus")
+    real_drain = srv._drain_for_swap
+    saved = {name: getattr(srv, name) for name in (
+        "_config_path", "_current_config", "_config_epoch", "_vendors",
+        "_config_swapping", "_inflight_count", "_swap_evictions",
+        "_swap_started_at")}
+    temp_dirs = []
+    try:
+        def fresh_state():
+            """A distinct temp config per case, plus the process state around it."""
+            temp_dir = tempfile.mkdtemp()
+            temp_dirs.append(temp_dir)
+            config_path = os.path.join(temp_dir, "config.json")
+            baseline = {t: {"provider": provider, "model": model} for t in tiers}
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump({"tiers": baseline}, f)
+            srv._config_path = config_path
+            srv._current_config = {
+                "tiers": {t: dict(cfg) for t, cfg in baseline.items()},
+                "models": {provider: [model]},
+            }
+            srv._config_epoch = 5
+            srv._vendors = {provider: {"url": "http://127.0.0.1:1",
+                                       "key": "k-p1"}}
+            srv._config_swapping = False
+            srv._inflight_count = 0
+            srv._swap_evictions = 0
+            return config_path, baseline
+
+        def disk_tiers(config_path):
+            with open(config_path) as f:
+                return json.load(f).get("tiers", {})
+
+        switch_tiers = {t: {"provider": provider, "model": model} for t in tiers}
+        switch_tiers["ghost-tier"] = {"provider": provider, "model": model}
+        body = json.dumps({"tiers": switch_tiers}).encode("utf-8")
+
+        # --- Case 1: a reload lands during the drain and drops the model. ----
+        config_path, baseline = fresh_state()
+
+        def reload_lands_dropping_model():
+            srv._config_epoch += 1                 # a reload completed here...
+            srv._current_config["models"] = {provider: []}   # ...minus the model
+            return real_drain()
+
+        srv._drain_for_swap = reload_lands_dropping_model
+        captured = _drive_post_in_process(srv, "/admin/api/switch", body)
+        if not captured:
+            fail("case 1: the switch handler sent no response")
+            return
+        status, resp = captured[-1]
+        text = resp.decode("utf-8", "replace")
+        if status != 400:
+            fail("case 1: a catalog that lost the model during the drain must "
+                 "refuse 400; got {} ({})".format(status, text[:300]))
+            return
+        pass_("case 1: refused 400 instead of persisting a tier Reload rejects")
+        if ("unknown model '{}' for provider '{}'".format(model, provider)
+                not in text):
+            fail("case 1: the 400 does not name the model and provider: "
+                 "{}".format(text[:300]))
+            return
+        named_tier = [t for t in tiers if "tier '{}'".format(t) in text]
+        if not named_tier:
+            fail("case 1: the 400 does not name the offending tier: "
+                 "{}".format(text[:300]))
+            return
+        pass_("case 1: the 400 names tier '{}', the model and the provider".format(
+            named_tier[0]))
+        if disk_tiers(config_path) != baseline:
+            fail("case 1: the refused switch wrote to config.json: {!r}".format(
+                disk_tiers(config_path)))
+            return
+        pass_("case 1: the persisted config.json is untouched")
+        if srv._config_epoch != 6:
+            fail("case 1: the refused switch took its own epoch bump; got "
+                 "{}".format(srv._config_epoch))
+            return
+        pass_("case 1: no install and no epoch bump of its own")
+
+        # --- Case 2: the epoch moves, but the catalog still lists the model. -
+        config_path, baseline = fresh_state()
+
+        def reload_lands_keeping_model():
+            srv._config_epoch += 1                 # a reload completed here...
+            return real_drain()                    # ...and the model survived
+
+        srv._drain_for_swap = reload_lands_keeping_model
+        captured = _drive_post_in_process(srv, "/admin/api/switch", body)
+        if not captured:
+            fail("case 2: the switch handler sent no response")
+            return
+        status, resp = captured[-1]
+        text = resp.decode("utf-8", "replace")
+        if status != 200:
+            fail("case 2: an epoch move whose catalog still lists the model is "
+                 "NOT stale and must succeed; got {} ({})".format(status,
+                                                                  text[:300]))
+            return
+        pass_("case 2: answered 200 (the re-check gates on the catalog, not on "
+              "the epoch alone)")
+        persisted = disk_tiers(config_path)
+        ghost = persisted.get("ghost-tier")
+        if not isinstance(ghost, dict) or ghost.get("model") != model:
+            fail("case 2: the applied tier did not reach config.json: {!r}".format(
+                ghost))
+            return
+        pass_("case 2: the extra tier reached the persisted config.json")
+        if srv._current_config.get("models") != {provider: [model]}:
+            fail("case 2: the live catalog was not carried forward: {!r}".format(
+                srv._current_config.get("models")))
+            return
+        pass_("case 2: the live catalog was carried forward")
+    finally:
+        srv._drain_for_swap = real_drain
+        for name, value in saved.items():
+            setattr(srv, name, value)
+        for temp_dir in temp_dirs:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def _js_braced_block(text, start):
     """Extract the brace-balanced block beginning at the first '{' at or after
     `start`, braces included ('' when absent or unbalanced).
@@ -3473,6 +4171,241 @@ def test_admin_html_pending_status_styled():
         cleanup()
 
 
+# ===========================================================================
+# The Apply press refuses on an incomplete view
+# (plan 2026-10-25-guard-totality-and-blank-admin, Step 4)
+# ===========================================================================
+
+def _save_config_body(html):
+    """saveConfig's body extracted by brace matching ('' when absent)."""
+    return _js_function_body(html, "async function saveConfig(")
+
+
+def _save_config_requires_rendered_row_checks(html):
+    """Assertion rows for the unrendered-tier-row press guard.
+
+    Returns [(ok, message), ...]. Kept separate from the test function so a
+    measurement harness can run these same assertions against a pre-change page
+    without starting a proxy — an assertion whose failing branch cannot be
+    reached is not a test.
+    """
+    body = _save_config_body(html)
+    if not body:
+        return [(False, "saveConfig could not be read from the served page")]
+    checks = []
+
+    # The guard's semantic core: a NEGATED existence test on a tier provider
+    # select. renderTiers() creates all nine selects or none, so testing any one
+    # of them decides the question; the index is left loose rather than pinning
+    # TIERS[0].
+    row_guard = re.search(
+        r"if\s*\(\s*!\s*document\.getElementById\(\s*"
+        r"`\$\{TIERS\[\d+\]\}-provider`\s*\)\s*\)", body)
+    if not row_guard:
+        checks.append((False, (
+            "saveConfig has no rendered-tier-row existence guard (a negated "
+            "`document.getElementById(`${TIERS[n]}-provider`)` test) — on a "
+            "blank page it dereferences a missing element and rejects with an "
+            "unhandled TypeError instead of refusing")))
+    else:
+        checks.append((True, "saveConfig tests that a tier row was rendered"))
+
+    # Before it TOUCHES any tier select. The earliest access in the press body
+    # is the key-list guard's provider lookup, so comparing against it also
+    # proves the row guard comes first. The matcher deliberately anchors on the
+    # `getElementById(...)` CALL and not on a `.value` dereference: the guard
+    # loop reads its select through a null-checked handle
+    # (`const el = document.getElementById(...); if (!el) {...}; el.value`),
+    # and an earlier version of this check matched only the direct-dereference
+    # spelling. That version found nothing in the guard loop and anchored on a
+    # LATER read — a PASS about a different position (coder-filed
+    # `step10-el-handle-breaks-admin-html-row-guard-pin`). The property under
+    # test is the ORDERING ("refuse before touching a select"), so both
+    # spellings must count; the call is the earliest point either way.
+    tier_reads = [m.start() for m in re.finditer(
+        r"getElementById\(\s*`\$\{tier\}-(?:provider|model|key)`\s*\)", body)]
+    build_at = body.find("newConfig.tiers[tier] = {")
+    if not tier_reads:
+        checks.append((False, (
+            "saveConfig reads no tier select at all — the press body is not "
+            "the one this test documents")))
+    elif build_at == -1:
+        checks.append((False, (
+            "saveConfig no longer builds `newConfig.tiers[tier]` — the config "
+            "build this ordering check is anchored on is missing")))
+    elif row_guard:
+        if row_guard.start() < tier_reads[0] < build_at:
+            checks.append((True, (
+                "the row guard precedes the first tier-select read and the "
+                "config build")))
+        else:
+            checks.append((False, (
+                "the row guard is not before the tier selects it protects "
+                "(guard at {}, first read at {}, build at {})").format(
+                    row_guard.start(), tier_reads[0], build_at)))
+
+    # It must refuse rather than fall through: a return, and a STICKY line.
+    # Sticky matters because there is no later repaint on this path — the page
+    # never rendered, so nothing else will replace the message.
+    if row_guard:
+        block = _js_braced_block(body, row_guard.end())
+        if not block:
+            checks.append((False, "the row guard's block could not be read"))
+        else:
+            checks.append((bool(re.search(r"\breturn\b", block)), (
+                "the row guard returns instead of falling through")))
+            checks.append((bool(re.search(r"showStatus\s*\([^;]*,\s*true\s*\)",
+                                          block)), (
+                "the refusal line is sticky (third argument true)")))
+    return checks
+
+
+def _save_config_requires_key_list_checks(html):
+    """Assertion rows for the missing-key-list press guard.
+
+    Returns [(ok, message), ...], separate from the test function for the same
+    reason as the row-guard helper.
+    """
+    body = _save_config_body(html)
+    if not body:
+        return [(False, "saveConfig could not be read from the served page")]
+    checks = []
+
+    # saveConfig carries two `for (const tier of TIERS)` loops (the guard and
+    # the post-build validation), so the guard is identified by the lookup it
+    # performs, not by being the first loop.
+    guard_block = ""
+    for match in re.finditer(r"for\s*\(\s*const\s+tier\s+of\s+TIERS\s*\)\s*\{",
+                             body):
+        block = _js_braced_block(body, match.start())
+        if "providerKeys[provider]" in block:
+            guard_block = block
+            guard_at = match.start()
+            break
+
+    if not guard_block:
+        checks.append((False, (
+            "saveConfig has no per-tier key-list guard looping over TIERS and "
+            "consulting `providerKeys[provider]` — when /providers-detail "
+            "fails the row still renders with a disabled, empty key select, and "
+            "the press sends key=\"\" which the server maps to the provider's "
+            "FIRST key")))
+        return checks
+
+    checks.append((True, (
+        "saveConfig consults providerKeys for every tier before applying")))
+    checks.append((bool(re.search(r"\bprovider\s*&&", guard_block)), (
+        "the guard skips tiers with no provider selected (an unset provider has "
+        "no key list to check)")))
+    checks.append((("providerKeys[provider]" in guard_block
+                    and ".length" in guard_block), (
+        "the guard tests the key list's LENGTH (an absent or empty entry is the "
+        "failure condition)")))
+    checks.append((bool(re.search(r"showStatus\s*\([^;]*,\s*true\s*\)",
+                                  guard_block)), (
+        "the refusal line is sticky (third argument true) — Reload Providers "
+        "does not re-fetch provider-detail, so only a page reload clears it")))
+    checks.append((bool(re.search(r"\breturn\b", guard_block)), (
+        "the guard returns without POSTing /admin/api/switch")))
+
+    # It must sit before the config build that reads the nine selects — a guard
+    # after the build would refuse a press whose values were already collected.
+    build_at = body.find("newConfig.tiers[tier] = {")
+    if build_at == -1:
+        checks.append((False, (
+            "saveConfig no longer builds `newConfig.tiers[tier]` — the config "
+            "build this ordering check is anchored on is missing")))
+    else:
+        checks.append((guard_at < build_at, (
+            "the key-list guard precedes the config build")))
+    return checks
+
+
+def test_admin_html_apply_requires_rendered_row():
+    """On a blank page the Apply press REFUSES instead of throwing.
+
+    The initial load can fail before `renderTiers()` runs, so the nine tier
+    `<select>`s do not exist. Both buttons stay pressable (deliberately: Reload
+    Providers is the working recovery path). Before this plan, `saveConfig`
+    dereferenced a missing element as its first statement — above its own `try`
+    — so the `async` function rejected with an unhandled `TypeError` and painted
+    no status line at all. Nothing else in the suite served the page and looked
+    at this ordering, so a regression would have been silent.
+
+    WHAT THIS PINS, AND WHAT IT DOES NOT: the served page's SOURCE ORDER — a
+    negated tier-row existence test, before any tier-select read, whose block
+    returns with a sticky error line. It does not execute the JavaScript; the
+    behavioural contract is pinned by
+    `tmp/verification/2026-10-25-guard-totality-and-blank-admin-admin-page.py`
+    (check 1) under Node, which this repo deliberately does not make a suite
+    dependency.
+    """
+    print("\n--- Test: Apply Requires a Rendered Row ---")
+    port = find_free_port()
+    tiers = _mode_tiers("p")
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(port), "key": "K"}}
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(
+        tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body, _ = _admin_get(proxy_port, "/admin/")
+        if status != 200:
+            fail("expected 200 for /admin/, got {}".format(status))
+            return
+        html = body.decode("utf-8", errors="replace")
+        for ok, msg in _save_config_requires_rendered_row_checks(html):
+            if ok:
+                pass_(msg)
+            else:
+                fail(msg)
+    finally:
+        cleanup()
+
+
+def test_admin_html_apply_requires_key_list():
+    """Apply refuses when a tier's provider has no entry in `providerKeys`.
+
+    `/providers-detail` supplies the key NAMES, and `loadProviderModes()`
+    swallows a failed fetch by design — but `renderTiers()` still runs, so the
+    row renders and the page looks normal. `populateKeys` then builds no options
+    and disables the key select, and a disabled select still reads `""`. The
+    server maps `""` to `names[0]` — the provider's FIRST key, not "unchanged" —
+    so before this plan the press silently re-pointed every multi-key tier and
+    persisted it while reporting success. Neither Reload Providers nor
+    `refreshTiersFromServer` re-fetches provider-detail, so only a full page
+    reload clears the state.
+
+    WHAT THIS PINS, AND WHAT IT DOES NOT: the served page's source ordering and
+    shape — a per-tier `providerKeys[provider]` length test, before the config
+    build, that returns with a sticky error line. Runtime behaviour is pinned by
+    the Node-driven verification script's check 2, not here.
+    """
+    print("\n--- Test: Apply Requires the Key List ---")
+    port = find_free_port()
+    tiers = _mode_tiers("p")
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(port), "key": "K"}}
+    proxy_port, proc, mock_servers, temp_dir, cleanup = _start_admin_proxy(
+        tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, body, _ = _admin_get(proxy_port, "/admin/")
+        if status != 200:
+            fail("expected 200 for /admin/, got {}".format(status))
+            return
+        html = body.decode("utf-8", errors="replace")
+        for ok, msg in _save_config_requires_key_list_checks(html):
+            if ok:
+                pass_(msg)
+            else:
+                fail(msg)
+    finally:
+        cleanup()
+
+
 def test_request_blocked_at_admission_not_evicted():
     """A request blocked in _swap_done.wait() while a swap runs must NOT be
     evicted by the swap it waited on: after the release it is admitted with the
@@ -3552,6 +4485,8 @@ ALL_TESTS = [
     ("admin-api-csrf-missing-origin-rejected", test_admin_api_csrf_missing_origin_rejected),
     ("admin-api-csrf-ipv6-loopback-accepted", test_admin_api_csrf_ipv6_loopback_accepted),
     ("admin-api-switch-missing-tier-rejected", test_admin_api_switch_missing_tier_rejected),
+    ("admin-switch-input-rejections", test_admin_switch_input_rejections),
+    ("admin-switch-extra-tier-persisted", test_admin_switch_extra_tier_persisted),
     ("admin-api-reload", test_admin_api_reload),
     ("admin-reload-non-dict-extra-tier", test_admin_reload_non_dict_extra_tier),
     ("admin-models-provider-keyed", test_admin_models_provider_keyed),
@@ -3577,8 +4512,19 @@ ALL_TESTS = [
     ("admin-second-press-refused-409", test_second_press_refused_409),
     ("admin-concurrent-presses-single-flight", test_concurrent_presses_single_flight),
     ("admin-reload-stale-candidate-guard", test_reload_does_not_revert_concurrent_switch),
+    ("admin-reload-serialize-failure-500", test_admin_reload_serialize_failure_500),
+    ("admin-reload-serializability-probe-precedes-drain",
+     test_admin_reload_serializability_probe_precedes_drain),
+    ("admin-switch-apply-rewrites-tier-map",
+     test_admin_switch_apply_rewrites_tier_map),
+    ("admin-switch-rechecks-catalog-after-epoch-move",
+     test_admin_switch_rechecks_catalog_after_epoch_move),
     ("admin-html-poll-guard-after-await", test_admin_html_poll_guard_after_await),
     ("admin-html-pending-status-styled", test_admin_html_pending_status_styled),
+    ("admin-html-apply-requires-rendered-row",
+     test_admin_html_apply_requires_rendered_row),
+    ("admin-html-apply-requires-key-list",
+     test_admin_html_apply_requires_key_list),
     ("admin-admission-blocked-not-evicted", test_request_blocked_at_admission_not_evicted),
 ]
 

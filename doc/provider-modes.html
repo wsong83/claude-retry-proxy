@@ -10,7 +10,7 @@
 
 <h1>Provider Modes<span class="sub">anthropic, chat, and response — and what each one rewrites</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-18</p>
+<p><strong>Last updated:</strong> 2026-10-26</p>
 
 <p>The proxy speaks Anthropic Messages to its clients. What it speaks <em>upstream</em> is
 configurable per provider, because not every provider implements the Anthropic API. A
@@ -457,13 +457,13 @@ field carries the discriminator:</p>
       re-issue the request.</li>
   <li><strong>A frame that cannot be serialized</strong> — the proxy built a frame that
       <code>json.dumps</code> rejects. This is reachable because the decoder and the encoder have
-      different ceilings: <code>json.loads</code> survives to roughly 16,920 nesting levels while
-      <code>json.dumps</code> already fails at roughly 15,501, leaving a band of payloads that
-      parse and then fail to re-encode. Instead of aborting the stream with no terminal event —
-      which the client reads as a truncated <em>success</em> — the frame is replaced by an SSE
+      different ceilings, leaving a band of payloads that parse and then fail to re-encode; the
+      ceilings themselves and the guard discipline around them are owned by
+      <a href="architecture.html#json-ceilings">architecture.html#json-ceilings</a>, and are not
+      restated here. Instead of aborting the stream with no terminal event — which the client
+      reads as a truncated <em>success</em> — the frame is replaced by an SSE
       <code>error</code> frame carrying
-      <code>error.code: "response_frame_encode_failure"</code>. See
-      <a href="architecture.html#error-envelope">architecture.html#error-envelope</a>.</li>
+      <code>error.code: "response_frame_encode_failure"</code>.</li>
 </ul>
 
 <p>Every stream that <em>did</em> reach a <code>finish_reason</code> emits exactly one
@@ -619,6 +619,18 @@ legible in the transcript rather than invisible:</p>
 
 <p>A <code>tool_args_parse_failure</code> trace event is recorded alongside it.</p>
 
+<p><strong>The degradation is unconditional, and that is a property of the guard rather than
+of this code path.</strong> An <code>arguments</code> string is decoded with
+<code>json.loads</code>, which fails in three ways that are <em>not</em> related by
+inheritance — malformed syntax (<code>JSONDecodeError</code>), input bytes that are not valid
+UTF-8 (<code>UnicodeDecodeError</code>, a sibling rather than a subclass), and nesting past
+the stack ceiling (<code>RecursionError</code>, not a <code>ValueError</code> at all). Only
+the first is a <code>JSONDecodeError</code>, so a guard naming that alone let the other two
+escape and lose the placeholder entirely. Every parse now sits behind a <em>total</em> guard
+(<a href="architecture.html#json-ceilings">architecture.html#json-ceilings</a>), which is
+what makes "cannot be parsed" mean all three and keeps every failure mode inside the
+degradation rather than raising past it.</p>
+
 <p><strong><code>{}</code> is not malformed.</strong> An <code>arguments</code> string of
 <code>"{}"</code> is valid JSON and parses to a dict, so it produces a real
 <code>tool_use</code> block carrying <code>input: {}</code> and fires no failure event. Response
@@ -742,6 +754,6 @@ transform it belongs to, and neither runs in response mode:</p>
 <a href="compatibility.html">compatibility.html</a>, as is the
 <a href="compatibility.html#reasoning-field">reasoning-field selection</a>.</p>
 
-<footer>Last updated: 2026-10-22</footer>
+<footer>Last updated: 2026-10-26</footer>
 </body>
 </html>

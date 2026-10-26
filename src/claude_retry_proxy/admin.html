@@ -217,6 +217,42 @@
         }
 
         async function saveConfig() {
+            // The tier selects exist only after renderTiers() has run, and the
+            // failing initial-load path never reaches it. Reading one would
+            // throw above this function's try, surfacing as an unhandled
+            // rejection with no status line at all.
+            if (!document.getElementById(`${TIERS[0]}-provider`)) {
+                showStatus('error', 'Failed to load config — reload the page', true);
+                return;
+            }
+            // /providers-detail supplies the key NAMES. When that fetch fails the
+            // row still renders, so the page looks normal — but populateKeys
+            // builds no options and disables the select, and a disabled select
+            // still reads "". The server maps "" to names[0] (the provider's
+            // FIRST key), not to "unchanged", so pressing Apply would silently
+            // re-point every multi-key tier and persist it. Reload Providers
+            // does not re-fetch provider-detail, so only a full page reload
+            // clears this state.
+            for (const tier of TIERS) {
+                // The element may be missing even when guard 1 passed: both
+                // guards sit ABOVE saveConfig's try, so a null dereference here
+                // rejects unhandled with no status line — the failure guard 1
+                // removed, one row later. Checking the handle makes this guard
+                // self-sufficient instead of relying on the haiku row standing
+                // in for all nine selects; once this loop completes, the two
+                // later loops' dereferences are safe by construction.
+                const el = document.getElementById(`${tier}-provider`);
+                if (!el) {
+                    showStatus('error', 'Failed to load config — reload the page', true);
+                    return;
+                }
+                const provider = el.value;
+                if (provider && !(providerKeys[provider] || []).length) {
+                    showStatus('error', 'The key list could not be loaded — '
+                        + 'reload the page before applying', true);
+                    return;
+                }
+            }
             const newConfig = {
                 tiers: {}
             };

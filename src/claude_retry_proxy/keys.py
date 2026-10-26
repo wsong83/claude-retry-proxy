@@ -139,7 +139,10 @@ def load_keys_file(path, passphrase=None):
         raise ValueError("keys file is not valid UTF-8: {}".format(e))
     try:
         keys_data = json.loads(text)
-    except json.JSONDecodeError as e:
+    except Exception as e:
+        # Total by design: RecursionError is not a JSONDecodeError, so a
+        # gravely over-nested keys file escaped as a raw traceback instead of
+        # the clean message this guard exists to produce.
         raise ValueError("keys file is not valid JSON: {}".format(e))
     if not isinstance(keys_data, dict):
         raise ValueError("keys file must be a JSON object")

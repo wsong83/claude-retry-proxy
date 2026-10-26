@@ -268,7 +268,7 @@ def _load_compat_state(state=_state):
             data = json.load(f)
     except FileNotFoundError:
         return
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+    except Exception as e:
         print("[proxy] WARNING: compatibility state file unreadable "
               "({}) — failing open with empty state".format(
                   sanitize_error(str(e))), file=sys.stderr)

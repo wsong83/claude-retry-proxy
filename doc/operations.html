@@ -10,7 +10,7 @@
 
 <h1>Operations<span class="sub">Running, inspecting, and stopping the proxy</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-18</p>
+<p><strong>Last updated:</strong> 2026-10-26</p>
 
 <p>The <code>claude-retry-proxy</code> command manages a <em>background server process</em>. It
 does not run in the foreground. Understanding that split explains most of the command's
@@ -158,7 +158,10 @@ buttons, which do deliberately different things:</p>
 <tr><td><span class="badge badge-local">GET</span></td><td><code>/admin/</code></td>
     <td>The admin page itself</td></tr>
 <tr><td><span class="badge badge-local">GET</span></td><td><code>/admin/api/config</code></td>
-    <td>Current tiers (including each tier's key selection) and the model catalog</td></tr>
+    <td>Current tiers (including each tier's key selection) and the model catalog.
+        <code>500</code> when the configuration cannot be <em>serialized</em> — the document is
+        held in memory, and a config that was decoded successfully can still fail to re-encode;
+        see <a href="architecture.html#json-ceilings">architecture.html#json-ceilings</a></td></tr>
 <tr><td><span class="badge badge-local">GET</span></td><td><code>/admin/api/providers</code></td>
     <td>Available provider names</td></tr>
 <tr><td><span class="badge badge-local">GET</span></td><td><code>/admin/api/providers-detail</code></td>
@@ -168,12 +171,17 @@ buttons, which do deliberately different things:</p>
         the drain has been waiting, how long since the last upstream byte, and the configured
         silence budget (<code>budget_s</code>)</td></tr>
 <tr><td><span class="badge badge-anthropic">POST</span></td><td><code>/admin/api/switch</code></td>
-    <td>Update tier mappings</td></tr>
+    <td>Update tier mappings. <code>400</code> for each rejection below — a tier name
+        that is not a safe-charset string, a tier carrying an unsupported key, an
+        invalid (or non-string) provider/model/key name, and a model that is not in
+        the provider's catalog</td></tr>
 <tr><td><span class="badge badge-anthropic">POST</span></td><td><code>/admin/api/reload</code></td>
     <td>Reload the provider catalog from <code>models.json</code>. Never re-reads the tier mapping
         and writes nothing. <code>400</code> — naming the tier, provider, and model — when a tier
         currently in use is missing from the reloaded catalog; the previous catalog stays in
-        effect</td></tr>
+        effect. <code>500</code> when the reloaded configuration cannot be <em>serialized</em>
+        — the success body embeds the document itself — with the previous catalog still in
+        effect; see <a href="architecture.html#json-ceilings">architecture.html#json-ceilings</a></td></tr>
 <tr><td><span class="badge badge-anthropic">POST</span></td><td><code>/admin/shutdown</code></td>
     <td>Stop the proxy gracefully</td></tr>
 </table>
@@ -187,12 +195,105 @@ names must exist, and each tier's optional key selector must name a real key of 
 An absent selector is defaulted to the provider's first key and written back into the persisted
 configuration, so what is on disk always matches what is running.</p>
 
+<p><strong>Four inputs are refused rather than passed through</strong>, and they are refused for
+three <em>different</em> reasons — which is worth keeping straight, because only one of them
+ever made the endpoint abort. A tier name that is not a safe-charset string is refused with
+<code>400</code> — but note carefully that this <strong>validates the name and does not
+restrict which tiers exist</strong>: extra tiers beyond the required three are permitted
+and reachable (see <a href="configuration.html#config-schema">configuration.html</a>), so
+a well-formed fourth tier is applied normally. A tier object carrying <strong>any key other
+than <code>provider</code>, <code>model</code> and <code>key</code></strong> is refused with
+<code>400</code> naming the offending key(s); a <code>provider</code>/<code>model</code>
+that is not a string is refused with <code>400</code> rather than handed to the name
+validator; and a <code>model</code> that is not in that provider's catalog is refused with
+<code>400</code>, which is the same rule the reload path applies.</p>
+
+<p>The three pre-existing holes differed in kind, and it matters when reading older traces.
+An <strong>off-charset tier name</strong> never aborted anything: there was no name check at
+all, so the text travelled the whole validation loop and was <em>persisted</em> with a
+<code>200</code> — a write-path defect, not a crash. An <strong>unknown per-tier key</strong>
+was accepted and persisted too, and only a deeply nested value raised out of
+<code>write_config</code> and closed the socket — so it aborted <em>conditionally</em>. A
+<strong>non-string <code>provider</code>/<code>model</code></strong> is the one that
+unconditionally made the endpoint <strong>answer nothing at all</strong>, because the
+name validator raises <code>TypeError</code> on a dict, a list or an int rather than
+returning false — which is why the type test now comes first, and why every rejection is an
+ordinary <code>400</code> a client can parse. <strong>The catalog rule is the exception to
+all of it</strong>: it never aborted anything and never persisted anything invalid; it simply
+disagreed with the reload path, so Apply could install a configuration that Reload would
+then refuse.</p>
+
+<p><strong>Apply rewrites the tier map.</strong> The page's three rows are the three standard
+tiers, and pressing Apply sends exactly those, so any <em>extra</em> tier configured by hand
+in <code>config.json</code> is removed from both the on-disk and the in-memory map by that
+press. Extra tiers are still fully supported — the API keeps them
+(<a href="#admin">the endpoint table above</a>), and a hand-edited
+<code>config.json</code> plus a restart installs them — but the page is not an editor for
+them, and it will not preserve them across an Apply. If you maintain extra tiers, edit
+<code>config.json</code> and press Reload Providers, or script the API.</p>
+
+<p>The unknown-key case is worth spelling out, because it is where the write path met the
+serializer. Unknown keys were neither rejected nor stripped, so a tier dict could carry an
+extra key holding a deeply nested value straight to <code>write_config</code>, whose
+serializer is the shallowest JSON surface the proxy has — the <code>indent</code> argument
+moves the encoder off the C path, so its ceiling sits an order of magnitude below the
+decoder's (see <a href="architecture.html#json-ceilings">architecture.html#json-ceilings</a>).
+A body of a couple of kilobytes passed every check and then aborted the handler
+<em>after</em> the response had been decided, closing the socket with no HTTP reply.
+Refusing unknown keys closes that by construction, and the non-string check closes the
+sibling case, where the offending value never reached the serializer at all — it was the
+name validator that raised. Together they mean <strong>every surviving value is one of
+three keys, each a string, each bound by the same name validation the rest of the admin
+surface uses</strong>, so nothing on the write path can nest.</p>
+
 <p>A switch <strong>preserves everything it does not change</strong>: the models catalog,
 <code>disable_retry_claude_count_token</code>, and any <code>extra_request_headers</code> rules all
 survive a hot tier switch. Applying a switch cannot silently discard your header rules — but note
 the asymmetry: those three live in <code>models.json</code>, which the proxy never writes, so they
 survive <em>in memory</em> across a switch while the document written to disk holds only the tier
 mapping. See <a href="architecture.html#split-write">architecture.html#split-write</a>.</p>
+
+<h3 id="admin-incomplete-view">When the page's own fetches fail</h3>
+
+<p>The page loads in three requests: <code>/admin/api/config</code> and
+<code>/admin/api/providers</code>, then <code>/admin/api/providers-detail</code>, which supplies
+the key <em>names</em>. That third one is treated as <strong>optional by design</strong> — a
+failing fetch must not brick the page — so <code>loadProviderModes</code> swallows its error and
+leaves the key map empty. Two incomplete states reach the <strong>Apply Config</strong> button,
+and in both the press is <strong>refused</strong> with a sticky error line rather than acting on
+a view the page does not actually have:</p>
+
+<table>
+<tr><th>What failed</th><th>What the operator sees</th><th>What Apply does</th></tr>
+<tr>
+  <td><code>/admin/api/config</code></td>
+  <td>An empty tier area: <code>renderTiers</code> never ran, so the nine tier selects do not
+      exist</td>
+  <td>Refuses. Without the guard the press would dereference a missing element as the handler's
+      first statement and reject with an unhandled <code>TypeError</code>, painting nothing at
+      all — a silent no-op with no explanation</td>
+</tr>
+<tr>
+  <td><code>/admin/api/providers-detail</code></td>
+  <td>A row that <strong>looks completely normal</strong>. The key selects are present but empty
+      and disabled — and a disabled select still reads <code>value === ""</code></td>
+  <td>Refuses. The empty selector means "no choice", but the server reads <code>""</code> as
+      <em>absent</em>, which it defaults to the provider's <strong>first</strong> key and writes
+      back — so the press would silently re-point every multi-key tier to its first credential
+      and then report "Configuration saved successfully"</td>
+</tr>
+</table>
+
+<p>The refusal line is deliberately <strong>sticky</strong> — it does not auto-hide — because
+neither state clears on its own, and the operator needs to act before pressing again.</p>
+
+<p><strong>Reload Providers clears the first state and not the second.</strong> Its success path
+rebuilds the tier row from the server's current configuration (<code>config = result.config;
+renderTiers()</code>), so a page whose config fetch failed gets its nine selects back without a
+full page reload. But it never re-fetches <code>providers-detail</code>, so the key list stays
+empty — Apply is still refused, and <strong>that</strong> state does need a full page reload.
+This asymmetry is why both refusals say "reload the page": it is the one instruction that
+works for both, even though Reload rescues the first.</p>
 
 <h3 id="swap-drain">What a switch or reload waits for</h3>
 
@@ -378,6 +479,6 @@ server's memory and is rewritten every 30 seconds, so deleting the file is harml
 external edit is overwritten rather than merged. The mechanism is owned by
 <a href="architecture.html#heartbeat">architecture.html#heartbeat</a>.</p>
 
-<footer>Last updated: 2026-10-18</footer>
+<footer>Last updated: 2026-10-26</footer>
 </body>
 </html>

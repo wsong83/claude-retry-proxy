@@ -462,6 +462,45 @@ dropdown lists that provider's key names (never the key material); for a
 single-key provider it shows `default` and appears fixed, disabled, and
 greyed out.
 
+**If the page's own data failed to load, Apply refuses instead of guessing.** Two
+incomplete states are possible, and in both the press is refused with a sticky red
+line rather than acting on a view the page does not actually have. If the config
+fetch failed, the tier area stays empty and there are no selects to read. If the
+**key list** fetch failed the row looks entirely normal — but its key dropdowns are
+empty and disabled, and an empty dropdown means "no choice" to you while it means
+"use the provider's *first* key" to the server, so pressing Apply would silently
+re-point every multi-key tier to its first credential. **Reload Providers** does rescue
+the first state — it rebuilds the tier row from the server's config — but it never
+re-fetches the key list, so the second state still needs a full page reload. That is why
+both refusals simply say "reload the page": it is the one instruction that works for
+both.
+
+If you script against the API rather than using the page, the responses worth knowing
+are all rejections, and they exist so the endpoint *answers* instead of going quiet:
+`GET /admin/api/config` answers `500` when the configuration cannot be re-serialized
+(a config can decode and still fail to encode), and so does `POST /admin/api/reload`
+— before it drains, so a press that can never succeed disturbs nothing.
+`POST /admin/api/switch` answers `400` for a tier name that is not a safe-charset
+string, for a tier carrying any key
+other than `provider`, `model` and `key`, for a `provider`/`model` that is not a
+string, and for a `model` that is not in the provider's catalog. Those four did not
+fail the same way, and the difference matters if you are reading an old trace: a
+non-string `provider`/`model` is the one that produced **no HTTP response at all** — the
+name validator raised rather than returning false, so the handler aborted and the socket
+closed. An off-charset tier name was never an abort, it was a *persistence* defect: the
+text was accepted and written to `config.json`. An unknown per-tier key was accepted too
+unless the value was deeply nested enough to fail the write. The catalog rule is the
+other kind of fix again: it never aborted anything, it just disagreed with Reload, which
+already refused an off-catalog model.
+
+One thing the name check deliberately does **not** do is restrict which tiers may
+exist. Extra tiers beyond the required three are supported and reachable through
+reverse lookup, so a well-formed fourth tier applies normally; only a malformed *name*
+is refused. But the **page** is not an editor for them: its three rows are the three
+standard tiers, and pressing Apply sends exactly those, so an extra tier configured by
+hand in `config.json` is removed by that press. Keep extras in `config.json` and press
+Reload Providers, or script the API, which honours whatever tier map it is given.
+
 **What Apply and Reload wait for.** A change pauses new requests briefly and then
 lets the requests already in flight finish — a long generation is waited out, not
 killed, so the page can spin for minutes on a heavy turn. What it will *not* wait
@@ -683,6 +722,17 @@ The suite covers tier routing, model rewriting, admin API, config validation,
 key decryption, retry logic, streaming delivery, disconnect handling, and trace
 logging. Tests use mock upstream servers and temporary config/keys files — no
 live `~/.claude/settings.json` mutation required.
+
+It also carries **static invariants over the package's own source**, which no
+behavioural test can express. The load-bearing one: every JSON parse in `src/`
+must sit behind a guard that catches `Exception`. The three ways a parse fails —
+malformed syntax, input bytes that are not valid UTF-8, and nesting past the
+stack ceiling — are *not* related by inheritance (the second is a sibling of
+`JSONDecodeError` rather than a subclass; the third is not a `ValueError` at
+all), so a guard naming exception types one at a time lets two of the three
+escape. The invariant is checked by walking the AST and asking whether each call
+site is *enclosed* by a total handler, which is a structural question a text
+search cannot answer.
 
 The suite is safe to run while a proxy is live: it redirects its state,
 compatibility, and trace paths into a session temp directory at import time, so a
