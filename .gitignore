@@ -16,3 +16,4 @@ tests/temp/
 *.swo
 *~
 .DS_Store
+.codegraph/

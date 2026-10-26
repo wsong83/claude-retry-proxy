@@ -25,6 +25,7 @@ from test_sanitize import ALL_TESTS as SANITIZE_TESTS
 from test_settings import ALL_TESTS as SETTINGS_TESTS
 from test_nesting import ALL_TESTS as NESTING_TESTS
 from test_docs import ALL_TESTS as DOCS_TESTS
+from test_parse_guards import ALL_TESTS as PARSE_GUARDS_TESTS
 
 ALL_TESTS = (
     UNIT_TESTS +
@@ -44,7 +45,8 @@ ALL_TESTS = (
     SANITIZE_TESTS +
     SETTINGS_TESTS +
     NESTING_TESTS +
-    DOCS_TESTS
+    DOCS_TESTS +
+    PARSE_GUARDS_TESTS
 )
 
 if __name__ == "__main__":

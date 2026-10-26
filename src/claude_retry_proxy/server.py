@@ -3447,9 +3447,26 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(b'{"error":"forbidden"}')
                 return
 
-            with _config_lock:
-                config_copy = json.loads(json.dumps(_current_config))
-            self._send_response(200, json.dumps(config_copy).encode("utf-8"))
+            # Serialize INSIDE the lock and send those bytes. The previous
+            # json.loads(json.dumps(...)) round-trip existed to copy the config
+            # so the outer dumps could run outside the lock — but it left the
+            # ENCODE unguarded one line later, and a config that DECODES fine can
+            # still fail to ENCODE (the encoder's ceiling sits below the
+            # decoder's). Such a config aborted do_GET with no HTTP response.
+            # json.dumps(json.loads(json.dumps(x))) is byte-identical to
+            # json.dumps(x), so the round-trip bought nothing.
+            try:
+                with _config_lock:
+                    payload = json.dumps(_current_config).encode("utf-8")
+            except Exception:
+                # Reachable: a hand-edited config.json can hold a document that
+                # parses (decode ceiling ~16915) yet exceeds the encoder's
+                # (~15505). Step 3 keeps client-supplied values out of this path.
+                self._send_response(500, json.dumps({
+                    "error": "the configuration could not be serialized"
+                }).encode("utf-8"))
+                return
+            self._send_response(200, payload)
             return
 
         # Admin API: live config-swap status. Exactly five scalars, nothing
@@ -3607,7 +3624,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 return
             try:
                 data = json.loads(body)
-            except json.JSONDecodeError:
+            except Exception:
+                # Total by design. json.loads can fail on this bytes body as
+                # JSONDecodeError (syntax), UnicodeDecodeError (bytes that are
+                # not valid utf-8) or RecursionError (nesting deeper than the
+                # interpreter will recurse). RecursionError is a RuntimeError
+                # and UnicodeDecodeError is a SIBLING of JSONDecodeError rather
+                # than a subclass, so naming only JSONDecodeError let both
+                # escape and abort do_POST with no HTTP response at all.
                 self._send_response(400, b'{"error":"invalid JSON"}')
                 return
 
@@ -3631,6 +3655,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 }).encode("utf-8"))
                 return
 
+            # Tier names are validated, NOT restricted: extra tiers beyond the
+            # required three are a documented, supported shape (they are
+            # reachable through resolve_tier's reverse lookup, and
+            # validate_config iterates every tier for exactly that reason).
+            # What must not survive is arbitrary client text landing in
+            # config.json, so the name is bound by the same charset rule used
+            # for provider/model/key below.
+            for tier_name in new_tiers:
+                if not isinstance(tier_name, str) or not _validate_admin_name(tier_name):
+                    self._send_response(400, json.dumps({
+                        "error": "invalid tier name: {}".format(tier_name)
+                    }).encode("utf-8"))
+                    return
+
             # Validate provider names and model names
             for tier_name, tier_config in new_tiers.items():
                 if not isinstance(tier_config, dict):
@@ -3638,14 +3676,21 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         "error": "tier '{}' must be an object".format(tier_name)
                     }).encode("utf-8"))
                     return
+                extra = set(tier_config.keys()) - {"provider", "model", "key"}
+                if extra:
+                    self._send_response(400, json.dumps({
+                        "error": "tier '{}' has unsupported key(s): {}".format(
+                            tier_name, ", ".join(sorted(extra)))
+                    }).encode("utf-8"))
+                    return
                 provider = tier_config.get("provider", "")
                 model = tier_config.get("model", "")
-                if not _validate_admin_name(provider):
+                if not isinstance(provider, str) or not _validate_admin_name(provider):
                     self._send_response(400, json.dumps({
                         "error": "invalid provider name: {}".format(provider)
                     }).encode("utf-8"))
                     return
-                if not _validate_admin_name(model):
+                if not isinstance(model, str) or not _validate_admin_name(model):
                     self._send_response(400, json.dumps({
                         "error": "invalid model name: {}".format(model)
                     }).encode("utf-8"))
@@ -3660,11 +3705,30 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
             # Validate providers exist
             provider_names = set(_vendors.keys())
+            # Snapshot the epoch and the catalog together, under the lock: the
+            # check below validates against this snapshot, and Phase 3 re-checks
+            # it when the epoch has moved by then (see there). Reading the two
+            # separately would let a reload land between them.
+            with _config_lock:
+                validated_epoch = _config_epoch
+                validated_models = _current_config.get("models") or {}
             for tier_name, tier_config in new_tiers.items():
                 provider = tier_config.get("provider", "")
                 if provider not in provider_names:
                     self._send_response(400, json.dumps({
                         "error": "unknown provider: {}".format(provider)
+                    }).encode("utf-8"))
+                    return
+                # The reload gate already refuses a tier whose model is not in
+                # the catalog; without this the switch accepts a configuration
+                # that reload then rejects, so Apply and Reload would disagree
+                # about the same rule. `model` is a validated string here.
+                model = tier_config.get("model", "")
+                catalog = validated_models.get(provider)
+                if not isinstance(catalog, list) or model not in catalog:
+                    self._send_response(400, json.dumps({
+                        "error": "tier '{}': unknown model '{}' for provider '{}'"
+                                 .format(tier_name, model, provider)
                     }).encode("utf-8"))
                     return
                 names = vendor_key_names(_vendors[provider])
@@ -3704,6 +3768,30 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             # Phase 3: Perform the swap
             try:
                 with _config_lock:
+                    # The snapshot validated above was taken before this press
+                    # owned the swap, so a reload that finished in between can
+                    # have replaced the catalog it was checked against -- and
+                    # Phase 3 carries the LIVE catalog forward. Re-check against
+                    # that one when the epoch moved; otherwise the switch
+                    # persists a tier that Reload then refuses, which is the
+                    # Apply/Reload disagreement the check above exists to
+                    # remove. Answering the same 400 keeps the operator's
+                    # diagnostic identical to a fresh press.
+                    if (response_status is None
+                            and _config_epoch != validated_epoch):
+                        live_models = _current_config.get("models") or {}
+                        for _name, _cfg in new_tiers.items():
+                            _catalog = live_models.get(_cfg.get("provider", ""))
+                            if (not isinstance(_catalog, list)
+                                    or _cfg.get("model", "") not in _catalog):
+                                response_status = 400
+                                response_body = json.dumps({
+                                    "error": "tier '{}': unknown model '{}' for "
+                                             "provider '{}'".format(
+                                                 _name, _cfg.get("model", ""),
+                                                 _cfg.get("provider", ""))
+                                }).encode("utf-8")
+                                break
                     # The provider catalog lives in models.json and this
                     # process never writes it: the disk document carries the
                     # tier mapping and nothing else.
@@ -3844,6 +3932,21 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 }).encode("utf-8"))
                 return
 
+            # Whether the success body can be serialized is decidable BEFORE the
+            # press: its only raising component is `candidate`, and the three
+            # drain scalars are JSON-safe. Probe it here so a press that can
+            # never succeed does not drain — the same ordering rule the gate
+            # above follows, for the same reason (a refused reload abandons no
+            # retry chains). The post-drain build stays as it is; this is the
+            # early refusal, not a replacement for the total guard there.
+            try:
+                json.dumps(candidate)
+            except Exception:
+                self._send_response(500, json.dumps({
+                    "error": "the configuration could not be serialized"
+                }).encode("utf-8"))
+                return
+
             # Drain-and-swap: pause admissions and wait for in-flight work
             # (see /admin/api/switch).
             drain = _drain_for_swap()
@@ -3876,16 +3979,35 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             "being prepared; retry",
                             str(uuid.uuid4()))
                     else:
-                        _current_config = candidate
-                        _config_epoch += 1
-                        response_status = 200
-                        response_body = json.dumps({
-                            "status": "ok",
-                            "config": candidate,
-                            "drained": drained,
-                            "waited_s": round(waited_s, 3),
-                            "inflight_at_swap": inflight_at_press,
-                        }).encode("utf-8")
+                        # Serialize BEFORE installing. The success body embeds
+                        # `candidate` -- the document loaded from disk -- and a
+                        # config can decode yet fail to re-encode (the encoder's
+                        # stack ceiling sits below the decoder's, and `indent=`
+                        # collapses it again). Built after the install, such a
+                        # failure would leave the swap applied and the epoch
+                        # bumped while the client received NO HTTP response at
+                        # all (this try has no `except`, and `do_POST` has no
+                        # outer one). Built first, nothing has been installed
+                        # yet, so the 500 is truthful: the previous mapping is
+                        # still in force.
+                        try:
+                            success_body = json.dumps({
+                                "status": "ok",
+                                "config": candidate,
+                                "drained": drained,
+                                "waited_s": round(waited_s, 3),
+                                "inflight_at_swap": inflight_at_press,
+                            }).encode("utf-8")
+                        except Exception:
+                            response_status = 500
+                            response_body = json.dumps({
+                                "error": "the configuration could not be serialized"
+                            }).encode("utf-8")
+                        else:
+                            _current_config = candidate
+                            _config_epoch += 1
+                            response_status = 200
+                            response_body = success_body
             finally:
                 # Phase 4: Clear swap flag and signal completion (the
                 # timestamp clears in the same acquisition — see there).

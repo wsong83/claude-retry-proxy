@@ -390,8 +390,9 @@ parsed:</p>
 
 <p>The bound covers client- and upstream-derived JSON only. Operator-authored documents —
 <code>config.json</code>, <code>models.json</code>, <code>keys-index.json</code>, the compatibility
-state file — are not scanned: a nesting violation there is an authoring error, and their existing
-parse guards are unchanged.</p>
+state file — are not scanned: a nesting violation there is an authoring error. Their parse sites
+are still enclosed by the total guards described under
+<a href="#json-ceilings">JSON parse and encode ceilings</a>.</p>
 
 <p>The 400 says <em>which</em> JSON, not merely that a limit was crossed. The scanner records the
 crossing offset and appends the matching close sequence to the text up to that point, which is
@@ -487,6 +488,88 @@ while lo &lt; hi:                        # bisect the deepest surviving schema
     else: hi = mid - 1
 print("walker ceiling: %d levels at module level (in situ it is lower)" % lo)
 EOF</pre>
+<h2 id="json-ceilings">JSON parse and encode ceilings, and the guard discipline</h2>
+
+<p>The proxy parses client bodies, config documents, keys files and upstream frames with
+<code>json</code>, and re-encodes some of what it forwards. The decoder and the encoder are
+not symmetric — a structure can decode successfully and then <em>fail to re-encode</em> — and
+the guard discipline below exists because of it.</p>
+
+<p>Three ceilings are involved and they are far apart:</p>
+
+<table>
+<tr><th>Call</th><th>Where it recurses</th><th>Relative depth</th></tr>
+<tr><td><code>json.loads</code></td><td>once per nesting level, in C</td>
+    <td>the deepest of the three</td></tr>
+<tr><td><code>json.dumps(obj)</code></td><td>once per nesting level, in C</td>
+    <td>marginally shallower than <code>loads</code></td></tr>
+<tr><td><code>json.dump(obj, f, indent=…)</code></td>
+    <td>once per nesting level <strong>in Python</strong> — the <code>indent</code> argument
+        moves the encoder off the C path onto <code>_make_iterencode</code></td>
+    <td>roughly an <strong>order of magnitude</strong> shallower. The proxy's own config
+        writer uses this form, so it is the shallowest JSON surface the proxy has</td></tr>
+</table>
+
+<p>These are properties of the running interpreter and of the stack already consumed when the
+call happens — not properties of this code, and not stable numbers. Treat any figure as a
+snapshot and re-measure on the interpreter you care about:</p>
+
+<pre>python -c "
+import json, os
+def nested(n):
+    root = cur = []
+    for _ in range(n):
+        nxt = []; cur.append(nxt); cur = nxt
+    return root
+def ceil(fn, lo=1, hi=40000):
+    while lo &lt; hi:
+        mid = (lo + hi + 1) // 2
+        try: fn(mid)
+        except RecursionError: hi = mid - 1
+        else: lo = mid
+    return lo
+print('loads         ', ceil(lambda n: json.loads('[' * n + ']' * n)))
+print('dumps         ', ceil(lambda n: json.dumps(nested(n))))
+print('dump indent=2 ', ceil(lambda n: json.dump(nested(n), open(os.devnull, 'w'), indent=2)))
+"</pre>
+
+<p><strong>The failure classes are not related by inheritance</strong>, which is what makes
+naming them one at a time a losing game:</p>
+
+<table>
+<tr><th>Failure</th><th>Exception</th><th>Relationship</th></tr>
+<tr><td>Malformed syntax</td><td><code>json.JSONDecodeError</code></td>
+    <td>a <code>ValueError</code> subclass</td></tr>
+<tr><td>Input bytes are not valid UTF-8</td><td><code>UnicodeDecodeError</code></td>
+    <td>a <strong>sibling</strong> under <code>ValueError</code> — <em>not</em> a subclass of
+        <code>JSONDecodeError</code></td></tr>
+<tr><td>Nesting past the stack ceiling</td><td><code>RecursionError</code></td>
+    <td>a <code>RuntimeError</code> — not a <code>ValueError</code> at all</td></tr>
+</table>
+
+<p>A guard naming only <code>json.JSONDecodeError</code> therefore lets <strong>two of the
+three escape</strong>. The rule is <strong>totality</strong>: every parse site sits in a
+<code>try</code> whose handlers catch <code>Exception</code>. The rule covers
+<code>json.load(fp)</code> as well as <code>json.loads</code> — <code>load</code> is literally
+<code>loads(fp.read())</code> and carries the identical failure class, so a
+<code>loads</code>-only audit cannot see half the surface. It is enforced by a permanent test
+that walks the package's own AST (<code>tests/test_parse_guards.py</code>), not by review —
+this class of defect was found, fixed in part, and found again, because each round enumerated
+exception names instead of removing the need to.</p>
+
+<p>Guards are verified by <code>try</code>-<strong>enclosure</strong>, never by grepping for
+<code>except</code>: the question is whether the <em>call site</em> is enclosed by a total
+handler, which is a structural property a text search cannot answer.</p>
+
+<p><strong>Totality is a shape check, not a semantics check.</strong> The test proves each
+parse sits inside a total guard; it does not prove the <code>try</code> body is narrow, so a
+body widened to swallow unrelated failures would still pass it. Keeping each body to the parse
+and nothing else unrelated remains a review obligation, and widening a guard genuinely changes
+behaviour at every site — what the caller does with a newly-caught failure (message text,
+return value, retry decision, status code) is the thing to check when widening one.
+<a href="provider-modes.html#malformed-args">provider-modes.html#malformed-args</a> records one
+consequence: totality is what makes that page's malformed-arguments degradation
+unconditional.</p>
 
 <h2 id="give-up">Give-up behaviour</h2>
 

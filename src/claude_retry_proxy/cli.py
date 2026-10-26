@@ -155,7 +155,12 @@ def _parse_trace_entry(line):
     """
     try:
         obj = json.loads(line)
-    except (json.JSONDecodeError, ValueError):
+    except Exception:
+        # Total by design: RecursionError is a RuntimeError, not a ValueError,
+        # so the previous (JSONDecodeError, ValueError) tuple let a deeply
+        # nested line escape and abort the whole prune pass. This guard's
+        # contract is "unparseable line -> None -> preserved as-is", which
+        # covers that case exactly.
         return None
     if not isinstance(obj, dict):
         return None
@@ -271,13 +276,28 @@ def prune_trace_file(path):
 # Commands
 # ---------------------------------------------------------------------------
 
+_UNREADABLE = object()
+
+
 def _read_state():
-    """Read proxy-state.json. Returns dict or None."""
+    """Read proxy-state.json.
+
+    Returns the parsed dict; `None` when the file genuinely does not exist; or
+    `_UNREADABLE` when it exists but could not be read. The three outcomes are
+    deliberately distinct: collapsing "unreadable" into "absent" makes `cmd_stop`
+    report "not running" — exiting 0 — over a state file whose proxy is still
+    alive, which contradicts the documented stop contract. Totality is kept: a
+    `(ValueError, JSONDecodeError)` tuple would miss `RecursionError` (a
+    `RuntimeError`) and `UnicodeDecodeError` is a sibling of `JSONDecodeError`,
+    not a subclass.
+    """
     try:
         with open(PROXY_STATE_FILE) as f:
             return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
         return None
+    except Exception:
+        return _UNREADABLE
 
 
 def _write_state(state):
@@ -432,6 +452,10 @@ def cmd_start(args):
 
     # 6. Check if proxy already running
     state = _read_state()
+    if state is _UNREADABLE:
+        print("ERROR: the state file {} exists but could not be read; the proxy "
+              "may still be running".format(PROXY_STATE_FILE))
+        return 1
     if state:
         pid = state.get("pid")
         if pid and is_pid_alive(pid):
@@ -638,6 +662,10 @@ def cmd_stop(args):
     _trace("cmd_stop: entering")
 
     state = _read_state()
+    if state is _UNREADABLE:
+        print("ERROR: the state file {} exists but could not be read; the proxy "
+              "may still be running".format(PROXY_STATE_FILE))
+        return 1
     if not state:
         print("Proxy: not running (no state file)")
         return 0
@@ -735,6 +763,10 @@ def cmd_status(args):
     _trace("cmd_status: entering")
 
     state = _read_state()
+    if state is _UNREADABLE:
+        print("ERROR: the state file {} exists but could not be read; the proxy "
+              "may still be running".format(PROXY_STATE_FILE))
+        return 1
     if not state:
         _trace("cmd_status: no state file -> returning 1")
         print("Proxy: not running (no state file)")
@@ -777,6 +809,10 @@ def cmd_reload(args):
     _trace("cmd_reload: entering")
 
     state = _read_state()
+    if state is _UNREADABLE:
+        print("ERROR: the state file {} exists but could not be read; the proxy "
+              "may still be running".format(PROXY_STATE_FILE))
+        return 1
     if not state:
         print("ERROR: Proxy not running")
         return 1

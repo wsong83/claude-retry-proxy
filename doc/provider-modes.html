@@ -460,9 +460,12 @@ field carries the discriminator:</p>
       representation for. This is no longer about depth: a payload nested past the proxy's own
       limit is never parsed at all (see
       <a href="architecture.html#nesting-limit">architecture.html#nesting-limit</a>), so the
-      interpreter's decode/encode band is unreachable by construction. Instead of aborting the
-      stream with no terminal event — which the client reads as a truncated <em>success</em> — the
-      frame is replaced by an SSE <code>error</code> frame carrying
+      interpreter's decode/encode band is unreachable by construction; the ceilings and the guard
+      discipline around them are owned by
+      <a href="architecture.html#json-ceilings">architecture.html#json-ceilings</a> and are not
+      restated here. Instead of aborting the stream with no terminal event — which the client
+      reads as a truncated <em>success</em> — the frame is replaced by an SSE
+      <code>error</code> frame carrying
       <code>error.code: "response_frame_encode_failure"</code>. See
       <a href="architecture.html#error-envelope">architecture.html#error-envelope</a>.</li>
 </ul>
@@ -626,6 +629,18 @@ string nested past the proxy's JSON nesting limit takes this same path — the p
 the event — and additionally logs <code>nesting_limit_exceeded</code> with
 <code>site: "tool_args"</code>; see
 <a href="architecture.html#nesting-limit">architecture.html#nesting-limit</a>.</p>
+
+<p><strong>The degradation is unconditional, and that is a property of the guard rather than
+of this code path.</strong> An <code>arguments</code> string is decoded with
+<code>json.loads</code>, which fails in three ways that are <em>not</em> related by
+inheritance — malformed syntax (<code>JSONDecodeError</code>), input bytes that are not valid
+UTF-8 (<code>UnicodeDecodeError</code>, a sibling rather than a subclass), and nesting past
+the stack ceiling (<code>RecursionError</code>, not a <code>ValueError</code> at all). Only
+the first is a <code>JSONDecodeError</code>, so a guard naming that alone let the other two
+escape and lose the placeholder entirely. Every parse now sits behind a <em>total</em> guard
+(<a href="architecture.html#json-ceilings">architecture.html#json-ceilings</a>), which is
+what makes "cannot be parsed" mean all three and keeps every failure mode inside the
+degradation rather than raising past it.</p>
 
 <p><strong><code>{}</code> is not malformed.</strong> An <code>arguments</code> string of
 <code>"{}"</code> is valid JSON and parses to a dict, so it produces a real
