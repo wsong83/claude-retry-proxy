@@ -55,7 +55,7 @@ Rows ordered newest-first (latest issues at top). New issues are prepended; reso
 | [mega-audit-3-medium-doc-coverage-gaps](./tmp/reports/2026-10-25-guard-totality-and-blank-admin-mega-audit-2026-10-26-2.json) | Resolved | 2026-10-26 | 2026-10-27 | planner |
 | [mega-audit-3-medium-reviewer-suggestions-dropped-from-log](./tmp/reports/2026-10-25-guard-totality-and-blank-admin-mega-audit-2026-10-26-2.json) | Resolved | 2026-10-26 |  2026-10-27  | tester |
 | [reviewer-suggestion-read-state-oserror-misreported-as-absent](./tmp/reports/2026-10-25-guard-totality-and-blank-admin-review-2026-10-26.json) | Resolved | 2026-10-26 | 2026-10-27 | tester |
-| [defer-issue-admin-page-loadconfig-ignores-response-ok](./tmp/reports/defer-issue-admin-page-loadconfig-ignores-response-ok.json) | Deferred | 2026-10-26 | — | — |
+| [defer-issue-admin-page-loadconfig-ignores-response-ok](./tmp/reports/defer-issue-admin-page-loadconfig-ignores-response-ok.json) | Resolved | 2026-10-26 | 2026-11-01 | plan 2026-11-01-admin-config-500-surface — Step 1 added the loadConfig status guard; test_admin_html_load_config_status_guard pins it on the served page |
 | [defer-issue-parse-guard-gate-top-level-scope](./tmp/reports/defer-issue-parse-guard-gate-top-level-scope.json) | Deferred | 2026-10-26 | — | — |
 | [mega-audit-3-medium-test-subsumed](./tmp/reports/2026-10-25-guard-totality-and-blank-admin-mega-audit-2026-10-26-2.json) | Resolved | 2026-10-26 |  2026-10-27  | tester |
 | [step8-gate-check-f-contradicts-supplied-edit](./tmp/reports/2026-10-25-guard-totality-and-blank-admin-step8-gate-check-f-contradicts-supplied-edit.json) | Resolved | 2026-10-26 | 2026-10-26 | tester |
@@ -73,6 +73,7 @@ Rows ordered newest-first (latest issues at top). New issues are prepended; reso
 | [admin-page-gate-sticky-counter-unreachable](./tmp/reports/2026-10-25-guard-totality-and-blank-admin-admin-page-gate-sticky-counter-unreachable.json) | Resolved | 2026-10-26 | 2026-10-26 | tester |
 | [defer-issue-admin-unrendered-page-apply-throws](./tmp/reports/defer-issue-admin-unrendered-page-apply-throws.json) | Resolved | 2026-10-17 | 2026-10-26 | tester |
 | [defer-issue-recursion-guard-residual-sites](./tmp/reports/defer-issue-recursion-guard-residual-sites.json) | Resolved | 2026-10-16 | 2026-10-26 | tester |
+| 2026-11-01-admin-config-500-surface cross-reference — defer-issue-config-serialize-500-no-committed-coverage | Resolved | 2026-11-01 | 2026-11-01 | plan 2026-11-01-admin-config-500-surface — Step 2 committed test_admin_config_serialize_failure_500 (in-process GET, unserializable-value fixture) |
 
 **Resolution (2026-10-26, tester round).** All three resolve on the same
 evidence: tester session report

@@ -31,6 +31,10 @@
         .status.success { background: #1b5e20; display: block; }
         .status.error { background: #b71c1c; display: block; }
         .status.pending { background: #0f3460; display: block; }
+        .status-line { padding: 0.15rem 0; }
+        .status-line.success { background: #1b5e20; }
+        .status-line.error { background: #b71c1c; }
+        .status-line.pending { background: #0f3460; }
     </style>
 </head>
 <body>
@@ -71,7 +75,9 @@
         let attachGeneration = 0;
         let attachPollHandle = null;
         let attachPollFailures = 0;
-        let statusTimer = null;
+        // Status stack entries, newest first. Each carries its own expiry
+        // timer; a sticky entry has none.
+        let statusEntries = [];
 
         // Numeric-only rendering of the swap detail the server returns.
         // Never interpolate a raw response string here.
@@ -119,14 +125,32 @@
                     fetch('/admin/api/config'),
                     fetch('/admin/api/providers')
                 ]);
-                config = await configResp.json();
+                // Tolerant parse: a non-JSON body must not throw into the
+                // generic catch and masquerade as a network error.
+                let configResult = null;
+                try { configResult = await configResp.json(); } catch (err) { configResult = null; }
+                // The two fetches resolve together, so parse the provider list
+                // before the config guard branch: a failed config load must not
+                // discard the provider list the page already paid for.
                 const providersData = await providersResp.json();
                 providers = providersData.providers || [];
                 // Optional endpoint — a failing fetch must not brick the page.
                 await loadProviderModes();
+                if (!configResp.ok) {
+                    // A non-OK body is still valid JSON, so without this guard
+                    // the tiers-less document explodes later in renderTiers()
+                    // as a TypeError and the server's diagnostic never reaches
+                    // the operator. Same contract as save/reload: surface
+                    // errorText(result). Sticky — the page cannot be configured
+                    // until a success clears it or the page reloads.
+                    showStatus('error', 'Failed to load config: ' + errorText(configResult), true);
+                    checkInFlightSwapOnLoad();
+                    return;
+                }
+                config = configResult;
                 renderTiers();
             } catch (e) {
-                showStatus('error', 'Failed to load config: ' + e.message);
+                showStatus('error', 'Failed to load config: ' + e.message, true);
             }
             checkInFlightSwapOnLoad();
         }
@@ -285,7 +309,7 @@
             }
             swapSettled = false;
             setSwapControlsDisabled(true);
-            showStatus('pending', swapWaitText(null, 'applying — '), true);
+            showStatus('pending', swapWaitText(null, 'applying — '), true, 'swap-wait');
             swapPollHandle = setInterval(async () => {
                 if (swapSettled) {
                     // The press already wrote its terminal line: bail out.
@@ -305,7 +329,7 @@
                         return;
                     }
                     if (st.swapping && st.inflight > 0 && st.silence_s !== null) {
-                        showStatus('pending', swapWaitText(st, 'applying — '), true);
+                        showStatus('pending', swapWaitText(st, 'applying — '), true, 'swap-wait');
                     }
                 } catch (e) {
                     // Poll failures are cosmetic — never break the flow.
@@ -347,6 +371,12 @@
                 // would leak the interval forever.
                 clearInterval(swapPollHandle);
                 swapPollHandle = null;
+                // Every keyed swap-wait entry needs an exit: without this, a
+                // failed Apply leaves the sticky applying line with no repaint,
+                // no success and no timer. On success the stack is already
+                // empty, so this is a no-op; by key it cannot touch the attach
+                // watcher's lines.
+                removeStatusKey('swap-wait');
                 // The 409 branch hands off to the attach watcher, which owns the locked
                 // state until that swap ends; every other terminal path unlocks here.
                 if (attachPollHandle === null) {
@@ -362,7 +392,7 @@
             }
             swapSettled = false;
             setSwapControlsDisabled(true);
-            showStatus('pending', swapWaitText(null, 'applying — '), true);
+            showStatus('pending', swapWaitText(null, 'applying — '), true, 'swap-wait');
             swapPollHandle = setInterval(async () => {
                 if (swapSettled) {
                     // The press already wrote its terminal line: bail out.
@@ -382,7 +412,7 @@
                         return;
                     }
                     if (st.swapping && st.inflight > 0 && st.silence_s !== null) {
-                        showStatus('pending', swapWaitText(st, 'applying — '), true);
+                        showStatus('pending', swapWaitText(st, 'applying — '), true, 'swap-wait');
                     }
                 } catch (e) {
                     // Poll failures are cosmetic — never break the flow.
@@ -437,6 +467,9 @@
             } finally {
                 clearInterval(swapPollHandle);
                 swapPollHandle = null;
+                // Same exit as saveConfig's finally: a failed reload must not
+                // leave the sticky applying line behind.
+                removeStatusKey('swap-wait');
                 // The 409 branch hands off to the attach watcher, which owns the locked
                 // state until that swap ends; every other terminal path unlocks here.
                 if (attachPollHandle === null && !reloadStaleUnresolved) {
@@ -445,14 +478,69 @@
             }
         }
 
-        function showStatus(type, message, sticky) {
-            const el = document.getElementById('status');
-            if (statusTimer !== null) { clearTimeout(statusTimer); statusTimer = null; }
-            el.className = 'status ' + type;
-            el.textContent = message;
-            if (!sticky) {
-                statusTimer = setTimeout(() => { el.className = 'status'; statusTimer = null; }, 5000);
+        // Status stack: failures stack newest-on-top instead of replacing; any
+        // success clears the stack and shows itself; a keyed entry (the ticking
+        // wait lines) is removed and re-inserted at the top on every update.
+        // Re-painting a message identical to a stacked unkeyed entry updates it
+        // in place rather than duplicating.
+        function showStatus(type, message, sticky, key) {
+            if (key === undefined) { key = null; }
+            if (type === 'success') {
+                statusEntries.forEach(function (e) {
+                    if (e.timer !== null) { clearTimeout(e.timer); }
+                });
+                statusEntries = [];
+            } else {
+                const reuseAt = statusEntries.findIndex(function (e) {
+                    return (key !== null && e.key === key) ||
+                           (key === null && e.key === null && e.text === message);
+                });
+                if (reuseAt !== -1) {
+                    if (statusEntries[reuseAt].timer !== null) {
+                        clearTimeout(statusEntries[reuseAt].timer);
+                    }
+                    statusEntries.splice(reuseAt, 1);
+                }
             }
+            const entry = { type: type, text: message, key: key, sticky: sticky, timer: null };
+            statusEntries.unshift(entry);
+            if (!sticky) {
+                entry.timer = setTimeout(function () { removeStatusEntry(entry); }, 5000);
+            }
+            renderStatus();
+        }
+
+        function removeStatusEntry(entry) {
+            const at = statusEntries.indexOf(entry);
+            if (at !== -1) {
+                statusEntries.splice(at, 1);
+                renderStatus();
+            }
+        }
+
+        // Keyed removal: the exit for a keyed entry whose owner reached a
+        // terminal state without a repaint or success (a failed Apply must not
+        // leave the frozen 'applying — …' line as the page's only status —
+        // mega-audit 2026-11-01, defect-tracer High).
+        function removeStatusKey(key) {
+            const at = statusEntries.findIndex(function (e) { return e.key === key; });
+            if (at !== -1) {
+                if (statusEntries[at].timer !== null) { clearTimeout(statusEntries[at].timer); }
+                statusEntries.splice(at, 1);
+                renderStatus();
+            }
+        }
+
+        function renderStatus() {
+            const el = document.getElementById('status');
+            el.className = 'status' + (statusEntries.length ? ' ' + statusEntries[0].type : '');
+            el.innerHTML = '';
+            statusEntries.forEach(function (e) {
+                const line = document.createElement('div');
+                line.className = 'status-line ' + e.type;
+                line.textContent = e.text;
+                el.appendChild(line);
+            });
         }
 
         // Live pending line from a swap-status payload. prefix differs by context:
@@ -530,7 +618,7 @@
             let settled = false;
             attachPollFailures = 0;
             setSwapControlsDisabled(true);
-            showStatus('pending', swapWaitText(null, prefix), true);
+            showStatus('pending', swapWaitText(null, prefix), true, 'attach-wait');
             attachPollHandle = setInterval(async () => {
                 if (myGeneration !== attachGeneration) {
                     // A later attach owns the page now: only ever bail out.
@@ -572,6 +660,7 @@
                             setSwapControlsDisabled(false);
                             showStatus('success', doneText);
                         } else {
+                            removeStatusKey('attach-wait');
                             // The tier row could not be re-read, so it may
                             // still be one swap behind. Stay locked and say
                             // so — unlocking here would let a press write
@@ -581,7 +670,7 @@
                         }
                         return;
                     }
-                    showStatus('pending', swapWaitText(st, prefix), true);
+                    showStatus('pending', swapWaitText(st, prefix), true, 'attach-wait');
                 } catch (e) {
                     noteAttachPollFailure(prefix);
                 }
@@ -600,7 +689,7 @@
             if (attachPollFailures === 5) {
                 showStatus('pending', prefix +
                     'cannot reach the proxy — the switch may still be running; ' +
-                    'reload this page when it is back', true);
+                    'reload this page when it is back', true, 'attach-wait');
             }
         }
 

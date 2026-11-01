@@ -10,7 +10,7 @@
 
 <h1>Operations<span class="sub">Running, inspecting, and stopping the proxy</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-26</p>
+<p><strong>Last updated:</strong> 2026-11-01</p>
 
 <p>The <code>claude-retry-proxy</code> command manages a <em>background server process</em>. It
 does not run in the foreground. Understanding that split explains most of the command's
@@ -268,7 +268,10 @@ a view the page does not actually have:</p>
 <tr>
   <td><code>/admin/api/config</code></td>
   <td>An empty tier area: <code>renderTiers</code> never ran, so the nine tier selects do not
-      exist</td>
+      exist. The status area is a <strong>stack</strong>, newest line first: the server's
+      diagnostic (routed through the same <code>errorText</code> path the Apply/Reload loaders
+      use) stays visible beneath the newer re-read failure instead of being replaced by it; a
+      success clears the stack, and the ticking wait line pins to the top</td>
   <td>Refuses. Without the guard the press would dereference a missing element as the handler's
       first statement and reject with an unhandled <code>TypeError</code>, painting nothing at
       all — a silent no-op with no explanation</td>
@@ -484,6 +487,6 @@ server's memory and is rewritten every 30 seconds, so deleting the file is harml
 external edit is overwritten rather than merged. The mechanism is owned by
 <a href="architecture.html#heartbeat">architecture.html#heartbeat</a>.</p>
 
-<footer>Last updated: 2026-10-26</footer>
+<footer>Last updated: 2026-11-01</footer>
 </body>
 </html>
