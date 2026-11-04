@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 from _harness import (
@@ -2280,6 +2281,254 @@ def test_cli_unreadable_state_file_distinct_from_absent():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+# ===========================================================================
+# Readiness wait contract: one liveness-gated extension
+#
+# Plan 2026-11-03-gate-scope-echo-retirement, Step 5. `_harness._wait_for_readiness`
+# is the readiness wait extracted from _start_proxy_server_directly so its
+# contract can be driven by a fake proc and a stubbed connect: no child is
+# spawned, and each case is bounded by its own two-window budget — the longest
+# is case A at 0.8 s (window_s=0.4; its marker fires at 1.2 x window); the
+# other two use window_s=0.3, so 0.6 s.
+# ===========================================================================
+
+class _FakeProc:
+    """A spawned-child stand-in: the readiness wait reads only poll()."""
+
+    def __init__(self, poll_result=None):
+        self._poll = poll_result
+
+    def poll(self):
+        return self._poll
+
+
+class _RefusingSocket:
+    """A socket stand-in whose connect always says 'nothing is listening'.
+
+    Creation and closure are counted at CLASS level so a contract test can
+    prove the probe closes every socket it creates: a leaked socket surfaces
+    as `created > closed`. The case that asserts on them calls
+    `reset_counts()` immediately before its wait, so the pair describes one
+    case window rather than the whole run.
+    """
+
+    created = 0
+    closed = 0
+
+    @classmethod
+    def reset_counts(cls):
+        cls.created = 0
+        cls.closed = 0
+
+    def __init__(self):
+        type(self).created += 1
+
+    def settimeout(self, _timeout):
+        pass
+
+    def connect(self, _address):
+        raise ConnectionRefusedError("nothing is listening")
+
+    def close(self):
+        type(self).closed += 1
+
+
+class _RefusingSocketModule:
+    """Stands in for the `socket` module inside `_harness` during a case.
+
+    The host's TCP behaviour is not a usable clock for these cases: measured
+    on this machine, a connect to a closed localhost port black-holes for the
+    full 1 s socket timeout instead of refusing at once, so each window would
+    cost ~1.1 s instead of ~0.3 s and the two-window bound would be untestable
+    (and the whole suite would pay seconds per run). The stub refuses
+    immediately, leaving the window's 0.1 s poll sleep as its only cost.
+    """
+
+    AF_INET = socket.AF_INET
+    SOCK_STREAM = socket.SOCK_STREAM
+    error = socket.error
+
+    @staticmethod
+    def socket(*_args, **_kwargs):
+        return _RefusingSocket()
+
+
+class _always_refusing:
+    """Context manager swapping `_harness.socket` for the refusing stub.
+
+    INVARIANT: no live daemon thread touches `_harness.socket` while a case
+    window is open. The swap is PROCESS-GLOBAL — anything reaching
+    `_harness.socket` during the window receives the refusing stub — and it is
+    safe only because the suite's runner is sequential and the spawn helpers'
+    background readers (`_drain_child_stderr`, `_await_child_ready_marker`)
+    read pipes, never sockets. A future concurrent runner, or a new daemon
+    thread that probes a socket, would silently get the stub and fail here for
+    an unrelated reason; this note is what says so. `__exit__` restores the
+    real module even when a case raises.
+    """
+
+    def __enter__(self):
+        import _harness
+        self._saved = _harness.socket
+        _harness.socket = _RefusingSocketModule()
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        import _harness
+        _harness.socket = self._saved
+        return False
+
+
+def test_readiness_wait_grants_second_window_to_slow_alive_child():
+    """Case A: a child still ALIVE when the first window expires is slow, not
+    dead, and earns exactly one extra window.
+
+    The fake proc's poll() returns None throughout (the child never exits) and
+    its READY marker arrives only inside the SECOND window — the shape of the
+    real flake, where a healthy child's marker landed after the deadline. A
+    single-window wait returns probe_ok=False; the liveness-gated extension
+    returns True. The elapsed-time assertion pins that the success came from
+    the SECOND window rather than an early signal.
+
+    TIMING BUDGET. The marker fires at 1.2 x window and window 2 closes at
+    2 x window, so a late Timer thread has 0.8 x window of headroom — 0.32 s at
+    window_s = 0.4 — before the very test that exists to stop load flakes could
+    false-FAIL. The elapsed lower bound stays at ONE full window: the marker
+    cannot fire before 1.2 x window, so an elapsed at or past 1.0 x window can
+    only be a signal observed after window 1 ended.
+    """
+    print("\n--- Test: Readiness Wait Grants A Second Window To A Slow-Alive "
+          "Child ---")
+    import _harness
+
+    window = 0.4
+    port = find_free_port()
+    proc = _FakeProc(poll_result=None)
+    ready_event = threading.Event()
+    marker = threading.Timer(window * 1.2, ready_event.set)
+    marker.start()
+    started = time.time()
+    try:
+        with _always_refusing():
+            ok = _harness._wait_for_readiness(proc, port, ready_event,
+                                             window_s=window)
+            elapsed = time.time() - started
+    finally:
+        marker.cancel()
+
+    if not ok:
+        fail("the wait gave up on a still-alive child whose READY marker "
+             "arrived at 1.2x the window (probe_ok=False after {:.2f}s) — no "
+             "liveness-gated extension exists".format(elapsed))
+        return
+    pass_("the wait returned True for a still-alive child whose READY "
+          "marker arrived at 1.2x the window")
+    if elapsed >= window:
+        pass_("the readiness signal came from the second window ({:.2f}s >= "
+              "the {:.2f}s first window)".format(elapsed, window))
+    else:
+        fail("the wait succeeded before the first window expired ({:.2f}s), so "
+             "this case did not exercise the extension".format(elapsed))
+
+
+def test_readiness_wait_returns_false_fast_for_dead_child():
+    """Case B: a child that has EXITED fails the wait immediately.
+
+    poll() returns an exit code on the first check, so no window is consumed
+    and no extension is granted — the pre-change and post-change contract are
+    identical here, which is what makes the extension safe.
+    """
+    print("\n--- Test: Readiness Wait Returns False Fast For A Dead Child ---")
+    import _harness
+
+    window = 0.3
+    port = find_free_port()
+    proc = _FakeProc(poll_result=1)
+    ready_event = threading.Event()
+    started = time.time()
+    with _always_refusing():
+        ok = _harness._wait_for_readiness(proc, port, ready_event,
+                                         window_s=window)
+        elapsed = time.time() - started
+
+    if ok:
+        fail("the wait reported readiness for a child that had exited")
+    else:
+        pass_("a dead child ends the wait with probe_ok=False")
+    if elapsed < window:
+        pass_("the dead child returned without consuming a window "
+              "({:.3f}s < {:.2f}s)".format(elapsed, window))
+    else:
+        fail("a dead child consumed a whole window ({:.2f}s >= {:.2f}s) — the "
+             "liveness check does not gate the extension".format(elapsed, window))
+
+
+def test_readiness_wait_bounds_hung_alive_child():
+    """Case C: an alive child that NEVER becomes ready is bounded.
+
+    Nothing ever answers the probe and poll() stays None, so the wait must run
+    exactly two windows and then fail with the same probe_ok=False contract —
+    no third window, no unbounded loop. The lower bound (1.5 windows) is the
+    discriminating assertion: a single-window wait returns early and fails
+    here. The upper bound is generous (6 windows) so machine load cannot trip
+    it; it only has to catch an unbounded wait.
+
+    This is also the case that drives the refusal path hardest (alive child,
+    every probe refused, two full windows), so it carries the socket-leak
+    regression guard: the stub counts creations and closures, and the wait
+    must close every socket it created. Deleting the probe's `finally` — the
+    pre-fix leak shape — leaves `created > closed` and fails here.
+    """
+    print("\n--- Test: Readiness Wait Bounds A Hung-Alive Child ---")
+    import _harness
+
+    window = 0.3
+    port = find_free_port()
+    proc = _FakeProc(poll_result=None)
+    ready_event = threading.Event()
+    started = time.time()
+    with _always_refusing():
+        _RefusingSocket.reset_counts()
+        ok = _harness._wait_for_readiness(proc, port, ready_event,
+                                         window_s=window)
+        elapsed = time.time() - started
+        created = _RefusingSocket.created
+        closed = _RefusingSocket.closed
+
+    if ok:
+        fail("the wait reported readiness for a child that never answered the "
+             "probe")
+    else:
+        pass_("a hung-alive child ends the wait with probe_ok=False")
+    lower = window * 1.5
+    upper = window * 6.0
+    if elapsed < lower:
+        fail("the wait gave up after {:.2f}s, under {:.2f}s (one and a half "
+             "windows) — only one window ran, so the liveness-gated extension "
+             "is missing".format(elapsed, lower))
+    elif elapsed > upper:
+        fail("the wait ran {:.2f}s, past the {:.2f}s upper bound — the "
+             "extension is not bounded at two windows".format(elapsed, upper))
+    else:
+        pass_("the wait was bounded at two windows ({:.2f}s in [{:.2f}s, "
+              "{:.2f}s])".format(elapsed, lower, upper))
+
+    if created >= 1:
+        pass_("the wait drove the refusal probe ({} socket(s) created)".format(
+            created))
+    else:
+        fail("the wait never probed — no socket was created, so this case "
+             "does not exercise the refusal path")
+    if created == closed:
+        pass_("every probe socket was closed ({} created / {} closed)".format(
+            created, closed))
+    else:
+        fail("the probe leaked {} socket(s) ({} created / {} closed) — the "
+             "probe's closure is missing, so a long startup wait abandons one "
+             "socket per 0.1 s of refusal polling".format(
+                 created - closed, created, closed))
+
+
 ALL_TESTS = [
     ("cli-reload", test_cli_reload),
     ("start-rejects-uncatalogued-model-selector-at-cli", test_start_rejects_uncatalogued_model_selector_at_cli),
@@ -2305,6 +2554,9 @@ ALL_TESTS = [
     ("start-failure-reports-only-this-attempts-stderr", test_start_failure_reports_only_this_attempts_stderr),
     ("proxy-http-server-class-pins-platform-reuse", test_proxy_http_server_class_pins_platform_reuse),
     ("cli-unreadable-state-file-distinct-from-absent", test_cli_unreadable_state_file_distinct_from_absent),
+    ("readiness-wait-grants-second-window-to-slow-alive-child", test_readiness_wait_grants_second_window_to_slow_alive_child),
+    ("readiness-wait-returns-false-fast-for-dead-child", test_readiness_wait_returns_false_fast_for_dead_child),
+    ("readiness-wait-bounds-hung-alive-child", test_readiness_wait_bounds_hung_alive_child),
 ]
 
 

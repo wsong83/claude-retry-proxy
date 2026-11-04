@@ -541,6 +541,67 @@ def _await_child_ready_marker(proc, ready_event, seen):
         pass
 
 
+def _wait_for_readiness(proc, port, ready_event, window_s=_READY_DEADLINE_SECONDS):
+    """Probe for child readiness within `window_s`; one liveness-gated retry.
+
+    Returns True when the READY marker arrives or the TCP probe connects.
+    A child that outlives the first window under whole-suite load is slow,
+    not dead — dead children exit the wait via proc.poll() and never earn
+    a second window. Worst case for a hung-alive child is bounded: exactly
+    two windows, then failure with the same probe_ok=False contract.
+
+    Extracted verbatim from _start_proxy_server_directly's inline loop so the
+    contract is deterministically testable with a fake proc (plan
+    2026-11-03-gate-scope-echo-retirement, Step 5). The extension is what
+    closes the recurring full-suite SETUP flake: a healthy child whose
+    import-and-bind ran past a single fixed window failed its test without an
+    assertion ever running.
+    """
+    for _attempt in (1, 2):
+        deadline = time.time() + window_s
+        while time.time() < deadline:
+            if ready_event.is_set():
+                return True
+            if proc.poll() is not None:
+                return False
+            # Every socket this probe creates is closed EXACTLY ONCE by the
+            # `finally` below — on the successful-connect path after the
+            # connect returns, and on the refusal path AFTER the handler's
+            # 0.1 s sleep (the sleep is in `except`, the close in `finally`,
+            # so the close follows the sleep rather than preceding it). The
+            # refusal path is the COMMON one during a normal startup wait
+            # (refused every 0.1 s until the child binds), so leaving it to
+            # the garbage collector abandoned one short-lived socket per 0.1 s
+            # of waiting
+            # (defer-issue-readiness-wait-socket-leak-on-refusal). Creation
+            # stays inside the handler that swallows connect failures: a
+            # socket that cannot even be constructed was previously retried
+            # rather than propagated, and `sock` stays None so `finally`
+            # cannot raise UnboundLocalError.
+            sock = None
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                sock.connect(("127.0.0.1", port))
+                return True
+            except (socket.error, ConnectionRefusedError):
+                time.sleep(0.1)
+            finally:
+                if sock is not None:
+                    sock.close()
+        # The extension's explicit gate: a child that died during window 1 must
+        # never earn window 2. Under TODAY's loop shape this is redundant with
+        # window 2's own in-loop poll — once a real process has exited, poll()
+        # stays non-None (monotonic), so the in-loop check observes the same
+        # death on every real input, which is also why the contract tests do
+        # not pin this line. It is load-bearing under refactor: a changed
+        # extension count, or a window-2 loop that stops polling, would make
+        # this the only guard between a dead child and a whole extra window.
+        if proc.poll() is not None:
+            return False   # died during the window - no extension helps
+    return False
+
+
 # Children whose stderr is drained by a background reader, keyed BY THE CHILD
 # (not by id(proc) — CPython reuses id() values once an object is collected, so
 # an address-keyed entry that outlives its child can be found again by a later,
@@ -692,7 +753,10 @@ def _start_proxy_server_directly(port, config_path=None, keys_path=None,
     # child. The deadline is generous (see _READY_DEADLINE_SECONDS): under
     # whole-suite load a healthy child was measured missing the old 10 s, and
     # the extra headroom costs nothing because a dead child ends the wait via
-    # proc.poll().
+    # proc.poll(). _wait_for_readiness grants exactly ONE liveness-gated extra
+    # window (see its docstring): a child still alive when the first expires is
+    # slow, not dead, while a dead child returns False immediately. The stderr
+    # diagnostic on ultimate failure is unchanged.
     ready_event = threading.Event()
     ready_lines = []
     threading.Thread(
@@ -701,26 +765,7 @@ def _start_proxy_server_directly(port, config_path=None, keys_path=None,
         daemon=True,
     ).start()
 
-    deadline = time.time() + _READY_DEADLINE_SECONDS
-    probe_ok = False
-    while time.time() < deadline:
-        if ready_event.is_set():
-            probe_ok = True
-            break
-        if proc.poll() is not None:
-            # The child exited before signalling readiness; no later probe can
-            # succeed. Its stderr (not read here — callers drain it themselves)
-            # carries the reason.
-            break
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            sock.connect(("127.0.0.1", port))
-            sock.close()
-            probe_ok = True
-            break
-        except (socket.error, ConnectionRefusedError):
-            time.sleep(0.1)
+    probe_ok = _wait_for_readiness(proc, port, ready_event)
     return proc, probe_ok
 
 

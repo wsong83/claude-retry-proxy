@@ -3084,6 +3084,151 @@ def test_admin_config_serialize_failure_500():
         srv._current_config = saved
 
 
+def test_switch_nesting_gate_precedes_key_echo():
+    """`/admin/api/switch` refuses a >limit body at the NESTING GATE, before the
+    `key` echo — and the echo branch is still live for containers that pass it.
+
+    Adopts `defer-issue-switch-key-name-container-echo` by construction. Every
+    failure branch on this path formats the raw value — the isinstance test is
+    the branch's trigger, not a guard — so a deeply nested container in `key`,
+    `provider` or `model` would reach `str()`, which recurses per nesting level,
+    and a RecursionError there has no enclosing try: the request would die with
+    no HTTP response at all. (Tier names are exempt only by JSON grammar, which
+    makes object keys strings.) What closes that class is not the
+    interpreter's repr headroom but the ORDER: `check_payload_nesting` runs at
+    the top of the branch, so any body past `MAX_JSON_NESTING_DEPTH` is refused
+    `400 nesting_limit_exceeded`, bounding a `key` container to <= 497 levels
+    (root -> tiers -> tier). Nothing drove a deep `key` through this handler
+    before this test, so a reorder or a removed gate would reopen the abort
+    class with the suite green.
+
+    The DEEP half is the pin, and it DISCRIMINATES the two orderings rather than
+    green-lighting anything: with the gate gone (removed, or moved after
+    validation) the SAME body reaches the echo and answers `invalid key name`.
+    The body therefore carries all three required tiers, deep container last —
+    a one-tier body would answer `missing tiers` instead, which is a different
+    rejection and would leave the pin pointing at the wrong rule. The SHALLOW
+    half keeps it non-vacuous — a container that PASSES the gate is still
+    echoed, proving the echo branch is alive and sits AFTER the gate.
+
+    In-process (`_drive_post_in_process`) rather than over a socket: both
+    branches fire before the first catalog read, so no proxy, vendor or model
+    catalog is needed, and an abort-class failure raises here instead of
+    surfacing as a transport error the caller could mistake for a timeout.
+
+    The deep half asserts only the DELTA this test uniquely proves: a response
+    exists at all, and it does not carry the key echo. The shared gate
+    branch's status, flat `{"error","code"}` shape, `nesting_limit_exceeded`
+    code and limit-naming message are pinned end-to-end over a real proxy by
+    `test_nesting_limit_admin_body` (test_tier_routing.py); repeating them here
+    would read as two independent pins of one branch. What only this test can
+    show is the ORDER, and `invalid key name`'s absence is the assertion that
+    carries it — a handler reordered to validate first, or a gate removed,
+    answers with the echo instead.
+    """
+    print("\n--- Test: Switch Nesting Gate Precedes Key Echo ---")
+    import claude_retry_proxy.server as srv
+
+    limit = srv.MAX_JSON_NESTING_DEPTH
+    # A real container, not a string of brackets: brackets inside a JSON string
+    # do not count as nesting (the scanner is string-aware), so a bracketed
+    # string would sail through the gate and prove nothing. Depth in the body
+    # reaches limit + 103 — the root object, `tiers`, the tier object, then the
+    # list itself.
+    #
+    # ALL THREE required tiers are present, with the deep container LAST. That is
+    # load-bearing for the discriminant: the required-tier check runs BEFORE the
+    # per-tier loop, so a one-tier deep body would answer `missing tiers` rather
+    # than the echo once the gate is gone — the pin would then discriminate the
+    # tier check, not the `key` echo this deferral is about. Measured both ways;
+    # see the round's discriminant script.
+    deep = json.loads("[" * (limit + 100) + "]" * (limit + 100))
+    deep_body = json.dumps({"tiers": {
+        "haiku": {"provider": "p", "model": "m", "key": "k"},
+        "sonnet": {"provider": "p", "model": "m", "key": "k"},
+        "opus": {"provider": "p", "model": "m", "key": deep}}}).encode("utf-8")
+
+    # Both bodies are refused before any install, so nothing is mutated today.
+    # The regression this test guards — gate removed or moved after validation —
+    # is precisely a run where the handler could proceed past the field checks,
+    # and a red run must not leave the process-global config state changed for
+    # every later test in the same process. Snapshot/restore the neighbours'
+    # way, and assert the refusal left the epoch alone (a refusal must never
+    # advance it).
+    saved = {name: getattr(srv, name) for name in (
+        "_config_path", "_current_config", "_config_epoch", "_vendors",
+        "_config_swapping", "_inflight_count")}
+    epoch_before = srv._config_epoch
+    try:
+        try:
+            captured = _drive_post_in_process(srv, "/admin/api/switch",
+                                              deep_body)
+        except Exception as e:
+            fail("the switch handler RAISED on a >limit body instead of "
+                 "answering ({0}: {1}) — the abort class this ordering "
+                 "closes".format(type(e).__name__, e))
+            return
+        if not captured:
+            fail("the switch handler sent NO response at all for a >limit body "
+                 "— the request dies with no HTTP answer")
+            return
+        _status, body = captured[-1]
+        text = body.decode("utf-8", "replace")
+        if "invalid key name" in text:
+            fail("the key echo answered a body the gate must refuse FIRST — the "
+                 "echo runs before, or without, the nesting gate: {}".format(
+                     text[:300]))
+            return
+        pass_("a >limit body was answered without the key echo — the nesting "
+              "gate ran first")
+
+        # Non-vacuity: a CONTAINER key that passes the gate is still echoed.
+        # Without this half, a handler that rejected every container `key`
+        # before the echo — or an echo branch deleted outright — would leave
+        # the deep half green.
+        shallow_body = json.dumps({"tiers": {
+            name: {"provider": "p", "model": "m", "key": ["a"]}
+            for name in ("haiku", "sonnet", "opus")}}).encode("utf-8")
+        try:
+            captured = _drive_post_in_process(srv, "/admin/api/switch",
+                                              shallow_body)
+        except Exception as e:
+            fail("the switch handler raised on a shallow container key ({0}: "
+                 "{1})".format(type(e).__name__, e))
+            return
+        if not captured:
+            fail("the switch handler sent no response for a shallow container "
+                 "key")
+            return
+        status, body = captured[-1]
+        text = body.decode("utf-8", "replace")
+        if status != 400:
+            fail("a container key that passes the gate must be refused 400 by "
+                 "the name check; got {} ({})".format(status, text[:300]))
+            return
+        if "invalid key name: ['a']" not in text:
+            fail("the echo branch did not answer for a container key that "
+                 "passes the gate — expected \"invalid key name: ['a']\" in the "
+                 "body: {}".format(text[:300]))
+            return
+        if "nesting_limit_exceeded" in text:
+            fail("a body WITHIN the nesting limit was refused by the gate: "
+                 "{}".format(text[:300]))
+            return
+        pass_("a container key within the limit is still echoed "
+              "\"invalid key name: ['a']\" — the echo branch is live and runs "
+              "after the gate")
+
+        if srv._config_epoch != epoch_before:
+            fail("a refused switch must not advance the config epoch; {} -> "
+                 "{}".format(epoch_before, srv._config_epoch))
+            return
+        pass_("both refusals left the config epoch unchanged")
+    finally:
+        for name, value in saved.items():
+            setattr(srv, name, value)
+
+
 def test_admin_reload_serialize_failure_500():
     """The reload answers 500 — and installs nothing — when its success body
     cannot be serialized (plan 2026-10-25, Step 8 coder edit 3).
@@ -5179,6 +5324,8 @@ ALL_TESTS = [
     ("admin-switch-with-key-name", test_admin_switch_with_key_name),
     ("admin-switch-unknown-key-rejected", test_admin_switch_unknown_key_rejected),
     ("admin-switch-invalid-key-type-rejected", test_admin_switch_invalid_key_type_rejected),
+    ("admin-switch-nesting-gate-precedes-key-echo",
+     test_switch_nesting_gate_precedes_key_echo),
     ("admin-switch-missing-key-defaults", test_admin_switch_missing_key_defaults),
     ("admin-switch-validates-key-names", test_admin_switch_validates_key_names),
     ("admin-html-key-column", test_admin_html_key_column),

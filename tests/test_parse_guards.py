@@ -36,6 +36,8 @@ Part of the claude-retry-proxy suite; runnable standalone.
 
 import ast
 import os
+import shutil
+import tempfile
 
 from _harness import (
     fail,
@@ -233,7 +235,7 @@ def _scan_source(path, src):
 
 
 def _scan_dir(src_dir):
-    """Aggregate `_scan_source` over every `*.py` under `src_dir`."""
+    """Aggregate `_scan_source` over every `*.py` under `src_dir`, recursively."""
     lines, fatal = [], []
     sites = 0
     site_failures = 0
@@ -242,17 +244,41 @@ def _scan_dir(src_dir):
         fatal.append("source directory not found: {}".format(src_dir))
         return lines, sites, site_failures, fatal
 
-    files = sorted(f for f in os.listdir(src_dir) if f.endswith(".py"))
+    # A recursive walk, deterministically ordered, `.py` only. `os.listdir` does
+    # not recurse, so a subpackage's parse sites were invisible to this gate —
+    # silently, with the suite green — which is what
+    # `test_parse_guard_scanner_walks_subpackages` pins.
+    #
+    # `onerror` is wired for the same reason: `os.walk`'s default `None` DROPS a
+    # `scandir` failure, so an unlistable directory (permission denied, a locked
+    # directory on Windows) would take its subtree out of the scan with no
+    # verdict — the same silent-hole class, one level up from the file set.
+    # A scan problem is a visible `fatal`, never a quietly narrower scan.
+    files = []
+    unlistable = []
+    for root, dirs, names in os.walk(src_dir, onerror=unlistable.append):
+        dirs.sort()
+        for name in sorted(names):
+            if name.endswith(".py"):
+                files.append(os.path.join(root, name))
+    for exc in unlistable:
+        fatal.append("{}: cannot list ({})".format(
+            getattr(exc, "filename", None) or src_dir, exc))
+        lines.append((False, fatal[-1]))
     if not files:
         fatal.append("no python modules under {}".format(src_dir))
         return lines, sites, site_failures, fatal
 
-    for name in files:
-        path = os.path.join(src_dir, name)
+    for path in files:
         try:
             with open(path, encoding="utf-8") as fh:
                 src = fh.read()
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # ValueError, not just OSError: a module that is valid Python but
+            # not UTF-8-decodable (a PEP 263 coding declaration, say) raises
+            # UnicodeDecodeError, which is a ValueError SIBLING of OSError. Left
+            # uncaught it aborts the gate with a traceback — no verdict at all,
+            # the dangerous shape this module exists to prevent.
             fatal.append("{}: cannot read ({})".format(path, exc))
             lines.append((False, fatal[-1]))
             continue
@@ -408,6 +434,249 @@ _SCANNER_CASES = [
 ]
 
 
+# Synthetic package for `test_parse_guard_scanner_walks_subpackages`. One parse
+# site at the package's TOP level (guarded) and one one level down, in a
+# SUBPACKAGE (whose guard state the test flips). The nested site is what makes
+# the enumeration observable: on a flat tree a recursive walk and `os.listdir`
+# return the same file set, so only a synthetic subpackage can tell them apart.
+_PKG_TOP_GUARDED = (
+    "import json\n"
+    "\n"
+    "def f(s):\n"
+    "    try:\n"
+    "        return json.loads(s)\n"
+    "    except Exception:\n"
+    "        return None\n"
+)
+
+_PKG_NESTED_UNGUARDED = (
+    "import json\n"
+    "\n"
+    "def g(s):\n"
+    "    return json.loads(s)\n"
+)
+
+_PKG_NESTED_GUARDED = (
+    "import json\n"
+    "\n"
+    "def g(s):\n"
+    "    try:\n"
+    "        return json.loads(s)\n"
+    "    except Exception:\n"
+    "        return None\n"
+)
+
+
+def _write_synthetic_module(path, text):
+    """Write one synthetic module's source (parent directories must exist)."""
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+# Captured at import: `_OneErrorWalk` walks the real tree through this, so a
+# test that swaps `os.walk` (see `_walk_reports`) cannot recurse into itself.
+_REAL_WALK = os.walk
+
+
+class _OneErrorWalk:
+    """`os.walk` stand-in that reports one injected directory error.
+
+    `os.walk` consults the `onerror` callback only when the caller SUPPLIED
+    one; with the default `onerror=None` it drops the `scandir` failure on the
+    floor. Reproducing that difference is the whole point of the stub: an
+    injected error reaches the scanner when the scanner wired `onerror`, and is
+    silently dropped otherwise — exactly the hole the real default has. The
+    directory tree itself is walked by the real `os.walk`, so injecting the
+    error does not change the file set the scan sees.
+    """
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def __call__(self, top, onerror=None, **kwargs):
+        if onerror is not None:
+            onerror(self._exc)
+        return _REAL_WALK(top, **kwargs)
+
+
+class _walk_reports:
+    """Swap `os.walk` for `stub` for the duration of one scan.
+
+    `_scan_dir` resolves `os.walk` off the shared `os` module at call time, so
+    this is a process-global swap. It is safe only because the suite's runner
+    is sequential and no other thread walks the tree while the window is open;
+    `__exit__` restores the real function even when the scan raises.
+    """
+
+    def __init__(self, stub):
+        self._stub = stub
+
+    def __enter__(self):
+        self._saved = os.walk
+        os.walk = self._stub
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        os.walk = self._saved
+        return False
+
+
+def test_parse_guard_scanner_walks_subpackages():
+    """The site enumeration walks the whole package tree, subpackages included.
+
+    `os.listdir` does not recurse, so a future `src/claude_retry_proxy/<pkg>/`
+    is filtered out by the `.py` suffix test and its parse sites become
+    invisible — silently, with the suite green (the non-zero site count still
+    passes on the remaining top-level sites). Latent today: the package tree is
+    flat, so on the LIVE tree a flat listing and a recursive walk are
+    indistinguishable, which is exactly why this test builds its own package
+    instead of asserting anything about `SRC_DIR`.
+
+    Both halves are load-bearing. The first proves the nested site is REACHED
+    and still judged — 2 sites, exactly 1 failure, and the FAIL line naming
+    `nested.py` while the guarded top-level site passes. The second guards the
+    nested site and asserts 2 sites / 0 failures, so the count alone cannot be
+    satisfied by a scanner that reports the file without scanning it.
+
+    The THIRD half covers the other way a subtree can vanish: a directory the
+    walk cannot enumerate. `os.walk`'s default `onerror=None` drops the
+    `scandir` failure, so an unlistable subpackage would be skipped silently
+    while the non-zero site count kept the gate green. The error is injected
+    through a `os.walk` stub rather than a real unlistable directory: making
+    one on this host would mean `chmod 0o000` (a no-op for directory listing on
+    Windows, and bypassable as root elsewhere), and the stub pins the wiring —
+    which is the thing that can be deleted — deterministically on every
+    platform. Its assertions demand the `onerror` branch's own "cannot list"
+    marker AND that both sites were still counted, so a read-error fatal on a
+    file under the same directory (which also names that path and is also a
+    FAIL line) cannot satisfy it.
+
+    The FOURTH half covers the file-level twin: a module that is valid Python
+    but not UTF-8-decodable. Reading it raises `UnicodeDecodeError`, a
+    `ValueError` SIBLING of `OSError`, so a guard naming only `OSError` let it
+    abort the gate with no verdict at all. The module is written as raw bytes
+    with a PEP 263 `coding: latin-1` declaration and a 0xE9 byte; the scan must
+    report a `fatal` naming the file rather than raise.
+    """
+    print("\n--- Test: Parse-Guard Scanner Walks Subpackages ---")
+    temp_dir = tempfile.mkdtemp(prefix="proxy_parse_guard_walk_")
+    try:
+        pkg = os.path.join(temp_dir, "pkg")
+        sub = os.path.join(pkg, "sub")
+        os.makedirs(sub)
+        _write_synthetic_module(os.path.join(pkg, "__init__.py"), "")
+        _write_synthetic_module(os.path.join(pkg, "top.py"), _PKG_TOP_GUARDED)
+        _write_synthetic_module(os.path.join(sub, "nested.py"),
+                                _PKG_NESTED_UNGUARDED)
+
+        lines, sites, site_failures, fatal = _scan_dir(pkg)
+        if fatal:
+            fail("the scan reported file-level problem(s) on a well-formed "
+                 "synthetic package: {}".format("; ".join(fatal)))
+            return
+        if sites != 2:
+            fail("the scan found {} parse site(s) in a package holding 2 — one "
+                 "at the top level and one in sub/nested.py — so the "
+                 "enumeration does not reach subpackages: {}".format(
+                     sites, "; ".join(msg for _ok, msg in lines) or "no lines"))
+            return
+        pass_("both parse sites were scanned (the top-level one and "
+              "sub/nested.py)")
+
+        if site_failures != 1:
+            fail("expected exactly 1 failing site (the unguarded parse in "
+                 "sub/nested.py), got {}: {}".format(
+                     site_failures,
+                     "; ".join(msg for ok, msg in lines if not ok) or "none"))
+            return
+        if not any("nested.py" in msg for ok, msg in lines if not ok):
+            fail("the single site failure does not name sub/nested.py: "
+                 "{}".format("; ".join(msg for _ok, msg in lines)))
+            return
+        pass_("the nested unguarded parse was reported, and the guarded "
+              "top-level site passed")
+
+        # Second half: guard the NESTED site. Still 2 sites — the enumeration
+        # must keep reaching it — and now 0 failures.
+        _write_synthetic_module(os.path.join(sub, "nested.py"),
+                                _PKG_NESTED_GUARDED)
+        lines, sites, site_failures, fatal = _scan_dir(pkg)
+        if fatal:
+            fail("the re-scan reported file-level problem(s): {}".format(
+                "; ".join(fatal)))
+            return
+        if sites != 2 or site_failures != 0:
+            fail("after guarding the nested site the scan must still see 2 "
+                 "sites with 0 failures; got {} site(s) / {} failing: "
+                 "{}".format(sites, site_failures,
+                             "; ".join(msg for _ok, msg in lines)))
+            return
+        pass_("guarded nested site: 2 sites, 0 failures")
+
+        # Third half: an UNLISTABLE subdirectory must be a visible failure.
+        # A scan error may not narrow the file set silently. The assertion is
+        # TIGHT on purpose: the fatal must carry the `onerror` branch's own
+        # "cannot list" marker — a READ-error fatal on a file under `sub` also
+        # names the directory and is also a FAIL line, so a bare path match
+        # could green this half without the wiring it exists to pin — and the
+        # scan must still count both sites (errors REPORT; they do not silently
+        # narrow the file set).
+        exc = PermissionError(13, "Permission denied", sub)
+        with _walk_reports(_OneErrorWalk(exc)):
+            lines, sites, site_failures, fatal = _scan_dir(pkg)
+        if not any(sub in msg and "cannot list" in msg for msg in fatal):
+            fail("a subdirectory the walk cannot list did not produce a fatal "
+                 "carrying the `onerror` branch's \"cannot list\" marker — the "
+                 "enumeration silently narrowed the file set, which is the "
+                 "hole the recursion exists to close; fatal: {}".format(
+                     "; ".join(fatal) or "none"))
+            return
+        if sites != 2:
+            fail("the unlistable-directory error narrowed the scan to {} "
+                 "site(s) from 2 — a scan error must report, never drop "
+                 "files; lines: {}".format(
+                     sites, "; ".join(msg for _ok, msg in lines)))
+            return
+        if not any(not ok and sub in msg for ok, msg in lines):
+            fail("the unlistable-directory problem was recorded in `fatal` but "
+                 "never printed as a FAIL line: {}".format(
+                     "; ".join(msg for _ok, msg in lines)))
+            return
+        pass_("an unlistable subdirectory surfaced as a fatal FAIL line naming "
+              "it, and the scan still counted both sites")
+
+        # Fourth half: a module that is VALID PYTHON but not UTF-8-decodable (a
+        # PEP 263 `coding:` declaration) must be a visible failure, not an
+        # abort. `_scan_dir` reads with encoding="utf-8", so the 0xE9 byte
+        # raises UnicodeDecodeError — a ValueError SIBLING of OSError — and a
+        # guard naming only OSError let it escape the gate with no verdict at
+        # all. Pinned permanently here because the audit fix that widened the
+        # guard was otherwise calibrated by a transient script only
+        # (defer-issue-parse-guard-read-error-permanent-pin).
+        undecodable = os.path.join(sub, "latin.py")
+        with open(undecodable, "wb") as fh:
+            fh.write(b"# -*- coding: latin-1 -*-\n\nvalue = '\xe9'\n")
+        try:
+            lines, sites, site_failures, fatal = _scan_dir(pkg)
+        except Exception as e:
+            fail("the scan RAISED on a module it cannot decode ({0}: {1}) — the "
+                 "gate emitted no verdict at all".format(type(e).__name__, e))
+            return
+        if not any(undecodable in msg and "cannot read" in msg for msg in fatal):
+            fail("an undecodable module did not produce a fatal naming it — the "
+                 "read guard is narrower than (OSError, ValueError); fatal: "
+                 "{}".format("; ".join(fatal) or "none"))
+            return
+        if not any(not ok and undecodable in msg for ok, msg in lines):
+            fail("the unreadable-module problem was recorded in `fatal` but "
+                 "never printed as a FAIL line: {}".format(
+                     "; ".join(msg for _ok, msg in lines)))
+            return
+        pass_("an undecodable module surfaced as a fatal FAIL line naming it")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def test_parse_guard_scanner_semantics():
     """Each accept/reject branch of the scanner, on synthetic sources.
 
@@ -467,6 +736,8 @@ def test_parse_guard_gate_python38_portable():
 
 ALL_TESTS = [
     ("parse-guards-totality", test_parse_guards_totality),
+    ("parse-guard-scanner-walks-subpackages",
+     test_parse_guard_scanner_walks_subpackages),
     ("parse-guard-scanner-semantics", test_parse_guard_scanner_semantics),
     ("parse-guard-gate-python38-portable",
      test_parse_guard_gate_python38_portable),
