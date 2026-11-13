@@ -2903,6 +2903,8 @@ def test_retry_path_print_failure_does_not_misclassify():
     upstream_port = find_free_port()
     reqs = []
     mock_server = _start_mode_mock_upstream(upstream_port, reqs, _responder_503)
+    # The mock owns the port it actually bound; the URL below follows it.
+    upstream_port = mock_server.server_address[1]
     root = tempfile.mkdtemp(prefix="proxy_retryprint_")
     # The sinks hold their own path, so the redirection goes through
     # configure(); assigning server.PROXY_TRACE_FILE would be inert here.
@@ -2959,6 +2961,7 @@ def test_retry_path_print_failure_does_not_misclassify():
         sinks.configure(trace_path=prev_trace_path, state_path=prev_state_path)
         try:
             mock_server.shutdown()
+            mock_server.server_close()
         except Exception:
             pass
         shutil.rmtree(root, ignore_errors=True)

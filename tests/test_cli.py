@@ -694,14 +694,17 @@ def test_cli_reload():
                 "opus": {"provider": "p", "model": "claude-opus-5"},
             }
             config_path = _create_test_config(temp_dir, tiers_a)
+
+            req_list = []
+            mock_server = _start_mock_upstream(p_port, req_list)
+            # The mock owns the port it actually bound; the URL follows it.
+            p_port = mock_server.server_address[1]
             keys_path = _create_test_keys_plain(temp_dir, {
                 "p": {"url": f"http://127.0.0.1:{p_port}", "key": "k"}
             })
             trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
             os.close(trace_fd)
 
-            req_list = []
-            mock_server = _start_mock_upstream(p_port, req_list)
             mock_started = True
 
             proc, stdout, stderr, rc = _cli_start_with_plain_keys(
@@ -782,6 +785,7 @@ def test_cli_reload():
         finally:
             if 'mock_started' in dir():
                 mock_server.shutdown()
+                mock_server.server_close()
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     finally:
@@ -1208,13 +1212,14 @@ def test_cli_status_shows_tiers():
                 "opus": {"provider": "p", "model": "claude-opus-5"},
             }
             config_path = _create_test_config(temp_dir, tiers)
+            mock_server = _start_mock_upstream(p_port, [])
+            # The mock owns the port it actually bound; the URL follows it.
+            p_port = mock_server.server_address[1]
             keys_path = _create_test_keys_plain(temp_dir, {
                 "p": {"url": f"http://127.0.0.1:{p_port}", "key": "k"}
             })
             trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
             os.close(trace_fd)
-
-            mock_server = _start_mock_upstream(p_port, [])
 
             proc, stdout, stderr, rc = _cli_start_with_plain_keys(
                 port, config_path, keys_path, trace_file)
@@ -1249,6 +1254,7 @@ def test_cli_status_shows_tiers():
             if stop_result.returncode != 0:
                 fail(f"stop failed: {stop_result.stdout} {stop_result.stderr}")
             mock_server.shutdown()
+            mock_server.server_close()
 
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1333,13 +1339,14 @@ def test_start_status_reload_tier_lines_show_key():
             }
             config_path = _create_test_config(temp_dir, tiers, models={
                 "p": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]})
+            mock_server = _start_mock_upstream(p_port, [])
+            # The mock owns the port it actually bound; the URL follows it.
+            p_port = mock_server.server_address[1]
             keys_path = _create_test_keys_plain(temp_dir, {
                 "p": {"url": "http://127.0.0.1:{}".format(p_port), "keys": {"SW": "p1", "CZ": "p2"}}
             })
             trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
             os.close(trace_fd)
-
-            mock_server = _start_mock_upstream(p_port, [])
 
             proc, stdout, stderr, rc = _cli_start_with_plain_keys(
                 port, config_path, keys_path, trace_file)
@@ -1373,6 +1380,7 @@ def test_start_status_reload_tier_lines_show_key():
                     fail("stop after start failed: {} {}".format(
                         stop_result.stdout, stop_result.stderr))
                 mock_server.shutdown()
+                mock_server.server_close()
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
     finally:

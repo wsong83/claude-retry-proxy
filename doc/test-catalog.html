@@ -10,7 +10,7 @@
 
 <h1>Test Catalog<span class="sub">Suite layout, harness isolation, and testing patterns</span></h1>
 
-<p><strong>Last updated:</strong> 2026-11-04</p>
+<p><strong>Last updated:</strong> 2026-11-13</p>
 
 <p>The suite is a set of per-area modules merged by a single aggregator. It runs against
 <em>real</em> proxy processes and <em>real</em> mock upstream servers over loopback sockets —
@@ -105,6 +105,30 @@ anything that reads them.</p>
 spawned CLI agree on which state file is current — so a test that starts and stops a proxy is
 checking its own proxy, not yours.</p>
 
+<p><strong>Port ownership and failure evidence (added 2026-11-13, plan
+2026-11-12-test-harness-port-hardening).</strong> Two harness properties date from the fix of the
+intermittent <code>[Errno 98] Address already in use</code> setup crashes. First, <em>port
+ownership</em>: a port returned by <code>find_free_port()</code> is unowned until bound, so every
+fixture builder and every direct mock call site binds first and builds the vendor URL from the
+port the server actually owns (<code>server.server_address[1]</code>); the builders' and direct
+sites' mock binds go through <code>_bind_mock_server</code> (preferred-first, ephemeral
+fallback), and the proxy spawn goes through <code>_spawn_proxy_with_bind_retry</code>. Two
+deliberate exceptions: the handful of raw test-local <code>ThreadingHTTPServer</code> mocks that
+never pass through a builder (kept as an accepted residual — they hold their ports for a single
+test and are torn down with it), and
+<code>_setup_tier_routing_test</code>'s <code>caller_owns_ports=True</code> mode, used by exactly
+the three SSE-rewrite tests that pre-bind their own listener on the vendor port — there the
+helper's own bind is skipped on collision because the caller's listener <em>is</em> the upstream.
+Second, <em>teardown closes listeners</em>: every harness teardown site (and the six direct-site
+teardowns this plan touched) calls <code>server_close()</code> after <code>shutdown()</code>;
+test-local listeners at other sites are an accepted residual. And a <em>failed</em> test now
+preserves its evidence instead of deleting it: the wrapper <code>cleanup()</code> closures keep
+the temp dir, the trace file, and a <code>proxy-stderr.log</code> dump of the child's buffered
+stderr (paths printed in the failure output) when <code>fail()</code> was called or an exception
+is in flight; a failed setup preserves the same. Preserved dirs are rare, inert, and never
+collected automatically — they may be deleted by hand. A passing test still removes everything,
+which is what pins the no-residue property at the suite level.</p>
+
 <h2 id="catalog">The catalog</h2>
 
 <p>The catalog below describes what each module covers. Per-module test counts are deliberately
@@ -147,6 +171,12 @@ not carried — recount on demand with the command above, or read the aggregator
     <td>The sink class family: write contract, health reporting, counters, chmod mode, temp-file hygiene</td></tr>
 <tr><td><code>test_docs.py</code></td>
     <td>The committed doc-anchor checker — anchor resolution for CLAUDE.md / README.md / doc pages, credential-shape scan, exit-code mapping</td></tr>
+<tr><td><code>test_harness_hardening.py</code></td>
+    <td>The harness's own port-ownership contracts (added 2026-11-13): the mock-bind
+        preferred-first/ephemeral fallback with the vendor URL following the bound port
+        (proven end to end against a foreign listener), the proxy-port bind-collision retry
+        (marker-vs-connect discrimination plus a liveness grace), and failure-artifact
+        preservation on the harness's failure flag</td></tr>
 <tr><td><code>test_sanitize.py</code></td>
     <td>The <code>sanitize_error</code> redaction chokepoint — path and IP redaction, case variants, boundary cases, linear-time bound</td></tr>
 <tr><td><code>test_settings.py</code></td>
@@ -166,7 +196,7 @@ not carried — recount on demand with the command above, or read the aggregator
     <td><strong>Not a test module.</strong> The aggregator and CLI entry point.</td></tr>
 </table>
 
-<!-- BEGIN per-test inventory (generated 2026-09-16; extended 2026-10-06, 2026-10-25, 2026-10-26) -->
+<!-- BEGIN per-test inventory (generated 2026-09-16; extended 2026-10-06, 2026-10-25, 2026-10-26, 2026-11-13) -->
 <h2 id="per-test">Per-Test Descriptions</h2>
 
 <p>Every test in the suite, grouped by the area it exercises. Use it to find which
@@ -842,6 +872,32 @@ nothing else unrelated stays a review obligation, and <code>import json as j; j.
 is a stated blind spot (the bare-name rule covers <code>from json import loads</code>, which the
 attribute-only matcher would miss).</p>
 
+<h3 id="cat-14">Category 14 — Harness Port-Ownership Contracts (added 2026-11-13)</h3>
+
+<p><strong>Scope:</strong> the harness's own fixture machinery, pinned behaviorally. These tests
+hold a foreign listener on a port and prove the harness's fallback and retry contracts — the
+class of intermittent setup failures (<code>[Errno 98] Address already in use</code>) closed by
+plan 2026-11-12-test-harness-port-hardening. See
+<a href="#isolation">Isolation</a> for the port-ownership model and the evidence-preservation
+policy, and <a href="#lifecycle-helpers">Proxy lifecycle</a> for the helpers' contracts.</p>
+
+<h4><code>tests/test_harness_hardening.py</code></h4>
+<ul>
+<li><code>test_bind_fallback_rebinds_and_url_follows</code>: a vendor port held by a foreign
+listener — the mock rebinds ephemeral (<code>_bind_mock_server</code>), the vendor URL follows
+the bound port (<code>server_address[1]</code>), and a real request through the proxy completes
+200 against the mock on its new port. Proven against a <em>live</em> holder, not a
+TIME_WAIT residue.</li>
+<li><code>test_proxy_port_busy_retries_once</code>: a proxy spawn onto a held port — the
+readiness probe's TCP connect reaches the <em>foreign</em> listener, the wrapper rejects the
+connect-only success via the marker/liveness discrimination, matches the server's own
+busy-port message, and one retry on a fresh port comes up ready with a live child.</li>
+<li><code>test_cleanup_preserves_artifacts_on_failure</code>: with the failure flag set,
+<code>cleanup()</code> keeps the temp dir, the trace file, and the <code>proxy-stderr.log</code>
+dump, and prints their paths. (The removal branch is pinned at suite level — the no-residue
+property of a passing run.)</li>
+</ul>
+
 <!-- END per-test inventory -->
 <h2 id="harness">The harness</h2>
 
@@ -855,7 +911,11 @@ hand-rolling setup. The ones you are most likely to need:</p>
 <tr><td><code>start_proxy(port, extra_args)</code></td><td>Start a proxy on a given port and wait for readiness</td></tr>
 <tr><td><code>stop_proxy()</code></td><td>Stop it and clean up</td></tr>
 <tr><td><code>proxy_status()</code></td><td>Read the recorded state</td></tr>
-<tr><td><code>find_free_port()</code></td><td>Pick an unused port — always prefer this over a hard-coded one</td></tr>
+<tr><td><code>find_free_port()</code></td><td>Pick an unused port — always prefer this over a hard-coded one. The returned port is <strong>unowned until something binds it</strong>: the probe binds <code>:0</code>, reads the port, and closes, so between that close and the caller's real bind a neighbour can take it. Mocks never bind a probed port directly — they go through <code>_bind_mock_server</code>, and any URL carrying the port is built <em>after</em> the bind from <code>server.server_address[1]</code> (added 2026-11-13, plan 2026-11-12-test-harness-port-hardening).</td></tr>
+<tr><td><code>_MockHTTPServer</code> + <code>_bind_mock_server(handler_cls, preferred_port)</code></td>
+    <td>The mock-listener bind path (added 2026-11-13). <code>_MockHTTPServer</code> is a <code>ThreadingHTTPServer</code> with POSIX-only <code>allow_reuse_address</code> (mirroring the proxy's own <code>_ProxyHTTPServer</code>; http.server's default permits a second listener on an occupied port on Windows, which would defeat the fallback). <code>_bind_mock_server</code> binds preferred-port-first and falls back to an ephemeral port on <code>EADDRINUSE</code> — removing the intermittent <code>[Errno 98]</code> setup crashes — and every fixture that embeds the port in a config/keys URL must read back <code>server.server_address[1]</code> and use that.</td></tr>
+<tr><td><code>_spawn_proxy_with_bind_retry(port, **kwargs)</code></td>
+    <td>Spawn the proxy with a one-shot bind-collision retry (added 2026-11-13). The TCP-connect readiness fallback succeeds against a <em>foreign</em> listener holding the port, so the wrapper trusts only the child's own READY marker (plumbed via the optional <code>_readiness_detail</code> dict on <code>_start_proxy_server_directly</code>); a connect-only success is confirmed by the child surviving <code>_BIND_RACE_GRACE_SECONDS</code>. A child that died naming the busy port — the server's own <code>[proxy] Port N is already in use.</code> guard message, or the raw <code>OSError</code> forms (<code>Address already in use</code>, <code>Errno 98</code>, <code>10048</code>) from the narrow probe-to-bind window — is retried once on a fresh port. Returns <code>(port, proc, probe_ok)</code>; the returned port replaces the caller's copy. Direct test-file callers of <code>_start_proxy_server_directly</code> keep today's behavior.</td></tr>
 <tr><td><code>_start_proxy_server_directly(...)</code> → <code>_wait_for_readiness(proc, port, ready_event, window_s)</code></td>
     <td>Spawn the server module directly and compute readiness. The child's own stdout READY marker is the primary signal — emitted after the socket is bound, so a slow-but-healthy child cannot be mistaken for a dead one — with a TCP connect as the fallback. The wait grants a slow child exactly <strong>one</strong> liveness-gated extension window (added 2026-11-04): a child still alive when the first window expires under whole-suite load gets a second identical window, because a healthy child that misses the deadline is slow, not dead; a child that <em>exits</em> ends the wait immediately (no extension can help it), and an alive-but-never-ready child is bounded at the two windows and fails with the same <code>probe_ok=False</code> contract, so the caller's readiness diagnostic still carries the child's own stderr. The three branches of this contract are pinned by the <code>readiness-wait-*</code> tests in Category 9.</td></tr>
 </table>
@@ -900,7 +960,7 @@ headers, path, and body — rather than only on what came back.</p>
 <tr><td><code>_send_proxy_request_stream(port, body, path)</code></td><td>Send and read a streaming response</td></tr>
 <tr><td><code>_admin_get</code> / <code>_admin_post</code></td><td>Hit the admin API with a correct Origin by default. <code>_admin_post</code> also carries the transport tolerance its sibling <code>_send_proxy_request</code> has: a <code>ConnectionAbortedError</code> or other transport abort during the request/read is returned as <code>(0, str(e))</code> rather than raised, so a whole-suite abort under load surfaces as a <strong>failed assertion carrying the error text</strong> instead of <code>Test crashed</code> with no diagnostic. The error is a <code>str</code>, not the sibling's <code>bytes</code>, matching <code>_admin_post</code>'s own decoded-<code>str</code> contract</td></tr>
 <tr><td><code>_drain_child_stderr(proc)</code></td>
-    <td>Install a daemon reader for a long-lived child's stderr so the ~64&nbsp;KiB pipe buffer cannot fill and block the child. Called at spawn time by the one long-lived spawn helper (<code>_start_proxy_server_directly</code>) and by the <strong>21 long-lived spawn sites whose children nothing else reads</strong> — 17 in <code>test_retry_streaming.py</code>, 4 in <code>test_trace.py</code>. The reader is keyed <em>by the child</em> (<code>weakref.WeakKeyDictionary</code>), so its buffer is released when the child is collected rather than by an address that a later child could reuse</td></tr>
+    <td>Install a daemon reader for a long-lived child's stderr so the ~64&nbsp;KiB pipe buffer cannot fill and block the child. Called at spawn time by the spawn helpers (<code>_start_proxy_server_directly</code>, and <code>_spawn_proxy_with_bind_retry</code> which delegates to it) and by the <strong>21 long-lived spawn sites whose children nothing else reads</strong> — 17 in <code>test_retry_streaming.py</code>, 4 in <code>test_trace.py</code>. The reader is keyed <em>by the child</em> (<code>weakref.WeakKeyDictionary</code>), so its buffer is released when the child is collected rather than by an address that a later child could reuse</td></tr>
 <tr><td><code>_read_child_stderr(proc, timeout)</code></td>
     <td>Read a spawned child's stderr. This is the <strong>only</strong> accessor for a child whose stderr is drained at spawn: the reader owns that pipe, so <em>any</em> direct read returns <code>""</code> — a plain <code>proc.communicate()</code> (measured, plan 2026-10-15-test-harness-robustness's Step&nbsp;2 issue report) and equally a plain <code>proc.stderr.read()</code> (measured, that plan's Step&nbsp;6 issue: it is the one failure a whole-suite run caught, because the assertions that break <em>silently</em> are the ones checking for absence). Returns the retained buffer, so a repeat read gives the same text. Falls back to the original kill-then-<code>communicate()</code> path for every other child</td></tr>
 <tr><td><code>_parse_sse_frames(raw)</code>, <code>_sse_types(frames)</code>, <code>_sse_frames_with_type</code></td>
@@ -970,6 +1030,6 @@ whenever a proxy is running.</p>
       that the full suite passes with a live proxy running.</li>
 </ol>
 
-<footer>Last updated: 2026-11-04</footer>
+<footer>Last updated: 2026-11-13</footer>
 </body>
 </html>

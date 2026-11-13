@@ -2010,7 +2010,17 @@ def test_chat_sse_reasoning_then_text_transition():
         starts = _sse_frames_with_type(frames, "content_block_start")
         stops = _sse_frames_with_type(frames, "content_block_stop")
         if len(starts) != 2 or len(stops) != 2:
-            fail("expected 2 starts and 2 stops, got starts={!r} stops={!r}".format(starts, stops))
+            # Self-classifying failure (deferred issue
+            # flaky-chat-sse-transition-empty-stream): the frame types and
+            # raw head distinguish an SSE error frame (proxy cut the
+            # stream) from raw chat-completion chunks (Content-Type
+            # misdetected, untransformed passthrough) without a rerun —
+            # and with Step 8's preservation the trace and stderr survive
+            # for the same triage.
+            fail("expected 2 starts and 2 stops, got starts={!r} stops={!r}; "
+                 "frame types={!r}; raw head={!r}".format(
+                     starts, stops,
+                     [t for t, _ in frames[:8]], raw[:200]))
             return
         thinking_stop = stops[0]
         text_start = starts[1]

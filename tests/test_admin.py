@@ -609,11 +609,16 @@ def test_admin_api_reload():
     temp_dir = tempfile.mkdtemp(prefix="proxy_admin_reload_")
     proxy_port = find_free_port()
     config_path = _create_test_config(temp_dir, tiers_a)
-    keys_path = _create_test_keys_plain(temp_dir, vendors)
 
     req_list = []
+    p_server = _start_mock_upstream(p_port, req_list)
+    # The mock owns the port it actually bound (an EADDRINUSE fallback
+    # rebinds ephemeral) — the URL must carry that port, so bind first.
+    p_port = p_server.server_address[1]
+    vendors["p"]["url"] = "http://127.0.0.1:{}".format(p_port)
+    keys_path = _create_test_keys_plain(temp_dir, vendors)
     mock_servers = {"p": {
-        "server": _start_mock_upstream(p_port, req_list),
+        "server": p_server,
         "requests": req_list,
     }}
 
@@ -639,6 +644,7 @@ def test_admin_api_reload():
         except subprocess.TimeoutExpired:
             proc.kill()
         mock_servers["p"]["server"].shutdown()
+        mock_servers["p"]["server"].server_close()
         shutil.rmtree(temp_dir, ignore_errors=True)
 
     try:
@@ -1448,10 +1454,14 @@ def test_admin_switch_validates_key_names():
     temp_dir = tempfile.mkdtemp(prefix="proxy_admin_reload_key_")
     proxy_port = find_free_port()
     config_path = _create_test_config(temp_dir, tiers, models=_derive_models_from_tiers(tiers))
-    keys_path = _create_test_keys_plain(temp_dir, vendors)
 
     req_list = []
-    mock_servers = {"mkp": {"server": _start_mock_upstream(port, req_list), "requests": req_list}}
+    mkp_server = _start_mock_upstream(port, req_list)
+    # Same as the reload test above: the URL follows the bound port.
+    port = mkp_server.server_address[1]
+    vendors["mkp"]["url"] = "http://127.0.0.1:{}".format(port)
+    keys_path = _create_test_keys_plain(temp_dir, vendors)
+    mock_servers = {"mkp": {"server": mkp_server, "requests": req_list}}
     trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
     os.close(trace_fd)
     proc, probe_ok = _start_proxy_server_directly(
@@ -1471,6 +1481,7 @@ def test_admin_switch_validates_key_names():
         except subprocess.TimeoutExpired:
             proc.kill()
         mock_servers["mkp"]["server"].shutdown()
+        mock_servers["mkp"]["server"].server_close()
         shutil.rmtree(temp_dir, ignore_errors=True)
 
     def switch_tiers(tiers_cfg):

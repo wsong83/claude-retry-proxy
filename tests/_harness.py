@@ -139,6 +139,11 @@ URL_SWAP_LOCK_FILE = os.path.join(PROXY_DIR, "url-swap.lock")
 
 
 errors = []
+# Set by fail() and read by the builders' cleanup() closures: a failed
+# test's temp_dir (trace file + child stderr + artifacts) is the only
+# record of what the proxy actually did, so it is preserved instead of
+# deleted.
+_TEST_FAILED = False
 
 
 warnings_list = []
@@ -147,6 +152,8 @@ warnings_list = []
 
 
 def fail(msg):
+    global _TEST_FAILED
+    _TEST_FAILED = True
     errors.append(msg)
     print(f"  FAIL: {msg}")
 
@@ -694,7 +701,7 @@ def _read_child_stderr(proc, timeout=2):
 
 def _start_proxy_server_directly(port, config_path=None, keys_path=None,
                                   passphrase="test-passphrase", trace_file=None, cwd=None,
-                                  extra_env=None):
+                                  extra_env=None, _readiness_detail=None):
     """Start proxy server directly (not via claude-retry-proxy CLI) for testing.
 
     New flow: uses config.json + keys-index.json + passphrase instead of settings.json.
@@ -766,7 +773,73 @@ def _start_proxy_server_directly(port, config_path=None, keys_path=None,
     ).start()
 
     probe_ok = _wait_for_readiness(proc, port, ready_event)
+    if _readiness_detail is not None:
+        # True from the TCP fallback alone does not mean the CHILD is
+        # listening — a foreign listener holding the port also accepts the
+        # connect. The bind-retry wrapper reads marker_seen from this dict
+        # to discriminate; every other caller ignores the kwarg.
+        _readiness_detail["marker_seen"] = ready_event.is_set()
     return proc, probe_ok
+
+
+_BIND_RACE_GRACE_SECONDS = 1.5
+
+
+def _spawn_proxy_with_bind_retry(port, **kwargs):
+    """Spawn the proxy via _start_proxy_server_directly, retrying once on a
+    fresh port when the child died of a busy listen port.
+
+    The proxy's own port comes from find_free_port() and carries the same
+    TOCTOU window as the mock ports. Two facts shape the discrimination:
+    (1) the server pre-probes its port and exits with the fixed message
+    "[proxy] Port {N} is already in use." — the raw OSError text reaches
+    stderr only in the narrow probe-close-to-bind window, so both forms
+    are matched; (2) the readiness probe's TCP-connect fallback succeeds
+    against a FOREIGN listener holding the port, so probe_ok=True does not
+    by itself mean the child is up. marker_seen (plumbed through the
+    optional _readiness_detail dict) is the trustworthy success signal; a
+    connect-only success is confirmed by the child staying alive past a
+    short grace — a child that lost its bind exits within ~1s of spawn.
+    Real startup failures (bad config, bad keys) die with other stderr and
+    surface unchanged. _start_proxy_server_directly's signature is
+    unchanged apart from the optional kwarg; its direct test-file callers
+    keep today's behavior.
+
+    Returns (port, proc, probe_ok): `port` is the port actually bound and
+    must replace the caller's copy.
+    """
+    for attempt in (0, 1):
+        detail = {}
+        proc, probe_ok = _start_proxy_server_directly(
+            port, _readiness_detail=detail, **kwargs)
+        if probe_ok and not detail.get("marker_seen"):
+            # Connect-only success: the connect may have reached a foreign
+            # listener holding the port. A child that lost its bind exits
+            # quickly; confirm liveness before trusting the probe.
+            try:
+                proc.wait(timeout=_BIND_RACE_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+            if proc.poll() is None:
+                return port, proc, True
+            probe_ok = False
+        if probe_ok:
+            return port, proc, True
+        if attempt == 1:
+            return port, proc, False
+        if proc.poll() is None:
+            # Alive but not ready: not a bind race; surface as before.
+            return port, proc, False
+        stderr = _read_child_stderr(proc) or ""
+        proc.wait()  # reap the dead first attempt; returncode is set
+        if ("is already in use" not in stderr
+                and "Address already in use" not in stderr
+                and "Errno 98" not in stderr
+                and "10048" not in stderr):
+            # Died of something else; surface as before.
+            return port, proc, False
+        port = find_free_port()
+    return port, proc, probe_ok  # unreachable
 
 
 def _send_proxy_request(port, path="/v1/messages", body=None, headers=None):
@@ -841,7 +914,8 @@ def _admin_post(proxy_port, path, body, origin=None, timeout=10):
 # Helper: standard test setup with mock upstreams and config
 # ---------------------------------------------------------------------------
 
-def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-passphrase"):
+def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-passphrase",
+                             caller_owns_ports=False):
     """Set up a standard tier routing test environment.
 
     Creates temp directory with config.json and keys-index.json, starts mock
@@ -851,6 +925,13 @@ def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-pas
         tiers_config: Dict mapping tier -> {provider, model}
         vendors: Dict mapping vendor -> {url, key}
         default_passphrase: Passphrase for keys decryption
+        caller_owns_ports: True when the caller pre-binds its own listener
+            on each vendor URL's port (the SSE-rewrite family); that
+            listener IS the upstream, so this helper's own bind is skipped
+            on EADDRINUSE instead of rebound. False (default): this
+            helper's bind is the vendor's only upstream — bind
+            preferred-first with an ephemeral fallback and repoint the
+            vendor URL at the port actually owned.
 
     Returns:
         (temp_dir, proxy_port, proxy_proc, mock_servers, cleanup_fn)
@@ -858,18 +939,10 @@ def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-pas
     temp_dir = tempfile.mkdtemp(prefix="proxy_tier_test_")
     proxy_port = find_free_port()
 
-    # Create config — every vendor in keys needs >=1 model for startup validation
-    config_path = _create_test_config(
-        temp_dir, tiers_config, models=_models_for_vendors(tiers_config, vendors)
-    )
-
-    # Create keys (plain or encrypted depending on passphrase)
-    if default_passphrase is None:
-        keys_path = _create_test_keys_plain(temp_dir, vendors)
-    else:
-        keys_path = _create_test_keys(temp_dir, vendors, default_passphrase)
-
-    # Start mock upstreams
+    # Start mock upstreams FIRST (same reason as _start_admin_proxy): when
+    # caller_owns_ports is False, a mock that lost its preferred port to
+    # EADDRINUSE rebinds ephemeral (_bind_mock_server) and the vendor URL
+    # written into keys below carries the bound port.
     mock_servers = {}
     for vendor_name, vendor_info in vendors.items():
         # Parse port from URL
@@ -910,28 +983,48 @@ def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-pas
             return MockHandler
 
         MockHandler = make_handler(requests_received)
-        try:
-            server = http.server.ThreadingHTTPServer(("127.0.0.1", port), MockHandler)
-        except OSError as e:
-            # A caller may pre-bind its own listener on the vendor URL's port
-            # before calling this helper (the SSE-rewrite tests bind their SSE
-            # mock first). Linux rejects a second bind with EADDRINUSE; skip
-            # ours and leave `server` None so teardown skips it — the caller's
-            # listener serves the upstream traffic instead.
-            if e.errno != errno.EADDRINUSE:
-                raise
-            server = None
+        if caller_owns_ports:
+            # The pre-binding family: the caller's own listener on this
+            # port IS the upstream; this helper's bind is the redundant
+            # one, so on EADDRINUSE skip it and leave `server` None so
+            # teardown skips it.
+            try:
+                server = http.server.ThreadingHTTPServer(("127.0.0.1", port), MockHandler)
+            except OSError as e:
+                if e.errno != errno.EADDRINUSE:
+                    raise
+                server = None
+        else:
+            # The majority: this bind is the vendor's ONLY upstream. Bind
+            # preferred-first with an ephemeral fallback and let the URL
+            # carry the port actually owned.
+            server = _bind_mock_server(MockHandler, port)
+            actual_port = server.server_address[1]
+            if actual_port != port:
+                vendor_info["url"] = "{}://{}:{}".format(
+                    parsed.scheme, parsed.hostname, actual_port)
         if server is not None:
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             time.sleep(0.1)
         mock_servers[vendor_name] = {"server": server, "requests": requests_received}
 
+    # Create config — every vendor in keys needs >=1 model for startup validation
+    config_path = _create_test_config(
+        temp_dir, tiers_config, models=_models_for_vendors(tiers_config, vendors)
+    )
+
+    # Create keys (plain or encrypted depending on passphrase)
+    if default_passphrase is None:
+        keys_path = _create_test_keys_plain(temp_dir, vendors)
+    else:
+        keys_path = _create_test_keys(temp_dir, vendors, default_passphrase)
+
     # Start proxy
     trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
     os.close(trace_fd)
 
-    proc, probe_ok = _start_proxy_server_directly(
+    proxy_port, proc, probe_ok = _spawn_proxy_with_bind_retry(
         proxy_port, config_path=config_path, keys_path=keys_path,
         passphrase=default_passphrase, trace_file=trace_file
     )
@@ -944,8 +1037,19 @@ def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-pas
         for ms in mock_servers.values():
             if ms["server"] is not None:
                 ms["server"].shutdown()
+                ms["server"].server_close()
         proc.kill()
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        # A failed spawn IS the failure: keep its evidence for triage —
+        # the trace AND the child's stderr, which is buffered in memory
+        # and lost once the proc is collected.
+        stderr_path = os.path.join(temp_dir, "proxy-stderr.log")
+        try:
+            with open(stderr_path, "w", encoding="utf-8") as f:
+                f.write(child_stderr or "")
+        except Exception:
+            pass
+        print("  NOTE: setup failed — artifacts preserved at {} (trace: {}; stderr: {})".format(
+            temp_dir, trace_file, stderr_path))
         return None, None, None, None, None
 
     def cleanup():
@@ -957,7 +1061,24 @@ def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-pas
         for ms in mock_servers.values():
             if ms["server"] is not None:
                 ms["server"].shutdown()
-        shutil.rmtree(temp_dir, ignore_errors=True)
+                ms["server"].server_close()
+        if _TEST_FAILED or sys.exc_info()[0] is not None:
+            # The failure's evidence (trace, child stderr, artifacts) is
+            # the only record of what the proxy actually did — keep it for
+            # triage. sys.exc_info covers crash-shaped failures: an
+            # uncaught exception unwinds through this finally BEFORE
+            # run_cli records anything, so the flag alone would miss
+            # exactly the hardest failures to diagnose.
+            stderr_path = os.path.join(temp_dir, "proxy-stderr.log")
+            try:
+                with open(stderr_path, "w", encoding="utf-8") as f:
+                    f.write(_read_child_stderr(proc) or "")
+            except Exception:
+                pass
+            print("  NOTE: test failed — artifacts preserved at {} (trace: {}; stderr: {})".format(
+                temp_dir, trace_file, stderr_path))
+        else:
+            shutil.rmtree(temp_dir, ignore_errors=True)
         # Shared removal for the per-run state file — see
         # _remove_test_state_file for why rmtree and the child's own cleanup
         # cannot be relied on here.
@@ -971,6 +1092,40 @@ def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-pas
 # ===========================================================================
 # Test: Admin API Switch
 # ===========================================================================
+
+class _MockHTTPServer(http.server.ThreadingHTTPServer):
+    """ThreadingHTTPServer with POSIX-only SO_REUSEADDR, mirroring the
+    proxy's own _ProxyHTTPServer (src server.py): http.server's default
+    allow_reuse_address=1 lets a second listener bind a port a live
+    listener already holds on Windows, which would defeat the EADDRINUSE
+    fallback _bind_mock_server depends on."""
+    allow_reuse_address = (sys.platform != "win32")
+
+
+def _bind_mock_server(handler_cls, preferred_port):
+    """Bind a _MockHTTPServer on preferred_port, falling back to an
+    ephemeral port on EADDRINUSE.
+
+    find_free_port() hands out a port nobody owns between its probe's
+    close and the caller's real bind (the TOCTOU behind the intermittent
+    [Errno 98] setup crashes). Binding preferred-first with an ephemeral
+    fallback keeps the requested port in the common case and removes the
+    crash; callers that embed the port in a config/keys URL must use the
+    port the server actually owns — server.server_address[1] — not the
+    number they asked for.
+    """
+    try:
+        server = _MockHTTPServer(("127.0.0.1", preferred_port), handler_cls)
+    except OSError as e:
+        # On Windows a bind collision surfaces as winerror 10048
+        # (WSAEADDRINUSE), which CPython does not map to EADDRINUSE —
+        # match it explicitly so the fallback works there too (review R1).
+        if (e.errno != errno.EADDRINUSE
+                and getattr(e, "winerror", None) != 10048):
+            raise
+        server = _MockHTTPServer(("127.0.0.1", 0), handler_cls)
+    return server
+
 
 def _start_mock_upstream(port, req_list):
     """Start a mock upstream server recording requests into req_list."""
@@ -998,7 +1153,7 @@ def _start_mock_upstream(port, req_list):
 
         def log_message(self, format, *args):
             pass
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), MockHandler)
+    server = _bind_mock_server(MockHandler, port)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     time.sleep(0.1)
@@ -1036,7 +1191,7 @@ def _start_streaming_mock_upstream(port, req_list, handler_fn):
 
         def log_message(self, format, *args):
             pass
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), MockHandler)
+    server = _bind_mock_server(MockHandler, port)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     time.sleep(0.1)
@@ -1066,9 +1221,11 @@ def _start_admin_proxy(tiers, vendors, models=None, extra_env=None,
     if models is None:
         # Every vendor in keys needs >=1 model for startup validation
         models = _models_for_vendors(tiers, vendors)
-    config_path = _create_test_config(temp_dir, tiers, models=models)
-    keys_path = _create_test_keys_plain(temp_dir, vendors)
 
+    # Bind the mock upstreams BEFORE the config/keys files are written: a
+    # mock that lost its preferred port to EADDRINUSE rebinds ephemeral
+    # (_bind_mock_server), and the vendor URL written into keys.json must
+    # carry the port the mock actually owns, not the number it asked for.
     mock_servers = {}
     for vendor_name, vendor_info in vendors.items():
         from urllib.parse import urlparse
@@ -1083,12 +1240,19 @@ def _start_admin_proxy(tiers, vendors, models=None, extra_env=None,
                 port, req_list, responders[vendor_name])
         else:
             server = _start_mock_upstream(port, req_list)
+        actual_port = server.server_address[1]
+        if actual_port != port:
+            vendor_info["url"] = "{}://{}:{}".format(
+                parsed.scheme, parsed.hostname, actual_port)
         mock_servers[vendor_name] = {"server": server, "requests": req_list}
+
+    config_path = _create_test_config(temp_dir, tiers, models=models)
+    keys_path = _create_test_keys_plain(temp_dir, vendors)
 
     trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
     os.close(trace_fd)
 
-    proc, probe_ok = _start_proxy_server_directly(
+    proxy_port, proc, probe_ok = _spawn_proxy_with_bind_retry(
         proxy_port, config_path=config_path, keys_path=keys_path,
         passphrase=None, trace_file=trace_file, extra_env=extra_env
     )
@@ -1100,8 +1264,19 @@ def _start_admin_proxy(tiers, vendors, models=None, extra_env=None,
             info(child_stderr.rstrip())
         for ms in mock_servers.values():
             ms["server"].shutdown()
+            ms["server"].server_close()
         proc.kill()
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        # A failed spawn IS the failure: keep its evidence for triage —
+        # the trace AND the child's stderr, which is buffered in memory
+        # and lost once the proc is collected.
+        stderr_path = os.path.join(temp_dir, "proxy-stderr.log")
+        try:
+            with open(stderr_path, "w", encoding="utf-8") as f:
+                f.write(child_stderr or "")
+        except Exception:
+            pass
+        print("  NOTE: setup failed — artifacts preserved at {} (trace: {}; stderr: {})".format(
+            temp_dir, trace_file, stderr_path))
         return None, None, None, None, None
 
     def cleanup():
@@ -1112,7 +1287,24 @@ def _start_admin_proxy(tiers, vendors, models=None, extra_env=None,
             proc.kill()
         for ms in mock_servers.values():
             ms["server"].shutdown()
-        shutil.rmtree(temp_dir, ignore_errors=True)
+            ms["server"].server_close()
+        if _TEST_FAILED or sys.exc_info()[0] is not None:
+            # The failure's evidence (trace, child stderr, artifacts) is
+            # the only record of what the proxy actually did — keep it for
+            # triage. sys.exc_info covers crash-shaped failures: an
+            # uncaught exception unwinds through this finally BEFORE
+            # run_cli records anything, so the flag alone would miss
+            # exactly the hardest failures to diagnose.
+            stderr_path = os.path.join(temp_dir, "proxy-stderr.log")
+            try:
+                with open(stderr_path, "w", encoding="utf-8") as f:
+                    f.write(_read_child_stderr(proc) or "")
+            except Exception:
+                pass
+            print("  NOTE: test failed — artifacts preserved at {} (trace: {}; stderr: {})".format(
+                temp_dir, trace_file, stderr_path))
+        else:
+            shutil.rmtree(temp_dir, ignore_errors=True)
         # Shared removal for the per-run state file — see
         # _remove_test_state_file for why rmtree and the child's own cleanup
         # cannot be relied on here.
@@ -1228,7 +1420,7 @@ def _start_mode_mock_upstream(port, req_list, responder):
 
         def log_message(self, format, *args):
             pass
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), MockHandler)
+    server = _bind_mock_server(MockHandler, port)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     time.sleep(0.1)
@@ -1280,18 +1472,16 @@ def _start_mode_proxy(tiers, vendors, responders=None, extra_env=None,
     """
     temp_dir = tempfile.mkdtemp(prefix="proxy_mode_")
     proxy_port = find_free_port()
-    config_path = _create_test_config(
-        temp_dir, tiers, models=_models_for_vendors(tiers, vendors),
-        extra_request_headers=extra_headers,
-        reasoning_field_switch=reasoning_field_switch,
-        reasoning_roundtrip=reasoning_roundtrip)
-    keys_path = _create_test_keys_plain(temp_dir, vendors)
 
+    # Bind the mock upstreams BEFORE the config/keys files are written
+    # (same reason as _start_admin_proxy): the vendor URL in keys.json
+    # must carry the port the mock actually owns.
     responders = responders or {}
     mock_servers = {}
     for vendor_name, vendor_info in vendors.items():
         from urllib.parse import urlparse
-        port = urlparse(vendor_info["url"]).port
+        parsed = urlparse(vendor_info["url"])
+        port = parsed.port
         req_list = []
         if streamers and vendor_name in streamers:
             server = _start_streaming_mock_upstream(
@@ -1299,12 +1489,23 @@ def _start_mode_proxy(tiers, vendors, responders=None, extra_env=None,
         else:
             responder = responders.get(vendor_name, _mode_default_responder)
             server = _start_mode_mock_upstream(port, req_list, responder)
+        actual_port = server.server_address[1]
+        if actual_port != port:
+            vendor_info["url"] = "{}://{}:{}".format(
+                parsed.scheme, parsed.hostname, actual_port)
         mock_servers[vendor_name] = {"server": server, "requests": req_list}
+
+    config_path = _create_test_config(
+        temp_dir, tiers, models=_models_for_vendors(tiers, vendors),
+        extra_request_headers=extra_headers,
+        reasoning_field_switch=reasoning_field_switch,
+        reasoning_roundtrip=reasoning_roundtrip)
+    keys_path = _create_test_keys_plain(temp_dir, vendors)
 
     trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
     os.close(trace_fd)
 
-    proc, probe_ok = _start_proxy_server_directly(
+    proxy_port, proc, probe_ok = _spawn_proxy_with_bind_retry(
         proxy_port, config_path=config_path, keys_path=keys_path,
         passphrase=None, trace_file=trace_file, extra_env=extra_env
     )
@@ -1316,8 +1517,19 @@ def _start_mode_proxy(tiers, vendors, responders=None, extra_env=None,
             info(child_stderr.rstrip())
         for ms in mock_servers.values():
             ms["server"].shutdown()
+            ms["server"].server_close()
         proc.kill()
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        # A failed spawn IS the failure: keep its evidence for triage —
+        # the trace AND the child's stderr, which is buffered in memory
+        # and lost once the proc is collected.
+        stderr_path = os.path.join(temp_dir, "proxy-stderr.log")
+        try:
+            with open(stderr_path, "w", encoding="utf-8") as f:
+                f.write(child_stderr or "")
+        except Exception:
+            pass
+        print("  NOTE: setup failed — artifacts preserved at {} (trace: {}; stderr: {})".format(
+            temp_dir, trace_file, stderr_path))
         return None, None, None, None, None, None
 
     def cleanup():
@@ -1328,7 +1540,24 @@ def _start_mode_proxy(tiers, vendors, responders=None, extra_env=None,
             proc.kill()
         for ms in mock_servers.values():
             ms["server"].shutdown()
-        shutil.rmtree(temp_dir, ignore_errors=True)
+            ms["server"].server_close()
+        if _TEST_FAILED or sys.exc_info()[0] is not None:
+            # The failure's evidence (trace, child stderr, artifacts) is
+            # the only record of what the proxy actually did — keep it for
+            # triage. sys.exc_info covers crash-shaped failures: an
+            # uncaught exception unwinds through this finally BEFORE
+            # run_cli records anything, so the flag alone would miss
+            # exactly the hardest failures to diagnose.
+            stderr_path = os.path.join(temp_dir, "proxy-stderr.log")
+            try:
+                with open(stderr_path, "w", encoding="utf-8") as f:
+                    f.write(_read_child_stderr(proc) or "")
+            except Exception:
+                pass
+            print("  NOTE: test failed — artifacts preserved at {} (trace: {}; stderr: {})".format(
+                temp_dir, trace_file, stderr_path))
+        else:
+            shutil.rmtree(temp_dir, ignore_errors=True)
         # Shared removal for the per-run state file — see
         # _remove_test_state_file for why rmtree and the child's own cleanup
         # cannot be relied on here.
@@ -1748,6 +1977,8 @@ def run_cli(all_tests, description):
         # Clear per-test errors
         global errors
         errors = []
+        global _TEST_FAILED
+        _TEST_FAILED = False
         try:
             func()
         except Exception as e:

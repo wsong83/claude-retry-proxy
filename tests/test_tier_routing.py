@@ -429,7 +429,8 @@ def test_response_model_rewrite_streaming():
     }
     vendors = {"p": {"url": f"http://127.0.0.1:{upstream_port}", "key": "k"}}
 
-    temp_dir, proxy_port, proc, mock_servers, cleanup = _setup_tier_routing_test(tiers, vendors)
+    temp_dir, proxy_port, proc, mock_servers, cleanup = _setup_tier_routing_test(
+        tiers, vendors, caller_owns_ports=True)
     if proc is None:
         mock_server.shutdown()
         fail("Failed to set up test")
@@ -503,7 +504,8 @@ def test_response_model_rewrite_streaming_non_message_start():
     }
     vendors = {"p": {"url": f"http://127.0.0.1:{upstream_port}", "key": "k"}}
 
-    temp_dir, proxy_port, proc, mock_servers, cleanup = _setup_tier_routing_test(tiers, vendors)
+    temp_dir, proxy_port, proc, mock_servers, cleanup = _setup_tier_routing_test(
+        tiers, vendors, caller_owns_ports=True)
     if proc is None:
         mock_server.shutdown()
         fail("Failed to set up test")
@@ -716,7 +718,8 @@ def test_response_model_rewrite_upstream_model():
     }
     vendors = {"p": {"url": f"http://127.0.0.1:{upstream_port}", "key": "k"}}
 
-    temp_dir, proxy_port, proc, mock_servers, cleanup = _setup_tier_routing_test(tiers, vendors)
+    temp_dir, proxy_port, proc, mock_servers, cleanup = _setup_tier_routing_test(
+        tiers, vendors, caller_owns_ports=True)
     if proc is None:
         mock_server.shutdown()
         fail("Failed to set up test")
