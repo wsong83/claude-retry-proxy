@@ -50,6 +50,37 @@ def geomean(values):
     return math.exp(sum(math.log(v) for v in positive_values) / len(positive_values))
 
 
+def _term_safe(value):
+    """Escape terminal-hostile characters for operator output.
+
+    The per-model table's key is client-supplied text read back from the
+    trace: on pre-routing rejections the trace's model field is the raw
+    client string, and a CSI/OSC sequence in it would otherwise be
+    replayed verbatim into the operator's terminal. Escaped: the C0, DEL
+    and C1 control ranges (as \\xNN), and lone UTF-16 surrogates
+    (U+D800-U+DFFF, as \\uNNNN) — a surrogate survives the json
+    round-trip (a client may send {"model": "\\ud800"}; json.dumps writes
+    the ASCII escape, the analyzer's json.loads decodes it back), but
+    print() of one raises UnicodeEncodeError on a strict-UTF-8 stdout,
+    so unescaped it is a client-controlled crash of the analyzer.
+    Legitimate model names — including non-ASCII ones — stay
+    byte-identical. A non-string value (hand-edited or third-party
+    trace) is coerced, not crashed on.
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    out = []
+    for ch in value:
+        o = ord(ch)
+        if 0xD800 <= o <= 0xDFFF:
+            out.append("\\u{:04x}".format(o))
+        elif o < 0x20 or o == 0x7F or 0x80 <= o <= 0x9F:
+            out.append("\\x{:02x}".format(o))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Analyze proxy trace log for model statistics",
@@ -281,7 +312,7 @@ def main():
         all_ttft.extend(stats["ttft_list"])
         all_latency.extend(stats["latency_list"])
 
-        print(f"{model:<20} {req_count:>10} {avg_retries:>12.4f} {query_success_rate:>14.2f}% {attempt_success_rate:>16.2f}% {geo_ttft:>11.2f}s {geo_latency:>11.2f}s")
+        print(f"{_term_safe(model):<20} {req_count:>10} {avg_retries:>12.4f} {query_success_rate:>14.2f}% {attempt_success_rate:>16.2f}% {geo_ttft:>11.2f}s {geo_latency:>11.2f}s")
 
     print("=" * 130)
 

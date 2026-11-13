@@ -27,6 +27,7 @@ from test_nesting import ALL_TESTS as NESTING_TESTS
 from test_docs import ALL_TESTS as DOCS_TESTS
 from test_parse_guards import ALL_TESTS as PARSE_GUARDS_TESTS
 from test_harness_hardening import ALL_TESTS as HARNESS_HARDENING_TESTS
+from test_response_headers import ALL_TESTS as RESPONSE_HEADERS_TESTS
 
 ALL_TESTS = (
     UNIT_TESTS +
@@ -48,7 +49,8 @@ ALL_TESTS = (
     NESTING_TESTS +
     DOCS_TESTS +
     PARSE_GUARDS_TESTS +
-    HARNESS_HARDENING_TESTS
+    HARNESS_HARDENING_TESTS +
+    RESPONSE_HEADERS_TESTS
 )
 
 if __name__ == "__main__":

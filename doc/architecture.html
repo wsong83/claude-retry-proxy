@@ -99,6 +99,23 @@ internal model id. The mechanism differs by content type and mode; see
 </div>
 
 <div class="step-box info">
+<div class="step-label">Response headers — one Date, no proxy Server</div>
+<p>Every response the proxy sends carries exactly one <code>Date</code> header — the proxy's
+own — and never a <code>Server</code> header of its own. A
+<code>ProxyHandler.send_response</code> override replaces the stdlib auto-emitted pair
+(<code>Server: BaseHTTP/0.6 Python/&lt;version&gt;</code> plus its own <code>Date</code>) with
+<code>send_response_only</code> + one explicit <code>Date</code>, so the proxy discloses nothing
+about its implementation on any path — the admin surface, OPTIONS, proxy-generated errors, and
+forwarded responses alike. On the two forwarding loops (buffered and streamed) the upstream's
+<code>Date</code> is dropped in favour of the proxy's own, while the upstream's <code>Server</code>
+is forwarded <em>verbatim</em> — deliberately, because which edge served a refusal is a
+load-bearing diagnostic (a <code>Server: cloudflare</code> on a 403 says the provider's edge
+rejected the request before the origin saw it). The 429/503 give-up path
+(<a href="#give-up">below</a>) delivers the upstream error body under proxy-generated headers
+— one <code>Date</code>, no <code>Server</code> — its headers are never forwarded.</p>
+</div>
+
+<div class="step-box info">
 <div class="step-label">Step 7 — Trace</div>
 <p>One JSONL record is appended describing the outcome. See
 <a href="trace-log.html">trace-log.html</a>.</p>

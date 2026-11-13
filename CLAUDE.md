@@ -274,8 +274,9 @@ startup on failure).
   User-Agent as the proxy forwards it — a repeated header resolves to the last
   line sent upstream — capped at 512 bytes with a visible marker, and omitted
   when that resolved value is empty; its value is arbitrary raw client text with
-  no allowlist, and `method`/`path`/`model` are client strings too). The Windows
-  caveat above applies to both.
+  no allowlist, and `method`/`path`/`model` are client strings too — `model`
+  head-capped at 512 characters with a `[proxy: model truncated]` marker). The
+  Windows caveat above applies to both.
   [doc/trace-log.html#all](doc/trace-log.html#all)
 
 - **Admin API CSRF protection.** Admin POST endpoints validate the Origin
@@ -318,6 +319,7 @@ what you need in context, and the link has the rest.
 | In one line | Detail |
 |---|---|
 | Provider mode dispatch — `anthropic`/`chat`/`response` differ in auth header, path, and both body transforms | [doc/provider-modes.html](doc/provider-modes.html) |
+| Every response carries exactly one `Date` (the proxy's own) and never a proxy `Server`; the upstream `Server` forwards verbatim on the two forwarding loops, and the give-up path delivers the upstream body under proxy-generated headers | [doc/architecture.html#request-path](doc/architecture.html#request-path) |
 | Tool-schema `pattern` regexes are normalized (ECMA identity escapes stripped) in **all three modes** before forwarding — anthropic mode included, via `_sanitize_body_tools` on its verbatim forward — so strict backends accept MCP/Zod tool schemas | [doc/provider-modes.html#pattern-normalization](doc/provider-modes.html#pattern-normalization) |
 | Chat mode never substitutes `input: {}` for tool arguments it could not parse — it degrades them to a visible placeholder block | [doc/provider-modes.html#malformed-args](doc/provider-modes.html#malformed-args) |
 | Chat mode maps `image` blocks — top-level and `tool_result`-nested — to `image_url` parts (base64 → `data:` URI, url verbatim, merged text part first); inconvertible images (incl. the Files-API `file` source) are dropped and counted, and there is deliberately no reverse mapping | [doc/provider-modes.html#image-content-blocks](doc/provider-modes.html#image-content-blocks) |

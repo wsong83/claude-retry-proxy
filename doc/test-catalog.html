@@ -177,6 +177,13 @@ not carried — recount on demand with the command above, or read the aggregator
         (proven end to end against a foreign listener), the proxy-port bind-collision retry
         (marker-vs-connect discrimination plus a liveness grace), and failure-artifact
         preservation on the harness's failure flag</td></tr>
+<tr><td><code>test_response_headers.py</code></td>
+    <td>Response-header and operator-output contracts (added 2026-11-13): exactly one
+        <code>Date</code> and no proxy <code>Server</code> on every response path (buffered,
+        streamed, proxy-generated, OPTIONS), the upstream <code>Server</code> forwarded verbatim
+        and an upstream without a <code>Date</code> still yielding exactly one, the trace
+        <code>model</code> field's 512-character cap boundaries, and the analyzer's terminal
+        escaping of control-character and lone-surrogate model names</td></tr>
 <tr><td><code>test_sanitize.py</code></td>
     <td>The <code>sanitize_error</code> redaction chokepoint — path and IP redaction, case variants, boundary cases, linear-time bound</td></tr>
 <tr><td><code>test_settings.py</code></td>
@@ -896,6 +903,39 @@ busy-port message, and one retry on a fresh port comes up ready with a live chil
 <code>cleanup()</code> keeps the temp dir, the trace file, and the <code>proxy-stderr.log</code>
 dump, and prints their paths. (The removal branch is pinned at suite level — the no-residue
 property of a passing run.)</li>
+</ul>
+
+<h3 id="cat-15">Category 15 — Response-Header and Operator-Output Contracts (added 2026-11-13)</h3>
+
+<p>All in <code>tests/test_response_headers.py</code> (plan 2026-11-13-operator-output-hygiene).
+The mock upstreams deliberately use <code>send_response_only</code> — a plain
+<code>send_response</code> would auto-emit the mock's own <code>BaseHTTP</code>
+<code>Server</code>/<code>Date</code> pair, and the "the proxy forwarded the upstream Server"
+assertion could then pass by accident.</p>
+
+<h4><code>tests/test_response_headers.py</code></h4>
+<ul>
+<li><code>test_response_headers_buffered</code>: a buffered proxied 200 carries exactly one
+<code>Date</code> and exactly the upstream's distinctive <code>Server</code> — no
+<code>BaseHTTP</code>/Python disclosure, no duplicate pair from the stdlib auto-headers.</li>
+<li><code>test_response_headers_streamed</code>: the same contract on a streamed SSE response
+(the relayed body is also asserted to contain <code>message_stop</code>, so a mock-side body
+failure cannot pass on headers alone).</li>
+<li><code>test_response_headers_proxy_generated</code>: a proxy-generated 400 (unknown model)
+carries exactly one <code>Date</code> and no <code>Server</code> at all.</li>
+<li><code>test_response_headers_options</code>: the OPTIONS preflight carries exactly one
+<code>Date</code> and no <code>Server</code>.</li>
+<li><code>test_response_headers_upstream_no_date</code>: an upstream that sends no
+<code>Date</code> (HTTP/1.0-origin shape) still yields exactly one <code>Date</code> — the
+proxy's own; the substitution can never produce a double.</li>
+<li><code>test_trace_model_field_capped</code>: rejected requests' client model strings at the cap
+boundaries — 512 characters pass through unchanged, 513 and 600 truncate head-kept with the
+visible <code>[proxy: model truncated]</code> marker (the 512/513 pair discriminates an
+off-by-one in the guard or the <code>keep</code> arithmetic; 600 alone cannot).</li>
+<li><code>test_analyzer_model_escape</code>: the analyzer renders a control-character and
+lone-surrogate model name (CSI/OSC + <code>\ud800</code>) as escaped forms, exits 0 — pre-fix
+the surrogate crashed <code>print()</code> with <code>UnicodeEncodeError</code> — and emits no
+raw ESC byte.</li>
 </ul>
 
 <!-- END per-test inventory -->

@@ -990,6 +990,9 @@ def _resolve_extra_request_headers(headers, provider_name, config, request_id):
 CLIENT_USER_AGENT_MAX_CHARS = 512
 CLIENT_USER_AGENT_TRUNCATION_MARKER = "[proxy: user-agent truncated]"
 
+TRACE_MODEL_MAX_CHARS = 512
+TRACE_MODEL_TRUNCATION_MARKER = "[proxy: model truncated]"
+
 
 def _client_user_agent(headers):
     """The User-Agent the proxy forwards, capped; None when absent or empty.
@@ -1030,6 +1033,23 @@ def _client_user_agent(headers):
         return value
     keep = CLIENT_USER_AGENT_MAX_CHARS - len(CLIENT_USER_AGENT_TRUNCATION_MARKER)
     return value[:keep] + CLIENT_USER_AGENT_TRUNCATION_MARKER
+
+
+def _trace_model(actual_model, model):
+    """The model name recorded on the request trace entry, capped.
+
+    The resolved tier name (config-controlled, short) wins; the fallback
+    is the raw client-supplied string -- unbounded client text of the
+    same class _client_user_agent bounds. A value longer than the cap
+    keeps its head and gains a visible marker, so a truncated model name
+    is never mistaken for a genuine one; the body-size cap bounds the
+    raw input, this bounds its at-rest record.
+    """
+    value = actual_model or model or "unknown"
+    if len(value) <= TRACE_MODEL_MAX_CHARS:
+        return value
+    keep = TRACE_MODEL_MAX_CHARS - len(TRACE_MODEL_TRUNCATION_MARKER)
+    return value[:keep] + TRACE_MODEL_TRUNCATION_MARKER
 
 
 def _forward_request_impl(method, path, headers, body, handler, request_id,
@@ -2081,13 +2101,28 @@ def _crlf_safe(headers):
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
+    def send_response(self, code, message=None):
+        """send_response minus BaseHTTPRequestHandler's auto-emitted pair.
+
+        The stock method emits "Server: BaseHTTP/0.6 Python/<version>" --
+        an implementation disclosure -- and its own "Date" before the
+        handler's headers, which the upstream-forwarding loops then
+        duplicate. This override emits no Server ever (the upstream's is
+        forwarded verbatim by the loops) and exactly one Date (the
+        proxy's own; the loops skip the upstream's). log_request is
+        preserved: the stderr access-log behavior is unchanged.
+        """
+        self.log_request(code)
+        self.send_response_only(code, message)
+        self.send_header("Date", self.date_time_string())
+
     def _send_response(self, status, body_bytes, headers=None):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         if headers:
             for k, v in _crlf_safe(headers).items():
                 if k.lower() not in {"content-type", "transfer-encoding",
-                                     "content-length", "connection"}:
+                                     "content-length", "connection", "date"}:
                     self.send_header(k, v)
         self.send_header("Content-Length", str(len(body_bytes)))
         self.end_headers()
@@ -2204,7 +2239,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             # the response is close-delimited via HTTP/1.0.
             for k, v in _crlf_safe(resp_headers).items():
                 if k.lower() not in {"transfer-encoding", "content-length",
-                                     "connection"}:
+                                     "connection", "date"}:
                     self.send_header(k, v)
             self.end_headers()
 
@@ -4109,7 +4144,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "request_id": request_id,
             "method": self.command,
             "path": self.path,
-            "model": actual_model or model or "unknown",
+            "model": _trace_model(actual_model, model),
             "tier": tier,
             "provider": provider,
             "key": None,  # resolved below; omitted when resolution fails

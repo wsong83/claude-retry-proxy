@@ -602,7 +602,9 @@ impossible. Requests to providers with `extra_request_headers` rules
 additionally log an `extra_request_headers` field with the resolved header
 map. Every routed request also logs `client_user_agent` — your client's inbound
 `User-Agent` as the proxy forwards it, capped at 512 bytes with a visible
-`[proxy: user-agent truncated]` marker. When a request carries the header more
+`[proxy: user-agent truncated]` marker — and `model`, which is likewise capped
+at 512 characters with a `[proxy: model truncated]` marker when the client's
+model string runs long. When a request carries the header more
 than once, the recorded value is the last `User-Agent` line the proxy sends
 upstream, so it still names the UA that produced the response; the field is
 omitted when that resolved value is empty (no header at all, or an empty last
@@ -660,7 +662,8 @@ stable per-conversation identifier, so treat the trace file accordingly.
 The `client_user_agent` field is likewise logged on every routed request
 regardless of `--all`; its value is arbitrary raw client text with no
 allowlist, and it is not the only such field — `method`, `path` and `model`
-are verbatim client strings too, and `extra_request_headers` copies client
+are verbatim client strings too (`model` head-capped at 512 characters with a
+visible `[proxy: model truncated]` marker), and `extra_request_headers` copies client
 header values. The trace escapes all of them, which keeps the file one entry
 per line and free of raw control characters, but escaping is not trust. The
 resolved key **name**
