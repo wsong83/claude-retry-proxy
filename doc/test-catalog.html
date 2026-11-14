@@ -10,7 +10,7 @@
 
 <h1>Test Catalog<span class="sub">Suite layout, harness isolation, and testing patterns</span></h1>
 
-<p><strong>Last updated:</strong> 2026-11-04</p>
+<p><strong>Last updated:</strong> 2026-11-14</p>
 
 <p>The suite is a set of per-area modules merged by a single aggregator. It runs against
 <em>real</em> proxy processes and <em>real</em> mock upstream servers over loopback sockets —
@@ -44,7 +44,10 @@ needs no edit unless you add a whole new module.</p>
 harness redirects the state, compatibility, and trace paths into isolated temp files at
 import time — the state path per-run, the other two session-scoped — so a test run cannot
 touch a running proxy's files. See
-<a href="#isolation">Isolation</a>.
+<a href="#isolation">Isolation</a>. One suite module
+(<code>tests/test_spawn_isolation.py</code>) additionally scans the repo's gitignored
+verification-script corpus, so a run can go red from workspace content rather than code —
+run <code>python scripts/check_spawn_isolation.py</code> to see what tripped.
 </div>
 
 <h2 id="isolation">Isolation</h2>
@@ -85,7 +88,9 @@ A <em>completed</em> run therefore leaves nothing behind; a run that is hard-kil
 orphan its own file, since no cleanup can run. Those orphans are inert — the next run uses a new
 PID-keyed name and clears it at import — but they are never collected automatically, so
 <code>~/.claude/proxy/claude-retry-proxy-test-state-*.json</code> files may be deleted by hand at
-any time.</p>
+any time. Verification and diagnostic scripts that spawn proxy children owe the same isolation —
+see <a href="#pattern-spawn-isolation">Spawn isolation for verification scripts</a>;
+<code>python scripts/check_spawn_isolation.py</code> measures the corpus on demand.</p>
 
 <p><strong>Known limitation (accepted by user decision, 2026-10-03).</strong> The product side is
 deliberately unchanged: a proxy killed outside <code>claude-retry-proxy stop</code> (Task Manager,
@@ -160,13 +165,18 @@ not carried — recount on demand with the command above, or read the aggregator
         <code>try</code> whose handlers are total, plus pins on the scanner's own accept/reject
         branches and on the gate's Python-3.8 portability. See
         <a href="architecture.html#json-ceilings">architecture.html#json-ceilings</a>.</td></tr>
+<tr><td><code>test_spawn_isolation.py</code></td>
+    <td>The verification-script corpus hygiene gate — the committed checker
+        (<code>scripts/check_spawn_isolation.py</code>) driven over synthetic fixtures for its
+        teeth, satisfiability, classification and fault branches, plus the live-corpus hook.
+        See <a href="#pattern-spawn-isolation">Spawn isolation for verification scripts</a>.</td></tr>
 <tr><td><code>_harness.py</code></td>
     <td><strong>Not a test module.</strong> Shared helpers, isolation setup, proxy lifecycle.</td></tr>
 <tr><td><code>test_claude_proxy.py</code></td>
     <td><strong>Not a test module.</strong> The aggregator and CLI entry point.</td></tr>
 </table>
 
-<!-- BEGIN per-test inventory (generated 2026-09-16; extended 2026-10-06, 2026-10-25, 2026-10-26) -->
+<!-- BEGIN per-test inventory (generated 2026-09-16; extended 2026-10-06, 2026-10-25, 2026-10-26, 2026-11-14) -->
 <h2 id="per-test">Per-Test Descriptions</h2>
 
 <p>Every test in the suite, grouped by the area it exercises. Use it to find which
@@ -636,9 +646,9 @@ EOF</code></pre>
 <li><code>test_second_press_refused_409</code>: While a drain is in progress a second switch or reload returns <code>409 config_swap_in_progress</code>, the in-flight request is unaffected, and exactly one <code>_config_epoch</code> bump occurs for the pair.</li>
 <li><code>test_concurrent_presses_single_flight</code>: Two presses issued <em>concurrently</em> (inside the race window the sequential 409 test cannot reach) must not both land: the outcome is asserted tolerantly as one 200 + one 409 <em>or</em> two sequential 200s, so a scheduling flip on a <em>correct</em> tree cannot be misread as the single-flight defect, and the refusal is checked as the Anthropic envelope accepting <em>either</em> legitimate 409 code (<code>config_swap_in_progress</code>, or the stale-candidate <code>config_reload_stale</code>). The load-bearing assertion holds in both outcomes: the surviving press's mapping is the one in force afterwards (two post-swap route probes). That is what catches the measured silent revert — with the guard and the press split across two lock acquisitions, both presses drained and the reload's stale candidate reverted the switch while the switch still reported success. The epoch-advances-once pin holds only in the one-200 branch: the two-200 outcome is by definition two landed presses, hence two bumps.</li>
 <li><code>test_request_blocked_at_admission_not_evicted</code>: A request blocked at admission in <code>_swap_done.wait()</code> while a swap runs is <em>not</em> evicted by the swap it waited on: it is admitted after the release with the POST-swap epoch and completes against the new provider, never with <code>config_swap_restart</code>.</li>
-<li><code>test_reload_does_not_revert_concurrent_switch</code>: The reload's stale-candidate epoch guard, driven <em>deterministically in-process</em>: <code>_drain_for_swap</code> is monkeypatched to simulate a switch completing its whole press → swap → release cycle between the reload's gated tier read and Phase 3's compare-and-install, then the reload handler runs via the suite's <code>object.__new__(srv.ProxyHandler)</code> pattern. Phase 3 must refuse <code>409 config_reload_stale</code> (Anthropic envelope), install nothing and bump no epoch, and the switch's mapping must survive — a guard that fired but reverted the mapping would still fail. The window cannot be driven from outside the process (an 8/8-trial E2E probe saw only <code>config_swap_in_progress</code> in both geometries), so the guard's precondition is driven directly; <code>tmp/verification/2026-10-12-swap-silence-drain-reload-stale-guard-sensitivity.py</code> proves sensitivity in both directions — with the epoch signal defeated the stale candidate <em>does</em> revert the switch, which is what makes the mapping assertion load-bearing.</li>
+<li><code>test_reload_does_not_revert_concurrent_switch</code>: The reload's stale-candidate epoch guard, driven <em>deterministically in-process</em>: <code>_drain_for_swap</code> is monkeypatched to simulate a switch completing its whole press → swap → release cycle between the reload's gated tier read and Phase 3's compare-and-install, then the reload handler runs via the suite's <code>object.__new__(srv.ProxyHandler)</code> pattern. Phase 3 must refuse <code>409 config_reload_stale</code> (Anthropic envelope), install nothing and bump no epoch, and the switch's mapping must survive — a guard that fired but reverted the mapping would still fail. The window cannot be driven from outside the process (an 8/8-trial E2E probe saw only <code>config_swap_in_progress</code> in both geometries), so the guard's precondition is driven directly; a dedicated sensitivity proof script has proven the guard in both directions — with the epoch signal defeated the stale candidate <em>does</em> revert the switch, which is what makes the mapping assertion load-bearing (the script was plan-scoped evidence, since retired with its plan's artifacts).</li>
 <li><code>test_admin_html_poll_guard_after_await</code>: All <em>three</em> <code>setInterval(async () =&gt; {…}, 1000)</code> poll callbacks must carry the top-of-callback guard <em>and</em> a second check after <code>await resp.json()</code> that sits before the <code>showStatus</code> repaint — the fix for a 1 Hz poll response that resolves after the press wrote its terminal line and repaints over it. The guard is asserted <strong>by block identity, positionally</strong> — each callback is identified by the function that <em>encloses</em> it (<code>_POLL_BLOCK_OWNERS</code>), because neither press callback contains its handler's fetch (the switch/reload POST sits outside the <code>setInterval</code>) and the two press callbacks are byte-identical, so no in-block marker can tell them apart, while a name marker could be forged by any block. The two press blocks must carry <code>if (swapSettled)</code> twice each; the attach watcher must carry <code>if (myGeneration !== attachGeneration)</code> twice. That identity requirement is what stops a mutant where all three blocks guard on the same flag from passing — in such a mutant both press paths lose their real re-check. Pins source <em>ordering</em> on the page the proxy actually serves (fetched from <code>/admin/</code>): a JS harness was judged disproportionate for a cosmetic status-line guard, so runtime behaviour is verified by reading, and this structural assertion is what fails if a post-await check is deleted.</li>
-<li><code>test_admin_html_pending_status_styled</code>: The admin page's swap-status surface, pinned on the served HTML in 22 evidence lines. <strong>(a)-(c)</strong> the pending state is visible at all: a <code>.status.pending</code> rule whose body carries <code>display: block</code>; the disabled-button selector list carries <code>button.secondary:disabled:hover</code> as well as <code>button:disabled</code> (the bare <code>button:disabled</code> is (0,1,1) and loses to <code>button.secondary:hover</code> at (0,2,1), so a disabled Reload button would keep painting the enabled hover colour); and no empty-type <code>showStatus('')</code> call remains — that call shape is the exact defect the plan fixes, and nothing else in the suite would have caught it. <strong>(d)-(j)</strong> the surface itself: the pending line occurs at ≥ 6 call sites — a threshold, not a count: the page carries <strong>10</strong> sites today (2 press entry paints + 2 press repaints + 2 attach-watcher paints + the reload-stale sticky line + the attach completion's failed-re-read line + the load path's failed-re-read line + the poll-failure line), and the plan's threshold of 4 was rejected because it is satisfied by the press sites alone and would pass with the watcher's paints deleted; <code>attachToInFlightSwap</code> and <code>checkInFlightSwapOnLoad</code> are defined and invoked; both button ids are present; the lockout helper disables the nine tier selects as well as the buttons and restores <code>populateKeys</code>' single-key rule on unlock; <code>noteAttachPollFailure</code> is defined, invoked, and carries its threshold constant; <code>refreshTiersFromServer</code> is invoked from the attach completion; and the pending line carries the "no need to refresh" guidance while the poll-failure line tells the operator to reload. <strong>(k)-(l)</strong> the lock arms before the fetch: <em>both</em> press handlers call <code>setSwapControlsDisabled(true)</code> before their POST, asserted <em>by block</em> rather than by a file-wide count (deleting it from <code>reloadConfig()</code> leaves a count-based probe green); and a <strong>failed</strong> re-read must neither unlock nor claim success — the correction reviewer Warning 1 required, which nothing guarded before. <strong>(m)-(o)</strong> the reload-stale correction: the <code>config_reload_stale</code> branch captures the re-read result (<code>const refreshed = await refreshTiersFromServer();</code>) and confines the "has been refreshed" claim to the <em>successful</em> re-read; its failure path sets <code>reloadStaleUnresolved = true</code> and paints the sticky "reload this page before applying" line — never the success text; and <code>reloadConfig</code>'s <code>finally</code> holds the lock on that path (<code>attachPollHandle === null &amp;&amp; !reloadStaleUnresolved</code>), so a failed re-read leaves the controls locked and the stale baseline is never actionable. Worth its own guard because <code>server.py</code> emits <code>config_reload_stale</code> <em>because</em> a concurrent switch completed, so the row is one swap behind by construction. <strong>(p)</strong> the attach watcher's <code>if (settled)</code> bail sits before <code>if (!st.swapping)</code>. <strong>(q)-(r)</strong> the load path's own gate — the third and last call site of the same discipline: its no-swap branch <em>captures</em> the re-read result (<code>const refreshed = await refreshTiersFromServer();</code>), and its <code>if (!refreshed)</code> failure branch locks the surface, never unlocks it, paints the sticky "reload this page before applying" line, never claims a refresh, and returns after painting so the guard below cannot hand the page back unlocked; and a three-condition press guard (<code>swapPollHandle !== null || attachPollHandle !== null || swapSettled</code>) sits both before that await and again after it, the second re-locking and never unlocking — the fix for a press whose select lock <code>renderTiers()</code> would otherwise drop. Both probes reach the load path through the same <code>_js_function_body</code>/<code>_js_braced_block</code> extractors as the other two sites. The branch, its nested <code>if (refreshed)</code> pair, the failure branch and the <code>finally</code> are all extracted with the module's brace-balanced <code>_js_braced_block</code>, never a <code>(.*?)…} else</code> delimiter — the branch legitimately contains a nested <code>} else</code>, which is exactly how an earlier plan-authored verification script went stale. Every probe added across the last two rounds is proven <em>red-capable</em> by mutation-based proof scripts rather than merely green: round 3's four by <code>tmp/verification/2026-10-15-admin-apply-status-step5-proof.py</code> (the live page, the pre-fix literal, and 8 mutants), and round 4's two — plus the re-quoted discriminator — by <code>tmp/verification/2026-10-15-admin-apply-status-step5-round4-proof.py</code> (the live page, a pre-fix shape derived by programmatic reversal of the branch and required to be byte-identical to the plan's own literal, and 11 mutants), each probe green on the live page, red on the pre-fix shape, and red on the mutant that breaks exactly what it asserts.</li>
+<li><code>test_admin_html_pending_status_styled</code>: The admin page's swap-status surface, pinned on the served HTML in 22 evidence lines. <strong>(a)-(c)</strong> the pending state is visible at all: a <code>.status.pending</code> rule whose body carries <code>display: block</code>; the disabled-button selector list carries <code>button.secondary:disabled:hover</code> as well as <code>button:disabled</code> (the bare <code>button:disabled</code> is (0,1,1) and loses to <code>button.secondary:hover</code> at (0,2,1), so a disabled Reload button would keep painting the enabled hover colour); and no empty-type <code>showStatus('')</code> call remains — that call shape is the exact defect the plan fixes, and nothing else in the suite would have caught it. <strong>(d)-(j)</strong> the surface itself: the pending line occurs at ≥ 6 call sites — a threshold, not a count: the page carries <strong>10</strong> sites today (2 press entry paints + 2 press repaints + 2 attach-watcher paints + the reload-stale sticky line + the attach completion's failed-re-read line + the load path's failed-re-read line + the poll-failure line), and the plan's threshold of 4 was rejected because it is satisfied by the press sites alone and would pass with the watcher's paints deleted; <code>attachToInFlightSwap</code> and <code>checkInFlightSwapOnLoad</code> are defined and invoked; both button ids are present; the lockout helper disables the nine tier selects as well as the buttons and restores <code>populateKeys</code>' single-key rule on unlock; <code>noteAttachPollFailure</code> is defined, invoked, and carries its threshold constant; <code>refreshTiersFromServer</code> is invoked from the attach completion; and the pending line carries the "no need to refresh" guidance while the poll-failure line tells the operator to reload. <strong>(k)-(l)</strong> the lock arms before the fetch: <em>both</em> press handlers call <code>setSwapControlsDisabled(true)</code> before their POST, asserted <em>by block</em> rather than by a file-wide count (deleting it from <code>reloadConfig()</code> leaves a count-based probe green); and a <strong>failed</strong> re-read must neither unlock nor claim success — the correction reviewer Warning 1 required, which nothing guarded before. <strong>(m)-(o)</strong> the reload-stale correction: the <code>config_reload_stale</code> branch captures the re-read result (<code>const refreshed = await refreshTiersFromServer();</code>) and confines the "has been refreshed" claim to the <em>successful</em> re-read; its failure path sets <code>reloadStaleUnresolved = true</code> and paints the sticky "reload this page before applying" line — never the success text; and <code>reloadConfig</code>'s <code>finally</code> holds the lock on that path (<code>attachPollHandle === null &amp;&amp; !reloadStaleUnresolved</code>), so a failed re-read leaves the controls locked and the stale baseline is never actionable. Worth its own guard because <code>server.py</code> emits <code>config_reload_stale</code> <em>because</em> a concurrent switch completed, so the row is one swap behind by construction. <strong>(p)</strong> the attach watcher's <code>if (settled)</code> bail sits before <code>if (!st.swapping)</code>. <strong>(q)-(r)</strong> the load path's own gate — the third and last call site of the same discipline: its no-swap branch <em>captures</em> the re-read result (<code>const refreshed = await refreshTiersFromServer();</code>), and its <code>if (!refreshed)</code> failure branch locks the surface, never unlocks it, paints the sticky "reload this page before applying" line, never claims a refresh, and returns after painting so the guard below cannot hand the page back unlocked; and a three-condition press guard (<code>swapPollHandle !== null || attachPollHandle !== null || swapSettled</code>) sits both before that await and again after it, the second re-locking and never unlocking — the fix for a press whose select lock <code>renderTiers()</code> would otherwise drop. Both probes reach the load path through the same <code>_js_function_body</code>/<code>_js_braced_block</code> extractors as the other two sites. The branch, its nested <code>if (refreshed)</code> pair, the failure branch and the <code>finally</code> are all extracted with the module's brace-balanced <code>_js_braced_block</code>, never a <code>(.*?)…} else</code> delimiter — the branch legitimately contains a nested <code>} else</code>, which is exactly how an earlier plan-authored verification script went stale. Every probe added across the last two rounds is proven <em>red-capable</em> by mutation-based proof scripts rather than merely green: round 3's four by a mutation proof script run against the live page, the pre-fix literal, and 8 mutants, and round 4's two — plus the re-quoted discriminator — by a second proof script against the live page, a pre-fix shape derived by programmatic reversal of the branch and required to be byte-identical to the plan's own literal, and 11 mutants (both scripts were plan-scoped evidence, since retired with their plans'), each probe green on the live page, red on the pre-fix shape, and red on the mutant that breaks exactly what it asserts.</li>
 <li><code>test_admin_html_apply_requires_rendered_row</code>: Pins the first of <code>saveConfig</code>'s two incomplete-view refusals, on the HTML the proxy actually serves (<code>GET /admin/</code>), in 4 evidence lines: a <em>negated</em> test for the first tier's provider select exists, is the guard's condition, precedes both the first tier-select read and the config build, returns, and paints a <strong>sticky</strong> line. The state it guards is real: when the initial <code>/admin/api/config</code> fetch fails, <code>renderTiers()</code> never runs, so the nine tier selects do not exist — and reading one would throw <em>above</em> <code>saveConfig</code>'s own <code>try</code>, surfacing as an unhandled rejection that paints nothing at all. Ordering is asserted rather than mere presence, because a guard placed after the first select read reproduces the original defect.</li>
 <li><code>test_admin_html_apply_requires_key_list</code>: Pins the second refusal in 6 evidence lines: the per-tier <code>providerKeys[provider]</code> length guard exists, skips tiers with no provider selected, tests the list <em>length</em>, paints a sticky line, returns <strong>before any POST</strong>, and precedes the config build. This is the silent-credential-repointing state: when <code>/admin/api/providers-detail</code> fails, <code>loadProviderModes</code> swallows it by design (a failing fetch must not brick the page) and leaves the key map empty, but the row <em>still renders</em> and looks normal — <code>populateKeys</code> builds no options and disables the select, and a disabled select still reads <code>value === ""</code>, which the server maps to <code>names[0]</code> (the provider's <em>first</em> key), not to "unchanged". Without the guard the press would re-point every multi-key tier and persist it while reporting success.</li>
 <li><code>test_admin_switch_input_rejections</code>: The switch endpoint's six rejection rules driven as one parameterized table over nine request bodies on a single started proxy — an unsupported per-tier key; a body missing a required tier; an invalid tier name; <code>provider</code> as a dict, a list and an int; <code>model</code> as an int and null; and an off-catalog model. Per body it asserts three things: the response <strong>arrives</strong> (status <code>0</code> is reported as "no HTTP response at all — the handler aborted", which is the pre-change failure mode, so a "not 200" assertion could never pass on a dead socket), that it is a <code>400</code> whose text names what was rejected, and that <code>GET /admin/api/config</code> still shows the baseline mapping. One parameterized table rather than three hand-rolled copies because the module already carried that rejection-harness shape three times.</li>
@@ -842,6 +852,40 @@ nothing else unrelated stays a review obligation, and <code>import json as j; j.
 is a stated blind spot (the bare-name rule covers <code>from json import loads</code>, which the
 attribute-only matcher would miss).</p>
 
+<h3 id="cat-14">Category 14 — Verification-Script Isolation</h3>
+
+<p><strong>Scope:</strong> The gitignored verification-script corpus
+(<code>tmp/verification/</code>) is runtime state the harness cannot see — the suite owns only
+its own paths. This category pins the committed corpus checker
+(<code>scripts/check_spawn_isolation.py</code>) through
+<code>tests/test_spawn_isolation.py</code>: its classification teeth, its satisfiability, its
+per-file fault and encoding branches, its root handling, and its live-corpus hook. The
+canonical block the checker enforces is specified once, in
+<a href="#pattern-spawn-isolation">Spawn isolation for verification scripts</a>.</p>
+
+<h4><code>tests/test_spawn_isolation.py</code> — the corpus runtime-isolation gate</h4>
+<ul>
+<li><code>spawn-isolation-teeth</code>: One fixture per violated rule, each expected to fail the checker with exit 1 and one aggregated FAIL line — a spawner with none of the three env assignments; a hardcoded live <code>~/.claude</code> state path over an unrelated <code>mkdtemp</code>; the full block placed after the first proxy import; the split shape (state before the import, trace + compat after it); the block after the spawn call with no in-process import; a comment-skew shape (header comment block interleaved between spawn and block — the mixed-basis comparator catch); and a canonical block plus a later live-path <code>PROXY_STATE_FILE</code> reassignment (exactly-once).</li>
+<li><code>spawn-isolation-satisfiable</code>: The canonical block, copied from the plan's single source, in a file that also carries launch and spawn tokens → exit 0 with a PASS line — the gate is satisfiable, so its teeth are not vacuous.</li>
+<li><code>spawn-isolation-import-only-skip</code>: Launch tokens without a spawn API classify <code>SKIP … launch tokens without a spawn API</code> and exit 0 — import-only files are visible, not enforced.</li>
+<li><code>spawn-isolation-exemption</code>: The exemption contract — a reasoned marker is honored (EXEMPT, with the derivation, state assignment and ordering still enforced); an empty reason fails <code>exempt marker without reason</code>; an exempt spawner whose state assignment does not point into its own temp dir fails <code>exempt-without-state-isolation</code>; the exempt teeth pin that enforcement: a live-path or empty <code>_ISOLATION_DIR</code> derivation fails under the marker, and the canonical pair placed after the first spawn-API token fails ordering; the reason is cut after the full prefix, not the first colon, so a reason containing colons survives intact, and a reason carrying control characters is emitted sanitized on one line.</li>
+<li><code>spawn-isolation-prose-overflag</code>: Detection runs on raw text — proxy tokens appearing only inside a docstring or a comment still classify the file, so prose can never green-light a real spawner (overflag is the safe side by design).</li>
+<li><code>spawn-isolation-encoding</code>: A BOM-carrying, em-dash-bearing spawner produces one aggregated FAIL line naming the file, never a traceback; a UTF-16 BOM fails <code>undecodable encoding</code> instead of silently token-scanning NUL-interleaved text.</li>
+<li><code>spawn-isolation-root-and-bad-paths</code>: The default root resolves from the checker's own location to the repo's corpus; an empty or whitespace-only <code>--path</code>, and a <code>--path</code> naming a regular file, each exit 2; a nonexistent explicit root exits 0 with a visible <code>corpus absent</code> line — vacuity is never indistinguishable from a real scan.</li>
+<li><code>spawn-isolation-corpus-hook</code>: The hook that runs in every suite pass: the checker runs over the repo's real corpus with a zero-FAIL census asserted (the spawner/exempt counts are recorded as the case's precondition, not enforced), and an absent or empty corpus is itself visible (<code>corpus absent</code> / <code>corpus empty</code>) so the hook cannot pass vacuously over a vanished workspace. Non-hermetic by design — see the suite-safety note.</li>
+<li><code>spawn-isolation-checker-self-scan</code>: The checker's own source carries both token families, so it excludes itself by identity — pointed at <code>scripts/</code> it prints <code>SKIP check_spawn_isolation.py: checker itself</code> and exits 0 rather than failing on its own text.</li>
+<li><code>spawn-isolation-unreadable-directory</code>: An unlistable directory surfaces as a FAIL naming it rather than silently narrowing the scan. The construct is POSIX-only (directory permissions); on Windows the case runs its documented pass-skip branch, and as root on POSIX it is skipped the same way — the gated branch remains exercised on any POSIX non-root run.</li>
+<li><code>spawn-isolation-quarantine-prune</code>: <code>retired-artifacts</code> directories under the corpus root are pruned from the walk — an inner spawner left in quarantine is unreported, a clean spawner beside it still passes, and the run exits 0; quarantine must not resurrect findings.</li>
+<li><code>spawn-isolation-spawn-only-skip</code>: A spawn-API token without proxy launch tokens classifies <code>SKIP … spawn API without proxy tokens</code> and exits 0 — helpers shelling out to the suite are visible, not enforced.</li>
+</ul>
+
+<p><strong>What this category does not cover.</strong> The hook is deliberately non-hermetic —
+the corpus-hook case scans the repo's real corpus, so a red run there means a script in
+<code>tmp/verification/</code>, not suite code. The checker's declared limitations (mimicry,
+cleanup, non-Python spawners, dynamic construction) are limitations of the enforcement,
+documented with <a href="#pattern-spawn-isolation">the pattern</a>; the tests pin the
+checker's behavior, not the convention's completeness.</p>
+
 <!-- END per-test inventory -->
 <h2 id="harness">The harness</h2>
 
@@ -931,6 +975,78 @@ sanctioned way to assert on internals, and it avoids reaching into module state.
 fixture builders place the files. A test that writes to a real path will pass locally and fail
 whenever a proxy is running.</p>
 
+<h3 id="pattern-spawn-isolation">Spawn isolation for verification scripts</h3>
+
+<p>Tests get their isolation from the harness. Verification and diagnostic scripts under the
+gitignored <code>tmp/verification/</code> corpus get none automatically — and a script that
+spawns the proxy server (or merely imports a proxy module) without redirecting the runtime
+paths can create or <em>delete</em> the live <code>~/.claude/proxy/proxy-state.json</code>:
+the spawned child inherits the forking environment, and the server removes its state file at
+shutdown. The committed checker <code>scripts/check_spawn_isolation.py</code> classifies every
+corpus <code>.py</code> file by raw-text tokens — proxy launch tokens
+(<code>claude_retry_proxy</code>, <code>claude-retry-proxy</code>, <code>PROXY_SERVER</code>,
+<code>CLAUDE_PROXY</code>) and spawn-API tokens — and enforces the canonical isolation block
+on spawners:</p>
+
+<pre><code>import atexit
+import os
+import shutil
+import tempfile
+
+# Spawned or imported proxy code must never touch live runtime state. These
+# three overrides must execute BEFORE the first `import claude_retry_proxy`
+# line AND before the first process spawn: settings.py binds ALL THREE paths
+# from the environment at import (state, trace, and compat — the sinks are
+# configured from SETTINGS at import), and a spawned child inherits the env
+# it is forked with.
+_ISOLATION_DIR = tempfile.mkdtemp(prefix="proxy-probe-")
+os.environ["PROXY_STATE_FILE"] = os.path.join(_ISOLATION_DIR, "state.json")
+os.environ["PROXY_TRACE_FILE"] = os.path.join(_ISOLATION_DIR, "trace.jsonl")
+os.environ["PROXY_FEATURE_COMPAT_FILE"] = os.path.join(_ISOLATION_DIR, "feature-compat.json")
+# Best-effort cleanup once this script exits (children are waited on first):
+atexit.register(shutil.rmtree, _ISOLATION_DIR, True)</code></pre>
+
+<p>Ordering is part of the rule: the assignments must precede BOTH the first
+<code>import claude_retry_proxy</code> line AND the first spawn call, because
+<code>settings.py</code> binds all three paths from the environment at import (the trace sinks
+are configured from <code>SETTINGS</code> at import), and a spawned child inherits the env it
+is forked with. The spawn boundary is the first spawn-API token, and the from-import form
+(<code>from subprocess import …</code>) counts as one — place the block above the whole
+import block to stay unambiguous. Detection runs on raw text deliberately — a token only
+inside a comment still
+counts, and a script that imports a proxy module without spawning anything is classified
+<code>SKIP … launch tokens without a spawn API</code>: visible, not enforced. The block is
+still the convention for any script that imports proxy modules at all — the import-only route
+is a gap the checker declares rather than closes. The checker is run over the real corpus by
+<code>tests/test_spawn_isolation.py</code> on every suite pass (see
+<a href="#cat-14">Category 14</a>); measure the corpus on demand with
+<code>python scripts/check_spawn_isolation.py</code>.</p>
+
+<p><strong>Exemption.</strong> A comment line starting
+<code># spawn-isolation: exempt:</code> with a non-empty reason after the full prefix waives
+the trace and compatibility assignments only. The mkdtemp derivation, the state assignment,
+and the ordering rule stay enforced under the marker: an exempt spawner that lacks the
+temp-dir derivation, lacks the state assignment
+(<code>exempt-without-state-isolation</code>), or places the block after its first spawn-API
+token or proxy import still fails — the marker can never green-light a script whose spawned
+child would write or delete the live state document. Redirecting the trace with the server's
+<code>--log &lt;tempdir&gt;</code> flag is the sanctioned narrow remedy, and it is trace-only
+— a proxy-spawning script is never exemptible on trace grounds alone.</p>
+
+<p><strong>Declared limitations.</strong> The checker proves token presence and position, not
+execution: a docstring quoting the block passes when no real block exists (mimicry — and fails
+the exactly-once checks when the real block is also present); cleanup is not
+checker-verifiable; non-Python spawners are not scanned; fully dynamic module construction
+defeats literal tokens; and a hard-killed script still orphans its <code>proxy-probe-*</code>
+temp dir — OS temp cleaners own it, measure on demand with
+<code>ls %TEMP%/proxy-probe-*</code> (no "no residue" claim is made). The realistic threat is
+forgetfulness, not mimicry: deliberate tampering — deleting or popping the variables after
+the block, or spawn forms the token list does not name — is out of scope by the same
+scoping. The summary line's <code>&lt;n&gt; skip</code> counts scanned
+<code>.py</code> dispositions only — non-Python files, pruned <code>retired-artifacts</code>
+directories, and the checker's own identity exclusion print SKIP lines without being
+counted.</p>
+
 <h2 id="anti-patterns">Anti-patterns</h2>
 
 <table>
@@ -970,6 +1086,6 @@ whenever a proxy is running.</p>
       that the full suite passes with a live proxy running.</li>
 </ol>
 
-<footer>Last updated: 2026-11-04</footer>
+<footer>Last updated: 2026-11-14</footer>
 </body>
 </html>

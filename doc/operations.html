@@ -10,7 +10,7 @@
 
 <h1>Operations<span class="sub">Running, inspecting, and stopping the proxy</span></h1>
 
-<p><strong>Last updated:</strong> 2026-11-01</p>
+<p><strong>Last updated:</strong> 2026-11-14</p>
 
 <p>The <code>claude-retry-proxy</code> command manages a <em>background server process</em>. It
 does not run in the foreground. Understanding that split explains most of the command's
@@ -472,8 +472,11 @@ it is unharmed, which is exactly the difference between <code>SIGTERM</code> and
 <p>Several of these paths can be relocated with environment variables
 (<code>PROXY_TRACE_FILE</code>, <code>PROXY_STATE_FILE</code>,
 <code>PROXY_FEATURE_COMPAT_FILE</code>, <code>PROXY_KEYS_PATH</code>), which is how the test
-suite keeps its proxies isolated from a live one. See
-<a href="configuration.html#env-vars">configuration.html</a>.</p>
+suite keeps its proxies isolated from a live one. Verification and diagnostic scripts that
+spawn or import the proxy owe the same isolation; the corpus checker enforces it on the
+scripts that spawn. See
+<a href="configuration.html#env-vars">configuration.html</a> and
+<a href="test-catalog.html#pattern-spawn-isolation">test-catalog.html</a>.</p>
 
 <h3 id="state">The state file</h3>
 
@@ -487,6 +490,6 @@ server's memory and is rewritten every 30 seconds, so deleting the file is harml
 external edit is overwritten rather than merged. The mechanism is owned by
 <a href="architecture.html#heartbeat">architecture.html#heartbeat</a>.</p>
 
-<footer>Last updated: 2026-11-01</footer>
+<footer>Last updated: 2026-11-14</footer>
 </body>
 </html>

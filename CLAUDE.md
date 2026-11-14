@@ -52,6 +52,7 @@ tests/            per-area test modules + aggregator; see doc/test-catalog.html
 scripts/
   analyze_proxy_trace.py  trace log analysis tool (model stats, latency, success rates)
   check_doc_anchors.py    doc anchor + credential-shape checker (invoked by the test suite)
+  check_spawn_isolation.py  corpus runtime-isolation checker (invoked by the test suite)
 doc/              human-facing HTML reference, indexed by content.html
 pyproject.toml   setuptools src-layout, console scripts, cryptography dependency
 LICENSE          MIT
@@ -241,8 +242,8 @@ for the rest.
 | `PROXY_LOG_ALL` | "" | Set to `1` to log full request/response bodies |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | Trace log path |
 | `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | Keys file path (encrypted or plain JSON) |
-| `PROXY_STATE_FILE` | `~/.claude/proxy/proxy-state.json` | State file path override (added 2026-08-28). The server heartbeat writes PID/port/start_time to this file; `claude-retry-proxy stop`/`status`/`reload` read it. Override for test isolation. |
-| `PROXY_FEATURE_COMPAT_FILE` | `~/.claude/proxy/feature-compatibility.json` | Compatibility state file path (added 2026-09-02). Stores learned per-provider field incompatibility. Override for test isolation. |
+| `PROXY_STATE_FILE` | `~/.claude/proxy/proxy-state.json` | State file path override (added 2026-08-28). The server heartbeat writes PID/port/start_time to this file; `claude-retry-proxy stop`/`status`/`reload` read it. Override for test and script isolation. |
+| `PROXY_FEATURE_COMPAT_FILE` | `~/.claude/proxy/feature-compatibility.json` | Compatibility state file path (added 2026-09-02). Stores learned per-provider field incompatibility. Override for test and script isolation. |
 | `PROXY_CHAT_RETRY_NUDGE` | the `[proxy nudge] …` text | Retry-nudge text (added 2026-10-06), chat mode: appended as a trailing user message to a retry that recovers an errored unfinished tool turn. Unset = default text; empty, whitespace-only, or >4096 chars **disables the feature** (`""` is the kill switch — unlike the numeric vars, blank/oversize is not defaulted). Read at startup. |
 
 [doc/configuration.html#env-vars](doc/configuration.html#env-vars) is the
@@ -308,6 +309,12 @@ startup on failure).
   `Proxy already running`. A hard-killed run can still orphan its own file (no
   cleanup can run); those are inert and may be deleted from `~/.claude/proxy` by
   hand.
+  Verification and diagnostic scripts that spawn or import the proxy owe the
+  same isolation: the three runtime-path overrides above are pointed at files
+  under a `tempfile.mkdtemp()` directory before the script's first proxy import
+  AND its first process spawn — the canonical block is at
+  [doc/test-catalog.html#pattern-spawn-isolation](doc/test-catalog.html#pattern-spawn-isolation),
+  and `python scripts/check_spawn_isolation.py` measures the corpus on demand.
   [doc/test-catalog.html#isolation](doc/test-catalog.html#isolation)
 
 ### Moved out of this section
