@@ -423,11 +423,17 @@ is absent both processes honor the same variable.</p>
 <tr><td><code>PROXY_SWAP_SILENCE_TIMEOUT</code></td><td class="num">30</td><td class="num">1–300</td>
     <td>Per-request silence budget (seconds) for the config-swap drain: the window of
         <em>no upstream byte from any in-flight request</em> after which the drain declares the
-        remainder silent and evicts it retryably (<code>config_swap_restart</code>). It also bounds a
-        streaming read's socket arm while a swap is in progress, and it is the value reported as
-        <code>budget_s</code> by <code>/admin/api/swap-status</code>. A blank or out-of-range value
-        falls back to <code>30</code>. See
+        remainder silent and evicts it retryably (<code>config_swap_restart</code>). It is the value
+        reported as <code>budget_s</code> by <code>/admin/api/swap-status</code>. A blank or
+        out-of-range value falls back to <code>30</code>. See
         <a href="architecture.html#config-swap">architecture.html#config-swap</a>.</td></tr>
+<tr><td><code>PROXY_READ_TIMEOUT</code></td><td class="num">120</td><td class="num">10–600</td>
+    <td>Upstream stall timeout, in seconds — applied uniformly (connect/read/write/pool) on the
+        per-request-chain httpx2 client, so it bounds connect, headers, and each inter-byte gap.
+        A streamed response silent longer than this ends at its next read boundary; a stream
+        silent at a config-swap press wakes there too and dies retryably. A blank or out-of-range
+        value falls back to <code>120</code>. Read at startup. See
+        <a href="architecture.html#retry">architecture.html#retry</a>.</td></tr>
 <tr><td><code>PROXY_LOG_ALL</code></td><td class="num">""</td><td>—</td>
     <td>Set to <code>1</code> to record full request and response bodies. See the warning in
         <a href="trace-log.html#all">trace-log.html</a>.</td></tr>

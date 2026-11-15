@@ -26,10 +26,12 @@ attribute scan pins the receiver name to `json`. The bare-name rule catches the
 today; an aliased module import would need a per-module import analysis this
 gate deliberately does not do. Stated here rather than claimed away.
 
-PYTHON 3.8. `pyproject.toml` declares `requires-python = ">=3.8"`, so the gate
-must not use `ast.unparse` (3.9+); exception names are read straight off the
-nodes. `test_parse_guard_gate_python38_portable` pins that on this module's own
-source.
+PYTHON 3.10. `pyproject.toml` declares `requires-python = ">=3.10"` (plan
+2026-11-15-httpx2-transport-sse, Step 2); the gate's exception names are read
+straight off the nodes rather than through `ast.unparse`, which is a style
+choice at this floor rather than the 3.8 constraint it once was.
+`test_parse_guard_gate_python_floor_portable` pins the declared floor and that
+this module uses nothing newer than it.
 
 Part of the claude-retry-proxy suite; runnable standalone.
 """
@@ -57,6 +59,19 @@ TOTAL_NAMES = {"Exception", "BaseException"}
 
 # Parse entry points that carry the same failure class.
 PARSE_CALLS = {"loads", "load"}
+
+# Stdlib APIs / constructs introduced AFTER the declared floor (3.10), as
+# (token, introducing release). Curated, not exhaustive — it carries the
+# post-3.10 names the stdlib most invites. The floor-portability test scans
+# this module's own source for these tokens and skips this definition block.
+_POST_FLOOR_APIS = (
+    ("itertools.batched", "3.12"),
+    ("typing.Self", "3.11"),
+    ("tomllib", "3.11"),
+    ("TaskGroup", "3.11"),
+    ("asyncio.timeout", "3.11"),
+    ("except*", "3.11"),
+)
 
 
 def _exc_name(node):
@@ -705,33 +720,70 @@ def test_parse_guard_scanner_semantics():
                 "; ".join(msg for _ok, msg in lines)))
 
 
-def test_parse_guard_gate_python38_portable():
-    """This gate runs on Python 3.8, so it must not call `ast.unparse` (3.9+).
+def test_parse_guard_gate_python_floor_portable():
+    """The declared floor is 3.10, and this gate uses nothing newer than it.
 
-    A gate that raises AttributeError on a supported interpreter emits no
-    verdict at all — the failure mode is a silent skip, not a red line. Read
-    off this module's own source so a future edit that reaches for the
-    convenience cannot land quietly.
+    A gate that raises AttributeError/SyntaxError on an interpreter the package
+    claims to support emits no verdict at all — the failure mode is a silent
+    skip, not a red line. The pin has two halves: (1) `pyproject.toml` still
+    declares the `>=3.10` floor the package now ships (plan
+    2026-11-15-httpx2-transport-sse, Step 2), so a silent drift back to a floor
+    the suite cannot run on is caught here; (2) this module's own source
+    references no API or construct introduced after 3.10 — read off its own
+    text, so a future edit cannot land quietly.
+
+    The denylist is curated, not exhaustive: it carries the post-3.10 names the
+    stdlib most invites. `ast.unparse` is no longer on it — it is 3.9+, and the
+    old 3.8-era ban is obsolete at this floor.
     """
-    print("\n--- Test: Parse-Guard Gate Is Python 3.8 Portable ---")
+    print("\n--- Test: Parse-Guard Gate Is Portable at the Declared Floor ---")
+    floor = "3.10"
+    try:
+        with open(os.path.join(REPO_ROOT, "pyproject.toml"), encoding="utf-8") as fh:
+            pyproject = fh.read()
+    except OSError as exc:
+        fail("cannot read pyproject.toml: {}".format(exc))
+        return
+    if 'requires-python = ">={}"'.format(floor) in pyproject:
+        pass_("pyproject.toml declares requires-python >= {}".format(floor))
+    else:
+        fail("pyproject.toml does not declare requires-python >= {} — this "
+             "gate's portability premise is out of date".format(floor))
+        return
+
     try:
         with open(os.path.abspath(__file__), encoding="utf-8") as fh:
-            src = fh.read()
+            lines = fh.read().splitlines()
     except OSError as exc:
         fail("cannot read this module's own source: {}".format(exc))
         return
+    # The denylist is itself text in this file, so its own definition block is
+    # excluded from the scan — otherwise the constant matches itself and the
+    # gate can never pass.
+    skip_from = None
+    skip_to = None
+    for index, line in enumerate(lines):
+        if line.startswith("_POST_FLOOR_APIS = ("):
+            skip_from = index
+        elif skip_from is not None and line == ")":
+            skip_to = index
+            break
+    if skip_from is None or skip_to is None:
+        fail("cannot locate the _POST_FLOOR_APIS block in this module's source")
+        return
     offenders = []
-    for node in ast.walk(ast.parse(src)):
-        if isinstance(node, ast.Attribute) and node.attr == "unparse":
-            offenders.append(node.lineno)
-        elif isinstance(node, ast.Name) and node.id == "unparse":
-            offenders.append(node.lineno)
+    for index, line in enumerate(lines):
+        if skip_from <= index <= skip_to:
+            continue
+        for token, release in _POST_FLOOR_APIS:
+            if token in line:
+                offenders.append((index + 1, token, release))
     if offenders:
-        fail("this module references `unparse` at line(s) {} — `ast.unparse` "
-             "is Python 3.9+, and pyproject declares requires-python >= "
-             "3.8".format(sorted(set(offenders))))
+        fail("this module references post-{} API(s): {}".format(
+            floor, "; ".join("line {} -> {!r} ({}+)".format(n, t, r)
+                             for n, t, r in offenders)))
     else:
-        pass_("no `unparse` reference in this module (3.8-compatible)")
+        pass_("no post-{} API reference in this module (floor-compatible)".format(floor))
 
 
 ALL_TESTS = [
@@ -739,8 +791,8 @@ ALL_TESTS = [
     ("parse-guard-scanner-walks-subpackages",
      test_parse_guard_scanner_walks_subpackages),
     ("parse-guard-scanner-semantics", test_parse_guard_scanner_semantics),
-    ("parse-guard-gate-python38-portable",
-     test_parse_guard_gate_python38_portable),
+    ("parse-guard-gate-python-floor-portable",
+     test_parse_guard_gate_python_floor_portable),
 ]
 
 if __name__ == "__main__":

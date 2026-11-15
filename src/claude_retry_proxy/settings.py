@@ -49,6 +49,7 @@ class ProxySettings:
         self.swap_silence_timeout = _env_int("PROXY_SWAP_SILENCE_TIMEOUT", 30, 1, 300)
         self.max_body_size = _env_int("PROXY_MAX_BODY_SIZE", 10 * 1024 * 1024, 1024, 100 * 1024 * 1024)
         self.max_response_size = _env_int("PROXY_MAX_RESPONSE_SIZE", 100 * 1024 * 1024, 1024, 1024 * 1024 * 1024)
+        self.read_timeout = _env_int("PROXY_READ_TIMEOUT", 120, 10, 600)
 
         self.log_all = _env_str("PROXY_LOG_ALL", "") == "1"
 

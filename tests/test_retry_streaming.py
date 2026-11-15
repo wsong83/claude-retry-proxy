@@ -28,6 +28,7 @@ from _harness import (
     _read_child_stderr,
     _send_proxy_request,
     _send_proxy_request_stream,
+    _spawn_proxy_with_bind_retry,
     _start_mode_mock_upstream,
     _start_mode_proxy,
     _start_proxy_server_directly,
@@ -3063,6 +3064,466 @@ def test_response_mode_swap_aborts_sse_fallback():
         cleanup()
 
 
+# ===========================================================================
+# httpx2 transport migration (plan 2026-11-15-httpx2-transport-sse)
+# ===========================================================================
+
+def test_upstream_accept_encoding_identity():
+    """The forwarded request carries exactly one `Accept-Encoding: identity`.
+
+    Defence-in-depth only: correctness of the read paths rests on iter_raw,
+    which is byte-faithful regardless of the response's Content-Encoding. The
+    pin preserves the wire state the stdlib transport already produced (the
+    name is not in FORWARD_HEADERS, so http.client's own `identity` default
+    was what reached upstream) and cannot be overridden from config —
+    RESERVED_EXTRA_HEADER_NAMES reserves the name.
+    """
+    print("\n--- Test: Upstream Accept-Encoding Identity Pin ---")
+    tiers = _mode_tiers()
+    upstream_port = find_free_port()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, _body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200 from the default responder, got {}".format(status))
+            return
+        reqs = mock_servers["p"]["requests"]
+        if not reqs:
+            fail("mock upstream recorded no request")
+            return
+        got = (reqs[0].get("headers") or {}).get("accept-encoding")
+        if got == ["identity"]:
+            pass_("upstream request carries exactly one Accept-Encoding: identity")
+        else:
+            fail("expected accept-encoding ['identity'], got {!r}".format(got))
+    finally:
+        cleanup()
+
+
+def test_upstream_cookie_isolation():
+    """A `Set-Cookie` on one proxied request never replays on the next.
+
+    The upstream client is created per retry chain and dies with it, so
+    connection state — cookies included — cannot accumulate across proxied
+    requests. This is the mirror of the stateless forwarding the stdlib
+    transport provided; a pooled cross-request client would silently start
+    replaying provider cookies.
+    """
+    print("\n--- Test: Upstream Cookie Isolation ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port),
+                     "key": "K"}}
+    body_bytes = json.dumps({
+        "id": "msg_ok", "type": "message", "role": "assistant",
+        "model": "claude-sonnet-5",
+        "content": [{"type": "text", "text": "hello"}],
+        "stop_reason": "end_turn", "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }).encode()
+
+    def streamer(handler, info):
+        # A custom handler is the only shape that can carry an extra response
+        # header (the canned responder owns Content-Type/Length only).
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(body_bytes)))
+        handler.send_header("Set-Cookie", "provider_session=abc123")
+        handler.end_headers()
+        handler.wfile.write(body_bytes)
+        handler.wfile.flush()
+
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, streamers={"p": streamer})
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        first_status, _first = _send_proxy_request(proxy_port)
+        second_status, _second = _send_proxy_request(proxy_port)
+        if first_status != 200 or second_status != 200:
+            fail("expected 200 on both requests, got {} / {}".format(
+                first_status, second_status))
+            return
+        reqs = mock_servers["p"]["requests"]
+        if len(reqs) != 2:
+            fail("expected exactly two upstream requests, got {}".format(len(reqs)))
+            return
+        second_cookie = (reqs[1].get("headers") or {}).get("cookie")
+        if second_cookie is None:
+            pass_("request 2 carries no Cookie header after request 1's Set-Cookie")
+        else:
+            fail("request 2 replayed the upstream cookie: {!r}".format(second_cookie))
+    finally:
+        cleanup()
+
+
+def test_stream_read_timeout_bounds_stall():
+    """A silent SSE upstream ends the client-visible stream at the read
+    boundary, not at a multi-minute hang.
+
+    PROXY_READ_TIMEOUT is pinned to its validation floor (10 s — smaller
+    values are refused by design and fall back to 120). The old transport
+    armed a per-read socket timeout; httpx2 has no mid-stream timeout API, so
+    the uniform client timeout is the only bound. The lower bound matters as
+    much as the upper one: an immediate close would pass an upper-bound-only
+    assertion while proving nothing about the read bound.
+    """
+    print("\n--- Test: Stream Read Timeout Bounds a Silent Stall ---")
+    read_timeout = 10
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K"}}
+    frame = (b"event: message_start\ndata: " + json.dumps({
+        "type": "message_start",
+        "message": {"id": "msg_stall", "type": "message", "role": "assistant",
+                    "content": [], "model": "claude-sonnet-5",
+                    "stop_reason": None, "stop_sequence": None,
+                    "usage": {"input_tokens": 1, "output_tokens": 0}},
+    }).encode() + b"\n\n")
+
+    def streamer(handler, info):
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.end_headers()
+        handler.wfile.write(frame)
+        handler.wfile.flush()
+        time.sleep(60)  # silent hold: the read bound is the only exit
+
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, streamers={"p": streamer},
+        extra_env={"PROXY_READ_TIMEOUT": str(read_timeout)})
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        start = time.time()
+        status, _ctype, raw = _send_proxy_request_stream(
+            proxy_port, {"model": "sonnet", "stream": True,
+                         "messages": [{"role": "user", "content": "hi"}]})
+        elapsed = time.time() - start
+        if status != 200:
+            fail("expected 200, got {}".format(status))
+            return
+        if b"message_start" not in raw:
+            fail("the pre-stall frame never reached the client: {!r}".format(raw[:200]))
+            return
+        if elapsed < read_timeout - 1.5:
+            fail("the stream ended after only {:.1f}s — the stall was not bounded "
+                 "by the read timeout, so this passes vacuously".format(elapsed))
+            return
+        if elapsed > read_timeout + 6:
+            fail("silent stream held the client {:.1f}s, beyond the {}s read "
+                 "bound".format(elapsed, read_timeout))
+            return
+        pass_("silent SSE stream ended at the {}s read boundary ({:.1f}s)".format(
+            read_timeout, elapsed))
+    finally:
+        cleanup()
+
+
+def test_connection_error_retry_mapping():
+    """A mid-response upstream reset is retried and labelled connection_error.
+
+    The stub declares a Content-Length it does not honour and closes, which
+    httpx2 surfaces as RemoteProtocolError (TransportError -> RequestError).
+    The retry loop's total tuple must map it to a `retry` event with
+    reason "connection_error" — an unmapped type would either escape the loop
+    (no retry, no record) or be retried as a 429/503. The exhaustion/502 half
+    is covered by test_exhaust_connection_error_synthesizes_body and
+    test_disable_retry_count_tokens_conn_error and is deliberately not
+    re-pinned here.
+    """
+    print("\n--- Test: Connection Error Retry Mapping ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K"}}
+    partial = b'{"id":"msg_trunc'
+
+    def streamer(handler, info):
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        # Promise far more than is delivered, then return: the close leaves the
+        # message body short and the next read raises.
+        handler.send_header("Content-Length", "4096")
+        handler.end_headers()
+        handler.wfile.write(partial)
+        handler.wfile.flush()
+        handler.close_connection = True
+
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, streamers={"p": streamer},
+        extra_env={"PROXY_MAX_RETRIES": "1", "PROXY_INITIAL_DELAY": "1",
+                   "PROXY_MAX_DELAY": "1"})
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        _send_proxy_request(proxy_port)
+        events = _wait_for_trace_events(trace_file, "retry", timeout_s=8.0)
+        conn_retries = [e for e in events if e.get("reason") == "connection_error"]
+        if conn_retries:
+            pass_("mid-response reset mapped to a retry event with "
+                  "reason 'connection_error'")
+        else:
+            fail("no retry event with reason 'connection_error'; got {}".format(
+                [e.get("reason") for e in events]))
+    finally:
+        cleanup()
+
+
+def test_forward_failure_returns_envelope():
+    """A forwarding exception outside the retry tuple still answers the client.
+
+    do_POST has no outer try of its own: anything raised above the retry loop
+    used to drop the connection with no response and no record. The vendor URL
+    here carries a NUL in its host, which urlparse accepts but httpx2 rejects
+    with InvalidURL at client construction — an exception outside
+    (RequestError, StreamError, OSError) and therefore outside the retry loop.
+    The client must receive the proxy's 502 Anthropic envelope with
+    error.code "upstream_unreachable", and the failure must leave a
+    forward_failed trace entry.
+    """
+    print("\n--- Test: Forwarding Failure Returns the Envelope ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://exa\x00mple.invalid:{}".format(upstream_port),
+                     "key": "K"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors)
+    if proc is None:
+        fail("Failed to set up test (does startup reject the vendor URL?)")
+        return
+    try:
+        status, body = _send_proxy_request(proxy_port)
+        if status != 502:
+            fail("expected 502 for a forwarding failure, got {}: {!r}".format(
+                status, body[:300]))
+            return
+        try:
+            payload = json.loads(body)
+        except Exception:
+            fail("502 body is not JSON: {!r}".format(body[:300]))
+            return
+        code = ((payload or {}).get("error") or {}).get("code")
+        if code != "upstream_unreachable":
+            fail("expected error.code 'upstream_unreachable', got {!r}".format(code))
+            return
+        events = _wait_for_trace_events(trace_file, "forward_failed")
+        if not events:
+            fail("no forward_failed trace event landed")
+            return
+        pass_("forwarding failure answered with the 502 upstream_unreachable "
+              "envelope plus a forward_failed trace entry")
+    finally:
+        cleanup()
+
+
+def test_ipv6_provider_url_routes():
+    """A provider URL with an IPv6-literal authority routes to the upstream.
+
+    urlparse returns `parsed.hostname`, which strips the brackets from
+    '[::1]', so the client's base_url has to put them back: an unbracketed
+    'http://::1:<port>' makes httpx2 raise InvalidURL at Client construction,
+    which sits OUTSIDE the retry loop — every request to such a provider
+    answered 502 with zero upstream attempts (the stdlib transport accepted
+    the bare host, so the transport swap introduced this). The assertion is
+    wire-level on purpose: the ::1 stub must actually receive the POST.
+    """
+    print("\n--- Test: IPv6-Literal Provider URL Routes ---")
+
+    class Ipv6StubServer(http.server.ThreadingHTTPServer):
+        # Windows: SO_REUSEADDR would let a second listener take a held port —
+        # the same POSIX-only reuse choice the proxy and the suite's mocks make.
+        address_family = socket.AF_INET6
+        allow_reuse_address = (sys.platform != "win32")
+
+    hits = []
+
+    class StubHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            if length > 0:
+                self.rfile.read(length)
+            hits.append(self.path)
+            payload = json.dumps({
+                "id": "msg_v6", "type": "message", "role": "assistant",
+                "model": "claude-sonnet-5",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn", "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, fmt, *args):
+            pass
+
+    try:
+        # Bind port 0 directly: no find-free-port TOCTOU, and the stub owns
+        # whatever port it reports.
+        stub = Ipv6StubServer(("::1", 0), StubHandler)
+    except OSError as exc:
+        fail("this host cannot bind an IPv6 loopback stub ({}), so the "
+             "IPv6-literal routing path cannot be exercised".format(exc))
+        return
+    threading.Thread(target=stub.serve_forever, daemon=True).start()
+    temp_dir = tempfile.mkdtemp(prefix="proxy_ipv6_")
+    proc = None
+    try:
+        upstream_port = stub.server_address[1]
+        tiers = _mode_tiers()
+        vendors = {"p": {"url": "http://[::1]:{}/v1".format(upstream_port),
+                         "key": "K"}}
+        config_path = _create_test_config(temp_dir, tiers)
+        keys_path = _create_test_keys_plain(temp_dir, vendors)
+        trace_fd, trace_file = tempfile.mkstemp(suffix=".jsonl", dir=temp_dir)
+        os.close(trace_fd)
+        proxy_port, proc, ready = _spawn_proxy_with_bind_retry(
+            find_free_port(), config_path=config_path, keys_path=keys_path,
+            passphrase=None, trace_file=trace_file)
+        if not ready:
+            fail("proxy did not become ready with an IPv6-literal provider URL")
+            return
+        status, body = _send_proxy_request(proxy_port)
+        if status != 200:
+            fail("expected 200 from the IPv6 provider route, got {}: {!r}"
+                 .format(status, body[:300]))
+            return
+        if len(hits) != 1:
+            fail("expected exactly one upstream POST, got {} — zero attempts "
+                 "with a 502 is the client-construction failure this test "
+                 "guards".format(len(hits)))
+            return
+        if not hits[0].endswith("/messages"):
+            fail("unexpected upstream path {!r} — the plan's '{}' vendor URL is "
+                 "expected to carry the appended client path".format(
+                     hits[0], "/v1"))
+            return
+        pass_("IPv6-literal provider URL reached the ::1 stub exactly once "
+              "({})".format(hits[0]))
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        stub.shutdown()
+        stub.server_close()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_429_drain_bounded():
+    """A 429 body larger than the body cap still retries promptly.
+
+    The pre-retry drain must be raw and bounded: `resp.read()` decodes
+    (b"".join(iter_bytes()) — a compressed error body expands into worker
+    memory, uncapped, on every retry attempt) and waits for the whole
+    declared response, so a slow or withheld error body stalls the retry.
+    Here the stub answers 429 with `Content-Encoding: gzip`, a real ~8 KiB
+    gzip blob (8 MiB decoded, well past PROXY_MAX_BODY_SIZE=1024) and a
+    Content-Length covering a remainder it never sends, then holds. The
+    bounded iter_raw discard breaks after the cap and closes, so attempt 2
+    lands in seconds; a regression to a full decoding read waits out the
+    pinned read timeout (10 s) — which both exceeds this test's client
+    deadline and fails the elapsed assertion.
+    """
+    print("\n--- Test: 429 Drain Is Bounded ---")
+    import gzip
+    oversize = gzip.compress(b"\x00" * (8 * 1024 * 1024))
+    withheld = 4 * 1024 * 1024          # declared, never sent
+    attempts = []
+    attempt_lock = threading.Lock()
+    hold = threading.Event()
+    ok_body = json.dumps({
+        "id": "msg_ok", "type": "message", "role": "assistant",
+        "model": "claude-sonnet-5",
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn", "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }).encode()
+
+    def streamer(handler, info):
+        with attempt_lock:
+            attempts.append(info.get("path"))
+            n = len(attempts)
+        if n == 1:
+            handler.send_response(429)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Encoding", "gzip")
+            handler.send_header("Content-Length",
+                                str(len(oversize) + withheld))
+            handler.end_headers()
+            handler.wfile.write(oversize)
+            handler.wfile.flush()
+            # The remainder never arrives inside the drain's bound. Return
+            # without writing: the proxy has already closed the connection,
+            # and a post-hoc write would only noise this process's stderr.
+            hold.wait(15)
+            handler.close_connection = True
+            return
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(ok_body)))
+        handler.end_headers()
+        handler.wfile.write(ok_body)
+        handler.wfile.flush()
+
+    tiers = _mode_tiers()
+    upstream_port = find_free_port()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port),
+                     "key": "K"}}
+    temp_dir, proxy_port, proc, _mock_servers, trace_file, cleanup = \
+        _start_mode_proxy(
+            tiers, vendors, streamers={"p": streamer},
+            extra_env={"PROXY_MAX_BODY_SIZE": "1024",
+                       "PROXY_READ_TIMEOUT": "10",
+                       "PROXY_MAX_RETRIES": "3",
+                       "PROXY_INITIAL_DELAY": "1",
+                       "PROXY_MAX_DELAY": "2"})
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        start = time.time()
+        status, body = _send_proxy_request(proxy_port)
+        elapsed = time.time() - start
+        if status != 200:
+            fail("expected 200 after the 429 retry, got {} after {:.1f}s: "
+                 "{!r}".format(status, elapsed, body[:300]))
+            return
+        if len(attempts) != 2:
+            fail("expected exactly two upstream attempts, got {}".format(
+                len(attempts)))
+            return
+        events = _wait_for_trace_events(trace_file, "retry", timeout_s=5.0)
+        retries_429 = [e for e in events if e.get("reason") == "429"]
+        if not retries_429:
+            fail("no retry trace event with reason '429'; got {}".format(
+                [e.get("reason") for e in events]))
+            return
+        if elapsed >= 9.0:
+            fail("the retried exchange took {:.1f}s — the drain waited for the "
+                 "withheld remainder instead of stopping at the "
+                 "PROXY_MAX_BODY_SIZE bound".format(elapsed))
+            return
+        pass_("bounded non-decoding 429 drain retried in {:.1f}s "
+              "(oversize gzip body, {} bytes withheld)".format(
+                  elapsed, withheld))
+    finally:
+        hold.set()
+        cleanup()
+
+
 ALL_TESTS = [
     ("concurrent-requests", test_concurrent_requests),
     ("retry-logic", test_retry_logic),
@@ -3089,6 +3550,15 @@ ALL_TESTS = [
     ("retry-path-print-failure-does-not-misclassify", test_retry_path_print_failure_does_not_misclassify),
     # Config-swap drain (plan 2026-10-12-swap-silence-drain)
     ("response-mode-swap-aborts-sse-fallback", test_response_mode_swap_aborts_sse_fallback),
+    # httpx2 transport migration (plan 2026-11-15-httpx2-transport-sse)
+    ("upstream-accept-encoding-identity", test_upstream_accept_encoding_identity),
+    ("upstream-cookie-isolation", test_upstream_cookie_isolation),
+    ("stream-read-timeout-bounds-stall", test_stream_read_timeout_bounds_stall),
+    ("connection-error-retry-mapping", test_connection_error_retry_mapping),
+    ("forward-failure-returns-envelope", test_forward_failure_returns_envelope),
+    # Step 8 review-Warning fixes (same plan, revision 6)
+    ("ipv6-provider-url-routes", test_ipv6_provider_url_routes),
+    ("429-drain-bounded", test_429_drain_bounded),
 ]
 
 

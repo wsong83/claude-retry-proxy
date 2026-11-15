@@ -16,7 +16,7 @@ hot-switching tier mappings at runtime.
 
 Extracted from the personal `claude-config` repo into a standalone, public,
 pip-installable package. Runtime dependency: `cryptography` (for vim blowfish2
-decryption). Python 3.8+.
+decryption) and `httpx2>=2.13.1` (the upstream HTTP/SSE transport). Python 3.10+.
 
 This file is the operational summary. The `doc/` tree holds the deep reference —
 rationale, mechanisms, and edge cases — and is indexed by
@@ -27,7 +27,7 @@ rationale, mechanisms, and edge cases — and is indexed by
 ```
 src/claude_retry_proxy/
   __init__.py           __version__
-  server.py             the HTTP retry gateway server (ThreadingHTTPServer, tier routing, model rewriting, admin API, retry/backoff)
+  server.py             the HTTP retry gateway server (ThreadingHTTPServer, tier routing, model rewriting, admin API, httpx2 upstream transport, retry/backoff)
   compat.py             the compatibility learner: the `COMPAT_FEATURES` registry (two features — `context_management` in anthropic mode, `reasoning_field` in chat mode) whose descriptors own their mode, presence test, matcher, field set and retry budget; COMPAT_* policy constants; the owned `_CompatState` state object (default-param `state=` injection); the `context_management` state machine with its 400-shape matchers and its retry lock, and the `reasoning_field` credit learner (a per-key in-memory credit; the switch thresholds are `models.json` policy, `reasoning_field_switch`) with its lock-free, key-free rescue (its passes repair the forwarded body rather than re-rolling) and matcher, plus its demanding-turn-scoped presence gate (`_reasoning_present`: reasoning on the last `tool_use`-bearing assistant turn, read from the raw client body) (extracted from server.py; the probe-outcome + retry orchestration slice stays in server.py)
   sanitize.py           error-text redaction leaf: `sanitize_error`, the chokepoint for text reaching stderr, trace `error` fields and client-facing error bodies
   sinks.py              sink class family: private `_Sink` base, `TraceSink` (JSONL append + counters + markers), `StateSink` (atomic state document), shared `_SinkHealth` failure reporter, process-wide pair + `configure()`
@@ -54,7 +54,7 @@ scripts/
   check_doc_anchors.py    doc anchor + credential-shape checker (invoked by the test suite)
   check_spawn_isolation.py  corpus runtime-isolation checker (invoked by the test suite)
 doc/              human-facing HTML reference, indexed by content.html
-pyproject.toml   setuptools src-layout, console scripts, cryptography dependency
+pyproject.toml   setuptools src-layout, console scripts, cryptography + httpx2 dependencies
 LICENSE          MIT
 ```
 
@@ -194,7 +194,9 @@ for the rest.
   (`_SWAP_QUIET_GRACE`) means every survivor is silent by construction. There is
   **no wall-clock cap** — live work is waited to completion — and retry chains
   abandon at the press with a retryable `503 config_swap_restart` instead of
-  being awaited. The swap then bumps `_config_epoch` under lock and signals
+  being awaited. A *streamed* response silent at the press has no armed wake
+  anymore — it wakes at its next read boundary (≤ `PROXY_READ_TIMEOUT`) and
+  dies retryably there. The swap then bumps `_config_epoch` under lock and signals
   `_swap_done`; old-epoch stragglers die retryably at their next checkpoint, so
   no old-routing result is delivered after a swap. `forward_request` snapshots
   config, vendors **and** the epoch at entry and threads them throughout.
@@ -211,7 +213,7 @@ for the rest.
   `StateSink`, sharing one never-raising implementation in the private `_Sink`
   base — so trace and state cannot drift apart. Each returns `True`/`False`.
   This is load-bearing: an `OSError` escaping a trace write would be caught by
-  the retry loop's `except (socket.error, ConnectionError, OSError)` clause and
+  the retry loop's `except (httpx2.RequestError, httpx2.StreamError, OSError)` clause and
   misread as a connection error, re-issuing the upstream POST; in
   `heartbeat_loop` it would kill that thread permanently. Both sinks redo their
   work every call, so transient faults self-heal — but entries written during
@@ -238,7 +240,8 @@ for the rest.
 | `PROXY_MAX_DELAY` | 30 | Backoff cap, seconds (1-300). Applied *before* jitter, so actual sleeps can exceed it by up to 25%. 429 retries use this value directly (jittered). |
 | `PROXY_MAX_BODY_SIZE` | 10485760 | Request body size cap, bytes (1024-100MiB) → 413. Also caps the upstream error body drain on retry exhaustion (give-up path). |
 | `PROXY_MAX_RESPONSE_SIZE` | 104857600 | Streaming response size cap, bytes (1024-1GiB). Responses exceeding this are truncated with a `response_size_cap_exceeded` warning trace event. |
-| `PROXY_SWAP_SILENCE_TIMEOUT` | 30 | Per-request silence budget for the config-swap drain, seconds (1-300; blank/invalid → 30). The drain exits when no upstream byte has arrived from *any* in-flight request for this long, then evicts the remainder retryably (`config_swap_restart`). Also bounds a streamed read's socket arm while a swap is in progress, and is reported as `budget_s` by `/admin/api/swap-status`. Read at startup. |
+| `PROXY_SWAP_SILENCE_TIMEOUT` | 30 | Per-request silence budget for the config-swap drain, seconds (1-300; blank/invalid → 30). The drain exits when no upstream byte has arrived from *any* in-flight request for this long, then evicts the remainder retryably (`config_swap_restart`). Reported as `budget_s` by `/admin/api/swap-status`. Read at startup. |
+| `PROXY_READ_TIMEOUT` | 120 | Upstream stall timeout, seconds (10-600; blank/invalid → 120). Applied uniformly (connect/read/write/pool) on the per-chain httpx2 upstream client — it bounds connect, headers, and each inter-byte gap. A streamed response silent longer than this ends at its next read boundary; a stream silent at a config-swap press wakes there too (≤ 120 s) and dies retryably. Read at startup. |
 | `PROXY_LOG_ALL` | "" | Set to `1` to log full request/response bodies |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | Trace log path |
 | `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | Keys file path (encrypted or plain JSON) |
@@ -330,7 +333,7 @@ what you need in context, and the link has the rest.
 | Tool-schema `pattern` regexes are normalized (ECMA identity escapes stripped) in **all three modes** before forwarding — anthropic mode included, via `_sanitize_body_tools` on its verbatim forward — so strict backends accept MCP/Zod tool schemas | [doc/provider-modes.html#pattern-normalization](doc/provider-modes.html#pattern-normalization) |
 | Chat mode never substitutes `input: {}` for tool arguments it could not parse — it degrades them to a visible placeholder block | [doc/provider-modes.html#malformed-args](doc/provider-modes.html#malformed-args) |
 | Chat mode maps `image` blocks — top-level and `tool_result`-nested — to `image_url` parts (base64 → `data:` URI, url verbatim, merged text part first); inconvertible images (incl. the Files-API `file` source) are dropped and counted, and there is deliberately no reverse mapping | [doc/provider-modes.html#image-content-blocks](doc/provider-modes.html#image-content-blocks) |
-| A chat-mode stream that goes silent after `finish_reason` waits up to 5 s before the terminal event, not the upstream socket timeout | [doc/provider-modes.html#chat-sse-drain](doc/provider-modes.html#chat-sse-drain) |
+| A chat-mode stream silent after `finish_reason` ends its drain at the next read boundary (≤ `PROXY_READ_TIMEOUT`) if no frames arrive, or at the per-chunk 5 s budget if they do; `drain_exit` records which | [doc/provider-modes.html#chat-sse-drain](doc/provider-modes.html#chat-sse-drain) |
 | A chat-mode stream that ends with no `finish_reason` closes differently depending on whether `[DONE]` arrived | [doc/provider-modes.html#chat-sse](doc/provider-modes.html#chat-sse) |
 | A chat-mode turn that declared tools, ends its text in a colon and emitted no tool call is closed with a retryable error and its retry nudged (`PROXY_CHAT_RETRY_NUDGE=""` disables); a repeated stall passes through | [doc/provider-modes.html#chat-sse-unfinished-turn](doc/provider-modes.html#chat-sse-unfinished-turn) |
 | A vendor carries either `key` (string) or `keys` (name→payload); a tier's `key` selector picks one | [doc/configuration.html#multi-key](doc/configuration.html#multi-key) |

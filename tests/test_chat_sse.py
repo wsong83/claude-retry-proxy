@@ -58,7 +58,8 @@ DRAIN_BOUND_TEST_SECONDS = 20
 
 
 
-def _start_hanging_chat_proxy(pre_body, hold_s, post_body=None, gap_s=0.0):
+def _start_hanging_chat_proxy(pre_body, hold_s, post_body=None, gap_s=0.0,
+                              extra_env=None):
     """Chat-mode proxy whose mock upstream streams `pre_body` over an unterminated
     response (HTTP/1.0, no Content-Length) and then holds the socket open.
 
@@ -70,6 +71,10 @@ def _start_hanging_chat_proxy(pre_body, hold_s, post_body=None, gap_s=0.0):
     which lands it in a later read chunk than `pre_body` — the shape that makes
     a post-finish frame count as *late* (the per-chunk offset is taken at chunk
     receipt, before the frames are parsed).
+
+    `extra_env` passes additional env vars to the proxy subprocess — the drain
+    tests pin PROXY_READ_TIMEOUT here (its validation floor is 10; smaller
+    values are refused by design and fall back to 120).
 
     Returns (proxy_port, trace_file, cleanup), or (None, None, None) on failure.
     """
@@ -112,7 +117,7 @@ def _start_hanging_chat_proxy(pre_body, hold_s, post_body=None, gap_s=0.0):
     os.close(trace_fd)
     proc, probe_ok = _start_proxy_server_directly(
         proxy_port, config_path=config_path, keys_path=keys_path,
-        passphrase=None, trace_file=trace_file)
+        passphrase=None, trace_file=trace_file, extra_env=extra_env)
 
     if not probe_ok:
         server.shutdown()
@@ -1739,65 +1744,6 @@ def test_chat_sse_non_dict_arguments_at_close():
 
 
 
-def test_chat_sse_frame_dropped_guard():
-    """A mid-stream oversized no-delimiter frame is counted; the emitted block still claims tool_use.
-
-    D4-revised (2026-10-03): frame_dropped no longer blocks the finish claim —
-    the tool block was emitted before the drop, so tool_use is claimed. The
-    drop is still diagnosed via frame_dropped: 1.
-    """
-    print("\n--- Test: Chat SSE Frame Dropped Guard ---")
-    upstream_port = find_free_port()
-    tiers = _mode_tiers()
-    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K", "mode": "chat"}}
-    chunks = [
-        _cc({"role": "assistant"}),
-        _cc({"tool_calls": [{"index": 0, "id": "call_fd", "function": {"name": "fd_tool", "arguments": "{\"a\":1}"}}]}),
-    ]
-    finish = _cc({}, finish="tool_calls")
-    sse_body = (_sse_stream_chunks(chunks) + b"z" * 90000 + b"\n\n"
-                + _sse_stream_chunks([finish]) + b"data: [DONE]\n\n")
-    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
-    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
-        tiers, vendors, responders=responders)
-    if proc is None:
-        fail("Failed to set up test")
-        return
-    try:
-        frames = _chat_sse_fetch_frames(proxy_port)
-        if frames is None:
-            return
-        blocks = _sse_tool_use_blocks(frames)
-        if len(blocks) != 1 or not blocks[0]["closed"]:
-            fail("tool block emitted before the drop should close, got {!r}".format(blocks))
-            return
-        if blocks[0]["input"] != {"a": 1}:
-            fail("tool input wrong after frame drop: {!r}".format(blocks[0]))
-            return
-        if _sse_stop_reason(frames) != "tool_use":
-            fail("emitted block must claim tool_use despite the dropped frame, got {!r}".format(_sse_stop_reason(frames)))
-            return
-        events = _degraded_trace_events(trace_file)
-        if len(events) != 1:
-            fail("expected exactly one degradation event, got {}".format(len(events)))
-            return
-        if events[0].get("frame_dropped") != 1:
-            fail("expected frame_dropped 1 in the trace event, got {!r}".format(events[0]))
-            return
-        if not _assert_degradation_metadata_only(events[0]):
-            return
-        blob = json.dumps(events[0])
-        for marker in ["call_fd", "fd_tool"]:
-            if marker in blob:
-                fail("degradation event leaked tool marker {!r}: {}".format(marker, blob))
-                return
-        pass_("oversized no-delimiter frame mid-tool-stream: emitted block claims tool_use, frame_dropped 1")
-    finally:
-        cleanup()
-
-
-
-
 def test_chat_mode_streamed_tool_command_e2e():
     """State-wide: a streamed Bash tool call becomes a runnable Anthropic tool_use turn."""
     print("\n--- Test: Chat Mode Streamed Tool Command E2E ---")
@@ -2380,12 +2326,22 @@ def test_chat_sse_tool_degradation_on_cut_stream():
 
 def test_chat_sse_drain_time_deadline():
     """A provider that sends finish_reason and then goes silent must not hold the
-    request open past the drain bound."""
+    request open past the drain bound.
+
+    The bound is now the request read timeout (PROXY_READ_TIMEOUT, pinned to its
+    10 s floor here) — the old point-of-blocking socket arming died with the
+    stdlib transport. The per-chunk MAX_DRAIN_SECONDS check still governs a
+    CHATTY drain (a provider that keeps sending frames); it cannot fire for a
+    silent one, so `drain_exit` must read "read_timeout", which is what
+    distinguishes the read boundary from the time budget.
+    """
     print("\n--- Test: Chat SSE Drain Time Deadline ---")
+    read_timeout = 10
     pre = _sse_stream_chunks([_cc({"role": "assistant", "content": "hi"}),
                               _cc({}, finish="stop")])
     proxy_port, trace_file, cleanup = _start_hanging_chat_proxy(
-        pre, DRAIN_BOUND_TEST_SECONDS * 3)
+        pre, DRAIN_BOUND_TEST_SECONDS * 3,
+        extra_env={"PROXY_READ_TIMEOUT": str(read_timeout)})
     if proxy_port is None:
         return
     try:
@@ -2401,10 +2357,10 @@ def test_chat_sse_drain_time_deadline():
         if _sse_stop_reason(frames) != "end_turn":
             fail("drain must still emit the mapped stop reason, got {!r}".format(_sse_stop_reason(frames)))
             return
-        # The fixture goes silent after finish_reason, so the drain exits on
-        # the socket timeout (the except socket.timeout clause). If that clause
-        # were dead code — e.g. ordered after the OSError tuple, which
-        # socket.timeout subclasses — this would report "read_error".
+        # The fixture goes silent after finish_reason, so the drain exits on the
+        # read timeout. If that clause were dead code — e.g. a silent drain
+        # mislabelled "read_error" by the generic exception arm — this reports
+        # the wrong enum.
         # Poll: _read_sse_until_stop returns at message_stop, which the proxy
         # writes before it logs the drain event, so an immediate read races
         # the sink write.
@@ -2412,11 +2368,12 @@ def test_chat_sse_drain_time_deadline():
         if len(drain_events) != 1:
             fail("expected exactly one chat_sse_drain event, got {}".format(len(drain_events)))
             return
-        if drain_events[0].get("drain_exit") != "time_budget":
-            fail("silent provider must exit the drain on its own deadline "
-                 "(socket.timeout -> time_budget), got {!r}".format(drain_events[0].get("drain_exit")))
+        if drain_events[0].get("drain_exit") != "read_timeout":
+            fail("silent provider must exit the drain on the read boundary "
+                 "(read_timeout), got {!r}".format(drain_events[0].get("drain_exit")))
             return
-        pass_("silent provider: drain bounded, terminal emitted in {:.1f}s".format(elapsed))
+        pass_("silent provider: drain bounded by the {}s read timeout, terminal "
+              "emitted in {:.1f}s".format(read_timeout, elapsed))
     finally:
         cleanup()
 
@@ -3800,23 +3757,29 @@ def test_chat_retry_nudge_evicts_at_sixty_four_entries():
 
 
 def test_chat_sse_drain_late_tool_call_time_budget():
-    """A tool call that arrives after finish_reason on a drain that ends by
-    the time budget reports a non-null late_tool_call_ms — the arrival latency
+    """A tool call that arrives after finish_reason on a drain that ends at the
+    read boundary reports a non-null late_tool_call_ms — the arrival latency
     of a tool call the drain would otherwise have lost, and the number that
-    answers whether the 5 s budget is generous or binding.
+    answers whether the 5 s per-chunk budget is generous or binding.
 
     Uses a two-phase hanging upstream: the finish stream lands first, the tool
     frame 0.3 s later (a distinct read chunk, so it counts as late), then the
-    socket goes silent until the drain's socket timeout fires — the same
-    except-socket.timeout exit test_chat_sse_drain_time_deadline pins."""
+    socket goes silent until the REQUEST READ TIMEOUT fires (PROXY_READ_TIMEOUT
+    pinned to its 10 s floor) — the same read_timeout exit
+    test_chat_sse_drain_time_deadline pins. The name is kept for continuity;
+    the exit enum is no longer "time_budget", which now belongs to a chatty
+    drain cut by the per-chunk MAX_DRAIN_SECONDS check.
+    """
     print("\n--- Test: Chat SSE Drain Late Tool Call Time Budget ---")
+    read_timeout = 10
     pre = _sse_stream_chunks([_cc({"role": "assistant", "content": "hi"}),
                               _cc({}, finish="stop")])
     post = _sse_stream_chunks([_cc({"tool_calls": [{"index": 0, "id": "call_really_late",
                                                     "function": {"name": "late_tool",
                                                                  "arguments": "{\"q\":1}"}}]})])
     proxy_port, trace_file, cleanup = _start_hanging_chat_proxy(
-        pre, DRAIN_BOUND_TEST_SECONDS * 3, post_body=post, gap_s=0.3)
+        pre, DRAIN_BOUND_TEST_SECONDS * 3, post_body=post, gap_s=0.3,
+        extra_env={"PROXY_READ_TIMEOUT": str(read_timeout)})
     if proxy_port is None:
         return
     try:
@@ -3836,8 +3799,9 @@ def test_chat_sse_drain_late_tool_call_time_budget():
             fail("expected exactly one chat_sse_drain event, got {}".format(len(events)))
             return
         ev = events[0]
-        if ev.get("drain_exit") != "time_budget":
-            fail("drain must end on its own deadline, got {!r}".format(ev.get("drain_exit")))
+        if ev.get("drain_exit") != "read_timeout":
+            fail("a silent drain must end at the read boundary, got {!r}".format(
+                ev.get("drain_exit")))
             return
         if ev.get("late_tool_call_ms") is None:
             fail("a tool call arriving after finish_reason must record late_tool_call_ms, "
@@ -4352,8 +4316,12 @@ _CHAT_SWITCH_TO_Q = {"tiers": {
 }}
 
 
-def _chat_swap_proxy(p_streamer):
+def _chat_swap_proxy(p_streamer, extra_env=None):
     """Start a chat-mode two-provider proxy: sonnet -> p, q for the switch.
+
+    `extra_env` merges over the 2 s swap budget — the swap eviction tests pin
+    PROXY_READ_TIMEOUT there so the read-boundary eviction is deterministic
+    rather than waiting out the 120 s default.
 
     Returns (proxy_port, trace_file, mock_servers, cleanup), or (None,)*4 on
     failure.
@@ -4365,9 +4333,11 @@ def _chat_swap_proxy(p_streamer):
         "q": {"url": "http://127.0.0.1:{}".format(find_free_port()),
               "key": "K", "mode": "chat"},
     }
+    env = dict(_CHAT_SWAP_BUDGET_ENV)
+    if extra_env:
+        env.update(extra_env)
     temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
-        tiers, vendors, streamers={"p": p_streamer},
-        extra_env=dict(_CHAT_SWAP_BUDGET_ENV))
+        tiers, vendors, streamers={"p": p_streamer}, extra_env=env)
     if proc is None:
         return None, None, None, None
     return proxy_port, trace_file, mock_servers, cleanup
@@ -4392,7 +4362,13 @@ def test_chat_sse_swap_evicts_pre_finish():
     """A chat-mode stream evicted pre-finish (a byte after the press, then
     silence) closes with the retryable config_swap_restart error and emits
     chat_sse_truncated, keeping the trace invariant (exactly one of
-    chat_sse_drain / chat_sse_truncated)."""
+    chat_sse_drain / chat_sse_truncated).
+
+    The eviction now lands at the stream's next READ BOUNDARY (the request read
+    timeout, pinned to 10 s here) rather than at the retired 30 s armed wake;
+    by then the swap itself has usually completed, so the epoch check — not the
+    in-progress flag — is what closes it.
+    """
     print("\n--- Test: Chat SSE Pre-Finish Swap Eviction ---")
     post_press_byte = threading.Event()
 
@@ -4403,14 +4379,20 @@ def test_chat_sse_swap_evicts_pre_finish():
         handler.wfile.write(_sse_stream_chunks(
             [_cc({"role": "assistant", "content": "hi"})]))
         handler.wfile.flush()
-        # A byte AFTER the press, then silence: the loop's next read is then
-        # armed at the budget while _config_swapping is True.
+        # A byte AFTER the press, then silence: the loop's next read then
+        # blocks until the request read timeout, with _config_swapping (or the
+        # completed swap's epoch) owning the wake.
         post_press_byte.wait(15)
         handler.wfile.write(_sse_stream_chunks([_cc({"content": "more"})]))
         handler.wfile.flush()
         time.sleep(30)  # hold silently
 
-    proxy_port, trace_file, mock_servers, cleanup = _chat_swap_proxy(streamer)
+    # The wake is the request read timeout (there is no armed wake any more),
+    # so it is pinned to its 10 s floor to keep the test bounded; the swap's
+    # quiet window (budget 2 + grace 2) still expiring first is fine — the
+    # completed swap's epoch check owns the wake either way.
+    proxy_port, trace_file, mock_servers, cleanup = _chat_swap_proxy(
+        streamer, extra_env={"PROXY_READ_TIMEOUT": "10"})
     if proxy_port is None:
         fail("Failed to set up test")
         return
@@ -4472,14 +4454,14 @@ def test_chat_sse_swap_abort_in_drain_window():
     chat_sse_drain, no chat_sse_truncated).
 
     The finish frame is written at handler entry, i.e. BEFORE the press, so the
-    drain-entry pin is taken with _config_swapping still False and is therefore
-    the mode's own bound, max(1, MAX_DRAIN_SECONDS) = 5 s — longer than the
-    swap's quiet window of budget + _SWAP_QUIET_GRACE = 4 s at this suite's 2 s
-    budget. The swap therefore completes first, and the late frame is then
-    released to trigger the drain's post-read epoch check. (The pin is
-    conditional now: taken WHILE a swap is in progress it is capped at the
-    budget — the other half of that conditional, pinned separately by
-    test_chat_sse_swap_drain_pin_taken_mid_swap.)"""
+    stream is already in the post-finish drain when the swap runs. The drain
+    itself has no timer any more: a SILENT drain is bounded only by the request
+    read timeout (120 s here, unpinned), and the per-chunk MAX_DRAIN_SECONDS
+    check fires only when chunks keep arriving. What ends this stream is
+    therefore the released late frame: the swap's quiet window
+    (budget + _SWAP_QUIET_GRACE = 4 s at this suite's 2 s budget) completes the
+    swap first, and the frame then hits the drain's post-read epoch check —
+    the disposition this test pins, independent of any drain timer."""
     print("\n--- Test: Chat SSE Drain-Window Swap Abort ---")
     late_frame = threading.Event()
 
@@ -4552,149 +4534,6 @@ def test_chat_sse_swap_abort_in_drain_window():
         cleanup()
 
 
-def test_chat_sse_swap_drain_pin_taken_mid_swap():
-    """A chat stream whose drain-entry pin is taken WHILE the swap is in
-    progress — the case fix 2's conditional drain_pin() exists for.
-
-    The finish frame is released only after the press has been observed on
-    /admin/api/swap-status, so drain_pin() sees _config_swapping True and caps
-    the drain window at this suite's 2 s silence budget instead of the mode's
-    own 5 s bound. The drain's quiet window is budget + _SWAP_QUIET_GRACE = 4 s,
-    so a capped pin wakes INSIDE the drain: the drain-window wake takes the
-    time_budget exit and the turn closes normally — which means the request has
-    already left the in-flight set when the drain exits, so the swap lands after
-    the client's terminal, never before it.
-
-    With the old unconditional 5 s pin the wake (t+5) outlives the quiet window
-    (t+4): the swap completes first and the epoch rule closes the stream instead
-    (a swap_abort event plus the retryable config_swap_restart error), so every
-    assertion below fails. The property pinned here is therefore: a drain-entry
-    pin taken mid-swap never delivers a normal terminal on the old routing after
-    the swap has completed.
-    """
-    print("\n--- Test: Chat SSE Drain Pin Taken Mid-Swap ---")
-    release_finish = threading.Event()
-
-    def streamer(handler, info):
-        handler.send_response(200)
-        handler.send_header("Content-Type", "text/event-stream")
-        handler.end_headers()
-        handler.wfile.write(_sse_stream_chunks(
-            [_cc({"role": "assistant", "content": "hi"})]))
-        handler.wfile.flush()
-        # The finish frame is what takes the drain-entry pin; releasing it only
-        # after the press is what makes that pin land while swapping.
-        release_finish.wait(20)
-        handler.wfile.write(_sse_stream_chunks([_cc({}, finish="stop")]))
-        handler.wfile.flush()
-        time.sleep(30)  # hold silently: the drain window is the only exit
-
-    proxy_port, trace_file, mock_servers, cleanup = _chat_swap_proxy(streamer)
-    if proxy_port is None:
-        fail("Failed to set up test")
-        return
-    try:
-        out = {}
-
-        def client_worker():
-            try:
-                out["result"] = _send_proxy_request_stream(
-                    proxy_port, {"model": "sonnet", "stream": True,
-                                 "messages": [{"role": "user", "content": "hi"}]})
-            except Exception as e:
-                out["result"] = (0, "", str(e).encode())
-            out["done_at"] = time.time()
-
-        client = threading.Thread(target=client_worker, daemon=True)
-        client.start()
-        if not _wait_upstream_request(mock_servers, "p"):
-            fail("upstream never received the stream request")
-            return
-        switch_out = {}
-
-        def switch_worker():
-            try:
-                switch_out.update(zip(
-                    ("status", "data"),
-                    _admin_post(proxy_port, "/admin/api/switch", _CHAT_SWITCH_TO_Q)))
-            except Exception as e:
-                switch_out["error"] = str(e)
-            switch_out["done_at"] = time.time()
-
-        sw = threading.Thread(target=switch_worker, daemon=True)
-        sw.start()
-        if _wait_admin_swapping(proxy_port) is None:
-            fail("swap never became visible on /admin/api/swap-status")
-            return
-        # The press has landed: release the finish frame now, so the
-        # drain-entry pin is taken with _config_swapping True.
-        release_finish.set()
-        sw.join(25)
-        client.join(25)
-        if switch_out.get("status") != 200:
-            fail("switch returned {}: {}".format(
-                switch_out.get("status"), switch_out.get("data")))
-            return
-        cstatus, _ctype, raw = out.get("result", (0, "", b""))
-        if cstatus != 200:
-            fail("client stream status {}, expected 200".format(cstatus))
-            return
-        body = json.loads(switch_out.get("data", "{}"))
-        if body.get("drained") is not True:
-            fail("nothing was evicted, so drained must be True; got {!r}".format(
-                body.get("drained")))
-            return
-        if body.get("inflight_at_swap") != 1:
-            fail("the silent chat stream must be counted at the press, got {!r}".format(
-                body.get("inflight_at_swap")))
-            return
-        # The discriminator: a capped pin ends the stream INSIDE the drain, so
-        # the drain exits via count == 0 — after the client's terminal. The old
-        # unconditional 5 s pin instead lets the drain quiet-exit at
-        # budget + _SWAP_QUIET_GRACE = 4 s, and the stream then wakes after it.
-        waited = body.get("waited_s")
-        if not isinstance(waited, (int, float)) or waited >= 3.5:
-            fail("the capped drain-entry pin must end the stream inside the "
-                 "drain window (< the 4 s quiet window), got waited_s {!r}".format(
-                     waited))
-            return
-        if out.get("done_at", 1e18) > switch_out.get("done_at", 0.0) + 0.5:
-            fail("the client's terminal must precede the swap completing "
-                 "(client {!r} vs switch {!r})".format(
-                     out.get("done_at"), switch_out.get("done_at")))
-            return
-        if b"config swap in progress" in raw:
-            fail("the capped pin must not turn the drain-window wake into an "
-                 "eviction: {!r}".format(raw[-300:]))
-            return
-        if b"message_stop" not in raw:
-            fail("the drain-window time_budget exit must synthesize a terminal: "
-                 "{!r}".format(raw[-300:]))
-            return
-        aborts = _trace_events_named(trace_file, "swap_abort")
-        if aborts:
-            fail("nothing was evicted, so no swap_abort event may be emitted: "
-                 "{!r}".format(aborts))
-            return
-        drains = _wait_for_trace_events(trace_file, "chat_sse_drain")
-        if len(drains) != 1:
-            fail("expected exactly one chat_sse_drain, got {}".format(len(drains)))
-            return
-        if drains[0].get("drain_exit") != "time_budget":
-            fail("drain_exit must be 'time_budget' (the drain-window bound, "
-                 "woken inside the drain), got {!r}".format(
-                     drains[0].get("drain_exit")))
-            return
-        if _trace_events_named(trace_file, "chat_sse_truncated"):
-            fail("a drain-window close must not emit chat_sse_truncated")
-            return
-        pass_("mid-swap drain-entry pin capped at the budget: terminal delivered "
-              "before the swap (waited_s {:.2f}), one chat_sse_drain with "
-              "drain_exit 'time_budget', no swap_abort".format(waited))
-    finally:
-        cleanup()
-
-
 def test_chat_sse_eviction_stranded_sentinel_never_flushes():
     """A genuine eviction carrying a stranded `data: [DONE]\\n` in the residual
     buffer never runs the EOF flush: evict_swap returns before the flush, so
@@ -4717,14 +4556,19 @@ def test_chat_sse_eviction_stranded_sentinel_never_flushes():
             [_cc({"role": "assistant", "content": "hi"})]))
         handler.wfile.flush()
         # The stranded sentinel arrives AFTER the press, so it lands in buf
-        # while _config_swapping; the next read is then armed at the budget
-        # and times out into the pre-finish eviction arm.
+        # while _config_swapping; the next read then blocks until the request
+        # read timeout (pinned to 10 s below) and wakes into the pre-finish
+        # eviction arm.
         post_press_byte.wait(15)
         handler.wfile.write(b"data: [DONE]\n")
         handler.wfile.flush()
         time.sleep(30)  # hold silently
 
-    proxy_port, trace_file, mock_servers, cleanup = _chat_swap_proxy(streamer)
+    # The eviction wakes at the next read boundary, so the request read timeout
+    # is pinned to its 10 s floor: without the pin this waits out the 120 s
+    # default and the client join gives up before the eviction lands.
+    proxy_port, trace_file, mock_servers, cleanup = _chat_swap_proxy(
+        streamer, extra_env={"PROXY_READ_TIMEOUT": "10"})
     if proxy_port is None:
         fail("Failed to set up test")
         return
@@ -4896,6 +4740,223 @@ def test_chat_sse_post_swap_straggler_dies_retryably():
               "saw_done 1), retryable error, no terminal, swap_abort stream")
 
 
+# ===========================================================================
+# Frame-cap disposition (plan 2026-11-15-httpx2-transport-sse, Step 5a)
+# ===========================================================================
+
+# The cap is a local constant in server.py (2 MB). The fixtures overshoot it by
+# a margin far larger than any read-chunk boundary, so the trip is reached on
+# accumulated bytes rather than on a lucky split.
+_FRAME_CAP_BYTES = 2 * 1024 * 1024
+
+
+def test_chat_sse_first_frame_oversize_errors_loud():
+    """A pre-finish frame that never terminates errors out loud instead of
+    being silently dropped.
+
+    A >2 MB no-delimiter frame before finish_reason means the turn has not been
+    terminal-signaled: the client gets `message_start` then `event: error` with
+    error.code "upstream_frame_oversize" and NO message_delta/message_stop, so
+    the turn is retryable rather than silently degraded. The trace carries both
+    chat_sse_frame_oversize (with the frame size) and the invariant
+    chat_sse_truncated event — every 200 chat stream ends with exactly one of
+    chat_sse_drain / chat_sse_truncated.
+    """
+    print("\n--- Test: Chat SSE Pre-Finish Oversize Frame Errors Loud ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port),
+                     "key": "K", "mode": "chat"}}
+    # One frame head, no delimiter anywhere after it: the buffer can only grow.
+    sse_body = b"data: " + b"z" * (_FRAME_CAP_BYTES + 65536)
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        types = _sse_types(frames)
+        if not types or types[0] != "message_start":
+            fail("the stream must open with message_start, got {}".format(types[:3]))
+            return
+        if "message_delta" in types or "message_stop" in types:
+            fail("an oversize pre-finish frame must not synthesize a terminal: "
+                 "{}".format(types))
+            return
+        errors = [d for t, d in frames if _sse_frame_type((t, d)) == "error"]
+        if len(errors) != 1:
+            fail("expected exactly one SSE error frame, got {} ({})".format(
+                len(errors), types))
+            return
+        code = ((errors[0] or {}).get("error") or {}).get("code")
+        if code != "upstream_frame_oversize":
+            fail("expected error.code 'upstream_frame_oversize', got {!r}".format(code))
+            return
+        oversized = _wait_for_trace_events(trace_file, "chat_sse_frame_oversize")
+        if len(oversized) != 1:
+            fail("expected exactly one chat_sse_frame_oversize event, got {}".format(
+                len(oversized)))
+            return
+        size = oversized[0].get("bytes")
+        if not isinstance(size, int) or size <= _FRAME_CAP_BYTES:
+            fail("chat_sse_frame_oversize must record the frame size above the "
+                 "cap, got {!r}".format(size))
+            return
+        truncated = _wait_for_trace_events(trace_file, "chat_sse_truncated")
+        if len(truncated) != 1:
+            fail("the loud error must also emit the invariant chat_sse_truncated "
+                 "event, got {}".format(len(truncated)))
+            return
+        if _trace_events_named(trace_file, "chat_sse_drain"):
+            fail("a pre-finish close must not emit chat_sse_drain")
+            return
+        pass_("pre-finish oversize frame: message_start + upstream_frame_oversize "
+              "error, no terminal, frame_oversize {} bytes + chat_sse_truncated".format(
+                  size))
+    finally:
+        cleanup()
+
+
+def test_chat_sse_drain_window_frame_oversize_drops_and_completes():
+    """An oversize frame arriving AFTER finish_reason is dropped, and the turn
+    still completes.
+
+    The turn is already terminal-signaled in the drain window, so failing it
+    would force a full client re-run for data the client never needed. The drop
+    is trace-visible (chat_sse_frame_oversize with the size) and counted in
+    chat_sse_tool_degradation's frame_dropped — the field's narrowed,
+    drain-window-only meaning.
+
+    The oversize bytes must arrive without a delimiter in the same buffer (a
+    coalesced chunk containing the junk AND its terminator would be parsed as
+    one frame and charged to the byte budget instead), so the fixture flushes
+    the junk first and the terminator after a pause.
+    """
+    print("\n--- Test: Chat SSE Drain-Window Oversize Frame Drops and Completes ---")
+    upstream_port = find_free_port()
+    tiers = _mode_tiers()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port),
+                     "key": "K", "mode": "chat"}}
+    pre = _sse_stream_chunks([_cc({"role": "assistant", "content": "hi"}),
+                              _cc({}, finish="stop")])
+    junk = b"z" * (_FRAME_CAP_BYTES + 65536)
+
+    def streamer(handler, info):
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.end_headers()
+        handler.wfile.write(pre)
+        handler.wfile.flush()
+        handler.wfile.write(junk)
+        handler.wfile.flush()
+        time.sleep(0.3)
+        # Terminator + sentinel: the junk has no delimiter of its own, so it is
+        # dropped by the frame cap before these bytes are ever scanned.
+        handler.wfile.write(b"\ndata: [DONE]\n\n")
+        handler.wfile.flush()
+
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        tiers, vendors, streamers={"p": streamer})
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        types = _sse_types(frames)
+        missing = [t for t in ("message_delta", "message_stop") if t not in types]
+        if missing:
+            fail("the turn must still terminate normally, missing {}".format(missing))
+            return
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("stop reason must still be end_turn, got {!r}".format(
+                _sse_stop_reason(frames)))
+            return
+        oversized = _wait_for_trace_events(trace_file, "chat_sse_frame_oversize")
+        if len(oversized) != 1:
+            fail("expected exactly one chat_sse_frame_oversize event, got {}".format(
+                len(oversized)))
+            return
+        size = oversized[0].get("bytes")
+        if not isinstance(size, int) or size <= _FRAME_CAP_BYTES:
+            fail("chat_sse_frame_oversize must record the frame size above the "
+                 "cap, got {!r}".format(size))
+            return
+        events = _degraded_trace_events(trace_file)
+        if len(events) != 1:
+            fail("expected exactly one chat_sse_tool_degradation event, got {}".format(
+                len(events)))
+            return
+        if events[0].get("frame_dropped") != 1:
+            fail("the drain-window drop must count frame_dropped 1, got {!r}".format(
+                events[0].get("frame_dropped")))
+            return
+        if not _assert_degradation_metadata_only(events[0]):
+            return
+        pass_("drain-window oversize frame dropped ({} bytes, frame_dropped 1) and "
+              "the turn completed with its normal terminal".format(size))
+    finally:
+        cleanup()
+
+
+def test_chat_sse_drain_read_timeout_completes_turn():
+    """A silent post-finish drain completes the turn at the read boundary and
+    records which bound ended it.
+
+    PROXY_READ_TIMEOUT is pinned to its 10 s floor. The per-chunk
+    MAX_DRAIN_SECONDS budget cannot fire when no chunk arrives, so the exit is
+    the read timeout — the new drain_exit value that makes this residual
+    measurable — and the post-loop terminal synthesis still runs, so the client
+    sees message_delta + message_stop rather than a truncated stream.
+    """
+    print("\n--- Test: Chat SSE Drain Read Timeout Completes the Turn ---")
+    read_timeout = 10
+    pre = _sse_stream_chunks([_cc({"role": "assistant", "content": "hi"}),
+                              _cc({}, finish="stop")])
+    proxy_port, trace_file, cleanup = _start_hanging_chat_proxy(
+        pre, DRAIN_BOUND_TEST_SECONDS * 3,
+        extra_env={"PROXY_READ_TIMEOUT": str(read_timeout)})
+    if proxy_port is None:
+        return
+    try:
+        raw, saw_stop, elapsed = _read_sse_until_stop(proxy_port, DRAIN_BOUND_TEST_SECONDS)
+        if not saw_stop:
+            fail("a silent drain must still complete the turn, no message_stop "
+                 "within {}s (got {} bytes)".format(DRAIN_BOUND_TEST_SECONDS, len(raw)))
+            return
+        if elapsed > read_timeout + 8:
+            fail("the drain ran {:.1f}s — the {}s read timeout did not bound "
+                 "it".format(elapsed, read_timeout))
+            return
+        types = _sse_types(_parse_sse_frames(raw))
+        missing = [t for t in ("message_delta", "message_stop") if t not in types]
+        if missing:
+            fail("the read-timeout exit must synthesize the normal terminal, "
+                 "missing {}".format(missing))
+            return
+        events = _wait_for_trace_events(trace_file, "chat_sse_drain")
+        if len(events) != 1:
+            fail("expected exactly one chat_sse_drain event, got {}".format(len(events)))
+            return
+        if events[0].get("drain_exit") != "read_timeout":
+            fail("drain_exit must be 'read_timeout', got {!r}".format(
+                events[0].get("drain_exit")))
+            return
+        if _trace_events_named(trace_file, "chat_sse_truncated"):
+            fail("a completed drain must not emit chat_sse_truncated")
+            return
+        pass_("silent drain ended at the {}s read boundary ({:.1f}s) with the "
+              "normal terminal and drain_exit 'read_timeout'".format(
+                  read_timeout, elapsed))
+    finally:
+        cleanup()
+
+
 ALL_TESTS = [
     ("chat-sse-basic-streaming", test_chat_sse_basic_streaming),
     ("chat-sse-finish-reason-mapping", test_chat_sse_finish_reason_mapping),
@@ -4925,7 +4986,6 @@ ALL_TESTS = [
     ("chat-sse-eof-empty-tool-calls-sentinel", test_chat_sse_eof_empty_tool_calls_sentinel),
     ("chat-sse-mixed-parseable-unparseable-finish", test_chat_sse_mixed_parseable_unparseable_finish),
     ("chat-sse-non-dict-arguments-at-close", test_chat_sse_non_dict_arguments_at_close),
-    ("chat-sse-frame-dropped-guard", test_chat_sse_frame_dropped_guard),
     ("chat-mode-streamed-tool-command-e2e", test_chat_mode_streamed_tool_command_e2e),
     ("chat-sse-reasoning-delta-to-thinking-delta", test_chat_sse_reasoning_delta_to_thinking_delta),
     ("chat-sse-reasoning-delta-no-content", test_chat_sse_reasoning_delta_no_content),
@@ -4974,9 +5034,12 @@ ALL_TESTS = [
     # Config-swap drain (plan 2026-10-12-swap-silence-drain)
     ("chat-sse-swap-evicts-pre-finish", test_chat_sse_swap_evicts_pre_finish),
     ("chat-sse-swap-abort-in-drain-window", test_chat_sse_swap_abort_in_drain_window),
-    ("chat-sse-swap-drain-pin-taken-mid-swap", test_chat_sse_swap_drain_pin_taken_mid_swap),
     ("chat-sse-eviction-stranded-sentinel-never-flushes", test_chat_sse_eviction_stranded_sentinel_never_flushes),
     ("chat-sse-post-swap-straggler-dies-retryably", test_chat_sse_post_swap_straggler_dies_retryably),
+    # Frame-cap disposition (plan 2026-11-15-httpx2-transport-sse, Step 5a)
+    ("chat-sse-first-frame-oversize-errors-loud", test_chat_sse_first_frame_oversize_errors_loud),
+    ("chat-sse-drain-window-frame-oversize-drops-and-completes", test_chat_sse_drain_window_frame_oversize_drops_and_completes),
+    ("chat-sse-drain-read-timeout-completes-turn", test_chat_sse_drain_read_timeout_completes_turn),
 ]
 
 

@@ -7,15 +7,15 @@ provider credentials stored encrypted in ~/.claude/keys-index.json (vim blowfish
 and decrypted at startup via passphrase prompt. Supports concurrent requests via
 ThreadingHTTPServer.
 
-Dependencies: cryptography (for vim blowfish2 decryption), plus Python stdlib
-(http.server, http.client, json, threading, uuid, signal, socket, os, sys, time,
-re, urllib.parse, argparse).
+Dependencies: cryptography (for vim blowfish2 decryption) and httpx2 (upstream
+transport), plus Python stdlib (http.server, json, threading, uuid, signal,
+socket, os, sys, time, re, urllib.parse, argparse).
 """
 
 import argparse
 import hashlib
-import http.client
 import http.server
+import httpx2
 import json
 import math
 import os
@@ -585,9 +585,10 @@ class _BestEffortStderr:
     server.py holds ~40 runtime stderr prints, several inside the retry loop's
     try block. A stderr write failure there (full disk — proxy-stderr.log sits
     on the same volume as the sinks) would be read by the loop's
-    `except (socket.error, ConnectionError, OSError)` clause as a connection
-    error, re-issuing the upstream POST or dropping an already-answered
-    response. Guarding the stream covers every present and future print site.
+    `except (httpx2.RequestError, httpx2.StreamError, OSError)` clause as a
+    connection error, re-issuing the upstream POST or dropping an
+    already-answered response. Guarding the stream covers every present and
+    future print site.
     """
 
     def __init__(self, stream):
@@ -698,40 +699,41 @@ def _read_capped(resp, max_bytes, request_id=None):
     bounds memory: if the body exceeds max_bytes, stop reading and return a
     standalone truncation marker. Returns the full body unchanged if it fits
     within max_bytes.
+
+    ONE raw iterator serves both the capped read and the drain-and-discard:
+    an httpx2 response stream is single-consumption (a second iter_raw raises
+    StreamConsumed), so the cap crossing is handled inside a single loop with
+    a discard flag. iter_raw delivers the entity bytes undecoded, and the
+    slice preserves the never-overshoot truncation guarantee of a capped read.
     """
     if max_bytes <= 0:
         return b''
     chunks = []
     total = 0
-    try:
-        while total < max_bytes:
-            chunk = resp.read(min(8192, max_bytes - total))
-            if not chunk:
-                break
-            _touch_upstream_activity()
-            chunks.append(chunk)
-            total += len(chunk)
-    except OSError:
-        pass
-    # Drain-and-discard the rest so the connection can be closed without a
-    # pending RST. Track whether we actually read tail data to distinguish
-    # "exactly at cap" from "truncated".
+    # Track whether we actually read tail data to distinguish "exactly at
+    # cap" from "truncated".
     truncated = False
     try:
-        while True:
-            tail = resp.read(8192)
-            if not tail:
-                break
+        for chunk in resp.iter_raw():
             _touch_upstream_activity()
-            truncated = True
-    except OSError:
+            if truncated:
+                continue
+            if total < max_bytes:
+                keep = chunk[:max_bytes - total]
+                chunks.append(keep)
+                total += len(keep)
+                if len(keep) < len(chunk):
+                    truncated = True
+            else:
+                truncated = True
+    except (httpx2.RequestError, OSError):
         pass
     if truncated:
         # error.type tracks the status this body is returned under, so a
         # rate-limit/overload give-up keeps its taxonomy category.
-        if resp.status == 429:
+        if resp.status_code == 429:
             err_type = "rate_limit_error"
-        elif resp.status == 503:
+        elif resp.status_code == 503:
             err_type = "overloaded_error"
         else:
             err_type = "api_error"
@@ -767,7 +769,7 @@ def forward_request(method, path, headers, body, handler=None, request_id=None):
         handler: ProxyHandler instance for streaming responses
         request_id: unique request identifier for tracing
 
-    Returns (status, response_headers, body_bytes, first_byte_ms, total_sec, retries, tier, provider).
+    Returns (status, response_headers, body_bytes, first_byte_ms, total_sec, retries, tier, provider, actual_model).
     total_sec covers the entire request including all retry waits.
     On 429 and 503, retries with jittered exponential backoff. 429 uses the
     maximal delay (SETTINGS.max_delay); 503 uses the exponential.
@@ -1006,8 +1008,9 @@ def _client_user_agent(headers):
     Resolution MIRRORS THE FORWARDING PATH, because the field exists to name the
     UA that produced an upstream refusal, so a value the upstream never received
     is worse than no value at all. `do_POST` hands `forward_request` a plain dict
-    built from `self.headers.items()`, and `http.client` then sends that dict in
-    order: same-cased duplicates collapse to the last value (the single line the
+    built from `self.headers.items()`, and the upstream transport then sends
+    that dict in order (httpx2 puts each key on one wire line): same-cased
+    duplicates collapse to the last value (the single line the
     upstream receives), while differently-cased ones survive as separate keys
     and put two lines on the wire. Taking the collapse's last value names the
     last UA line forwarded. When the request carried one casing -- the ordinary
@@ -1369,6 +1372,14 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
             headers, provider_name, config, request_id).items():
         fwd_headers[_header_name] = _header_value
 
+    # httpx2 would send its own accept-encoding set by default; identity is
+    # pinned as defence-in-depth (the stdlib transport sent identity too, so
+    # this preserves the wire state). Correctness does not rest on it: read
+    # sites use iter_raw(), which is byte-faithful regardless of the
+    # response's Content-Encoding. Config cannot override the pin:
+    # RESERVED_EXTRA_HEADER_NAMES reserves the name.
+    fwd_headers["Accept-Encoding"] = "identity"
+
     # Dispatch upstream path per mode. chat/response modes strip a trailing
     # /v1 from the configured base URL so an OpenAI-style base does not
     # produce a doubled /v1/v1/ prefix.
@@ -1518,6 +1529,21 @@ def _forward_request_impl(method, path, headers, body, handler, request_id,
         _compat_retry_lock.release()
 
 
+def _upstream_header_value(value):
+    """Coerce a forwarded header value into h11's legal field-value shape.
+
+    The stdlib transport sent header values verbatim (it refused only a bare
+    CR/LF), so a hostile client header — a NUL, other C0 whitespace, an
+    obs-folded line — reached the upstream unchanged. h11 refuses those bytes
+    outright and would turn such a request into a transport error, which the
+    retry loop would then retry. The upstream copy is therefore flattened the
+    way an obs-fold is meant on the wire: NUL is dropped, other refused
+    whitespace becomes a single space, and the leading/trailing whitespace h11
+    also refuses is stripped. The trace field keeps the client's raw value.
+    """
+    return re.sub(r"[\x00]", "", re.sub(r"[\r\n\f\v]+", " ", value)).strip(" \t")
+
+
 def _forward_core(method, path, handler, request_id, config,
                   rewritten_body, fwd_headers, upstream_path,
                   host, port, use_ssl, tier, provider_name, actual_model,
@@ -1544,138 +1570,286 @@ def _forward_core(method, path, handler, request_id, config,
         max_attempts = 1 if (disable_retry and is_count_tokens) \
                        else SETTINGS.max_retries + 1
 
-    for attempt in range(max_attempts):
-        # Retry-loop head: an epoch change means a swap completed while this
-        # request was getting here. Epoch ONLY — an in-progress drain must
-        # not abort an immediate compat single-shot re-issue, which is live
-        # work (test_compat_config_swap_during_retry pins that boundary).
-        if _swap_epoch_changed(epoch):
-            _note_swap_eviction("retry_chain", request_id, tier=tier,
-                                provider=provider_name, model=actual_model)
-            return _swap_abort_tuple(request_id, total_start, retries, tier,
-                                     provider_name, actual_model)
-        try:
-            if use_ssl:
-                conn = http.client.HTTPSConnection(host, port, timeout=300)
-            else:
-                conn = http.client.HTTPConnection(host, port, timeout=300)
-            conn.request(method, upstream_path, body=rewritten_body, headers=fwd_headers)
-            resp = conn.getresponse()
-            _touch_upstream_activity()
-
-            # A response that landed after a completed swap is an old-routing
-            # result: fail it retryably before any byte reaches the client.
-            # getresponse() cannot be woken while blocked, so this is the
-            # accepted late-exit checkpoint.
+    # ONE client per retry chain. Retry attempts reuse a pooled connection
+    # (attempt isolation now by pool lifecycle rather than by opening a fresh
+    # socket), while the per-chain lifetime keeps connection state from
+    # accumulating across proxied requests — cookies cannot be replayed into a
+    # later request because the client dies with this chain. trust_env=False
+    # keeps ambient HTTP_PROXY/.netrc settings from silently rerouting upstream
+    # calls; the accepted cost is that the SSL_CERT_FILE / SSL_CERT_DIR
+    # ambient CA overrides are ignored (documented wire delta). The timeout is
+    # uniform over connect/read/write/pool — the closest equivalent of the old
+    # single socket timeout.
+    # urlparse strips the brackets from an IPv6 authority; httpx2's
+    # base_url requires them back (an unbracketed literal reads as an
+    # invalid port).
+    host_part = "[{}]".format(host) if ":" in host else host
+    client = httpx2.Client(
+        base_url="{}://{}:{}".format("https" if use_ssl else "http", host_part, port),
+        timeout=httpx2.Timeout(SETTINGS.read_timeout),
+        trust_env=False,
+        follow_redirects=False,
+    )
+    try:
+        for attempt in range(max_attempts):
+            # Retry-loop head: an epoch change means a swap completed while this
+            # request was getting here. Epoch ONLY — an in-progress drain must
+            # not abort an immediate compat single-shot re-issue, which is live
+            # work (test_compat_config_swap_during_retry pins that boundary).
             if _swap_epoch_changed(epoch):
-                try:
-                    conn.close()
-                except OSError:
-                    pass
-                _note_swap_eviction("pre_first_byte", request_id, tier=tier,
+                _note_swap_eviction("retry_chain", request_id, tier=tier,
                                     provider=provider_name, model=actual_model)
                 return _swap_abort_tuple(request_id, total_start, retries, tier,
                                          provider_name, actual_model)
-
-            if resp.status in (429, 503):
-                last_status = resp.status
-                if attempt < max_attempts - 1:
-                    if resp.status == 429:
-                        delay = compute_jittered_delay(SETTINGS.max_delay)
-                        reason = "429"
-                    elif resp.status == 503:
-                        delay = compute_jittered_delay(compute_delay(attempt))
-                        reason = "503"
-                    else:  # defensive — future expansion must add a branch here
-                        delay = compute_jittered_delay(compute_delay(attempt))
-                        reason = str(resp.status)
-                    try:
-                        resp.read()  # drain response body before close
-                    except (socket.error, OSError):
-                        pass
+            try:
+                # The stream context releases the response on every exit path:
+                # retry `continue`, give-up return, SSE dispatch, buffered
+                # return, and any exception. Header names/values are passed as
+                # latin-1 bytes: httpx2 encodes `str` header values as ASCII and
+                # would reject a non-ASCII User-Agent that the stdlib transport
+                # forwarded, so the encoding the old transport applied is
+                # reproduced here (a value outside latin-1 still raises, exactly
+                # as before). Values are flattened to h11's legal shape first —
+                # see _upstream_header_value.
+                with client.stream(method, upstream_path,
+                                   content=rewritten_body,
+                                   headers={k.encode("latin-1"):
+                                            _upstream_header_value(v).encode("latin-1")
+                                            for k, v in fwd_headers.items()}) as resp:
                     _touch_upstream_activity()
-                    # A backoff chain abandons at the press: sleep in slices
-                    # and close the still-open connection on the way out, or
-                    # every abandoned chain leaks an upstream socket (the
-                    # exact traffic a switch under rate limiting produces).
-                    aborted = _swap_chain_abort(epoch)
-                    if not aborted:
-                        aborted = _interruptible_sleep(delay, epoch)
-                    if aborted:
-                        try:
-                            conn.close()
-                        except OSError:
-                            pass
-                        _note_swap_eviction("retry_chain", request_id, tier=tier,
-                                            provider=provider_name,
-                                            model=actual_model)
-                        return _swap_abort_tuple(request_id, total_start, retries,
-                                                 tier, provider_name, actual_model)
-                    # Accounting follows the completed sleep: an abandoned
-                    # chain must never log a retry it did not take.
-                    retries += 1
-                    increment_retried()
-                    print("[proxy] {} on attempt {}/{}, model={}, provider={}, rid={}, retrying in {}s".format(
-                        reason, attempt + 1, max_attempts, actual_model,
-                        provider_name, request_id, delay), file=sys.stderr)
-                    log_trace({
-                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "event": "retry",
-                        "attempt": attempt + 1,
-                        "delay_s": delay,
-                        "reason": reason,
-                        "model": actual_model,
-                        "provider": provider_name,
-                        "request_id": request_id,
-                        "path": path,
-                    })
-                    conn.close()
-                    continue
-                else:
-                    err_body = _read_capped(resp, SETTINGS.max_body_size, request_id)
-                    try:
-                        conn.close()
-                    except OSError:
-                        pass
-                    return resp.status, {}, err_body, None, time.time() - total_start, retries, tier, provider_name, actual_model
 
-            # Non-retryable response
-            resp_headers = dict(resp.getheaders())
-            content_type = resp_headers.get("Content-Type", "").lower()
+                    # A response that landed after a completed swap is an
+                    # old-routing result: fail it retryably before any byte
+                    # reaches the client. httpx2 cannot be woken while blocked
+                    # on the response headers, so this is the accepted
+                    # late-exit checkpoint.
+                    if _swap_epoch_changed(epoch):
+                        _note_swap_eviction("pre_first_byte", request_id, tier=tier,
+                                            provider=provider_name, model=actual_model)
+                        return _swap_abort_tuple(request_id, total_start, retries, tier,
+                                                 provider_name, actual_model)
 
-            # Determine response handling strategy based on status and Content-Type
-            if handler is not None and 200 <= resp.status < 300:
-                # 2xx response - check Content-Type to decide streaming vs buffering
-                if "text/event-stream" in content_type:
-                    # SSE: stream with mode-appropriate rewriting/transform
-                    first_byte_ms = handler._stream_upstream_response(
-                        resp, resp.status, resp_headers, request_id, retries,
-                        epoch=epoch, tier=tier, mode=mode,
-                        tools_declared=tools_declared,
-                        provider=provider_name, key=key_name,
-                        retry_original_id=retry_original_id)
-                    conn.close()
-                    return (resp.status, resp_headers, b"",
-                            first_byte_ms, time.time() - total_start, retries, tier, provider_name, actual_model)
-                elif "application/json" in content_type:
-                    # JSON: buffer, then dispatch mode-appropriate transform
+                    if resp.status_code in (429, 503):
+                        last_status = resp.status_code
+                        if attempt < max_attempts - 1:
+                            if resp.status_code == 429:
+                                delay = compute_jittered_delay(SETTINGS.max_delay)
+                                reason = "429"
+                            elif resp.status_code == 503:
+                                delay = compute_jittered_delay(compute_delay(attempt))
+                                reason = "503"
+                            else:  # defensive — future expansion must add a branch here
+                                delay = compute_jittered_delay(compute_delay(attempt))
+                                reason = str(resp.status_code)
+                            try:
+                                # Drain the error body before close, raw and
+                                # bounded: iter_raw installs no decoder, so an
+                                # upstream that ignored the identity pin cannot
+                                # expand a compressed body into worker memory,
+                                # and the cap keeps the discard finite.
+                                drained = 0
+                                for chunk in resp.iter_raw():
+                                    drained += len(chunk)
+                                    if drained > SETTINGS.max_body_size:
+                                        break
+                            except (httpx2.RequestError, OSError):
+                                pass
+                            _touch_upstream_activity()
+                            # A backoff chain abandons at the press: sleep in slices
+                            # and leave the stream context on the way out, so every
+                            # abandoned chain releases its upstream connection (the
+                            # exact traffic a switch under rate limiting produces).
+                            aborted = _swap_chain_abort(epoch)
+                            if not aborted:
+                                aborted = _interruptible_sleep(delay, epoch)
+                            if aborted:
+                                _note_swap_eviction("retry_chain", request_id, tier=tier,
+                                                    provider=provider_name,
+                                                    model=actual_model)
+                                return _swap_abort_tuple(request_id, total_start, retries,
+                                                         tier, provider_name, actual_model)
+                            # Accounting follows the completed sleep: an abandoned
+                            # chain must never log a retry it did not take.
+                            retries += 1
+                            increment_retried()
+                            print("[proxy] {} on attempt {}/{}, model={}, provider={}, rid={}, retrying in {}s".format(
+                                reason, attempt + 1, max_attempts, actual_model,
+                                provider_name, request_id, delay), file=sys.stderr)
+                            log_trace({
+                                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                "event": "retry",
+                                "attempt": attempt + 1,
+                                "delay_s": delay,
+                                "reason": reason,
+                                "model": actual_model,
+                                "provider": provider_name,
+                                "request_id": request_id,
+                                "path": path,
+                            })
+                            continue
+                        else:
+                            err_body = _read_capped(resp, SETTINGS.max_body_size, request_id)
+                            return resp.status_code, {}, err_body, None, time.time() - total_start, retries, tier, provider_name, actual_model
+
+                    # Non-retryable response. Headers are mapped from
+                    # Headers.raw — the only carrier of the raw wire pairs:
+                    # dict(resp.headers) lowercases keys and comma-joins
+                    # duplicate values, which would blank the Content-Type
+                    # dispatch below and change every forwarded header's
+                    # casing. This comprehension reproduces today's
+                    # dict(resp.getheaders()) exactly: received casing,
+                    # last-wins duplicates.
+                    resp_headers = {k.decode("latin-1"): v.decode("latin-1")
+                                    for k, v in resp.headers.raw}
+                    content_type = resp_headers.get("Content-Type", "").lower()
+
+                    # Determine response handling strategy based on status and Content-Type
+                    if handler is not None and 200 <= resp.status_code < 300:
+                        # 2xx response - check Content-Type to decide streaming vs buffering
+                        if "text/event-stream" in content_type:
+                            # SSE: stream with mode-appropriate rewriting/transform
+                            first_byte_ms = handler._stream_upstream_response(
+                                resp, resp.status_code, resp_headers, request_id, retries,
+                                epoch=epoch, tier=tier, mode=mode,
+                                tools_declared=tools_declared,
+                                provider=provider_name, key=key_name,
+                                retry_original_id=retry_original_id)
+                            return (resp.status_code, resp_headers, b"",
+                                    first_byte_ms, time.time() - total_start, retries, tier, provider_name, actual_model)
+                        elif "application/json" in content_type:
+                            # JSON: buffer, then dispatch mode-appropriate transform
+                            first_byte_start = time.time()
+                            chunks = []
+                            first_byte = True
+                            first_byte_elapsed = None
+                            total_bytes = 0
+
+                            for chunk in resp.iter_raw():
+                                _touch_upstream_activity()
+                                if first_byte:
+                                    first_byte_elapsed = (time.time() - first_byte_start) * 1000
+                                    first_byte = False
+                                # Slice before appending: iter_raw chunks are
+                                # wire-sized, so one chunk can cross the cap by
+                                # any amount. Appending first and testing after
+                                # would return a cap-busting body whole.
+                                keep = chunk[:SETTINGS.max_response_size - total_bytes]
+                                chunks.append(keep)
+                                total_bytes += len(chunk)
+                                if len(keep) < len(chunk):
+                                    log_trace({
+                                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                        "event": "response_size_cap_exceeded",
+                                        "request_id": request_id,
+                                        "bytes_read": total_bytes,
+                                        "limit": SETTINGS.max_response_size,
+                                    })
+                                    print("[proxy] Response size limit exceeded ({} bytes), rid={}".format(
+                                        total_bytes, request_id), file=sys.stderr)
+                                    break
+
+                            total_elapsed = time.time() - total_start
+                            resp_body = b"".join(chunks)
+
+                            # Buffered bodies cannot be woken mid-read; their stall
+                            # exits late and then fails this checkpoint (recorded
+                            # boundary). The swap's result must not reach the client.
+                            if _swap_epoch_changed(epoch):
+                                _note_swap_eviction("buffered", request_id, tier=tier,
+                                                    provider=provider_name,
+                                                    model=actual_model)
+                                return _swap_abort_tuple(request_id, total_start, retries,
+                                                         tier, provider_name, actual_model)
+
+                            if mode == "chat":
+                                resp_body = _transform_and_guard(
+                                    resp_body, tier, _chat_to_anthropic, request_id, mode, provider_name)
+                            elif mode == "response":
+                                resp_body = _transform_and_guard(
+                                    resp_body, tier, _response_to_anthropic, request_id, mode, provider_name)
+                            else:
+                                resp_body = _rewrite_json_response(
+                                    resp_body, tier, request_id)
+                            resp_headers["Content-Length"] = str(len(resp_body))
+
+                            return (resp.status_code, resp_headers, resp_body,
+                                    first_byte_elapsed, total_elapsed, retries, tier, provider_name, actual_model)
+                        else:
+                            # Other content types: chat/response modes buffer and
+                            # transform as JSON (OpenAI APIs return JSON or SSE);
+                            # anthropic mode streams unchanged (existing behavior).
+                            if mode in ("chat", "response"):
+                                first_byte_start = time.time()
+                                chunks = []
+                                first_byte = True
+                                first_byte_elapsed = None
+                                total_bytes = 0
+                                for chunk in resp.iter_raw():
+                                    _touch_upstream_activity()
+                                    if first_byte:
+                                        first_byte_elapsed = (time.time() - first_byte_start) * 1000
+                                        first_byte = False
+                                    # Slice before appending: iter_raw chunks
+                                    # are wire-sized, so one chunk can cross
+                                    # the cap by any amount.
+                                    keep = chunk[:SETTINGS.max_response_size - total_bytes]
+                                    chunks.append(keep)
+                                    total_bytes += len(chunk)
+                                    if len(keep) < len(chunk):
+                                        log_trace({
+                                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                            "event": "response_size_cap_exceeded",
+                                            "request_id": request_id,
+                                            "bytes_read": total_bytes,
+                                            "limit": SETTINGS.max_response_size,
+                                        })
+                                        print("[proxy] Response size limit exceeded ({} bytes), rid={}".format(
+                                            total_bytes, request_id), file=sys.stderr)
+                                        break
+                                total_elapsed = time.time() - total_start
+                                resp_body = b"".join(chunks)
+                                if _swap_epoch_changed(epoch):
+                                    _note_swap_eviction("buffered", request_id, tier=tier,
+                                                        provider=provider_name,
+                                                        model=actual_model)
+                                    return _swap_abort_tuple(request_id, total_start, retries,
+                                                             tier, provider_name, actual_model)
+                                transform_fn = _chat_to_anthropic if mode == "chat" else _response_to_anthropic
+                                resp_body = _transform_and_guard(
+                                    resp_body, tier, transform_fn, request_id, mode, provider_name)
+                                resp_headers["Content-Length"] = str(len(resp_body))
+                                return (resp.status_code, resp_headers, resp_body,
+                                        first_byte_elapsed, total_elapsed, retries, tier, provider_name, actual_model)
+                            else:
+                                first_byte_ms = handler._stream_upstream_response(
+                                    resp, resp.status_code, resp_headers, request_id, retries,
+                                    epoch=epoch, tier=tier, mode=mode,
+                                    tools_declared=tools_declared,
+                                    provider=provider_name, key=key_name,
+                                    retry_original_id=retry_original_id)
+                                return (resp.status_code, resp_headers, b"",
+                                        first_byte_ms, time.time() - total_start, retries, tier, provider_name, actual_model)
+
+                    # Non-2xx or no handler — buffer the body so upstream error content
+                    # stays in the trace log.
                     first_byte_start = time.time()
                     chunks = []
                     first_byte = True
                     first_byte_elapsed = None
                     total_bytes = 0
 
-                    while True:
-                        chunk = resp.read(8192)
-                        if not chunk:
-                            break
+                    for chunk in resp.iter_raw():
                         _touch_upstream_activity()
                         if first_byte:
                             first_byte_elapsed = (time.time() - first_byte_start) * 1000
                             first_byte = False
-                        chunks.append(chunk)
+                        # Slice before appending: iter_raw chunks are
+                        # wire-sized, so one chunk can cross the cap by any
+                        # amount.
+                        keep = chunk[:SETTINGS.max_response_size - total_bytes]
+                        chunks.append(keep)
                         total_bytes += len(chunk)
-                        if total_bytes > SETTINGS.max_response_size:
+                        if len(keep) < len(chunk):
                             log_trace({
                                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                                 "event": "response_size_cap_exceeded",
@@ -1683,192 +1857,79 @@ def _forward_core(method, path, handler, request_id, config,
                                 "bytes_read": total_bytes,
                                 "limit": SETTINGS.max_response_size,
                             })
-                            print("[proxy] Response size limit exceeded ({} bytes), rid={}".format(
-                                total_bytes, request_id), file=sys.stderr)
+                            print("[proxy] Response size limit exceeded ({} bytes)".format(
+                                total_bytes), file=sys.stderr)
                             break
 
                     total_elapsed = time.time() - total_start
-                    resp_body = b"".join(chunks)
-                    conn.close()
 
-                    # Buffered bodies cannot be woken mid-read; their stall
-                    # exits late and then fails this checkpoint (recorded
-                    # boundary). The swap's result must not reach the client.
+                    resp_body = b"".join(chunks)
                     if _swap_epoch_changed(epoch):
                         _note_swap_eviction("buffered", request_id, tier=tier,
+                                            provider=provider_name, model=actual_model)
+                        return _swap_abort_tuple(request_id, total_start, retries, tier,
+                                                 provider_name, actual_model)
+
+                    # Non-2xx error path: anthropic mode keeps the model rewrite it had before;
+                    # chat/response modes pass upstream error bodies through
+                    # byte-for-byte untransformed.
+                    if "application/json" in content_type and mode == "anthropic":
+                        resp_body = _rewrite_json_response(
+                            resp_body, tier, request_id)
+                        resp_headers["Content-Length"] = str(len(resp_body))
+
+                    return (resp.status_code, resp_headers, resp_body,
+                            first_byte_elapsed, total_elapsed, retries, tier, provider_name, actual_model)
+
+            except (httpx2.RequestError, httpx2.StreamError, OSError) as e:
+                last_status = 0
+                if attempt < max_attempts - 1:
+                    delay = compute_jittered_delay(compute_delay(attempt))
+                    # Same abandonment rule as the 429/503 site; there is no open
+                    # connection to close here (its next statement is `continue`).
+                    aborted = _swap_chain_abort(epoch)
+                    if not aborted:
+                        aborted = _interruptible_sleep(delay, epoch)
+                    if aborted:
+                        _note_swap_eviction("retry_chain", request_id, tier=tier,
                                             provider=provider_name,
                                             model=actual_model)
                         return _swap_abort_tuple(request_id, total_start, retries,
                                                  tier, provider_name, actual_model)
-
-                    if mode == "chat":
-                        resp_body = _transform_and_guard(
-                            resp_body, tier, _chat_to_anthropic, request_id, mode, provider_name)
-                    elif mode == "response":
-                        resp_body = _transform_and_guard(
-                            resp_body, tier, _response_to_anthropic, request_id, mode, provider_name)
-                    else:
-                        resp_body = _rewrite_json_response(
-                            resp_body, tier, request_id)
-                    resp_headers["Content-Length"] = str(len(resp_body))
-
-                    return (resp.status, resp_headers, resp_body,
-                            first_byte_elapsed, total_elapsed, retries, tier, provider_name, actual_model)
-                else:
-                    # Other content types: chat/response modes buffer and
-                    # transform as JSON (OpenAI APIs return JSON or SSE);
-                    # anthropic mode streams unchanged (existing behavior).
-                    if mode in ("chat", "response"):
-                        first_byte_start = time.time()
-                        chunks = []
-                        first_byte = True
-                        first_byte_elapsed = None
-                        total_bytes = 0
-                        while True:
-                            chunk = resp.read(8192)
-                            if not chunk:
-                                break
-                            _touch_upstream_activity()
-                            if first_byte:
-                                first_byte_elapsed = (time.time() - first_byte_start) * 1000
-                                first_byte = False
-                            chunks.append(chunk)
-                            total_bytes += len(chunk)
-                            if total_bytes > SETTINGS.max_response_size:
-                                log_trace({
-                                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                                    "event": "response_size_cap_exceeded",
-                                    "request_id": request_id,
-                                    "bytes_read": total_bytes,
-                                    "limit": SETTINGS.max_response_size,
-                                })
-                                print("[proxy] Response size limit exceeded ({} bytes), rid={}".format(
-                                    total_bytes, request_id), file=sys.stderr)
-                                break
-                        total_elapsed = time.time() - total_start
-                        resp_body = b"".join(chunks)
-                        conn.close()
-                        if _swap_epoch_changed(epoch):
-                            _note_swap_eviction("buffered", request_id, tier=tier,
-                                                provider=provider_name,
-                                                model=actual_model)
-                            return _swap_abort_tuple(request_id, total_start, retries,
-                                                     tier, provider_name, actual_model)
-                        transform_fn = _chat_to_anthropic if mode == "chat" else _response_to_anthropic
-                        resp_body = _transform_and_guard(
-                            resp_body, tier, transform_fn, request_id, mode, provider_name)
-                        resp_headers["Content-Length"] = str(len(resp_body))
-                        return (resp.status, resp_headers, resp_body,
-                                first_byte_elapsed, total_elapsed, retries, tier, provider_name, actual_model)
-                    else:
-                        first_byte_ms = handler._stream_upstream_response(
-                            resp, resp.status, resp_headers, request_id, retries,
-                            epoch=epoch, tier=tier, mode=mode,
-                            tools_declared=tools_declared,
-                            provider=provider_name, key=key_name,
-                            retry_original_id=retry_original_id)
-                        conn.close()
-                        return (resp.status, resp_headers, b"",
-                                first_byte_ms, time.time() - total_start, retries, tier, provider_name, actual_model)
-
-            # Non-2xx or no handler — buffer the body so upstream error content
-            # stays in the trace log.
-            first_byte_start = time.time()
-            chunks = []
-            first_byte = True
-            first_byte_elapsed = None
-            total_bytes = 0
-
-            while True:
-                chunk = resp.read(8192)
-                if not chunk:
-                    break
-                _touch_upstream_activity()
-                if first_byte:
-                    first_byte_elapsed = (time.time() - first_byte_start) * 1000
-                    first_byte = False
-                chunks.append(chunk)
-                total_bytes += len(chunk)
-                if total_bytes > SETTINGS.max_response_size:
+                    retries += 1
+                    increment_retried()
+                    print("[proxy] Connection error on attempt {}/{}, model={}, provider={}, rid={}: {}, retrying in {}s".format(
+                        attempt + 1, max_attempts, actual_model, provider_name,
+                        request_id, e, delay), file=sys.stderr)
                     log_trace({
                         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "event": "response_size_cap_exceeded",
+                        "event": "retry",
+                        "attempt": attempt + 1,
+                        "delay_s": delay,
+                        "reason": "connection_error",
+                        "model": actual_model,
+                        "provider": provider_name,
                         "request_id": request_id,
-                        "bytes_read": total_bytes,
-                        "limit": SETTINGS.max_response_size,
+                        "error": sanitize_error(str(e)),
+                        "path": path,
                     })
-                    print("[proxy] Response size limit exceeded ({} bytes), rid={}".format(
-                        total_bytes, request_id), file=sys.stderr)
-                    break
+                    continue
+                else:
+                    total_elapsed = time.time() - total_start
+                    err_body = _error_body(
+                        "api_error", "upstream_unreachable",
+                        "upstream: {} after {} retries".format(
+                            sanitize_error(str(e)) or "connection failed", retries),
+                        request_id)
+                    return 502, {}, err_body, None, total_elapsed, retries, tier, provider_name, actual_model
 
-            total_elapsed = time.time() - total_start
-
-            resp_body = b"".join(chunks)
-            conn.close()
-            if _swap_epoch_changed(epoch):
-                _note_swap_eviction("buffered", request_id, tier=tier,
-                                    provider=provider_name, model=actual_model)
-                return _swap_abort_tuple(request_id, total_start, retries, tier,
-                                         provider_name, actual_model)
-
-            # Non-2xx error path: anthropic mode keeps the model rewrite it had before;
-            # chat/response modes pass upstream error bodies through
-            # byte-for-byte untransformed.
-            if "application/json" in content_type and mode == "anthropic":
-                resp_body = _rewrite_json_response(
-                    resp_body, tier, request_id)
-                resp_headers["Content-Length"] = str(len(resp_body))
-
-            return (resp.status, resp_headers, resp_body,
-                    first_byte_elapsed, total_elapsed, retries, tier, provider_name, actual_model)
-
-        except (socket.error, ConnectionError, OSError) as e:
-            last_status = 0
-            if attempt < max_attempts - 1:
-                delay = compute_jittered_delay(compute_delay(attempt))
-                # Same abandonment rule as the 429/503 site; there is no open
-                # connection to close here (its next statement is `continue`).
-                aborted = _swap_chain_abort(epoch)
-                if not aborted:
-                    aborted = _interruptible_sleep(delay, epoch)
-                if aborted:
-                    _note_swap_eviction("retry_chain", request_id, tier=tier,
-                                        provider=provider_name,
-                                        model=actual_model)
-                    return _swap_abort_tuple(request_id, total_start, retries,
-                                             tier, provider_name, actual_model)
-                retries += 1
-                increment_retried()
-                print("[proxy] Connection error on attempt {}/{}, model={}, provider={}, rid={}: {}, retrying in {}s".format(
-                    attempt + 1, max_attempts, actual_model, provider_name,
-                    request_id, e, delay), file=sys.stderr)
-                log_trace({
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "event": "retry",
-                    "attempt": attempt + 1,
-                    "delay_s": delay,
-                    "reason": "connection_error",
-                    "model": actual_model,
-                    "provider": provider_name,
-                    "request_id": request_id,
-                    "error": sanitize_error(str(e)),
-                    "path": path,
-                })
-                continue
-            else:
-                total_elapsed = time.time() - total_start
-                err_body = _error_body(
-                    "api_error", "upstream_unreachable",
-                    "upstream: {} after {} retries".format(
-                        sanitize_error(str(e)) or "connection failed", retries),
-                    request_id)
-                return 502, {}, err_body, None, total_elapsed, retries, tier, provider_name, actual_model
-
-    total_elapsed = time.time() - total_start
-    return (last_status or 502), {}, _error_body(
-        "api_error", "upstream_unreachable",
-        "upstream: connection failed after {} retries".format(retries),
-        request_id), None, total_elapsed, retries, tier, provider_name, actual_model
+        total_elapsed = time.time() - total_start
+        return (last_status or 502), {}, _error_body(
+            "api_error", "upstream_unreachable",
+            "upstream: connection failed after {} retries".format(retries),
+            request_id), None, total_elapsed, retries, tier, provider_name, actual_model
+    finally:
+        client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2144,14 +2205,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         For other content types: streams unchanged.
 
-        Each read iteration arms the upstream socket at the swap silence
-        budget ONLY while a config swap is in progress, and restores the
-        connection's original timeout otherwise — a no-swap stream keeps its
-        documented 300 s stall tolerance byte-for-byte. A `socket.timeout` is
-        terminal (measured: socket.SocketIO._timeout_occurred is set on the
-        first timeout and never reset, so every later read on that response
-        raises `cannot read from timed out object`), so an armed wake can only
-        ever end the stream — there is no wake-and-resume rule.
+        The upstream read bound is the client's `PROXY_READ_TIMEOUT` (uniform
+        connect/read/write/pool timeout), replacing the old hardcoded 300 s
+        socket timeout. There is no mid-stream timeout API in httpx2, so a
+        stream silent at a swap press wakes at its NEXT READ BOUNDARY — within
+        the read timeout, no longer the old 30 s armed wake — and is then
+        evicted retryably. That residual is accepted by design: reaching into
+        httpcore2 internals to interrupt a blocked read is deliberately not
+        done.
 
         A stream admitted before a completed swap is a straggler: the epoch
         check after each read closes it with the retryable config_swap_restart
@@ -2165,41 +2226,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         first_byte_ms = None
         first_chunk = True
         bytes_streamed = 0
-
-        # Capture the connection's original timeout once. Guarded by a boolean
-        # flag, never a `_orig is not None` test: a captured None (blocking
-        # mode) is a legitimate value that must be restorable.
-        _orig_timeout = None
-        _timeout_saved = False
-        try:
-            _orig_timeout = resp.fp.raw._sock.gettimeout()
-            _timeout_saved = True
-        except (AttributeError, OSError):
-            _timeout_saved = False
-
-        def arm_stream_timeout():
-            """Arm the upstream socket for this read iteration.
-
-            Conditional by construction: while a swap is in progress the read
-            wakes at the silence budget; otherwise the connection's original
-            timeout is restored.
-            """
-            nonlocal _timeout_saved
-            if not _timeout_saved:
-                return
-            try:
-                resp.fp.raw._sock.settimeout(
-                    SETTINGS.swap_silence_timeout if _config_swapping
-                    else _orig_timeout)
-            except (AttributeError, OSError):
-                _timeout_saved = False
-
-        def restore_stream_timeout():
-            if _timeout_saved:
-                try:
-                    resp.fp.raw._sock.settimeout(_orig_timeout)
-                except (AttributeError, OSError):
-                    pass
 
         def evict_stream():
             """Close a straggler stream with the retryable swap error.
@@ -2235,8 +2261,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(status)
             # Forward all other headers verbatim, including content-type
             # (required for text/event-stream SSE responses). Drop hop-by-hop
-            # headers — http.client already de-chunked the upstream body, and
-            # the response is close-delimited via HTTP/1.0.
+            # headers — transfer framing is handled by the library, and the
+            # response is close-delimited via HTTP/1.0.
             for k, v in _crlf_safe(resp_headers).items():
                 if k.lower() not in {"transfer-encoding", "content-length",
                                      "connection", "date"}:
@@ -2257,46 +2283,44 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 # 64KB cap is exceeded.
                 first_event_buffer = bytearray()
                 MAX_FIRST_EVENT_BUFFER = 64 * 1024  # 64 KB cap
-                first_event_found = False
                 rewrite_skipped = False
 
-                while not first_event_found:
-                    arm_stream_timeout()
-                    try:
-                        chunk = resp.read1(8192)
-                    except socket.timeout:
-                        # Terminal by construction (a timed-out response is
-                        # permanently unreadable): the only question is how to
-                        # close. A swap owns this wake — evict; otherwise this
-                        # is today's 300 s stall cut.
-                        if _config_swapping or _swap_epoch_changed(epoch):
+                # ONE raw iterator serves the first-event scan and the
+                # remainder loop: an httpx2 response stream is
+                # single-consumption (a second iter_raw raises StreamConsumed),
+                # so both phases consume this same object.
+                chunks = resp.iter_raw()
+                try:
+                    for chunk in chunks:
+                        _touch_upstream_activity()
+                        if _swap_epoch_changed(epoch):
+                            # A completed swap: never forward old-routing bytes.
                             evict_stream()
                             return first_byte_ms
-                        break
-                    except (http.client.IncompleteRead, http.client.RemoteDisconnected,
-                            socket.error, OSError):
-                        break
-                    if not chunk:
-                        break
-                    _touch_upstream_activity()
-                    if _swap_epoch_changed(epoch):
-                        # A completed swap: never forward old-routing bytes.
+                        first_event_buffer.extend(chunk)
+
+                        # Check for event delimiter
+                        if b"\n\n" in first_event_buffer:
+                            break
+                        if len(first_event_buffer) > MAX_FIRST_EVENT_BUFFER:
+                            # Buffer exceeded cap - forward as-is without rewriting
+                            rewrite_skipped = True
+                            log_trace({
+                                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                "event": "sse_buffer_cap_exceeded",
+                                "request_id": request_id,
+                                "bytes": len(first_event_buffer),
+                            })
+                            break
+                except httpx2.ReadTimeout:
+                    # The read bound is the client timeout. A swap in progress
+                    # owns this wake (evict retryably); otherwise the stall is
+                    # what ends the stream.
+                    if _config_swapping or _swap_epoch_changed(epoch):
                         evict_stream()
                         return first_byte_ms
-                    first_event_buffer.extend(chunk)
-
-                    # Check for event delimiter
-                    if b"\n\n" in first_event_buffer:
-                        first_event_found = True
-                    elif len(first_event_buffer) > MAX_FIRST_EVENT_BUFFER:
-                        # Buffer exceeded cap - forward as-is without rewriting
-                        rewrite_skipped = True
-                        first_event_found = True
-                        log_trace({
-                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                            "event": "sse_buffer_cap_exceeded",
-                            "request_id": request_id,
-                        })
+                except (httpx2.RequestError, httpx2.StreamError, OSError):
+                    pass
 
                 if first_event_buffer:
                     # Split buffer at first \n\n to isolate first event
@@ -2328,85 +2352,70 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     first_byte_ms = (time.time() - first_byte_start) * 1000
                     first_chunk = False
 
-                # Stream remaining events unchanged
-                while True:
-                    arm_stream_timeout()
-                    try:
-                        chunk = resp.read1(8192)
-                    except socket.timeout:
-                        if _config_swapping or _swap_epoch_changed(epoch):
+                # Stream remaining events unchanged. Same iterator: the
+                # stream stays single-consumption.
+                try:
+                    for chunk in chunks:
+                        _touch_upstream_activity()
+                        if _swap_epoch_changed(epoch):
                             evict_stream()
                             return first_byte_ms
-                        break
-                    except (http.client.IncompleteRead, http.client.RemoteDisconnected,
-                            socket.error, OSError):
-                        break
-                    if not chunk:
-                        break
-                    _touch_upstream_activity()
-                    if _swap_epoch_changed(epoch):
+                        bytes_streamed += len(chunk)
+                        if bytes_streamed > SETTINGS.max_response_size:
+                            log_trace({
+                                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                "event": "response_size_cap_exceeded",
+                                "request_id": request_id,
+                                "bytes_streamed": bytes_streamed,
+                                "limit": SETTINGS.max_response_size,
+                            })
+                            print("[proxy] Response size limit exceeded ({} bytes)".format(
+                                bytes_streamed), file=sys.stderr)
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                except httpx2.ReadTimeout:
+                    if _config_swapping or _swap_epoch_changed(epoch):
                         evict_stream()
                         return first_byte_ms
-                    bytes_streamed += len(chunk)
-                    if bytes_streamed > SETTINGS.max_response_size:
-                        log_trace({
-                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                            "event": "response_size_cap_exceeded",
-                            "request_id": request_id,
-                            "bytes_streamed": bytes_streamed,
-                            "limit": SETTINGS.max_response_size,
-                        })
-                        print("[proxy] Response size limit exceeded ({} bytes)".format(
-                            bytes_streamed), file=sys.stderr)
-                        break
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                except (httpx2.RequestError, httpx2.StreamError, OSError):
+                    pass
             else:
-                # Non-SSE path: stream unchanged
-                while True:
-                    arm_stream_timeout()
-                    try:
-                        chunk = resp.read1(8192)
-                    except socket.timeout:
-                        if _config_swapping or _swap_epoch_changed(epoch):
+                # Non-SSE path: stream unchanged. This branch is the sole
+                # consumer of the response, so it owns the iterator.
+                try:
+                    for chunk in resp.iter_raw():
+                        _touch_upstream_activity()
+                        if _swap_epoch_changed(epoch):
                             evict_stream()
                             return first_byte_ms
-                        break
-                    except (http.client.IncompleteRead, http.client.RemoteDisconnected,
-                            socket.error, OSError):
-                        break
-                    if not chunk:
-                        break
-                    _touch_upstream_activity()
-                    if _swap_epoch_changed(epoch):
+                        bytes_streamed += len(chunk)
+                        if bytes_streamed > SETTINGS.max_response_size:
+                            log_trace({
+                                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                "event": "response_size_cap_exceeded",
+                                "request_id": request_id,
+                                "bytes_streamed": bytes_streamed,
+                                "limit": SETTINGS.max_response_size,
+                            })
+                            print("[proxy] Response size limit exceeded ({} bytes)".format(
+                                bytes_streamed), file=sys.stderr)
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                        if first_chunk:
+                            first_byte_ms = (time.time() - first_byte_start) * 1000
+                            first_chunk = False
+                except httpx2.ReadTimeout:
+                    if _config_swapping or _swap_epoch_changed(epoch):
                         evict_stream()
                         return first_byte_ms
-                    bytes_streamed += len(chunk)
-                    if bytes_streamed > SETTINGS.max_response_size:
-                        log_trace({
-                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                            "event": "response_size_cap_exceeded",
-                            "request_id": request_id,
-                            "bytes_streamed": bytes_streamed,
-                            "limit": SETTINGS.max_response_size,
-                        })
-                        print("[proxy] Response size limit exceeded ({} bytes)".format(
-                            bytes_streamed), file=sys.stderr)
-                        break
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-                    if first_chunk:
-                        first_byte_ms = (time.time() - first_byte_start) * 1000
-                        first_chunk = False
+                except (httpx2.RequestError, httpx2.StreamError, OSError):
+                    pass
 
         except _DISCONNECT_ERRORS:
             self._log_client_disconnect(request_id, status, retries)
             return None
-        finally:
-            # Every exit path restores the connection's captured timeout
-            # (harmless after the caller's conn.close(), and the inverse of
-            # the per-iteration arming that only a swap installs).
-            restore_stream_timeout()
         return first_byte_ms
 
     def _sse_event(self, payload, request_id=None):
@@ -2459,13 +2468,22 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         A finish_reason chunk does not end the read: the loop drains trailing
         frames until EOF, [DONE], or the MAX_DRAIN_BYTES / MAX_DRAIN_SECONDS
-        bound, then emits the terminal sequence. The time bound is enforced by
-        a socket read timeout that tracks the remaining budget, so a silent
-        provider cannot hold the worker thread past it. The drain captures the
-        usage chunk and tool_calls (each tool call opening its own content
-        block); content and reasoning deltas arriving after the finish signal
-        are dropped by policy and counted. [DONE] ends the drain and is
+        bound, then emits the terminal sequence. The per-chunk
+        MAX_DRAIN_SECONDS check cuts a CHATTY drain; a SILENT drain is bounded
+        by the request read timeout (PROXY_READ_TIMEOUT), which is recorded as
+        `drain_exit: "read_timeout"` so the residual is measurable. The drain
+        captures the usage chunk and tool_calls (each tool call opening its own
+        content block); content and reasoning deltas arriving after the finish
+        signal are dropped by policy and counted. [DONE] ends the drain and is
         otherwise skipped, as are non-data frames.
+
+        A frame larger than MAX_EVENT_BUFFER (2 MB) is dispositioned by phase:
+        before the finish signal the stream is terminated with a retryable
+        `upstream_frame_oversize` error and no terminal sequence (the turn was
+        never terminal-signaled); inside the drain window the frame is dropped,
+        counted in `frame_dropped`, and the drain continues, because failing a
+        turn that already has its terminal signal would force a full client
+        re-run for data the client never needed.
 
         OpenAI delta.tool_calls are converted into Anthropic tool_use content
         blocks: per-upstream-index state buffers argument fragments until valid
@@ -2477,7 +2495,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         arguments); the malformed/dropped variants are still counted and
         reported via one bounded metadata-only trace event per stream.
         """
-        MAX_EVENT_BUFFER = 64 * 1024
+        MAX_EVENT_BUFFER = 2 * 1024 * 1024
         buf = bytearray()
         usage = {}
         chat_id = None
@@ -2501,7 +2519,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         dropped_fragment_count = 0
         unparseable_arg_count = 0
         scalar_after_tools_dropped = 0
-        frame_dropped = False
+        frame_dropped = 0
         degradation_logged = False
         finish_reason_seen = None
         drain_bytes = 0
@@ -2514,21 +2532,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         late_tool_call_ms = None
         _off = None
         drain_done = False
+        drain_cut = False
         finish_seen_at = None
         post_finish_suppressed = 0
-
-        # Capture the connection's original socket timeout once, for the
-        # pre-finish arming below. Boolean flag, never a `_orig is not None`
-        # test: a captured None (blocking mode) is a legitimate value. The
-        # drain window separately pins the socket to its own bound and
-        # re-captures _orig_timeout there.
-        _orig_timeout = None
-        _timeout_saved = False
-        try:
-            _orig_timeout = resp.fp.raw._sock.gettimeout()
-            _timeout_saved = True
-        except (AttributeError, OSError):
-            _timeout_saved = False
 
         def write(payload):
             nonlocal bytes_streamed, first_byte_ms
@@ -2689,7 +2695,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "dropped_fragment_count": dropped_fragment_count,
                 "unparseable_arg_count": unparseable_arg_count,
                 "scalar_after_tools_dropped": scalar_after_tools_dropped,
-                "frame_dropped": 1 if frame_dropped else 0,
+                # Drain-window oversize-frame drops only (a pre-finish trip
+                # errors the stream out instead of dropping).
+                "frame_dropped": frame_dropped,
             })
 
         def process_tool_calls(tool_calls):
@@ -2895,7 +2903,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "event": "chat_sse_truncated",
                     "request_id": request_id,
-                    "pending_bytes": len(buf) if isinstance(buf, bytearray) else 0,
+                    "pending_bytes": len(buf),
                     "saw_done": 1 if saw_done else 0,
                 })
                 close_all_blocks()
@@ -2907,22 +2915,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                                      "restarted; the client should retry"},
             })
             return first_byte_ms
-
-        def drain_pin():
-            """The drain window's socket bound, in seconds.
-
-            The mode's own budget (MAX_DRAIN_SECONDS) — capped by the swap
-            silence budget while a swap is in progress. The drain's quiet
-            window is `budget + _SWAP_QUIET_GRACE`, so a drain-window wake
-            pinned past the budget would fire after the swap had already
-            completed and synthesize a normal terminal on the old routing.
-            With the cap, an evictable straggler always wakes inside the
-            drain and is evicted before the drain exits.
-            """
-            bound = max(1, MAX_DRAIN_SECONDS)
-            if _config_swapping:
-                bound = min(bound, max(1, SETTINGS.swap_silence_timeout))
-            return bound
 
         def sentinel_of(text):
             """The frame payload as handle_frame reads it — every `data:` line,
@@ -3044,45 +3036,37 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 return ("finish", finish_reason)
             return None
 
+        # ONE raw iterator serves the pre-finish scan and the post-finish
+        # drain: an httpx2 response stream is single-consumption (a second
+        # iter_raw raises StreamConsumed). The read bound is the client's
+        # PROXY_READ_TIMEOUT, applied per read, so both a pre-finish stall and
+        # a silent drain end here instead of holding the worker thread.
+        chunks = resp.iter_raw()
         try:
             while True:
-                # Pre-finish only: arm the socket at the swap silence budget
-                # while a swap is in progress, restore the connection's
-                # original timeout otherwise. The drain window below owns its
-                # own pin (drain_pin(), re-pinned per chunk) and must not be
-                # overwritten here — that pin IS the drain's time bound.
-                if finish_reason_seen is None and _timeout_saved:
-                    try:
-                        resp.fp.raw._sock.settimeout(
-                            SETTINGS.swap_silence_timeout if _config_swapping
-                            else _orig_timeout)
-                    except (AttributeError, OSError):
-                        _timeout_saved = False
                 try:
-                    chunk = resp.read1(8192)
-                except socket.timeout:
+                    chunk = next(chunks)
+                except StopIteration:
+                    chunk = b""
+                except httpx2.ReadTimeout:
                     if finish_reason_seen is not None:
-                        # The drain's own time bound — MUST survive: it is
-                        # what defers the synthesized terminal to the drain
-                        # budget rather than the 300 s socket timeout. A
-                        # completed swap still owns this wake, though: close
-                        # with the retryable error instead of synthesizing a
-                        # terminal on old routing. Defence in depth — the pin
-                        # is already bounded by the swap budget, so a wake
-                        # this late means the door closed while blocked.
+                        # The drain's own bound: a silent provider cannot hold
+                        # the worker past the read timeout, and the exit is
+                        # recorded so the residual is measurable. A completed
+                        # swap still owns this wake: close with the retryable
+                        # error instead of synthesizing a terminal on old
+                        # routing.
                         if _swap_epoch_changed(epoch):
                             return evict_swap()
-                        drain_exit = "time_budget"
+                        drain_exit = "read_timeout"
                         break
-                    # Pre-finish: a timeout is terminal (an armed wake can
-                    # only end the stream), so the only question is how to
-                    # close. A swap owns this wake — evict; otherwise this is
-                    # today's stall cut.
+                    # Pre-finish: a read timeout is terminal, so the only
+                    # question is how to close. A swap owns this wake — evict;
+                    # otherwise the stall cuts the stream.
                     if _config_swapping or _swap_epoch_changed(epoch):
                         return evict_swap()
                     break
-                except (http.client.IncompleteRead, http.client.RemoteDisconnected,
-                        socket.error, OSError):
+                except (httpx2.RequestError, httpx2.StreamError, OSError):
                     # A completed swap owns this exit too: dying retryably beats
                     # delivering an old-routing result the client would trust.
                     if _swap_epoch_changed(epoch):
@@ -3101,10 +3085,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     # instead of synthesizing a terminal.
                     return evict_swap()
                 if finish_reason_seen is not None:
-                    drain_bytes += len(chunk)
-                    if drain_bytes > MAX_DRAIN_BYTES:
-                        drain_exit = "byte_budget"
-                        break
                     remaining = MAX_DRAIN_SECONDS - (time.time() - finish_seen_at)
                     if remaining <= 0:
                         drain_exit = "time_budget"
@@ -3112,24 +3092,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     _off = (time.time() - finish_seen_at) * 1000
                     _frames_before = frames_seen
                     _tools_before = tool_calls_seen
-                    if _timeout_saved:
-                        try:
-                            resp.fp.raw._sock.settimeout(
-                                min(max(1, remaining), drain_pin()))
-                        except (AttributeError, OSError):
-                            _timeout_saved = False
                 if first_byte_ms is None:
                     first_byte_ms = (time.time() - first_byte_start) * 1000
-                # Degraded mode (first-frame cap exceeded): forward raw bytes
-                if buf is None:
-                    bytes_streamed += len(chunk)
-                    if bytes_streamed > SETTINGS.max_response_size:
-                        drain_exit = "response_cap"
-                        self._log_response_cap_exceeded(request_id, bytes_streamed)
-                        break
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-                    continue
                 chunk = chunk.replace(b"\r\n", b"\n")
                 buf.extend(chunk)
                 while True:
@@ -3150,20 +3114,21 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     if isinstance(result, tuple) and result[0] == "finish":
                         finish_reason_seen = result[1]
                         finish_seen_at = time.time()
-                        # Bound the drain at the point of blocking: without
-                        # this, a provider that goes silent after finish_reason
-                        # pins resp.read1() for the full upstream socket
-                        # timeout (300 s). The value tracks the REMAINING drain
-                        # budget (recomputed per chunk) and is restored after
-                        # the drain. `drain_pin()` caps it by the swap silence
-                        # budget while a swap is in progress.
-                        try:
-                            _orig_timeout = resp.fp.raw._sock.gettimeout()
-                            resp.fp.raw._sock.settimeout(drain_pin())
-                            _timeout_saved = True
-                        except (AttributeError, OSError):
-                            _timeout_saved = False
                         continue  # enter drain mode
+                    if finish_reason_seen is not None:
+                        # Drain accounting is per FRAME, not per chunk: frames
+                        # following finish_reason inside the same coalesced
+                        # iter_raw chunk must count against both bounds, or a
+                        # large post-finish tail runs to EOF unmeasured.
+                        drain_bytes += len(frame) + len(SSE_EVENT_DELIMITER)
+                        if drain_bytes > MAX_DRAIN_BYTES:
+                            drain_exit = "byte_budget"
+                            drain_cut = True
+                            break
+                        if MAX_DRAIN_SECONDS - (time.time() - finish_seen_at) <= 0:
+                            drain_exit = "time_budget"
+                            drain_cut = True
+                            break
                 # Late-frame offsets: how far past finish_reason this chunk's
                 # frames arrived — the evidence for whether the 5 s drain
                 # budget is generous or binding.
@@ -3175,36 +3140,48 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         late_frames += 1
                     if tool_calls_seen and not _tools_before:
                         late_tool_call_ms = _off
-                if drain_done:
+                if drain_done or drain_cut:
                     break
-                # Memory guards for frames without a delimiter
+                # Memory guard for a frame with no delimiter. The disposition
+                # depends on the phase: PRE-finish the turn has not been
+                # terminal-signaled yet, so an oversize frame is a loud,
+                # retryable error (the cut-stream close shape: blocks closed,
+                # degradation finalized, one error frame, and NO
+                # message_delta/message_stop). In the DRAIN window the turn is
+                # already terminal-signaled — failing it would force a full
+                # client re-run for data the client never needed — so the frame
+                # is dropped and counted, and the drain continues.
                 if len(buf) > MAX_EVENT_BUFFER:
-                    if not message_started:
-                        # First event exceeded cap before \\n\\n: degrade to
-                        # raw passthrough with a synthetic start (accepted
-                        # residual for the chat-mode 64KB-cap edge case).
+                    oversize_bytes = len(buf)
+                    buf.clear()
+                    log_trace({
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "event": "chat_sse_frame_oversize",
+                        "request_id": request_id,
+                        "bytes": oversize_bytes,
+                    })
+                    if finish_reason_seen is None:
+                        # The invariant event: every 200 chat stream ends with
+                        # exactly one of chat_sse_drain / chat_sse_truncated.
                         log_trace({
                             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                            "event": "chat_sse_buffer_cap_exceeded",
+                            "event": "chat_sse_truncated",
                             "request_id": request_id,
+                            "pending_bytes": 0,
+                            "saw_done": 1 if saw_done else 0,
                         })
-                        start_message()
-                        raw_splice = bytes(buf)
-                        buf.clear()
-                        bytes_streamed += len(raw_splice)
-                        self.wfile.write(raw_splice)
+                        if not message_started:
+                            start_message()
+                        close_all_blocks()
+                        log_degradation_if_needed()
+                        self.wfile.write(b"event: error\ndata: " + _error_body(
+                            "api_error", "upstream_frame_oversize",
+                            "upstream sent an SSE frame larger than 2 MB; "
+                            "stream terminated",
+                            request_id) + b"\n\n")
                         self.wfile.flush()
-                        first_byte_ms = (time.time() - first_byte_start) * 1000
-                        buf = None  # switch to raw forwarding
-                    else:
-                        log_trace({
-                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                            "event": "chat_sse_frame_cap_exceeded",
-                            "request_id": request_id,
-                            "bytes": len(buf),
-                        })
-                        frame_dropped = True
-                        buf.clear()
+                        return first_byte_ms
+                    frame_dropped += 1
                 if bytes_streamed > SETTINGS.max_response_size:
                     drain_exit = "response_cap"
                     self._log_response_cap_exceeded(request_id, bytes_streamed)
@@ -3212,15 +3189,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         except _DISCONNECT_ERRORS:
             raise
         drain_ended_at = time.time()
-        # Restore the upstream socket timeout captured when the drain began.
-        # The _timeout_saved flag — not a `_orig_timeout is not None` test —
-        # gates it: a captured timeout of None (blocking mode) is a legitimate
-        # value that must be restored as-is.
-        if finish_reason_seen is not None and _timeout_saved:
-            try:
-                resp.fp.raw._sock.settimeout(_orig_timeout)
-            except (OSError, AttributeError):
-                pass
         # finish_reason was seen: the drain above ran to EOF, [DONE], or a
         # bound. Emit the terminal sequence now, so trailing usage and tool_call
         # frames captured during the drain are accounted for.
@@ -3315,7 +3283,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # line that delimits a frame, stranding the sentinel in the buffer.
         # At EOF the sentinel is unambiguous, so honour it rather than
         # treating a protocol-complete stream as one that was cut.
-        if not saw_done and buf is not None:
+        if not saw_done:
             if sentinel_of(bytes(buf).decode("utf-8", errors="replace")) == "[DONE]":
                 saw_done = True
         if not message_started:
@@ -3324,7 +3292,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "event": "chat_sse_truncated",
             "request_id": request_id,
-            "pending_bytes": len(buf) if isinstance(buf, bytearray) else 0,
+            "pending_bytes": len(buf),
             "saw_done": 1 if saw_done else 0,
         })
         if saw_done:
@@ -3376,16 +3344,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "request_id": request_id,
             })
             try:
-                while True:
-                    chunk = resp.read1(8192)
-                    if not chunk:
-                        break
+                for chunk in resp.iter_raw():
                     _touch_upstream_activity()
                     if _swap_epoch_changed(epoch):
                         _note_swap_eviction("stream", request_id, tier=tier)
                         break
-            except (http.client.IncompleteRead, http.client.RemoteDisconnected,
-                    socket.error, OSError):
+            except (httpx2.RequestError, httpx2.StreamError, OSError):
                 pass
             mid = "msg_" + str(uuid.uuid4())
             events = [
@@ -4126,10 +4090,34 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         increment_total()
 
-        status, resp_headers, resp_body, first_byte_ms, total_sec, retries, tier, provider, actual_model = \
-            forward_request(self.command, self.path,
-                            {k: v for k, v in self.headers.items()},
-                            body, handler=self, request_id=request_id)
+        try:
+            status, resp_headers, resp_body, first_byte_ms, total_sec, retries, tier, provider, actual_model = \
+                forward_request(self.command, self.path,
+                                {k: v for k, v in self.headers.items()},
+                                body, handler=self, request_id=request_id)
+        except Exception as e:  # total: no request may end with a closed
+                                # connection and no record (do_POST has no
+                                # outer try; anything outside the retry loop's
+                                # (httpx2.RequestError, httpx2.StreamError,
+                                # OSError) tuple -- e.g. httpx2.InvalidURL,
+                                # a bare Exception -- would reach
+                                # handle_error and drop the connection).
+            print("[proxy] forward failed, rid={}: {}".format(
+                request_id, sanitize_error(str(e))), file=sys.stderr)
+            log_trace({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "event": "forward_failed",
+                "request_id": request_id,
+                "method": self.command,
+                "path": self.path,
+                "error": sanitize_error(str(e)),
+            })
+            status, resp_headers, resp_body, first_byte_ms = 502, {}, _error_body(
+                "api_error", "upstream_unreachable",
+                "upstream: internal forwarding failure", request_id), None
+            # The trace entry below reads the remaining tuple members; no
+            # tier/provider was resolved on this path.
+            total_sec, retries, tier, provider, actual_model = 0, 0, None, None, None
 
         # Mirrors forward_request's streaming branch: streaming paths return
         # resp_body=b"" (already sent to client), buffering paths return the

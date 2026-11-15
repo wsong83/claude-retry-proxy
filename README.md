@@ -10,7 +10,7 @@ It works with **any** upstream provider — official Anthropic, third-party
 gateways, or self-hosted endpoints. Different tiers can route to different
 providers simultaneously.
 
-Python 3.8+. `cryptography` package required (for encrypted key storage; plain JSON keys files don't need it). MIT licensed.
+Python 3.10+. `cryptography` package required (for encrypted key storage; plain JSON keys files don't need it) and `httpx2` (the upstream HTTP/SSE transport). MIT licensed.
 
 **Going deeper:** this README is self-contained for setup and daily use. The
 [`doc/`](doc/content.html) tree holds the detailed reference — request path,
@@ -447,8 +447,9 @@ Chat-mode streaming correctly converts tool-call SSE deltas to Anthropic
 `tool_use` content blocks (per-index state, parallel/interleaved support,
 argument fragments forwarded verbatim, count-only diagnostics on malformed
 frames), and reads on past `finish_reason` so a trailing usage chunk or a
-late tool call is not lost; a provider that then goes silent is bounded by a
-5-second drain rather than held to the upstream socket timeout. A stream that
+late tool call is not lost; a provider that then goes silent ends its drain
+at the next read boundary (bounded by `PROXY_READ_TIMEOUT`), or at a 5-second
+budget if frames keep arriving after the finish signal. A stream that
 ends with no `finish_reason` at all is closed with a synthesised ending if the
 provider sent its `[DONE]` sentinel — even one written without the blank line
 that normally delimits a frame, since the sentinel is unambiguous at EOF — and
@@ -570,7 +571,8 @@ re-read — a possibly pre-swap row must never be left pressable, because
 | `PROXY_MAX_DELAY` | `30` | 1–300 | Backoff cap, seconds. Applied before jitter; 429 retries use this directly. |
 | `PROXY_MAX_BODY_SIZE` | `10485760` | 1024–100 MiB | Request body size cap (bytes); larger → 413. Also caps the upstream error body drain on retry exhaustion. |
 | `PROXY_MAX_RESPONSE_SIZE` | `104857600` | 1024–1 GiB | Streaming response size cap (bytes); larger → truncated with a warning trace event. |
-| `PROXY_SWAP_SILENCE_TIMEOUT` | `30` | 1–300 | Per-request silence budget (seconds) for the config-swap drain: how long the drain waits with no upstream byte from *any* in-flight request before declaring the remainder silent and evicting it retryably (`config_swap_restart`). Also bounds a streaming read's socket arm while a swap is in progress. Read at startup. |
+| `PROXY_SWAP_SILENCE_TIMEOUT` | `30` | 1–300 | Per-request silence budget (seconds) for the config-swap drain: how long the drain waits with no upstream byte from *any* in-flight request before declaring the remainder silent and evicting it retryably (`config_swap_restart`). Read at startup. |
+| `PROXY_READ_TIMEOUT` | `120` | 10–600 | Upstream stall timeout, seconds — applied uniformly on the httpx2 upstream client (connect, headers, and each inter-byte gap). A streamed response silent longer than this ends at its next read boundary. Read at startup. |
 | `PROXY_LOG_ALL` | unset | `1` to enable | Log full request bodies; response bodies on error paths only (streamed 2xx bodies are not captured) |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | path | Trace log location |
 | `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | path | Keys file location (encrypted or plain JSON) |

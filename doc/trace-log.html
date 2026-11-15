@@ -204,18 +204,30 @@ are the complete set the proxy can write.</p>
     <td>a recovery request that matched a marker stalled again: the turn passes through to the
     normal terminal synthesis instead of being errored a second time — the loop guard</td></tr>
 <tr><td><code>chat_sse_malformed_json</code>,
-    <code>chat_sse_frame_cap_exceeded</code>, <code>chat_sse_buffer_cap_exceeded</code></td>
-    <td>chat-mode SSE framing problems</td></tr>
+    <code>chat_sse_frame_oversize</code></td>
+    <td>chat-mode SSE framing problems. <code>chat_sse_frame_oversize</code> fires when a single
+    delimiter-less frame exceeds the 2&nbsp;MB buffer bound and carries its size in
+    <code>bytes</code> — pre-<code>finish_reason</code> the stream is terminated with the
+    retryable <code>upstream_frame_oversize</code> error (and the invariant
+    <code>chat_sse_truncated</code> event is written alongside); inside the drain window the
+    frame is dropped, <code>frame_dropped</code> counts it, and the turn completes</td></tr>
 <tr><td><code>chat_sse_post_finish_suppressed</code></td>
     <td>post-finish drain suppressed <code>content</code>/<code>reasoning</code> deltas
     (carries <code>count</code>)</td></tr>
 <tr><td><code>sse_buffer_cap_exceeded</code>, <code>sse_rewrite_malformed_json</code></td>
-    <td>anthropic-mode SSE buffering and rewrite problems</td></tr>
+    <td>anthropic-mode SSE buffering and rewrite problems; <code>sse_buffer_cap_exceeded</code>
+    carries the buffered size in <code>bytes</code></td></tr>
 <tr><td><code>response_sse_unexpected</code></td><td>a response-mode provider streamed despite <code>stream: false</code></td></tr>
+<tr><td><code>forward_failed</code></td>
+    <td>an exception escaped the forward path entirely (outside the retry loop's
+    <code>(httpx2.RequestError, httpx2.StreamError, OSError)</code> tuple) — the client receives
+    the 502 <code>upstream_unreachable</code> envelope and this event records
+    <code>request_id</code>, <code>path</code>, and the sanitized error, so no request ends with
+    a closed connection and no record</td></tr>
 <tr><td><code>swap_abort</code></td>
     <td>a config swap evicted an in-flight request. Carries <code>phase</code> —
     <code>"retry_chain"</code> (a backoff chain abandoning at the press), <code>"stream"</code> (a
-    streaming request stopped at a read boundary, or an armed wake, after the swap),
+    streaming request stopped at a read boundary after the swap),
     <code>"pre_first_byte"</code>, or <code>"buffered"</code> — plus <code>request_id</code>. The
     <code>stream</code> phase carries <code>tier</code> and <code>provider</code> and no
     <code>model</code>: the stream helpers never receive the resolved model name. The client is
@@ -244,7 +256,9 @@ also write a <code>swap_abort</code> event.</p>
 
 <p><code>chat_sse_drain</code> carries <code>drain_exit</code>, the reason the drain ended —
 <code>"done"</code> (<code>[DONE]</code>), <code>"eof"</code>, <code>"byte_budget"</code> (the
-64&nbsp;KB budget), <code>"time_budget"</code> (the 5&nbsp;s budget), <code>"read_error"</code>
+64&nbsp;KB budget), <code>"time_budget"</code> (the per-chunk 5&nbsp;s budget, when frames
+keep arriving), <code>"read_timeout"</code> (the upstream went silent and the read stalled to
+<code>PROXY_READ_TIMEOUT</code>), <code>"read_error"</code>
 (the connection died), <code>"response_cap"</code> (the response size cap was hit), or
 <code>"swap_abort"</code> (a config swap completed inside the drain window, so the turn is closed
 retryably instead of being given a terminal on the old routing). Alongside

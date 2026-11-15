@@ -42,7 +42,7 @@ where the request should go and what it should look like when it gets there.</p>
   <div class="overview-card"><div class="num">11</div><div class="label">max attempts (default)</div></div>
   <div class="overview-card"><div class="num">30s</div><div class="label">backoff cap (default)</div></div>
   <div class="overview-card"><div class="num">30s</div><div class="label">swap silence budget</div></div>
-  <div class="overview-card"><div class="num">300s</div><div class="label">upstream socket timeout</div></div>
+  <div class="overview-card"><div class="num">120s</div><div class="label">upstream stall timeout</div></div>
 </div>
 
 <h2 id="request-path">The request path</h2>
@@ -178,8 +178,10 @@ makes the rewrite ambiguous.
 <h2 id="retry">Retry and backoff</h2>
 
 <p>The retry loop lives in <code>_forward_core</code>. It retries exactly three conditions:
-HTTP <code>429</code>, HTTP <code>503</code>, and connection-level errors
-(<code>socket.error</code>, <code>ConnectionError</code>, <code>OSError</code>). Every other
+HTTP <code>429</code>, HTTP <code>503</code>, and transport-level errors
+(<code>httpx2.RequestError</code> — which covers the whole <code>TransportError</code> family
+<em>and</em> <code>DecodingError</code> — plus <code>httpx2.StreamError</code> for stream-state
+misuse, and plain <code>OSError</code> for the client-write residual below). Every other
 status is returned to the client immediately rather than retried. Whether its body is rewritten
 on the way out is mode-dependent — see
 <a href="provider-modes.html#response-rewrite">provider-modes.html</a>.</p>
@@ -658,10 +660,13 @@ That is the set Python raises for an ordinary client-side close.</p>
 <div class="warn">
 <strong>An accepted residual: a non-standard write error can be mistaken for a connection
 error.</strong> A client-write <code>OSError</code> outside that tuple — <code>WSAENOBUFS</code>,
-<code>WSAENOTSOCK</code>, <code>ENOTCONN</code> and their relatives — is not caught. Raised
-<em>after</em> response headers have been sent, it propagates into the retry loop's own
-<code>except (socket.error, ConnectionError, OSError)</code> clause and is read as a failed
-upstream connection, so the proxy re-issues a POST that had already been sent.
+<code>WSAENOTSOCK</code>, <code>ENOTCONN</code> and their relatives — is not caught by the
+handler's <code>_DISCONNECT_ERRORS</code> set. Raised <em>after</em> response headers have been
+sent, it propagates into the retry loop's own
+<code>except (httpx2.RequestError, httpx2.StreamError, OSError)</code> clause — the plain
+<code>OSError</code> member is retained precisely so this documented behavior is preserved across
+the httpx2 migration — and is read as a failed upstream connection, so the proxy re-issues a POST
+that had already been sent.
 <p>The class is exotic and Windows-only, and the consequence is bounded to a duplicate upstream
 call. It is documented rather than fixed because widening the catch would risk swallowing real
 upstream connection errors, which the retry loop depends on. The sharpest case is a streamed
@@ -723,14 +728,15 @@ no generation work, so they abandon at the press rather than being awaited, whic
 switch fast when it is issued <em>because</em> a provider is rate-limiting.</p>
 
 <p>A request parked in a blocking read at the moment of the press cannot be woken — there is no
-cross-thread socket surgery — so it exits <em>late</em>, at its next wake: an upstream answer, a
-socket timeout, or a stream loop's armed budget wake. It never forwards old-routing bytes, because
-the epoch check sits after each read and before the forwarding. A streamed read arms its socket to
-the budget <em>only while a swap is in progress</em>; with no swap in flight the connection keeps
-its documented 300 s stall tolerance byte-for-byte. An armed wake can only ever <em>end</em> a
-stream, never resume one: a timeout on an <code>http.client</code> response is terminal
-(<code>SocketIO._timeout_occurred</code> is set on the first one and never reset), which is why an
-expired arm is a close decision rather than a retry.</p>
+cross-thread socket surgery, and httpx2 offers no mid-stream timeout API — so it exits
+<em>late</em>, at its next wake: an upstream answer, or the read stalling to
+<code>PROXY_READ_TIMEOUT</code> (default 120&nbsp;s; the pre-migration mechanism — a same-thread
+socket re-arm to the 30&nbsp;s silence budget — died with the <code>http.client</code> response
+object, and the slower wake is the accepted residual). It never forwards old-routing bytes,
+because the epoch check sits after each read and before the forwarding, so the late wake still
+closes the straggler retryably. A timeout on an httpx2 read raises
+<code>httpx2.ReadTimeout</code> and is terminal for that stream — there is no wake-and-resume —
+which is why it is a close decision rather than a retry.</p>
 
 <h3 id="split-write">What a config change writes, and what it does not</h3>
 
@@ -789,8 +795,8 @@ misbehaviours:</p>
 
 <ul>
   <li>An <code>OSError</code> escaping a trace write would be caught by the retry loop's own
-      <code>except (socket.error, ConnectionError, OSError)</code> clause and misread as a
-      <em>connection error</em>, causing the proxy to re-issue an upstream POST that had
+      <code>except (httpx2.RequestError, httpx2.StreamError, OSError)</code> clause and misread
+      as a <em>connection error</em>, causing the proxy to re-issue an upstream POST that had
       already been sent.</li>
   <li>An <code>OSError</code> escaping inside the heartbeat thread would kill that thread
       permanently, silently stopping liveness reporting.</li>

@@ -420,15 +420,15 @@ now drains trailing frames first and emits the terminal sequence afterwards.</p>
 </ul>
 
 <p>The drain ends at EOF, at <code>[DONE]</code>, at a <strong>64&nbsp;KB byte budget</strong>
-(the crossing chunk is discarded unparsed), or at a <strong>5&nbsp;s time budget</strong>. The
-time budget is enforced <em>at the point of blocking</em>: the drain sets a socket read timeout to
-the remaining budget before each read and restores the original timeout afterwards. Without that,
-a provider that goes silent after <code>finish_reason</code> would pin the worker thread for the
-upstream socket timeout — 300&nbsp;s — instead of 5&nbsp;s. The pin is also bounded by a config
-swap's silence budget while one is in progress (<code>min(5 s, PROXY_SWAP_SILENCE_TIMEOUT)</code>):
-a drain-window read that woke <em>after</em> the swap completed would otherwise synthesise a normal
-terminal on the old routing. An epoch change inside the window closes the turn retryably instead,
-as <code>chat_sse_drain</code> with <code>drain_exit: "swap_abort"</code>.</p>
+(the crossing chunk is discarded unparsed and counted), at a <strong>per-chunk 5&nbsp;s time
+budget</strong> (checked after each arrived chunk, so a drain that keeps delivering frames is
+still cut at 5&nbsp;s), or — when the provider goes silent and <em>no</em> chunks arrive — at the
+upstream read timeout (<code>PROXY_READ_TIMEOUT</code>, default 120&nbsp;s), which surfaces as
+<code>drain_exit: "read_timeout"</code>. There is no point-of-blocking socket pin anymore: the
+httpx2 read timeout is the bound for a silent drain, so a silent provider holds the worker up to
+<code>PROXY_READ_TIMEOUT</code> rather than 5&nbsp;s — the accepted residual, made measurable by
+the <code>read_timeout</code> exit. An epoch change inside the window closes the turn retryably
+instead, as <code>chat_sse_drain</code> with <code>drain_exit: "swap_abort"</code>.</p>
 
 <p>A stream that ends with <em>no</em> <code>finish_reason</code> at all never reaches the drain.
 It takes the EOF path and reports <code>chat_sse_truncated</code>, whose <code>saw_done</code>
@@ -709,7 +709,7 @@ rather than implying that a call survived.</p>
 <tr><td><code>chat_sse_unfinished_turn</code></td><td>the detector saw a turn that ends with no tool call and no tool call on the wire (tools were declared, <code>finish_reason</code> was <code>stop</code>, and the text tail ends with <code>":"</code>); with the retry nudge enabled the turn is then closed with a retryable <code>error</code> and its marker armed, instead of a terminal sequence</td></tr>
 <tr><td><code>chat_retry_nudge</code></td><td>the nudge text was injected into a retry that matched an armed unfinished-turn marker (logged after the transform, so it never claims a nudge the upstream did not see)</td></tr>
 <tr><td><code>chat_retry_passthrough</code></td><td>a recovery request stalled again; the turn is closed with the normal terminal synthesis instead of being errored a second time (the loop guard)</td></tr>
-<tr><td><code>chat_sse_malformed_json</code>, <code>chat_sse_frame_cap_exceeded</code>, <code>chat_sse_buffer_cap_exceeded</code>, <code>sse_buffer_cap_exceeded</code>, <code>sse_rewrite_malformed_json</code></td><td>an SSE frame was malformed or exceeded a buffer bound</td></tr>
+<tr><td><code>chat_sse_malformed_json</code>, <code>chat_sse_frame_oversize</code>, <code>sse_buffer_cap_exceeded</code>, <code>sse_rewrite_malformed_json</code></td><td>an SSE frame was malformed or exceeded a buffer bound; <code>chat_sse_frame_oversize</code> (chat mode, 2&nbsp;MB bound, carries <code>bytes</code>) terminates the stream with the retryable <code>upstream_frame_oversize</code> error before <code>finish_reason</code> and merely drops-and-counts the frame inside the drain window; <code>sse_buffer_cap_exceeded</code> (anthropic mode, 64&nbsp;KB first-event bound, carries <code>bytes</code>) keeps its forward-as-is degrade</td></tr>
 </table>
 
 <p>Full field lists and the complete event inventory live in

@@ -1976,11 +1976,26 @@ def test_switch_succeeds_during_long_live_stream():
 
 def test_switch_evicts_silent_stream():
     """A stream that emits a byte AFTER the press and then goes silent is
-    evicted at the armed budget. drained False is deterministic because the
-    drain's quiet window is budget + _SWAP_QUIET_GRACE while the armed wake is
-    budget — if this flakes, that ordering is broken."""
+    evicted at its next READ BOUNDARY — inside the drain, so `drained: false`.
+
+    Re-based (plan 2026-11-15-httpx2-transport-sse) from the deleted 30 s armed
+    socket wake onto read-boundary semantics: httpx2 has no mid-stream timeout
+    API, so a blocked read wakes only at PROXY_READ_TIMEOUT. The timing basis
+    is therefore:
+      - the request read timeout is pinned to its 10 s validation floor; a
+        smaller value is refused by design and falls back to 120;
+      - the swap's silence budget is raised to 10 s, so its quiet window
+        (budget + _SWAP_QUIET_GRACE = 12 s) OUTLIVES the read boundary. The
+        straggler therefore wakes inside the drain, is evicted there, and the
+        drain then exits on count zero — which is what makes `drained: false`
+        deterministic instead of a race with the quiet window;
+      - the switch returns at the read boundary (~10 s), not within the budget.
+    If this flakes, the read-boundary wake is not firing (or the quiet window
+    is mis-measured) — not a timing accident.
+    """
     print("\n--- Test: Switch Evicts a Silent Stream ---")
-    budget = 2
+    read_timeout = 10
+    budget = 10  # quiet window budget + 2 must exceed read_timeout
     grace = 2
     post_press_byte = threading.Event()
 
@@ -1992,15 +2007,17 @@ def test_switch_evicts_silent_stream():
         handler.wfile.flush()
         # The fixture shape matters: a straggler that was already silent before
         # the press is a LATE exit (see the dedicated test). This one emits a
-        # byte after the press, so the loop's next read is armed at the budget
-        # while _config_swapping is True — its wake is deterministic.
+        # byte after the press, so its next read is armed at the read timeout
+        # while the drain is still running — its wake is deterministic.
         post_press_byte.wait(15)
         handler.wfile.write(_anthropic_sse(_text_delta("post-press")))
         handler.wfile.flush()
         time.sleep(30)  # hold silently
 
     proxy_port, proc, mock_servers, temp_dir, trace_file, cleanup = _swap_proxy(
-        streamers={"p1": streamer})
+        streamers={"p1": streamer},
+        extra_env={"PROXY_READ_TIMEOUT": str(read_timeout),
+                   "PROXY_SWAP_SILENCE_TIMEOUT": str(budget)})
     if proc is None:
         fail("Failed to set up test")
         return
@@ -2014,7 +2031,7 @@ def test_switch_evicts_silent_stream():
         sw = threading.Thread(
             target=lambda: switch_out.update(
                 zip(("status", "data"), _admin_post(
-                    proxy_port, "/admin/api/switch", _switch_body("p2")))),
+                    proxy_port, "/admin/api/switch", _switch_body("p2"), timeout=40))),
             daemon=True)
         sw.start()
         if _wait_admin_swapping(proxy_port) is None:
@@ -2022,17 +2039,19 @@ def test_switch_evicts_silent_stream():
             return
         post_press_byte.set()
         t0 = time.time()
-        sw.join(20)
+        sw.join(40)
         elapsed = time.time() - t0
-        client.join(20)
+        client.join(30)
         status = switch_out.get("status")
         data = switch_out.get("data")
         if status != 200:
             fail("switch of a silent stream returned {}: {}".format(status, data))
             return
-        if not (budget <= elapsed <= budget + grace + 8):
-            fail("switch returned after {:.1f}s, outside [{}s, {}s]".format(
-                elapsed, budget, budget + grace + 8))
+        if not (read_timeout - 1 <= elapsed <= read_timeout + grace + 8):
+            fail("switch returned after {:.1f}s, outside [{}s, {}s] — the "
+                 "eviction must land at the {}s read boundary".format(
+                     elapsed, read_timeout - 1, read_timeout + grace + 8,
+                     read_timeout))
             return
         resp = json.loads(data)
         if resp.get("drained") is not False:
@@ -2078,11 +2097,11 @@ def test_switch_silent_before_press_is_late_exit():
 
     Boundary: the straggler's upstream sends two chunks then holds the socket
     open silently; the press lands while its loop is ALREADY blocked in its
-    read (armed at the connection's 300 s timeout, not the budget), so the
-    drain cannot evict it. The client-side error lands at the straggler's own
-    wake, so this test does not assert its timing — it asserts only that the
-    old-routing bytes delivered at that wake are not forwarded (the epoch check
-    fires before the forward).
+    read (bounded by PROXY_READ_TIMEOUT — 120 s at this test's default, not the
+    swap budget), so the drain cannot evict it. The client-side error lands at
+    the straggler's own wake, so this test does not assert its timing — it
+    asserts only that the old-routing bytes delivered at that wake are not
+    forwarded (the epoch check fires before the forward).
 
     Clock discrimination: a SECOND request is in flight and keeps emitting a
     sub-budget cadence past the press, for longer than the drain's quiet window
@@ -2104,8 +2123,9 @@ def test_switch_silent_before_press_is_late_exit():
         handler.end_headers()
         if b"STRAGGLER" in info.get("body", b""):
             # Both pre-press chunks land immediately, so the proxy's next read
-            # blocks BEFORE the press and is armed at the connection's 300 s
-            # timeout — the un-wakeable read this boundary is about.
+            # blocks BEFORE the press and is bounded only by PROXY_READ_TIMEOUT
+            # (120 s at this test's default) — the un-wakeable read this
+            # boundary is about.
             handler.wfile.write(_anthropic_sse(_msg_start(), _text_delta("pre-press")))
             handler.wfile.flush()
             late_wake.wait(30)
