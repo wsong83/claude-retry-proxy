@@ -4636,10 +4636,8 @@ def test_admin_html_apply_requires_rendered_row():
     WHAT THIS PINS, AND WHAT IT DOES NOT: the served page's SOURCE ORDER — a
     negated tier-row existence test, before any tier-select read, whose block
     returns with a sticky error line. It does not execute the JavaScript; the
-    behavioural contract is pinned by
-    `tmp/verification/2026-10-25-guard-totality-and-blank-admin-admin-page.py`
-    (check 1) under Node, which this repo deliberately does not make a suite
-    dependency.
+    behavioural contract was measured under Node (check 1 of the page-behaviour
+    probe), which this repo deliberately does not make a suite dependency.
     """
     print("\n--- Test: Apply Requires a Rendered Row ---")
     port = find_free_port()
@@ -4828,11 +4826,10 @@ def test_admin_html_load_config_status_guard():
 # WHAT THESE PIN, AND WHAT THEY DO NOT: the served page's SOURCE SHAPE,
 # extracted per function with the module's brace-balanced walker. This suite is
 # pure Python and has no page harness (test_admin_html_pending_status_styled
-# records the same boundary). The behaviour those shapes produce is MEASURED
-# separately by tmp/verification/2026-11-01-admin-config-500-surface-step5.py,
-# which runs the shipped script under a stub DOM in Node, drives showStatus
-# directly, and proves each row below has a reachable failing branch by
-# mutating exactly one property at a time.
+# records the same boundary). The behaviour those shapes produce was MEASURED
+# separately, by running the shipped script under a stub DOM in Node, driving
+# showStatus directly, and proving each row below has a reachable failing
+# branch by mutating exactly one property at a time.
 # ===========================================================================
 
 

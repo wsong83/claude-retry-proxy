@@ -574,7 +574,8 @@ re-read — a possibly pre-swap row must never be left pressable, because
 | `PROXY_LOG_ALL` | unset | `1` to enable | Log full request bodies; response bodies on error paths only (streamed 2xx bodies are not captured) |
 | `PROXY_TRACE_FILE` | `~/.claude/logs/proxy-trace.jsonl` | path | Trace log location |
 | `PROXY_KEYS_PATH` | `~/.claude/keys-index.json` | path | Keys file location (encrypted or plain JSON) |
-| `PROXY_STATE_FILE` | `~/.claude/proxy/proxy-state.json` | path | State file path override. The server heartbeat writes PID/port/start_time here; `claude-retry-proxy stop`/`status`/`reload` read it. Override for test isolation. |
+| `PROXY_STATE_FILE` | `~/.claude/proxy/proxy-state.json` | path | State file path override. The server heartbeat writes PID/port/start_time here; `claude-retry-proxy stop`/`status`/`reload` read it. Override for test and script isolation. |
+| `PROXY_FEATURE_COMPAT_FILE` | `~/.claude/proxy/feature-compatibility.json` | path | Compatibility state file path. Stores learned per-provider field incompatibility. Override for test and script isolation. |
 | `PROXY_CHAT_RETRY_NUDGE` | `[proxy nudge] Your previous turn ended without a tool call. If you intended to call a tool, emit that tool call now and continue the task.` | unset = default; empty, blank, or >4096 chars = **disabled** | Chat mode only. Text injected as a trailing user message into the retry that recovers a turn errored as unfinished (nudging the model to emit the tool call it narrated). `PROXY_CHAT_RETRY_NUDGE=""` is the kill switch; a restart or relaunch applies it. |
 
 Backoff is `PROXY_INITIAL_DELAY * 2**attempt`, capped at `PROXY_MAX_DELAY`.
@@ -754,7 +755,10 @@ search cannot answer.
 
 The suite is safe to run while a proxy is live: it redirects its state,
 compatibility, and trace paths into a session temp directory at import time, so a
-test proxy can never touch a running proxy's files. See
+test proxy can never touch a running proxy's files. One module also scans the
+repo's gitignored verification-script corpus each pass
+(`python scripts/check_spawn_isolation.py` measures it on demand), so a run can
+go red from workspace content rather than code. See
 [doc/test-catalog.html](doc/test-catalog.html) for the module map, the harness
 helpers, and the testing patterns.
 

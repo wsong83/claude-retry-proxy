@@ -10,7 +10,7 @@
 
 <h1>Configuration<span class="sub">config.json, models.json, keys-index.json, and the environment</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-22</p>
+<p><strong>Last updated:</strong> 2026-11-14</p>
 
 <p>Three files configure the proxy, and the split between them is the important thing to
 understand: <strong><code>config.json</code> and <code>models.json</code> are safe to read, share,
@@ -436,9 +436,13 @@ is absent both processes honor the same variable.</p>
 <tr><td><code>PROXY_KEYS_PATH</code></td><td colspan="2"><code>~/.claude/keys-index.json</code></td>
     <td>Keys file path</td></tr>
 <tr><td><code>PROXY_STATE_FILE</code></td><td colspan="2"><code>~/.claude/proxy/proxy-state.json</code></td>
-    <td>Heartbeat state file. Override for test isolation.</td></tr>
+    <td>Heartbeat state file. Override for test and script isolation — the suite harness
+        points it at a temp dir, and scripts that spawn or import the proxy are required to
+        do the same; the corpus checker (see
+        <a href="test-catalog.html#pattern-spawn-isolation">test-catalog.html</a>) enforces
+        that on the repo's verification scripts.</td></tr>
 <tr><td><code>PROXY_FEATURE_COMPAT_FILE</code></td><td colspan="2"><code>~/.claude/proxy/feature-compatibility.json</code></td>
-    <td>Compatibility state file. Override for test isolation.</td></tr>
+    <td>Compatibility state file. Override for test and script isolation.</td></tr>
 <tr><td><code>PROXY_CHAT_RETRY_NUDGE</code></td>
     <td colspan="2"><code>[proxy nudge] Your previous turn ended without a tool call. If you
     intended to call a tool, emit that tool call now and continue the task.</code></td>
@@ -518,6 +522,6 @@ common mistake: <strong>config is authoritative</strong>. Every provider named i
 <code>config.json</code> must exist in the keys file. Providers that exist only in the keys file
 are ignored.</p>
 
-<footer>Last updated: 2026-10-22</footer>
+<footer>Last updated: 2026-11-14</footer>
 </body>
 </html>
