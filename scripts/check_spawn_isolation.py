@@ -447,7 +447,11 @@ def scan(root, quarantine_root):
               file=sys.stderr)
         return 2
 
-    if stats["py"] == 0:
+    if stats["py"] == 0 and stats["fail"] == 0:
+        # Corpus empty AND nothing failed: a vacuous pass is honest. An
+        # unreadable-directory fail with zero readable .py files must fall
+        # through to the counted summary below -- it is exit 1 by contract
+        # (the docstring's exit-code table), never a silent corpus-empty PASS.
         print("check_spawn_isolation: root=%s | corpus empty | PASS"
               % clean(root))
         return 0
