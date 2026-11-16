@@ -3,8 +3,9 @@
 WHY THIS EXISTS. Standalone verification scripts (``tmp/verification/*.py``)
 spawn throwaway proxy children outside the test suite. The suite isolates its
 children because ``_harness`` sets ``PROXY_STATE_FILE``, ``PROXY_TRACE_FILE``
-and ``PROXY_FEATURE_COMPAT_FILE`` at import, before ``cli.py``/``server.py``
-are imported; a standalone script does not, so the child it spawns inherits
+and ``PROXY_FEATURE_COMPAT_FILE`` at import, before ``cli.py``/``server.py``/
+``forwarder.py`` — the three settings-importing modules — are imported; a
+standalone script does not, so the child it spawns inherits
 the live paths and can write to — or delete — the live ``~/.claude/proxy``
 state document. The committed checker enforces the authoring-time rule (the
 canonical block, documented in ``doc/test-catalog.html#pattern-spawn-isolation``)

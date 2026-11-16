@@ -30,9 +30,11 @@ import weakref
 
 # Tests must never write into the user's live proxy trace. server.py binds
 # PROXY_TRACE_FILE at import time (in-process transforms log via log_trace),
-# and subprocess spawn helpers inherit the test runner's env via
-# os.environ.copy(). Force it to a session temp file before any server module
-# is imported, so both routes stay isolated from ~/.claude/logs.
+# and forwarder.py does the same — it is the third settings-importing module
+# alongside server.py and cli.py — and subprocess spawn helpers inherit the
+# test runner's env via os.environ.copy(). Force it to a session temp file
+# before any of those modules is imported, so every route stays isolated from
+# ~/.claude/logs.
 os.environ["PROXY_TRACE_FILE"] = os.path.join(
     tempfile.gettempdir(), "claude-retry-proxy-test-trace.jsonl")
 
@@ -40,10 +42,13 @@ os.environ["PROXY_TRACE_FILE"] = os.path.join(
 
 # Same isolation for the CLI/state file. cli.py and server.py read
 # PROXY_STATE_FILE from the env (added 2026-08-28 to fix the
-# test-suite-kills-live-proxy hazard). Force it to a per-run path before any
-# CLI subprocess or server module is spawned, so the dummy proxies the tests
-# launch read/write an isolated state file and can never stop or touch the
-# live proxy's ~/.claude/proxy/proxy-state.json.
+# test-suite-kills-live-proxy hazard), and forwarder.py imports the same
+# settings module — the settings singleton binds all three PROXY_*_FILE paths
+# at import, so forwarder.py is the third module this block must precede.
+# Force it to a per-run path before any CLI subprocess or proxy module is
+# spawned, so the dummy proxies the tests launch read/write an isolated state
+# file and can never stop or touch the live proxy's
+# ~/.claude/proxy/proxy-state.json.
 #
 # The path lives IN ~/.claude/proxy with the distinct PID-keyed filename
 # below that keeps it separate from the live proxy's proxy-state.json. The

@@ -27,8 +27,9 @@ rationale, mechanisms, and edge cases — and is indexed by
 ```
 src/claude_retry_proxy/
   __init__.py           __version__
-  server.py             the HTTP retry gateway server (ThreadingHTTPServer, tier routing, model rewriting, admin API, httpx2 upstream transport, retry/backoff)
-  compat.py             the compatibility learner: the `COMPAT_FEATURES` registry (two features — `context_management` in anthropic mode, `reasoning_field` in chat mode) whose descriptors own their mode, presence test, matcher, field set and retry budget; COMPAT_* policy constants; the owned `_CompatState` state object (default-param `state=` injection); the `context_management` state machine with its 400-shape matchers and its retry lock, and the `reasoning_field` credit learner (a per-key in-memory credit; the switch thresholds are `models.json` policy, `reasoning_field_switch`) with its lock-free, key-free rescue (its passes repair the forwarded body rather than re-rolling) and matcher, plus its demanding-turn-scoped presence gate (`_reasoning_present`: reasoning on the last `tool_use`-bearing assistant turn, read from the raw client body) (extracted from server.py; the probe-outcome + retry orchestration slice stays in server.py)
+  server.py             the HTTP retry gateway server (ThreadingHTTPServer, request handler, mode dispatch, admin API, CLI entry; re-exports forwarder.py's 23-name frozen surface — attribute-form for state, which is never re-exported)
+  forwarder.py          the upstream forward path (extracted 2026-11-16): `extract_model`/`resolve_tier` tier resolution, `_forward_core` retry/backoff over the httpx2 transport, the compat + reasoning retries' orchestration, response model rewriting, the config-swap drain protocol (its state lives here; server reads it attribute-form), and the chat retry-nudge store; never imports its parent
+  compat.py             the compatibility learner: the `COMPAT_FEATURES` registry (two features — `context_management` in anthropic mode, `reasoning_field` in chat mode) whose descriptors own their mode, presence test, matcher, field set and retry budget; COMPAT_* policy constants; the owned `_CompatState` state object (default-param `state=` injection); the `context_management` state machine with its 400-shape matchers and its retry lock, and the `reasoning_field` credit learner (a per-key in-memory credit; the switch thresholds are `models.json` policy, `reasoning_field_switch`) with its lock-free, key-free rescue (its passes repair the forwarded body rather than re-rolling) and matcher, plus its demanding-turn-scoped presence gate (`_reasoning_present`: reasoning on the last `tool_use`-bearing assistant turn, read from the raw client body) (extracted from server.py; the probe-outcome + retry orchestration slice lives in forwarder.py, which imports this module — `_compat_retry_lock` is dual-read)
   sanitize.py           error-text redaction leaf: `sanitize_error`, the chokepoint for text reaching stderr, trace `error` fields and client-facing error bodies
   sinks.py              sink class family: private `_Sink` base, `TraceSink` (JSONL append + counters + markers), `StateSink` (atomic state document), shared `_SinkHealth` failure reporter, process-wide pair + `configure()`
   settings.py           env-derived settings singleton: `SETTINGS` value object (the `PROXY_*` limits/flags, runtime paths incl. state/compat files, mode values) + `resolve_trace_file` — built at import from env, adjusted by `main()` at startup; imported by both the server and the CLI
@@ -300,8 +301,8 @@ startup on failure).
 - **Test suite is safe alongside a live proxy.** The suite sets
   `PROXY_TRACE_FILE` and `PROXY_FEATURE_COMPAT_FILE` to session temp paths, and
   `PROXY_STATE_FILE` to a per-run path (see below), at module load —
-  *before* importing `cli.py` or `server.py`
-  (`settings.py` binds those env vars at import — both modules import it). A test proxy
+  *before* importing `cli.py`, `server.py`, or `forwarder.py`
+  (`settings.py` binds those env vars at import — all three import it). A test proxy
   therefore cannot touch the live proxy's files, and the old docstring warning
   about not running tests alongside a live proxy is obsolete.
   `PROXY_STATE_FILE` goes further: it is a **per-run** path keyed to the runner
@@ -410,7 +411,7 @@ global guide, and the /refactor-split survey tracks oversized-file state,
 superseding the retired break-up backlog report.
 
 The `sanitize.py` + `sinks.py` extraction (2026-09-12) was the first step of the
-staged decomposition prescribed by the global refactor-split guidance. Four more
+staged decomposition prescribed by the global refactor-split guidance. Five more
 followed. The transforms extraction (`2026-09-14-extract-transforms`, step 2)
 moved the mode-transform cluster into `transforms_common.py` /
 `transforms_chat.py` / `transforms_response.py`. The settings extraction
@@ -429,9 +430,17 @@ CLI's template/keys/validation onto the shared policy. The compat extraction
 into `compat.py` behind an owned `_CompatState` state object with
 default-parameter injection; it was a verbatim move plus a design step, and its
 two verification gates were revised twice during implementation (nested-def
-walkers, HEAD-sourced byte-identity, dotless ImportFrom matching).
+walkers, HEAD-sourced byte-identity, dotless ImportFrom matching). The forwarder
+extraction (`2026-11-16-extract-forwarder`, step 6) moved the upstream forward
+path — tier resolution, the `_forward_core` retry loop, the compat/reasoning-retry
+orchestration, response rewriting, the config-swap drain protocol, and the chat
+retry-nudge store — into `forwarder.py` as a byte-identical verbatim move behind
+a 23-name frozen surface that `server.py` re-exports (state names deliberately
+never re-exported — attribute form mandatory). Named follow-up: forwarder
+owned-state-object conversion (guide §5 — swap-drain + nudge state as owned
+objects; supersedes the bare-globals relocation of 2026-11-16-extract-forwarder).
 
 Per-step line counts are deliberately not repeated here — they rot, and the plan
-archives hold them. The remaining clusters (router/forwarder, admin/handler) are
+archives hold them. The remaining clusters (admin/handler, chat-SSE drain) are
 tracked by the /refactor-split survey, which replaced the retired break-up
 backlog report on 2026-09-16. New deep detail belongs in `doc/`, not here.

@@ -2801,8 +2801,8 @@ def _oversized_json_responder(info):
     """200 anthropic-shape JSON, deliberately larger than the 1024-byte cap.
 
     Exceeding PROXY_MAX_RESPONSE_SIZE is what makes the in-loop
-    `response_size_cap_exceeded` log_trace (server.py:2072) fire on an
-    otherwise successful response.
+    `response_size_cap_exceeded` log_trace (in `forwarder._forward_core`) fire
+    on an otherwise successful response.
     """
     payload = json.dumps({
         "id": "msg_big",

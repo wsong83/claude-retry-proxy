@@ -2735,7 +2735,8 @@ def test_concurrent_presses_single_flight():
             # config_swap_in_progress, or the stale-candidate
             # config_reload_stale the reload's Phase-3 epoch guard emits when a
             # switch completed between its gated tier read and its install
-            # (server.py:3567 capture, :3638 compare). Asserting the envelope
+            # (the reload handler's `gated_epoch` capture, then its compare).
+            # Asserting the envelope
             # SHAPE rather than one code by name keeps a correct refusal from
             # being misdiagnosed as the single-flight defect.
             try:
@@ -2820,9 +2821,9 @@ def test_reload_does_not_revert_concurrent_switch():
     review-2-reload-stale-candidate), driven DETERMINISTICALLY in-process.
 
     The guard closes the window between the reload's gated tier read
-    (`gated_epoch = _config_epoch`, captured in the SAME `_config_lock`
-    acquisition that reads the candidate's tiers — server.py:3567) and Phase 3's
-    compare-and-install (`if _config_epoch != gated_epoch:` — server.py:3638).
+    (`gated_epoch = forwarder._config_epoch`, captured in the SAME
+    `_config_lock` acquisition that reads the candidate's tiers) and Phase 3's
+    compare-and-install (`if forwarder._config_epoch != gated_epoch:`).
     A /admin/api/switch that completes its whole press -> drain -> swap ->
     release cycle inside that window must not have its mapping silently
     reverted by the reload installing its stale candidate.
@@ -2847,6 +2848,7 @@ def test_reload_does_not_revert_concurrent_switch():
     """
     print("\n--- Test: Reload Does Not Revert a Concurrent Switch ---")
     import claude_retry_proxy.server as srv
+    import claude_retry_proxy.forwarder as forwarder
 
     temp_dir = tempfile.mkdtemp()
     try:
@@ -2861,30 +2863,33 @@ def test_reload_does_not_revert_concurrent_switch():
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump({"tiers": original_tiers}, f)
 
-        saved = {name: getattr(srv, name) for name in (
-            "_config_path", "_current_config", "_config_epoch", "_vendors",
-            "_config_swapping", "_inflight_count", "_swap_evictions")}
+        saved_srv = {name: getattr(srv, name) for name in (
+            "_config_path", "_current_config", "_vendors")}
+        saved_fwd = {name: getattr(forwarder, name) for name in (
+            "_config_epoch", "_config_swapping", "_inflight_count",
+            "_swap_evictions")}
         saved_drain = srv._drain_for_swap
         try:
             srv._config_path = config_path
             srv._current_config = {"tiers": original_tiers}
-            srv._config_epoch = 5
+            forwarder._config_epoch = 5
             srv._vendors = {
                 "p1": {"url": "http://127.0.0.1:1", "key": "k-p1"},
                 "p2": {"url": "http://127.0.0.1:2", "key": "k-p2"},
             }
-            srv._config_swapping = False
-            srv._inflight_count = 0
-            srv._swap_evictions = 0
+            forwarder._config_swapping = False
+            forwarder._inflight_count = 0
+            forwarder._swap_evictions = 0
 
             def concurrent_switch_completes():
                 # The interleaving the guard exists for: a switch presses, swaps
                 # and releases entirely between the reload's gated tier read and
                 # its Phase-3 install. `candidate` still holds `original_tiers`.
-                srv._config_swapping = True
+                import claude_retry_proxy.forwarder as forwarder
+                forwarder._config_swapping = True
                 srv._current_config = {"tiers": switch_tiers}
-                srv._config_epoch = 6
-                srv._config_swapping = False
+                forwarder._config_epoch = 6
+                forwarder._config_swapping = False
                 return (True, 0, 0.0)
 
             srv._drain_for_swap = concurrent_switch_completes
@@ -2932,16 +2937,21 @@ def test_reload_does_not_revert_concurrent_switch():
                      "{!r}, expected the switch's tiers {!r}".format(
                          srv._current_config, {"tiers": switch_tiers}))
                 return
-            if srv._config_epoch != 6:
+            if forwarder._config_epoch != 6:
                 fail("a refused reload must not bump the epoch; got {}".format(
-                    srv._config_epoch))
+                    forwarder._config_epoch))
                 return
             pass_("reload refused 409 config_reload_stale; the switch's mapping "
                   "survived and no epoch bump was taken")
         finally:
             srv._drain_for_swap = saved_drain
-            for name, value in saved.items():
-                setattr(srv, name, value)
+            srv._config_path = saved_srv["_config_path"]
+            srv._current_config = saved_srv["_current_config"]
+            srv._vendors = saved_srv["_vendors"]
+            forwarder._config_epoch = saved_fwd["_config_epoch"]
+            forwarder._config_swapping = saved_fwd["_config_swapping"]
+            forwarder._inflight_count = saved_fwd["_inflight_count"]
+            forwarder._swap_evictions = saved_fwd["_swap_evictions"]
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -3159,6 +3169,7 @@ def test_switch_nesting_gate_precedes_key_echo():
     """
     print("\n--- Test: Switch Nesting Gate Precedes Key Echo ---")
     import claude_retry_proxy.server as srv
+    import claude_retry_proxy.forwarder as forwarder
 
     limit = srv.MAX_JSON_NESTING_DEPTH
     # A real container, not a string of brackets: brackets inside a JSON string
@@ -3186,10 +3197,11 @@ def test_switch_nesting_gate_precedes_key_echo():
     # every later test in the same process. Snapshot/restore the neighbours'
     # way, and assert the refusal left the epoch alone (a refusal must never
     # advance it).
-    saved = {name: getattr(srv, name) for name in (
-        "_config_path", "_current_config", "_config_epoch", "_vendors",
-        "_config_swapping", "_inflight_count")}
-    epoch_before = srv._config_epoch
+    saved_srv = {name: getattr(srv, name) for name in (
+        "_config_path", "_current_config", "_vendors")}
+    saved_fwd = {name: getattr(forwarder, name) for name in (
+        "_config_epoch", "_config_swapping", "_inflight_count")}
+    epoch_before = forwarder._config_epoch
     try:
         try:
             captured = _drive_post_in_process(srv, "/admin/api/switch",
@@ -3250,14 +3262,18 @@ def test_switch_nesting_gate_precedes_key_echo():
               "\"invalid key name: ['a']\" — the echo branch is live and runs "
               "after the gate")
 
-        if srv._config_epoch != epoch_before:
+        if forwarder._config_epoch != epoch_before:
             fail("a refused switch must not advance the config epoch; {} -> "
-                 "{}".format(epoch_before, srv._config_epoch))
+                 "{}".format(epoch_before, forwarder._config_epoch))
             return
         pass_("both refusals left the config epoch unchanged")
     finally:
-        for name, value in saved.items():
-            setattr(srv, name, value)
+        srv._config_path = saved_srv["_config_path"]
+        srv._current_config = saved_srv["_current_config"]
+        srv._vendors = saved_srv["_vendors"]
+        forwarder._config_epoch = saved_fwd["_config_epoch"]
+        forwarder._config_swapping = saved_fwd["_config_swapping"]
+        forwarder._inflight_count = saved_fwd["_inflight_count"]
 
 
 def test_admin_reload_serialize_failure_500():
@@ -3282,12 +3298,14 @@ def test_admin_reload_serialize_failure_500():
     """
     print("\n--- Test: Admin Reload Serialize Failure Is a 500 ---")
     import claude_retry_proxy.server as srv
+    import claude_retry_proxy.forwarder as forwarder
 
     provider = "p1"
     model = "claude-sonnet-5"
     tiers = ("haiku", "sonnet", "opus")
     temp_dir = tempfile.mkdtemp()
-    saved = {}
+    saved_srv = {}
+    saved_fwd = {}
     try:
         with open(os.path.join(temp_dir, "models.json"), "w",
                   encoding="utf-8") as f:
@@ -3304,17 +3322,18 @@ def test_admin_reload_serialize_failure_500():
             "models": {provider: [model]},
         }
 
-        saved = {name: getattr(srv, name) for name in (
-            "_config_path", "_current_config", "_config_epoch", "_vendors",
-            "_config_swapping", "_inflight_count", "_swap_evictions",
-            "_swap_started_at")}
+        saved_srv = {name: getattr(srv, name) for name in (
+            "_config_path", "_current_config", "_vendors")}
+        saved_fwd = {name: getattr(forwarder, name) for name in (
+            "_config_epoch", "_config_swapping", "_inflight_count",
+            "_swap_evictions", "_swap_started_at")}
         srv._config_path = config_path
         srv._current_config = poisoned
-        srv._config_epoch = 5
+        forwarder._config_epoch = 5
         srv._vendors = {provider: {"url": "http://127.0.0.1:1", "key": "k-p1"}}
-        srv._config_swapping = False
-        srv._inflight_count = 0
-        srv._swap_evictions = 0
+        forwarder._config_swapping = False
+        forwarder._inflight_count = 0
+        forwarder._swap_evictions = 0
 
         captured = _drive_post_in_process(srv, "/admin/api/reload", b"")
         if not captured:
@@ -3338,14 +3357,25 @@ def test_admin_reload_serialize_failure_500():
                  "nothing".format(type(srv._current_config).__name__))
             return
         pass_("nothing was installed (_current_config is still the poisoned doc)")
-        if srv._config_epoch != 5:
+        if forwarder._config_epoch != 5:
             fail("a refused reload must not bump the epoch; got {}".format(
-                srv._config_epoch))
+                forwarder._config_epoch))
             return
         pass_("no epoch bump was taken")
     finally:
-        for name, value in saved.items():
-            setattr(srv, name, value)
+        # Guarded: the snapshots above populate INSIDE the try, so a setup
+        # failure before that point leaves the dicts empty — an unguarded
+        # restore would raise KeyError and mask the real exception.
+        if saved_srv:
+            srv._config_path = saved_srv["_config_path"]
+            srv._current_config = saved_srv["_current_config"]
+            srv._vendors = saved_srv["_vendors"]
+        if saved_fwd:
+            forwarder._config_epoch = saved_fwd["_config_epoch"]
+            forwarder._config_swapping = saved_fwd["_config_swapping"]
+            forwarder._inflight_count = saved_fwd["_inflight_count"]
+            forwarder._swap_evictions = saved_fwd["_swap_evictions"]
+            forwarder._swap_started_at = saved_fwd["_swap_started_at"]
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -3376,13 +3406,15 @@ def test_admin_reload_serializability_probe_precedes_drain():
     """
     print("\n--- Test: Admin Reload Serializability Probe Precedes the Drain ---")
     import claude_retry_proxy.server as srv
+    import claude_retry_proxy.forwarder as forwarder
 
     provider = "p1"
     model = "claude-sonnet-5"
     tiers = ("haiku", "sonnet", "opus")
     temp_dir = tempfile.mkdtemp()
     real_drain = srv._drain_for_swap
-    saved = {}
+    saved_srv = {}
+    saved_fwd = {}
     try:
         with open(os.path.join(temp_dir, "models.json"), "w",
                   encoding="utf-8") as f:
@@ -3398,17 +3430,18 @@ def test_admin_reload_serializability_probe_precedes_drain():
             "models": {provider: [model]},
         }
 
-        saved = {name: getattr(srv, name) for name in (
-            "_config_path", "_current_config", "_config_epoch", "_vendors",
-            "_config_swapping", "_inflight_count", "_swap_evictions",
-            "_swap_started_at")}
+        saved_srv = {name: getattr(srv, name) for name in (
+            "_config_path", "_current_config", "_vendors")}
+        saved_fwd = {name: getattr(forwarder, name) for name in (
+            "_config_epoch", "_config_swapping", "_inflight_count",
+            "_swap_evictions", "_swap_started_at")}
         srv._config_path = config_path
         srv._current_config = poisoned
-        srv._config_epoch = 5
+        forwarder._config_epoch = 5
         srv._vendors = {provider: {"url": "http://127.0.0.1:1", "key": "k-p1"}}
-        srv._config_swapping = False
-        srv._inflight_count = 0
-        srv._swap_evictions = 0
+        forwarder._config_swapping = False
+        forwarder._inflight_count = 0
+        forwarder._swap_evictions = 0
 
         drain_calls = []
 
@@ -3474,8 +3507,20 @@ def test_admin_reload_serializability_probe_precedes_drain():
                      len(drain_calls)))
     finally:
         srv._drain_for_swap = real_drain
-        for name, value in saved.items():
-            setattr(srv, name, value)
+        # Guarded: the snapshots above populate INSIDE the try, so a setup
+        # failure before that point leaves the dicts empty — an unguarded
+        # restore would raise KeyError and mask the real exception. The drain
+        # stand-in and the temp-dir removal stay unconditional.
+        if saved_srv:
+            srv._config_path = saved_srv["_config_path"]
+            srv._current_config = saved_srv["_current_config"]
+            srv._vendors = saved_srv["_vendors"]
+        if saved_fwd:
+            forwarder._config_epoch = saved_fwd["_config_epoch"]
+            forwarder._config_swapping = saved_fwd["_config_swapping"]
+            forwarder._inflight_count = saved_fwd["_inflight_count"]
+            forwarder._swap_evictions = saved_fwd["_swap_evictions"]
+            forwarder._swap_started_at = saved_fwd["_swap_started_at"]
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -3504,12 +3549,14 @@ def test_admin_switch_apply_rewrites_tier_map():
     """
     print("\n--- Test: Admin Switch Apply Rewrites the Tier Map ---")
     import claude_retry_proxy.server as srv
+    import claude_retry_proxy.forwarder as forwarder
 
     provider = "p1"
     model = "claude-sonnet-5"
     standard = ("haiku", "sonnet", "opus")
     temp_dir = tempfile.mkdtemp()
-    saved = {}
+    saved_srv = {}
+    saved_fwd = {}
     try:
         four_tiers = {t: {"provider": provider, "model": model}
                       for t in standard}
@@ -3518,20 +3565,21 @@ def test_admin_switch_apply_rewrites_tier_map():
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump({"tiers": four_tiers}, f)
 
-        saved = {name: getattr(srv, name) for name in (
-            "_config_path", "_current_config", "_config_epoch", "_vendors",
-            "_config_swapping", "_inflight_count", "_swap_evictions",
-            "_swap_started_at")}
+        saved_srv = {name: getattr(srv, name) for name in (
+            "_config_path", "_current_config", "_vendors")}
+        saved_fwd = {name: getattr(forwarder, name) for name in (
+            "_config_epoch", "_config_swapping", "_inflight_count",
+            "_swap_evictions", "_swap_started_at")}
         srv._config_path = config_path
         srv._current_config = {
             "tiers": {t: dict(cfg) for t, cfg in four_tiers.items()},
             "models": {provider: [model]},
         }
-        srv._config_epoch = 5
+        forwarder._config_epoch = 5
         srv._vendors = {provider: {"url": "http://127.0.0.1:1", "key": "k-p1"}}
-        srv._config_swapping = False
-        srv._inflight_count = 0
-        srv._swap_evictions = 0
+        forwarder._config_swapping = False
+        forwarder._inflight_count = 0
+        forwarder._swap_evictions = 0
 
         # Page-identical: `saveConfig` builds exactly provider/model/key per
         # standard tier, with `key: value || ''`.
@@ -3575,8 +3623,19 @@ def test_admin_switch_apply_rewrites_tier_map():
             fail("the persisted key selector did not resolve: {!r}".format(
                 disk.get("haiku")))
     finally:
-        for name, value in saved.items():
-            setattr(srv, name, value)
+        # Guarded: the snapshots above populate INSIDE the try, so a setup
+        # failure before that point leaves the dicts empty — an unguarded
+        # restore would raise KeyError and mask the real exception.
+        if saved_srv:
+            srv._config_path = saved_srv["_config_path"]
+            srv._current_config = saved_srv["_current_config"]
+            srv._vendors = saved_srv["_vendors"]
+        if saved_fwd:
+            forwarder._config_epoch = saved_fwd["_config_epoch"]
+            forwarder._config_swapping = saved_fwd["_config_swapping"]
+            forwarder._inflight_count = saved_fwd["_inflight_count"]
+            forwarder._swap_evictions = saved_fwd["_swap_evictions"]
+            forwarder._swap_started_at = saved_fwd["_swap_started_at"]
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -3587,9 +3646,9 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
     The press validates against a catalog snapshot taken before it owns the
     swap, while Phase 3 carries the LIVE catalog forward — so a reload that
     completes in between can leave the switch persisting a tier the Reload path
-    then refuses. `_drain_for_swap` is called by global lookup between the two
-    (server.py:3680), so rebinding it puts this test exactly inside that window
-    with no scheduling race.
+    then refuses. `_drain_for_swap` is reached through the server module's
+    binding in the switch handler, so rebinding it puts this test exactly
+    inside that window with no scheduling race.
 
     Two cases, and the second is what makes the first meaningful: refusing
     whenever the epoch moved would pass case 1 and fail case 2, and would be
@@ -3597,19 +3656,22 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
     """
     print("\n--- Test: Admin Switch Re-checks the Catalog After an Epoch Move ---")
     import claude_retry_proxy.server as srv
+    import claude_retry_proxy.forwarder as forwarder
 
     provider = "p1"
     model = "claude-sonnet-5"
     tiers = ("haiku", "sonnet", "opus")
     real_drain = srv._drain_for_swap
-    saved = {name: getattr(srv, name) for name in (
-        "_config_path", "_current_config", "_config_epoch", "_vendors",
-        "_config_swapping", "_inflight_count", "_swap_evictions",
-        "_swap_started_at")}
+    saved_srv = {name: getattr(srv, name) for name in (
+        "_config_path", "_current_config", "_vendors")}
+    saved_fwd = {name: getattr(forwarder, name) for name in (
+        "_config_epoch", "_config_swapping", "_inflight_count",
+        "_swap_evictions", "_swap_started_at")}
     temp_dirs = []
     try:
         def fresh_state():
             """A distinct temp config per case, plus the process state around it."""
+            import claude_retry_proxy.forwarder as forwarder
             temp_dir = tempfile.mkdtemp()
             temp_dirs.append(temp_dir)
             config_path = os.path.join(temp_dir, "config.json")
@@ -3621,12 +3683,12 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
                 "tiers": {t: dict(cfg) for t, cfg in baseline.items()},
                 "models": {provider: [model]},
             }
-            srv._config_epoch = 5
+            forwarder._config_epoch = 5
             srv._vendors = {provider: {"url": "http://127.0.0.1:1",
                                        "key": "k-p1"}}
-            srv._config_swapping = False
-            srv._inflight_count = 0
-            srv._swap_evictions = 0
+            forwarder._config_swapping = False
+            forwarder._inflight_count = 0
+            forwarder._swap_evictions = 0
             return config_path, baseline
 
         def disk_tiers(config_path):
@@ -3641,7 +3703,8 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
         config_path, baseline = fresh_state()
 
         def reload_lands_dropping_model():
-            srv._config_epoch += 1                 # a reload completed here...
+            import claude_retry_proxy.forwarder as forwarder
+            forwarder._config_epoch += 1                 # a reload completed here...
             srv._current_config["models"] = {provider: []}   # ...minus the model
             return real_drain()
 
@@ -3674,9 +3737,9 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
                 disk_tiers(config_path)))
             return
         pass_("case 1: the persisted config.json is untouched")
-        if srv._config_epoch != 6:
+        if forwarder._config_epoch != 6:
             fail("case 1: the refused switch took its own epoch bump; got "
-                 "{}".format(srv._config_epoch))
+                 "{}".format(forwarder._config_epoch))
             return
         pass_("case 1: no install and no epoch bump of its own")
 
@@ -3684,7 +3747,8 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
         config_path, baseline = fresh_state()
 
         def reload_lands_keeping_model():
-            srv._config_epoch += 1                 # a reload completed here...
+            import claude_retry_proxy.forwarder as forwarder
+            forwarder._config_epoch += 1                 # a reload completed here...
             return real_drain()                    # ...and the model survived
 
         srv._drain_for_swap = reload_lands_keeping_model
@@ -3715,8 +3779,14 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
         pass_("case 2: the live catalog was carried forward")
     finally:
         srv._drain_for_swap = real_drain
-        for name, value in saved.items():
-            setattr(srv, name, value)
+        srv._config_path = saved_srv["_config_path"]
+        srv._current_config = saved_srv["_current_config"]
+        srv._vendors = saved_srv["_vendors"]
+        forwarder._config_epoch = saved_fwd["_config_epoch"]
+        forwarder._config_swapping = saved_fwd["_config_swapping"]
+        forwarder._inflight_count = saved_fwd["_inflight_count"]
+        forwarder._swap_evictions = saved_fwd["_swap_evictions"]
+        forwarder._swap_started_at = saved_fwd["_swap_started_at"]
         for temp_dir in temp_dirs:
             shutil.rmtree(temp_dir, ignore_errors=True)
 

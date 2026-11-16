@@ -11,7 +11,7 @@ path — carries ``models``, ``extra_request_headers``,
 ``reasoning_roundtrip``; the two documents are merged at load
 (``models_path_for`` / ``load_models_document`` / ``_load_config_documents``).
 A leftover catalog key still in config.json warns on stderr and is ignored.
-``parse_upstream`` and ``resolve_api_key`` stay in server.py (request-path
+``parse_upstream`` and ``resolve_api_key`` live in forwarder.py (request-path
 resolution); the CLI consumes these functions via the re-exports on server.py
 or by importing ``install_template`` /``_load_config_for_validation`` directly.
 """

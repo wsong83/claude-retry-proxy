@@ -10,7 +10,7 @@
 
 <h1>Architecture<span class="sub">How a request is routed, retried, and rewritten</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-26</p>
+<p><strong>Last updated:</strong> 2026-11-16</p>
 
 <p>This page describes the path a request takes from the moment it reaches the proxy to the
 moment a response leaves it. It is the reference the other pages link back into — in
@@ -49,7 +49,9 @@ where the request should go and what it should look like when it gets there.</p>
 
 <p>Each request is handled independently on its own thread. The sequence below runs in
 <code>ProxyHandler.do_POST</code> and <code>forward_request</code> in
-<code>src/claude_retry_proxy/server.py</code>.</p>
+<code>src/claude_retry_proxy/server.py</code>, which hands the upstream call to
+<code>_forward_core</code> in <code>src/claude_retry_proxy/forwarder.py</code>
+(2026-11-16 forwarder extraction).</p>
 
 <div class="step-box info">
 <div class="step-label">Step 1 — Extract the model</div>
@@ -177,7 +179,7 @@ makes the rewrite ambiguous.
 
 <h2 id="retry">Retry and backoff</h2>
 
-<p>The retry loop lives in <code>_forward_core</code>. It retries exactly three conditions:
+<p>The retry loop lives in <code>_forward_core</code> (<code>forwarder.py</code>). It retries exactly three conditions:
 HTTP <code>429</code>, HTTP <code>503</code>, and transport-level errors
 (<code>httpx2.RequestError</code> — which covers the whole <code>TransportError</code> family
 <em>and</em> <code>DecodingError</code> — plus <code>httpx2.StreamError</code> for stream-state
@@ -899,6 +901,6 @@ readiness is two-phase and why the trace carries a marker of its own; see
 <a href="operations.html#readiness">operations.html#readiness</a> and
 <a href="trace-log.html#markers">trace-log.html#markers</a>.</p>
 
-<footer>Last updated: 2026-10-26</footer>
+<footer>Last updated: 2026-11-16</footer>
 </body>
 </html>

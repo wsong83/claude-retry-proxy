@@ -10,7 +10,7 @@
 
 <h1>Compatibility Learner<span class="sub">How the proxy learns, per provider-model pair, what an upstream will accept</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-25</p>
+<p><strong>Last updated:</strong> 2026-11-16</p>
 
 <p>Third-party providers that speak the Anthropic wire format do not always implement every
 field, and they disagree about how to echo an assistant turn's reasoning. Neither fact can be
@@ -105,9 +105,10 @@ entries, its <code>reasoning_credit</code> dict the per-key in-memory credit, an
 default parameter (<code>state=_state</code>), so tests can inject a fresh instance. Only
 <code>context_management</code> holds a <strong>retry lock</strong>, and it lives on the state
 object (<code>_CompatState.retry_lock</code>) rather than on its descriptor or a module global;
-the forward path in <code>server.py</code> reaches it through the module-level aliases
-<code>_compat_state_lock</code> / <code>_compat_retry_lock</code>, which remain importable for the
-tests that assert the alias identity. The retry lock's acquire/release discipline belongs to its caller, which holds it
+the forward path in <code>forwarder.py</code> reaches the lock through its own
+import of <code>_compat_retry_lock</code>; <code>server.py</code> keeps the module-level aliases
+<code>_compat_state_lock</code> / <code>_compat_retry_lock</code> importable for the tests that
+assert the alias identity. The retry lock's acquire/release discipline belongs to its caller, which holds it
 across the unstripped probe's upstream HTTP call. The <code>reasoning_field</code> rescue holds
 <strong>no</strong> lock at all: it shares no counter, persists nothing and takes no key, so
 concurrent complainers each run their own rescue rather than one denying the others.</p>
@@ -489,6 +490,6 @@ request or response content. The strip, probe and suppression events belong to
 <p>The full trace schema, including the fields common to every entry, is in
 <a href="trace-log.html">trace-log.html</a>.</p>
 
-<footer>Last updated: 2026-10-25</footer>
+<footer>Last updated: 2026-11-16</footer>
 </body>
 </html>

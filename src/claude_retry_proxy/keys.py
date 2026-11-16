@@ -6,9 +6,8 @@ The keys family lives here extracted verbatim from server.py:
 ``_validate_vendor_keys_shape`` (load-time gate) and ``load_keys_file``
 (the single decryption+parse entry point used by the server and the CLI), and
 ``read_passphrase_from_stdin`` — a declared member of the keys bootstrap.
-``resolve_api_key`` stays in server.py (request-path resolution, parent
-callers in the forwarder/admin); the CLI consumes ``load_keys_file`` /
-``vendor_key_names`` via server.py re-exports.
+``resolve_api_key`` lives in forwarder.py (request-path resolution); the CLI
+consumes ``load_keys_file`` / ``vendor_key_names`` via server.py re-exports.
 """
 
 import json

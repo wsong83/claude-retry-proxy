@@ -1649,10 +1649,13 @@ def test_sink_emission_survives_failing_stderr():
 def test_best_effort_stderr_wrapper():
     """_BestEffortStderr makes a failing stderr stream non-raising.
 
-    server.py holds ~40 runtime diagnostics, several inside the retry loop's
-    try block. An OSError from one of those prints is read by the loop's
-    `except (socket.error, ConnectionError, OSError)` clause as a connection
-    error, so guarding the stream covers every present and future print site.
+    Runtime diagnostics — server.py's own and, on the forward path,
+    forwarder.py's — include several inside the retry loop's try block (the
+    loop lives in forwarder.py's `_forward_request_impl`). An OSError from one
+    of those prints is read by the loop's
+    `except (httpx2.RequestError, httpx2.StreamError, OSError)` clause as a
+    connection error, so guarding the stream covers every present and future
+    print site.
     """
     print("\n--- Test: Best-Effort stderr Wrapper ---")
 

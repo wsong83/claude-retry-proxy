@@ -49,7 +49,7 @@ COMPAT_FAILED_CONFIRMATION_SUPPRESSION = 3  # failed confirmations before suppre
 # complaint (the initial attempt plus up to two rescue passes).
 COMPAT_REASONING_MAX_RETRIES_PER_REQUEST = 2
 
-# The legacy singleton constant: server.py imports it and the existing trace
+# The legacy singleton constant: forwarder.py imports it and the existing trace
 # events emit it. It names the anthropic-mode feature; the registry is keyed by
 # feature name, and each descriptor owns the feature's mode scope.
 COMPAT_FEATURE = "context_management"

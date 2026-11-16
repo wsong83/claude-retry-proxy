@@ -10,7 +10,7 @@
 
 <h1>Test Catalog<span class="sub">Suite layout, harness isolation, and testing patterns</span></h1>
 
-<p><strong>Last updated:</strong> 2026-11-14</p>
+<p><strong>Last updated:</strong> 2026-11-16</p>
 
 <p>The suite is a set of per-area modules merged by a single aggregator. It runs against
 <em>real</em> proxy processes and <em>real</em> mock upstream servers over loopback sockets —
@@ -53,8 +53,8 @@ run <code>python scripts/check_spawn_isolation.py</code> to see what tripped.
 <h2 id="isolation">Isolation</h2>
 
 <p>The suite's central correctness property is that it never touches real user state. This is
-achieved by setting environment variables <strong>before</strong> any server or CLI module is
-imported, because those modules read their paths at import time.</p>
+achieved by setting environment variables <strong>before</strong> any server, CLI, or
+forwarder module is imported, because those modules read their paths at import time.</p>
 
 <table>
 <tr><th>Variable</th><th>Redirected to</th></tr>
@@ -101,8 +101,8 @@ file. Hardening options (an advisory port probe, recording OS process creation t
 presented and declined.</p>
 
 <p>The ordering matters and is load-bearing: <code>settings.py</code> binds
-these paths at import and both <code>cli.py</code> and <code>server.py</code> import it,
-so setting the variables after import has no
+these paths at import and <code>cli.py</code>, <code>server.py</code>, and
+<code>forwarder.py</code> all import it, so setting the variables after import has no
 effect. <code>tests/_harness.py</code> does the assignment at module scope, before importing
 anything that reads them.</p>
 
@@ -1193,6 +1193,6 @@ counted.</p>
       that the full suite passes with a live proxy running.</li>
 </ol>
 
-<footer>Last updated: 2026-11-14</footer>
+<footer>Last updated: 2026-11-16</footer>
 </body>
 </html>
