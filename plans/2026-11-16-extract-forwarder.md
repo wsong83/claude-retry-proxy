@@ -864,8 +864,7 @@ place by round 2 — now argument-driven), `tmp/tester-round2-suite.py`), and
 - **Issues:** 13 Resolved, 0 Open, 0 deferred; accepted residuals recorded
   in-row (issue 13, gate binding-scope blind spot) and in History (iter-3 cap).
 - **Named follow-ups:** forwarder owned-state-object conversion (guide §5 —
-  swap-drain + nudge state as owned objects); the remaining clusters
-  (admin/handler, chat-SSE drain) are tracked by the /refactor-split survey.
+  swap-drain + nudge state as owned objects); ~~the remaining clusters (admin/handler, chat-SSE drain) are tracked by the /refactor-split survey~~ Resolved 2026-11-17 by plan 2026-11-17-extract-chat-sse: the chat-SSE cluster was extracted into `chat_sse.py` as `ChatSSEHandlerMixin`; only the admin/handler extraction remains.
 
 ## Plan Metadata
 

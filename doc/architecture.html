@@ -10,7 +10,7 @@
 
 <h1>Architecture<span class="sub">How a request is routed, retried, and rewritten</span></h1>
 
-<p><strong>Last updated:</strong> 2026-11-16</p>
+<p><strong>Last updated:</strong> 2026-11-17</p>
 
 <p>This page describes the path a request takes from the moment it reaches the proxy to the
 moment a response leaves it. It is the reference the other pages link back into — in
@@ -51,7 +51,9 @@ where the request should go and what it should look like when it gets there.</p>
 <code>ProxyHandler.do_POST</code> and <code>forward_request</code> in
 <code>src/claude_retry_proxy/server.py</code>, which hands the upstream call to
 <code>_forward_core</code> in <code>src/claude_retry_proxy/forwarder.py</code>
-(2026-11-16 forwarder extraction).</p>
+(2026-11-16 forwarder extraction). The chat-mode SSE conversion runs in
+<code>ChatSSEHandlerMixin</code> in <code>src/claude_retry_proxy/chat_sse.py</code>,
+which <code>ProxyHandler</code> inherits (2026-11-17 chat-SSE extraction).</p>
 
 <div class="step-box info">
 <div class="step-label">Step 1 — Extract the model</div>
@@ -85,11 +87,12 @@ This is a large enough subject to have its own page — see
 
 <div class="step-box info">
 <div class="step-label">Step 5 — Forward and retry</div>
-<p>A fresh connection is opened to the upstream per attempt, with a 300-second socket timeout,
-and the retry loop in <a href="#retry">Retry and backoff</a> takes over. (The one exception is a
-streamed read: while a config swap is in progress it arms that socket to the swap's much shorter
-silence budget — see <a href="#config-swap">Configuration snapshots and drain-and-swap</a>. With
-no swap in flight the timeout is untouched.)</p>
+<p>A fresh connection is opened to the upstream per attempt, bounded by
+<code>PROXY_READ_TIMEOUT</code> (default 120 s, applied uniformly to connect, headers, and each
+inter-byte gap), and the retry loop in <a href="#retry">Retry and backoff</a> takes over. (A
+streamed response admitted before a config swap is not woken early: there is no armed socket
+timeout, so a stream silent at the press ends at its next read boundary — see
+<a href="#config-swap">Configuration snapshots and drain-and-swap</a>.)</p>
 </div>
 
 <div class="step-box info">
@@ -663,7 +666,7 @@ That is the set Python raises for an ordinary client-side close.</p>
 <strong>An accepted residual: a non-standard write error can be mistaken for a connection
 error.</strong> A client-write <code>OSError</code> outside that tuple — <code>WSAENOBUFS</code>,
 <code>WSAENOTSOCK</code>, <code>ENOTCONN</code> and their relatives — is not caught by the
-handler's <code>_DISCONNECT_ERRORS</code> set. Raised <em>after</em> response headers have been
+<code>_DISCONNECT_ERRORS</code> tuple defined in <code>forwarder.py</code>. Raised <em>after</em> response headers have been
 sent, it propagates into the retry loop's own
 <code>except (httpx2.RequestError, httpx2.StreamError, OSError)</code> clause — the plain
 <code>OSError</code> member is retained precisely so this documented behavior is preserved across
@@ -901,6 +904,6 @@ readiness is two-phase and why the trace carries a marker of its own; see
 <a href="operations.html#readiness">operations.html#readiness</a> and
 <a href="trace-log.html#markers">trace-log.html#markers</a>.</p>
 
-<footer>Last updated: 2026-11-16</footer>
+<footer>Last updated: 2026-11-17</footer>
 </body>
 </html>

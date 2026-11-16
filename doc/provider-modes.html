@@ -10,7 +10,7 @@
 
 <h1>Provider Modes<span class="sub">anthropic, chat, and response — and what each one rewrites</span></h1>
 
-<p><strong>Last updated:</strong> 2026-10-26</p>
+<p><strong>Last updated:</strong> 2026-11-17</p>
 
 <p>The proxy speaks Anthropic Messages to its clients. What it speaks <em>upstream</em> is
 configurable per provider, because not every provider implements the Anthropic API. A
@@ -594,7 +594,7 @@ accumulates per-index state. Four bounds keep a misbehaving upstream from exhaus
 <tr><td><code>MAX_CHAT_TOOL_PENDING_BYTES</code></td><td class="num">64 KiB</td><td>buffered argument fragments per tool call</td></tr>
 <tr><td><code>MAX_JSON_NESTING_DEPTH</code></td><td class="num">500</td><td>nesting levels in any parsed payload — including the accumulated tool-argument string, whose depth no outer body scan can see</td></tr>
 <tr><td><code>MAX_CHAT_TRACKED_TOOL_INDEXES</code></td><td class="num">32</td><td>distinct tool-call indices tracked at once</td></tr>
-<tr><td><code>MAX_CHAT_OPEN_TOOL_BLOCKS</code></td><td class="num">32</td><td>Anthropic tool blocks left open simultaneously</td></tr>
+<tr><td><code>MAX_CHAT_OPEN_TOOL_BLOCKS</code></td><td class="num">32</td><td>Anthropic tool blocks opened over one stream — a per-stream total cap, not a concurrency cap (<code>tools_started</code> is never decremented)</td></tr>
 </table>
 
 <p>Overflow in any of these does not error the stream. The affected tool call degrades
@@ -766,6 +766,6 @@ transform it belongs to, and neither runs in response mode:</p>
 <a href="compatibility.html">compatibility.html</a>, as is the
 <a href="compatibility.html#reasoning-field">reasoning-field selection</a>.</p>
 
-<footer>Last updated: 2026-10-26</footer>
+<footer>Last updated: 2026-11-17</footer>
 </body>
 </html>

@@ -44,6 +44,15 @@ from .transforms_common import _sanitize_body_tools, _transform_and_guard
 from .transforms_response import _anthropic_to_response, _response_to_anthropic
 
 
+# Client-disconnect errors: raised when the client closed the connection
+# before we finished writing the response (e.g. it timed out during a long
+# retry storm). These are expected under load; we log a single line and a
+# trace event instead of letting socketserver print a traceback per request.
+# ConnectionAbortedError covers Windows WinError 10053; ConnectionResetError
+# covers WinError 10054 and POSIX ECONNRESET; BrokenPipeError covers POSIX EPIPE.
+_DISCONNECT_ERRORS = (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)
+
+
 # Thread-safe config access (read by worker threads, written by admin API)
 _config_lock = threading.RLock()
 

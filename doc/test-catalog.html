@@ -101,9 +101,9 @@ file. Hardening options (an advisory port probe, recording OS process creation t
 presented and declined.</p>
 
 <p>The ordering matters and is load-bearing: <code>settings.py</code> binds
-these paths at import and <code>cli.py</code>, <code>server.py</code>, and
-<code>forwarder.py</code> all import it, so setting the variables after import has no
-effect. <code>tests/_harness.py</code> does the assignment at module scope, before importing
+these paths at import and <code>cli.py</code>, <code>server.py</code>,
+<code>forwarder.py</code>, and <code>chat_sse.py</code> all import it, so setting the
+variables after import has no effect. <code>tests/_harness.py</code> does the assignment at module scope, before importing
 anything that reads them.</p>
 
 <p>Because <code>PROXY_STATE_FILE</code> is also what CLI subprocesses read, the harness and the
@@ -1193,6 +1193,6 @@ counted.</p>
       that the full suite passes with a live proxy running.</li>
 </ol>
 
-<footer>Last updated: 2026-11-16</footer>
+<footer>Last updated: 2026-11-17</footer>
 </body>
 </html>

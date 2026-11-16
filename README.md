@@ -41,7 +41,7 @@ pip install -e .
 ```
 
 Requires `setuptools >= 64` (for PEP 660 src-layout editable installs). Python
-3.8 or newer.
+3.10 or newer.
 
 ## Quick start
 
