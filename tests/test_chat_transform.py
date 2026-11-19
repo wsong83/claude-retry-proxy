@@ -66,7 +66,7 @@ def test_anthropic_to_chat_messages_transform():
 
 
 def test_anthropic_to_chat_messages_thinking_stripped():
-    """thinking is dropped by default (no reasoning echo); redacted_thinking non-empty data is folded into the same default."""
+    """thinking is dropped by default (no reasoning echo); redacted_thinking blocks are dropped like empty thinking."""
     print("\n--- Test: Anthropic To Chat Messages Thinking Stripped ---")
     fn = _require_server_func("_transform_anthropic_messages_to_chat")
     if fn is None:
@@ -81,25 +81,34 @@ def test_anthropic_to_chat_messages_thinking_stripped():
     out = fn(messages, request_id="T-" + uuid.uuid4().hex[:8], mode="chat", provider="p", tier="sonnet")
     expected = [{"role": "assistant", "content": "visible"}]
     if out != expected:
-        fail("default selection must emit no reasoning field (real thinking still wins over the redacted placeholder), got {!r}".format(out))
+        fail("default selection must emit no reasoning field, got {!r}".format(out))
     else:
-        pass_("default emits no reasoning field; redacted_thinking placeholder suppressed by real thinking")
+        pass_("default emits no reasoning field; redacted_thinking dropped")
 
 
 
 
-def test_anthropic_to_chat_messages_redacted_thinking_trace():
-    """redacted_thinking with non-empty data -> placeholder reasoning text + passthrough trace event.
+def test_anthropic_to_chat_messages_redacted_thinking_dropped():
+    """redacted_thinking is dropped and counted in every data shape (plan 2026-11-19).
 
-    The placeholder rides the same selection-dependent echo path as real
-    thinking, so at the default selection no field is emitted at all. Real
-    thinking text wins over the placeholder. Empty data is stripped and counted
-    in dropped.redacted_thinking, not passed through.
+    The block is unrepresentable in chat mode, so no reasoning field is ever
+    fabricated from it: a non-empty-data redacted-only turn forwards the exact
+    bare shape at the default selection, is counted in
+    content_block_dropped.redacted_thinking, and fires one
+    redacted_thinking_detected tripwire event carrying the per-block shape.
+    `data: ""` and a block with no `data` are counted the same way — that
+    behavior predates the plan and must not regress. With a selected field and
+    reasoning_always on, a demanding turn still carries "" (presence, not a
+    placeholder) and the injection event counts real=0, empty=1 with no
+    placeholder key.
     """
-    print("\n--- Test: Anthropic To Chat Messages Redacted Thinking Trace ---")
+    print("\n--- Test: Anthropic To Chat Messages Redacted Thinking Dropped ---")
     fn = _require_server_func("_transform_anthropic_messages_to_chat")
     if fn is None:
         return
+
+    # (a) Non-empty data, redacted-only turn, default selection: dropped,
+    # counted, tripwire fired, no reasoning field, no passthrough event.
     rid = "T-" + uuid.uuid4().hex[:8]
     messages = [
         {"role": "assistant", "content": [
@@ -110,59 +119,152 @@ def test_anthropic_to_chat_messages_redacted_thinking_trace():
     out = fn(messages, request_id=rid, mode="chat", provider="p", tier="sonnet")
     expected = [{"role": "assistant", "content": "visible"}]
     if out != expected:
-        fail("default selection must emit no reasoning field for a redacted placeholder, got {!r}".format(out))
+        fail("a non-empty-data redacted_thinking turn must forward the bare "
+             "shape (no reasoning field at the default selection), got "
+             "{!r}".format(out))
         return
-    evs = [e for e in _trace_events_for_request(rid) if e.get("event") == "redacted_thinking_passthrough"]
-    if len(evs) != 1:
-        fail("expected exactly ONE redacted_thinking_passthrough event, got {}: {!r}".format(len(evs), evs))
+    evs = _trace_events_for_request(rid)
+    dropped = [e for e in evs if e.get("event") == "content_block_dropped"]
+    counts = (dropped[0].get("dropped_counts") or {}) if dropped else {}
+    if counts.get("redacted_thinking") != 1:
+        fail("non-empty-data redacted_thinking must count in "
+             "dropped.redacted_thinking, got {!r}".format(counts))
         return
-    ev = evs[0]
+    stale = [e for e in evs if e.get("event") == "redacted_thinking_passthrough"]
+    if stale:
+        fail("the removed redacted_thinking_passthrough event must not fire, "
+             "got {!r}".format(stale))
+        return
+    det = [e for e in evs if e.get("event") == "redacted_thinking_detected"]
+    if len(det) != 1:
+        fail("expected exactly ONE redacted_thinking_detected tripwire event, "
+             "got {!r}".format(det))
+        return
+    ev = det[0]
     if not (ev.get("mode") == "chat" and ev.get("provider") == "p"
             and ev.get("tier") == "sonnet" and ev.get("request_id") == rid):
-        fail("redacted_thinking_passthrough missing correlation fields, got {!r}".format(ev))
+        fail("redacted_thinking_detected missing correlation fields, got "
+             "{!r}".format(ev))
         return
-    if ev.get("data_length") != 3:
-        fail("redacted_thinking_passthrough data_length should be len('enc')=3, got {!r}".format(ev.get("data_length")))
+    if (ev.get("reasoning_selection") != "none"
+            or ev.get("reasoning_always") is not False
+            or ev.get("conversation_has_tool_calls") is not False):
+        fail("redacted_thinking_detected must carry the policy facts "
+             "(selection 'none', always False, no conversation tool calls), "
+             "got {!r}".format(ev))
         return
-    # Real thinking text wins over the redacted placeholder.
+    blocks = ev.get("blocks")
+    if blocks != [{"data_length": 3, "turn_has_thinking": False,
+                   "turn_tool_use_seen": False}]:
+        fail("redacted_thinking_detected blocks must carry one per-block "
+             "record with data_length/turn_has_thinking/turn_tool_use_seen, "
+             "got {!r}".format(blocks))
+        return
+
+    # (b) Empty/missing data: both count (behavior untouched by this plan),
+    # and both are recorded by the one per-request tripwire event.
     rid2 = "T-" + uuid.uuid4().hex[:8]
     messages2 = [
-        {"role": "assistant", "content": [
-            {"type": "thinking", "thinking": "real", "signature": "s"},
-            {"type": "redacted_thinking", "data": "enc", "signature": "s2"},
-        ]},
-    ]
-    out2 = fn(messages2, request_id=rid2, mode="chat", provider="p", tier="sonnet")
-    if out2 != [{"role": "assistant", "content": ""}]:
-        fail("real thinking should win over redacted placeholder, got {!r}".format(out2))
-        return
-    evs2 = [e for e in _trace_events_for_request(rid2) if e.get("event") == "redacted_thinking_passthrough"]
-    if evs2:
-        fail("real thinking present should suppress redacted_thinking_passthrough event, got {!r}".format(evs2))
-        return
-    # Empty/missing data is stripped and counted in dropped, not passed through.
-    rid3 = "T-" + uuid.uuid4().hex[:8]
-    messages3 = [
         {"role": "assistant", "content": [
             {"type": "redacted_thinking", "data": "", "signature": "s2"},
             {"type": "redacted_thinking", "signature": "s3"},
             {"type": "text", "text": "x"},
         ]},
     ]
-    out3 = fn(messages3, request_id=rid3, mode="chat", provider="p", tier="sonnet")
-    if out3 != [{"role": "assistant", "content": "x"}]:
-        fail("empty-data redacted_thinking should be stripped, got {!r}".format(out3))
+    out2 = fn(messages2, request_id=rid2, mode="chat", provider="p", tier="sonnet")
+    if out2 != [{"role": "assistant", "content": "x"}]:
+        fail("empty/missing-data redacted_thinking must be dropped, got "
+             "{!r}".format(out2))
         return
-    evs3 = [e for e in _trace_events_for_request(rid3) if e.get("event") == "redacted_thinking_passthrough"]
-    if evs3:
-        fail("empty-data redacted_thinking must not log passthrough event, got {!r}".format(evs3))
+    dropped2 = [e for e in _trace_events_for_request(rid2)
+                if e.get("event") == "content_block_dropped"]
+    counts2 = (dropped2[0].get("dropped_counts") or {}) if dropped2 else {}
+    if counts2.get("redacted_thinking") != 2:
+        fail("empty/missing-data redacted_thinking must count in "
+             "dropped.redacted_thinking, got {!r}".format(counts2))
         return
-    dropped3 = [e for e in _trace_events_for_request(rid3) if e.get("event") == "content_block_dropped"]
+    det2 = [e for e in _trace_events_for_request(rid2)
+            if e.get("event") == "redacted_thinking_detected"]
+    if (len(det2) != 1 or not isinstance(det2[0].get("blocks"), list)
+            or len(det2[0]["blocks"]) != 2):
+        fail("two redacted blocks in one request must yield ONE tripwire event "
+             "with two block records, got {!r}".format(det2))
+        return
+    if [b.get("data_length") for b in det2[0]["blocks"]] != [0, None]:
+        fail("tripwire data_length must be 0 for empty data and null for "
+             "missing data, got {!r}".format(det2[0]["blocks"]))
+        return
+
+    # (c) Selection + reasoning_always + a tool call: the field carries "",
+    # counted empty=1, real=0 — and no placeholder key survives.
+    rid3 = "T-" + uuid.uuid4().hex[:8]
+    messages3 = [
+        {"role": "assistant", "content": [
+            {"type": "redacted_thinking", "data": "enc", "signature": "s1"},
+            {"type": "tool_use", "id": "t3", "name": "f", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t3", "content": "ok"},
+        ]},
+    ]
+    out3 = fn(messages3, request_id=rid3, mode="chat", provider="p",
+              tier="sonnet", reasoning_selection="reasoning_content",
+              reasoning_always=True)
+    assistants3 = [m for m in out3 if m.get("role") == "assistant"]
+    if [m.get("reasoning_content") for m in assistants3] != [""]:
+        fail("an always-on demanding turn whose only reasoning is redacted "
+             "must carry \"\" (presence, not a placeholder), got "
+             "{!r}".format(assistants3))
+        return
+    evs3 = _trace_events_for_request(rid3)
+    injected = [e for e in evs3 if e.get("event") == "reasoning_field_injected"]
+    if len(injected) != 1 or (injected[0].get("real"),
+                              injected[0].get("empty")) != (0, 1):
+        fail("injection must count real=0 empty=1, got {!r}".format(injected))
+        return
+    if "placeholder" in injected[0]:
+        fail("reasoning_field_injected must not carry the removed placeholder "
+             "key, got {!r}".format(injected[0]))
+        return
+    dropped3 = [e for e in evs3 if e.get("event") == "content_block_dropped"]
     counts3 = (dropped3[0].get("dropped_counts") or {}) if dropped3 else {}
-    if counts3.get("redacted_thinking") != 2:
-        fail("empty-data redacted_thinking should count in dropped.redacted_thinking, got {!r}".format(counts3))
+    if counts3.get("redacted_thinking") != 1:
+        fail("the dropped block must still be counted on an always-on turn, "
+             "got {!r}".format(counts3))
         return
-    pass_("redacted_thinking non-empty -> placeholder + passthrough trace; empty -> stripped")
+    det3 = [e for e in evs3 if e.get("event") == "redacted_thinking_detected"]
+    if len(det3) != 1:
+        fail("expected exactly ONE redacted_thinking_detected event, got "
+             "{!r}".format(det3))
+        return
+    if (det3[0].get("reasoning_always") is not True
+            or det3[0].get("conversation_has_tool_calls") is not True
+            or det3[0].get("blocks") != [{"data_length": 3,
+                                          "turn_has_thinking": False,
+                                          "turn_tool_use_seen": True}]):
+        fail("tripwire must record the always-flag, the conversation tool-call "
+             "presence, and the turn's tool_use shape, got {!r}".format(det3[0]))
+        return
+
+    # (d) A request with no redacted block emits no tripwire event.
+    rid4 = "T-" + uuid.uuid4().hex[:8]
+    fn([{"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "t", "signature": "s"},
+        {"type": "tool_use", "id": "t4", "name": "f", "input": {}},
+    ]}, {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t4", "content": "ok"},
+    ]}], request_id=rid4, mode="chat", provider="p", tier="sonnet",
+        reasoning_selection="reasoning_content", reasoning_always=True)
+    det4 = [e for e in _trace_events_for_request(rid4)
+            if e.get("event") == "redacted_thinking_detected"]
+    if det4:
+        fail("a request with no redacted block must not fire the tripwire, "
+             "got {!r}".format(det4))
+        return
+
+    pass_("redacted_thinking is dropped and counted in every data shape; one "
+          "tripwire event per request carries per-block turn facts; an "
+          "always-on demanding turn still carries \"\"")
 
 
 
@@ -444,19 +546,19 @@ def test_chat_transform_emits_only_selected_field():
 
 
 def test_anthropic_to_chat_injection_trace_counts():
-    """reasoning_field_injected separates real / empty / placeholder counts.
+    """reasoning_field_injected separates real from empty fills.
 
-    Three demanding turns — real reasoning, a redacted-thinking placeholder,
-    and a bare one — yield real=1, empty=1, placeholder=1, and the event fires
-    because the blank/placeholder fill is non-zero. A conversation whose every
-    assistant turn carries real reasoning fills nothing, so it emits no event
-    and its trace cannot be mistaken for a masked-loss alarm.
+    Three demanding turns — real reasoning, a redacted-thinking-only turn (its
+    block dropped, so the turn behaves as bare), and a bare one — yield
+    real=1, empty=2, and the event fires because the empty fill is non-zero.
+    The event carries no placeholder key. A conversation whose every assistant
+    turn carries real reasoning fills nothing, so it emits no event and its
+    trace cannot be mistaken for a masked-loss alarm.
     """
     print("\n--- Test: Anthropic To Chat Injection Trace Counts ---")
     fn = _require_server_func("_transform_anthropic_messages_to_chat")
     if fn is None:
         return
-    placeholder_text = "[redacted_thinking: data not available]"
     messages = [
         {"role": "assistant", "content": [
             {"type": "thinking", "thinking": "real one", "signature": "s"},
@@ -485,9 +587,10 @@ def test_anthropic_to_chat_injection_trace_counts():
              reasoning_always=True)
     assistants = [m for m in out if m.get("role") == "assistant"]
     sent = [m.get("reasoning_content") for m in assistants]
-    if sent != ["real one", placeholder_text, ""]:
-        fail("injection must fill real text, the redacted placeholder, then "
-             "\"\", got {!r}".format(sent))
+    if sent != ["real one", "", ""]:
+        fail("injection must fill real text, then \"\" for the redacted-only "
+             "turn (its block is dropped) and the bare turn, got "
+             "{!r}".format(sent))
         return
     evs = [e for e in _trace_events_for_request(rid)
            if e.get("event") == "reasoning_field_injected"]
@@ -496,10 +599,14 @@ def test_anthropic_to_chat_injection_trace_counts():
              .format(evs))
         return
     ev = evs[0]
-    if (ev.get("real"), ev.get("empty"), ev.get("placeholder")) != (1, 1, 1):
-        fail("reasoning_field_injected counters must be real=1 empty=1 "
-             "placeholder=1 (a redacted placeholder is never real), got {!r}"
-             .format(ev))
+    if (ev.get("real"), ev.get("empty")) != (1, 2):
+        fail("reasoning_field_injected counters must be real=1 empty=2 (the "
+             "redacted-only turn is a bare empty fill, never a placeholder), "
+             "got {!r}".format(ev))
+        return
+    if "placeholder" in ev:
+        fail("reasoning_field_injected must not carry the removed placeholder "
+             "key, got {!r}".format(ev))
         return
     if not (ev.get("mode") == "chat" and ev.get("provider") == "p"
             and ev.get("tier") == "sonnet" and ev.get("request_id") == rid):
@@ -536,29 +643,29 @@ def test_anthropic_to_chat_injection_trace_counts():
         fail("an all-real injection fills nothing and must not emit the "
              "event, got {!r}".format(evs2))
         return
-    pass_("injection event counts real/empty/placeholder and fires only when "
-          "empty + placeholder > 0")
+    pass_("injection event counts real/empty and fires only when empty > 0")
 
 
-def test_anthropic_to_chat_real_thinking_supersedes_placeholder():
-    """A real `thinking` block supersedes an earlier redacted placeholder on the
-    same turn, so the placeholder flag always describes the value actually kept.
+def test_anthropic_to_chat_real_thinking_and_redacted_dropped():
+    """A real `thinking` block still wins on a turn that also carries a
+    redacted_thinking block, which is dropped (plan 2026-11-19).
 
     A `[redacted_thinking, thinking, tool_use]` turn forwards the REAL text and
-    fires no `reasoning_field_injected` event: nothing blank was filled. When a
-    bare turn is present the event does fire, and the superseded turn is counted
-    `real=1, placeholder=0` — a real-text turn is never miscounted as a
-    placeholder.
+    fires no `reasoning_field_injected` event: nothing blank was filled. The
+    drop is still recorded: `content_block_dropped` counts the block, and the
+    tripwire's turn-scoped facts are order-independent —
+    `turn_has_thinking` is true because the real text wins wherever the
+    redacted block sits in the turn. When a bare turn is present the event does
+    fire, and the real-text turn is counted `real=1`.
 
-    Guard: a redacted-ONLY turn still forwards the placeholder and is counted
-    `placeholder=1, real=0`. A fix that merely dropped the placeholder (the
-    separately-deferred removal) could not pass both halves.
+    Guard: a redacted-only demanding turn forwards `""` (the always-present
+    fill), is counted `empty=1` with no placeholder key, and fires
+    `content_block_dropped` with `dropped_counts.redacted_thinking == 1`.
     """
-    print("\n--- Test: Anthropic To Chat Real Thinking Supersedes Placeholder ---")
+    print("\n--- Test: Anthropic To Chat Real Thinking And Redacted Dropped ---")
     fn = _require_server_func("_transform_anthropic_messages_to_chat")
     if fn is None:
         return
-    placeholder_text = "[redacted_thinking: data not available]"
 
     def superseded_turn(call_id):
         return {"role": "assistant", "content": [
@@ -578,15 +685,18 @@ def test_anthropic_to_chat_real_thinking_supersedes_placeholder():
         ]}
 
     # (a) Superseded turn alone: real text forwarded, nothing blank filled, so
-    # no injection event fires.
+    # no injection event fires. The redacted block is still dropped and
+    # counted, and the tripwire's turn facts are order-independent: the real
+    # text makes turn_has_thinking true even though the redacted block came
+    # FIRST in the turn.
     rid = "T-" + uuid.uuid4().hex[:8]
     out = fn([superseded_turn("t1"), tool_result("t1")], request_id=rid,
              mode="chat", provider="p", tier="sonnet",
              reasoning_selection="reasoning_content", reasoning_always=True)
     assistants = [m for m in out if m.get("role") == "assistant"]
     if [m.get("reasoning_content") for m in assistants] != ["REAL TEXT"]:
-        fail("a real thinking block must supersede the redacted placeholder, "
-             "got {!r}".format(assistants))
+        fail("the real thinking text must be forwarded on a turn that also "
+             "carried a redacted block, got {!r}".format(assistants))
         return
     evs = [e for e in _trace_events_for_request(rid)
            if e.get("event") == "reasoning_field_injected"]
@@ -594,9 +704,29 @@ def test_anthropic_to_chat_real_thinking_supersedes_placeholder():
         fail("nothing blank was filled, so no injection event may fire, got "
              "{!r}".format(evs))
         return
+    dropped = [e for e in _trace_events_for_request(rid)
+               if e.get("event") == "content_block_dropped"]
+    counts = (dropped[0].get("dropped_counts") or {}) if dropped else {}
+    if counts.get("redacted_thinking") != 1:
+        fail("the dropped redacted block must be counted even when real "
+             "thinking supersedes it, got {!r}".format(counts))
+        return
+    det = [e for e in _trace_events_for_request(rid)
+           if e.get("event") == "redacted_thinking_detected"]
+    if len(det) != 1:
+        fail("expected exactly ONE redacted_thinking_detected event, got "
+             "{!r}".format(det))
+        return
+    if det[0].get("blocks") != [{"data_length": 3,
+                                 "turn_has_thinking": True,
+                                 "turn_tool_use_seen": True}]:
+        fail("the tripwire must record turn_has_thinking true for a "
+             "[redacted_thinking, thinking, tool_use] turn — block order is "
+             "irrelevant, got {!r}".format(det[0].get("blocks")))
+        return
 
-    # (b) Superseded turn plus a bare turn: the event fires and counts the
-    # superseded turn as REAL, never as a placeholder.
+    # (b) Superseded turn plus a bare turn: the event fires with real=1,
+    # empty=1 and no placeholder key.
     rid2 = "T-" + uuid.uuid4().hex[:8]
     out2 = fn([superseded_turn("t1"), tool_result("t1"),
                bare_turn("t2"), tool_result("t2")], request_id=rid2,
@@ -613,14 +743,18 @@ def test_anthropic_to_chat_real_thinking_supersedes_placeholder():
         fail("expected exactly ONE reasoning_field_injected event, got {!r}"
              .format(evs2))
         return
-    if (evs2[0].get("real"), evs2[0].get("empty"),
-            evs2[0].get("placeholder")) != (1, 1, 0):
-        fail("a superseded turn is counted real=1, placeholder=0, got {!r}"
+    if (evs2[0].get("real"), evs2[0].get("empty")) != (1, 1):
+        fail("a superseded turn is counted real=1, empty=1, got {!r}"
              .format(evs2[0]))
         return
+    if "placeholder" in evs2[0]:
+        fail("reasoning_field_injected must not carry the removed placeholder "
+             "key, got {!r}".format(evs2[0]))
+        return
 
-    # (c) Guard: a redacted-only turn still forwards the placeholder and is
-    # counted as a placeholder, never as real.
+    # (c) Drop guard: a redacted-only demanding turn forwards "" (the
+    # always-present fill), is counted empty, and its block is dropped and
+    # counted — never a placeholder.
     rid3 = "T-" + uuid.uuid4().hex[:8]
     redacted_only = {"role": "assistant", "content": [
         {"type": "redacted_thinking", "data": "enc", "signature": "s1"},
@@ -630,20 +764,103 @@ def test_anthropic_to_chat_real_thinking_supersedes_placeholder():
               mode="chat", provider="p", tier="sonnet",
               reasoning_selection="reasoning_content", reasoning_always=True)
     assistants3 = [m for m in out3 if m.get("role") == "assistant"]
-    if [m.get("reasoning_content") for m in assistants3] != [placeholder_text]:
-        fail("a redacted-only turn must still forward the placeholder, got "
-             "{!r}".format(assistants3))
+    if [m.get("reasoning_content") for m in assistants3] != [""]:
+        fail("a redacted-only demanding turn must forward \"\" (presence), "
+             "got {!r}".format(assistants3))
         return
     evs3 = [e for e in _trace_events_for_request(rid3)
             if e.get("event") == "reasoning_field_injected"]
-    if len(evs3) != 1 or (evs3[0].get("placeholder"),
-                          evs3[0].get("real")) != (1, 0):
-        fail("a redacted-only turn is counted placeholder=1, real=0, got {!r}"
+    if len(evs3) != 1 or (evs3[0].get("real"),
+                          evs3[0].get("empty")) != (0, 1):
+        fail("a redacted-only turn is counted real=0, empty=1, got {!r}"
              .format(evs3))
         return
-    pass_("real thinking supersedes the redacted placeholder (real=1, "
-          "placeholder=0, no event when nothing blank was filled); a "
-          "redacted-only turn still counts as a placeholder")
+    if "placeholder" in evs3[0]:
+        fail("reasoning_field_injected must not carry the removed placeholder "
+             "key, got {!r}".format(evs3[0]))
+        return
+    dropped3 = [e for e in _trace_events_for_request(rid3)
+                if e.get("event") == "content_block_dropped"]
+    counts3 = (dropped3[0].get("dropped_counts") or {}) if dropped3 else {}
+    if counts3.get("redacted_thinking") != 1:
+        fail("a redacted-only demanding turn must count its dropped block, "
+             "got {!r}".format(counts3))
+        return
+    pass_("real thinking wins on a mixed turn (order-independent tripwire "
+          "facts, real=1); a redacted-only turn forwards \"\", counted "
+          "empty=1 with the block dropped and counted")
+
+
+def test_anthropic_to_chat_redacted_selection_without_always():
+    """Selection active, reasoning_always off: a redacted-only demanding turn
+    forwards NO reasoning field at attempt 1 (accepted presence delta, plan
+    2026-11-19).
+
+    This is the unflagged-pair state (a learned selection on a (provider,
+    model) pair with no reasoning_roundtrip flag): the block is unrepresentable
+    and nothing fills the field, so the forwarded message is bare while the
+    drop and the tripwire are still recorded. The reasoning_field rescue is the
+    backstop at request time; this pin holds the transform-level behavior that
+    makes the rescue necessary, and fails if an always-fill is reintroduced
+    outside the reasoning_always policy.
+    """
+    print("\n--- Test: Anthropic To Chat Redacted Selection Without Always ---")
+    fn = _require_server_func("_transform_anthropic_messages_to_chat")
+    if fn is None:
+        return
+    rid = "T-" + uuid.uuid4().hex[:8]
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "redacted_thinking", "data": "enc", "signature": "s1"},
+            {"type": "tool_use", "id": "t1", "name": "f", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+        ]},
+    ]
+    out = fn(messages, request_id=rid, mode="chat", provider="p",
+             tier="sonnet", reasoning_selection="reasoning_content")
+    assistants = [m for m in out if m.get("role") == "assistant"]
+    if len(assistants) != 1:
+        fail("expected one assistant message, got {!r}".format(assistants))
+        return
+    m = assistants[0]
+    if "reasoning_content" in m or "reasoning" in m:
+        fail("with a selection but no always-flag, the redacted-only turn must "
+             "forward no reasoning field, got {!r}".format(m))
+        return
+    evs = _trace_events_for_request(rid)
+    dropped = [e for e in evs if e.get("event") == "content_block_dropped"]
+    counts = (dropped[0].get("dropped_counts") or {}) if dropped else {}
+    if counts.get("redacted_thinking") != 1:
+        fail("the dropped block must be counted, got {!r}".format(counts))
+        return
+    det = [e for e in evs if e.get("event") == "redacted_thinking_detected"]
+    if len(det) != 1:
+        fail("expected exactly ONE redacted_thinking_detected event, got "
+             "{!r}".format(det))
+        return
+    if (det[0].get("reasoning_selection") != "reasoning_content"
+            or det[0].get("reasoning_always") is not False
+            or det[0].get("conversation_has_tool_calls") is not True):
+        fail("the tripwire must capture the learned selection, the absent "
+             "always-flag, and the conversation's tool calls, got "
+             "{!r}".format(det[0]))
+        return
+    if det[0].get("blocks") != [{"data_length": 3,
+                                 "turn_has_thinking": False,
+                                 "turn_tool_use_seen": True}]:
+        fail("the tripwire must record the turn's tool_use shape, got "
+             "{!r}".format(det[0].get("blocks")))
+        return
+    injected = [e for e in evs if e.get("event") == "reasoning_field_injected"]
+    if injected:
+        fail("no always-pass ran, so no reasoning_field_injected event may "
+             "fire, got {!r}".format(injected))
+        return
+    pass_("selection without reasoning_always forwards no field on a "
+          "redacted-only demanding turn; the drop and tripwire still fire, "
+          "and no injection event does")
 
 
 def test_anthropic_to_chat_messages_string_content_passthrough():
@@ -2545,7 +2762,7 @@ def test_chat_to_anthropic_image_parts_filtered():
 ALL_TESTS = [
     ("anthropic-to-chat-messages-transform", test_anthropic_to_chat_messages_transform),
     ("anthropic-to-chat-messages-thinking-stripped", test_anthropic_to_chat_messages_thinking_stripped),
-    ("anthropic-to-chat-messages-redacted-thinking-trace", test_anthropic_to_chat_messages_redacted_thinking_trace),
+    ("anthropic-to-chat-messages-redacted-thinking-dropped", test_anthropic_to_chat_messages_redacted_thinking_dropped),
     ("anthropic-to-chat-messages-tool-use-to-tool-calls", test_anthropic_to_chat_messages_tool_use_to_tool_calls),
     ("anthropic-to-chat-messages-tool-result-to-role-tool", test_anthropic_to_chat_messages_tool_result_to_role_tool),
     ("anthropic-to-chat-messages-mixed-text-and-tool-use", test_anthropic_to_chat_messages_mixed_text_and_tool_use),
@@ -2553,7 +2770,8 @@ ALL_TESTS = [
     ("anthropic-to-chat-messages-interleaved-thinking-tool-use", test_anthropic_to_chat_messages_interleaved_thinking_tool_use),
     ("chat-transform-emits-only-selected-field", test_chat_transform_emits_only_selected_field),
     ("anthropic-to-chat-injection-trace-counts", test_anthropic_to_chat_injection_trace_counts),
-    ("anthropic-to-chat-real-thinking-supersedes-placeholder", test_anthropic_to_chat_real_thinking_supersedes_placeholder),
+    ("anthropic-to-chat-real-thinking-and-redacted-dropped", test_anthropic_to_chat_real_thinking_and_redacted_dropped),
+    ("anthropic-to-chat-redacted-selection-without-always", test_anthropic_to_chat_redacted_selection_without_always),
     ("anthropic-to-chat-messages-string-content-passthrough", test_anthropic_to_chat_messages_string_content_passthrough),
     ("anthropic-to-chat-messages-cache-control-stripped", test_anthropic_to_chat_messages_cache_control_stripped),
     ("anthropic-to-chat-messages-non-list-guarded", test_anthropic_to_chat_messages_non_list_guarded),

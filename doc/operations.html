@@ -97,7 +97,11 @@ semantics. On POSIX both use <code>SO_REUSEADDR</code>, which tolerates a port l
 <code>TIME_WAIT</code> while still refusing a second <code>LISTEN</code>. On Windows both use a
 plain bind, because Windows' <code>SO_REUSEADDR</code> would otherwise permit binding a port that
 already has a live listener — the duplicate bind is accepted and the readiness probe cannot tell
-whose socket answered. A plain bind on Windows still tolerates <code>TIME_WAIT</code>.</p>
+whose socket answered. A plain bind on Windows still tolerates <code>TIME_WAIT</code>. The
+listener's accept backlog is <code>request_queue_size = 128</code> (burst tolerance): a connection
+the kernel drops under extreme overload never reaches the handler, so it leaves no trace entry —
+the drops are measurable on demand via <code>nstat -az | grep -E "ListenDrops|ListenOverflows"</code>
+deltas taken around a burst.</p>
 
 <div class="note">
 The line-by-line stdout reader replaced an earlier <code>select.select()</code> based approach

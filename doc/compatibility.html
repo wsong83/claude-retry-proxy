@@ -283,6 +283,17 @@ body whose demanding turn carries no reasoning is gate-<em>false</em>: a complai
 missing-field complaint, which says nothing about the field <em>name</em>, so it must not steer
 the selection — that evidence is unlearnable and would only pollute the credit.</p>
 
+<p>One post-2026-11-19 divergence is accepted: the chat transform now drops
+<code>redacted_thinking</code> blocks outright (<a
+href="provider-modes.html#redacted-standing-note">standing design note</a>), so a demanding turn
+whose only reasoning is such a block stays gate-<em>true</em> while the forwarded body carries no
+reasoning field unless the always-present policy fills <code>""</code>. A matched complaint from
+that shape still runs the usual credit decrement, and the rescue — which forces the always-present
+fill — repairs it; the credit <em>machinery</em> is unchanged, but what is new is that such a
+complaint can occur at all on a pair flagged only with a learned selection — one extra rescue round
+trip and one decrement per redacted-only demanding turn. The <code>redacted_thinking_detected</code>
+event is the tripwire that makes the episode observable.</p>
+
 <p>Four further details are load-bearing:</p>
 
 <ul>

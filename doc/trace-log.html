@@ -150,8 +150,8 @@ are the complete set the proxy can write.</p>
     <code>PROXY_MAX_RESPONSE_SIZE</code></td></tr>
 <tr><td><code>transform_failure</code></td><td>a body transform raised; the original body was used instead</td></tr>
 <tr><td><code>cache_control_stripped</code></td><td><code>cache_control</code> was removed while converting to chat format</td></tr>
-<tr><td><code>redacted_thinking_passthrough</code></td><td>a <code>redacted_thinking</code> block became a placeholder</td></tr>
-<tr><td><code>reasoning_field_injected</code></td><td>the always-present policy filled a blank reasoning field on one or more assistant messages. Fires only when at least one blank or placeholder was filled, and carries <code>real</code>, <code>empty</code> and <code>placeholder</code> counts — a filled placeholder is never counted as <code>real</code>. Metadata only, and it is the evidence that the policy acted on a request whose body would otherwise have omitted the field</td></tr>
+<tr><td><code>redacted_thinking_detected</code></td><td>a forward pass dropped one or more <code>redacted_thinking</code> blocks (chat mode). Unthrottled — one event per pass that dropped any; a rescue pass re-emits it, so a rescued client request can carry up to three (the feature's rescue budget; see the per-pass note below). Carries the learned <code>reasoning_selection</code>, the <code>reasoning_always</code> flag, <code>conversation_has_tool_calls</code>, and a <code>blocks</code> list with each dropped block's turn-scoped shape (<code>data_length</code>, <code>turn_has_thinking</code>, <code>turn_tool_use_seen</code>). Metadata only, and the tripwire behind the standing design note in <a href="provider-modes.html#redacted-standing-note">provider-modes.html</a>: when it fires, design the presence patch from the captured episode</td></tr>
+<tr><td><code>reasoning_field_injected</code></td><td>the always-present policy filled a blank reasoning field on one or more assistant messages. Fires only when at least one blank was filled, and carries <code>real</code> and <code>empty</code> counts. Metadata only, and it is the evidence that the policy acted on a request whose body would otherwise have omitted the field</td></tr>
 <tr><td><code>content_block_dropped</code></td><td>an unrepresentable content block was removed</td></tr>
 <tr><td><code>tool_args_parse_failure</code></td><td>tool arguments could not be parsed or serialised</td></tr>
 <tr><td><code>nesting_limit_exceeded</code></td>
@@ -314,7 +314,7 @@ Behaviour, the store's bounds, and the kill switch:
 <code>reasoning_field</code> answers a complaint with the rescue, each pass is a nested pass
 through the forward path, so <code>mode_dispatch</code>, one <code>reasoning_rescue</code> event
 and the chat transform's events above (<code>cache_control_stripped</code>,
-<code>redacted_thinking_passthrough</code>, <code>reasoning_field_injected</code> — when it
+<code>redacted_thinking_detected</code>, <code>reasoning_field_injected</code> — when it
 filled anything, <code>tool_args_parse_failure</code>,
 <code>content_block_dropped</code>) fire once per pass — up to three images for a single client
 request. The multiplicity is bounded by the feature's rescue budget (two passes), and it occurs

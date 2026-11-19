@@ -1469,6 +1469,17 @@ class _ProxyHTTPServer(http.server.ThreadingHTTPServer):
     reuse flag.
     """
     allow_reuse_address = sys.platform != "win32"
+    # socketserver's default accept backlog is 5; a burst of
+    # simultaneous connections (parallel tool fan-outs, test
+    # concurrency) overflows it and the kernel drops SYNs — measured
+    # 2026-11-19 via TcpExtListenDrops/ListenOverflows deltas (+71)
+    # during six 20-request bursts (evidence: plan
+    # 2026-11-19-drop-redacted-thinking-chat-placeholder, issue
+    # ingress-listen-backlog). A dropped connection never reaches the
+    # handler: the client sees a ~1 s SYN-retransmit stall or a
+    # ConnectionResetError, and leaves no trace entry. 128 gives
+    # realistic fan-outs 25x headroom; somaxconn clamps beyond that.
+    request_queue_size = 128
 
 
 def main():

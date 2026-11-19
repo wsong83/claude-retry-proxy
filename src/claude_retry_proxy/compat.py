@@ -660,8 +660,9 @@ def _compat_rejection_match(status, resp_body):
 
 def _reasoning_present(body_json):
     """True when the LAST assistant message carrying a ``tool_use`` block also
-    carries reasoning worth echoing (a non-empty ``thinking`` block, or a
-    ``redacted_thinking`` with non-empty ``data``).
+    carries reasoning material whose absence a demanding provider may reject
+    (a non-empty ``thinking`` block, or a ``redacted_thinking`` with non-empty
+    ``data``).
 
     The gate is demanding-turn scoped on purpose: a complaint about a turn
     that performs a tool call but carries no reasoning of its own is a

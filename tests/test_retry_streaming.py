@@ -3524,6 +3524,34 @@ def test_429_drain_bounded():
         cleanup()
 
 
+def test_proxy_listen_backlog():
+    """_ProxyHTTPServer pins the accept backlog at 128 (plan 2026-11-19).
+
+    socketserver's default request_queue_size is 5; a burst of simultaneous
+    connections (parallel tool fan-outs, test concurrency) overflows the
+    kernel accept queue and the kernel drops SYNs, so a dropped connection
+    never reaches the handler — no trace entry, and the client sees a ~1 s
+    SYN-retransmit stall or a ConnectionResetError. The issue
+    ingress-listen-backlog measured +71 TcpExtListenDrops/ListenOverflows
+    across six 20-request bursts on the default. This pin keeps a refactor
+    from silently reverting the class attribute; measure drops on demand with
+    `nstat -az | grep -E "ListenDrops|ListenOverflows"` deltas around a burst.
+    """
+    print("\n--- Test: Proxy Listen Backlog ---")
+    try:
+        from claude_retry_proxy.server import _ProxyHTTPServer
+    except Exception as e:
+        fail("cannot import _ProxyHTTPServer: {}".format(e))
+        return
+    got = getattr(_ProxyHTTPServer, "request_queue_size", None)
+    if got != 128:
+        fail("_ProxyHTTPServer.request_queue_size must be 128 (burst "
+             "tolerance; socketserver's default 5 drops SYNs under "
+             "simultaneous fan-outs), got {!r}".format(got))
+        return
+    pass_("_ProxyHTTPServer.request_queue_size is 128")
+
+
 ALL_TESTS = [
     ("concurrent-requests", test_concurrent_requests),
     ("retry-logic", test_retry_logic),
@@ -3559,6 +3587,8 @@ ALL_TESTS = [
     # Step 8 review-Warning fixes (same plan, revision 6)
     ("ipv6-provider-url-routes", test_ipv6_provider_url_routes),
     ("429-drain-bounded", test_429_drain_bounded),
+    # Listener accept backlog (plan 2026-11-19-drop-redacted-thinking-chat-placeholder)
+    ("proxy-listen-backlog", test_proxy_listen_backlog),
 ]
 
 

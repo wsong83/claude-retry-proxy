@@ -107,9 +107,9 @@ Always returns a new list (never mutates the input). One Anthropic
     field at all — never both. `reasoning_always` additionally sets the
     selected field on EVERY assistant message once the transformed list
     contains a tool call: the real reasoning text where one exists, "" where
-    none does (a redacted-thinking placeholder counts as a placeholder, never
-    as real). redacted_thinking blocks with non-empty data are converted to a
-    placeholder; a valid `image` block becomes an OpenAI `image_url` part --
+    none does. redacted_thinking blocks are dropped and counted
+    (content_block_dropped) — the block is unrepresentable in chat mode;
+    a valid `image` block becomes an OpenAI `image_url` part --
     top-level blocks and those nested inside `tool_result` content alike, the
     latter riding the following user message because OpenAI `role:tool`
     messages cannot carry images; an inconvertible image is counted as dropped
@@ -124,14 +124,14 @@ Always returns a new list (never mutates the input). One Anthropic
         return []
     dropped = {"thinking": 0, "redacted_thinking": 0, "image": 0,
                "tool_result": 0, "unknown": 0}
-    passthrough = {"redacted_thinking": 0}
+    redacted_turns = []
     cache_stripped = False
     tool_use_ids = set()
     out = []
     # Per-assistant-message reasoning material, keyed by message identity:
-    # {id(message): (text or None, is_redacted_placeholder)}. The always-present
-    # pass below runs over the built list and needs this to tell a real block
-    # from the redacted placeholder and from a message with none at all.
+    # {id(message): text-or-None}. The always-present pass below runs over the
+    # built list and needs this to tell a real block from a message with none
+    # at all.
     reasoning_by_msg = {}
     for msg in messages:
         if not isinstance(msg, dict):
@@ -150,7 +150,6 @@ Always returns a new list (never mutates the input). One Anthropic
             text_parts = []
             tool_calls = []
             reasoning_text = None
-            reasoning_is_placeholder = False
             for block in content:
                 if not isinstance(block, dict):
                     dropped["unknown"] += 1
@@ -162,29 +161,28 @@ Always returns a new list (never mutates the input). One Anthropic
                     thinking = block.get("thinking")
                     if isinstance(thinking, str) and thinking:
                         reasoning_text = thinking
-                        # Real text supersedes an earlier redacted placeholder,
-                        # so the flag must describe the value actually kept.
-                        reasoning_is_placeholder = False
                     else:
                         dropped["thinking"] += 1
                     continue
                 if btype == "redacted_thinking":
                     data = block.get("data")
-                    if isinstance(data, str) and data and reasoning_text is None:
-                        reasoning_text = "[redacted_thinking: data not available]"
-                        reasoning_is_placeholder = True
-                        passthrough["redacted_thinking"] += 1
-                        log_trace({
-                            "timestamp": _request_transform_timestamp(),
-                            "event": "redacted_thinking_passthrough",
-                            "request_id": request_id,
-                            "mode": mode,
-                            "provider": provider,
-                            "tier": tier,
-                            "data_length": len(data) if isinstance(data, str) else -1,
-                        })
-                    else:
-                        dropped["redacted_thinking"] += 1
+                    # Unrepresentable in chat mode (the payload is opaque
+                    # encrypted material): dropped and counted, matching
+                    # transforms_response.py. Presence for a demanding
+                    # turn is preserved by the always-present pass ("")
+                    # when the policy is active (reasoning_always, a
+                    # rescue pass, or a reasoning_roundtrip pair); with
+                    # only a learned selection this turn forwards no
+                    # field, and the reasoning_field rescue repairs the
+                    # complaint if the provider demands presence. Each
+                    # dropped block is recorded — turn OUTPUT index and
+                    # payload length only — for the per-request
+                    # redacted_thinking_detected tripwire, whose
+                    # turn-scoped facts are computed after the loop (see
+                    # the standing design note in doc/provider-modes.html).
+                    dropped["redacted_thinking"] += 1
+                    redacted_turns.append((len(out),
+                                           len(data) if isinstance(data, str) else None))
                     continue
                 if btype == "tool_use":
                     tool_name = block.get("name")
@@ -266,7 +264,7 @@ Always returns a new list (never mutates the input). One Anthropic
             else:
                 m = _assistant_msg("")
             out.append(m)
-            reasoning_by_msg[id(m)] = (reasoning_text, reasoning_is_placeholder)
+            reasoning_by_msg[id(m)] = reasoning_text
         elif role == "user":
             tool_messages = []
             text_parts = []
@@ -338,19 +336,16 @@ Always returns a new list (never mutates the input). One Anthropic
     if reasoning_always and reasoning_selection in COMPAT_REASONING_FIELDS:
         assistant_msgs = [m for m in out if m.get("role") == "assistant"]
         if any(m.get("tool_calls") for m in assistant_msgs):
-            real_count = empty_count = placeholder_count = 0
+            real_count = empty_count = 0
             for m in assistant_msgs:
-                text, is_placeholder = reasoning_by_msg.get(id(m), (None, False))
+                text = reasoning_by_msg.get(id(m))
                 if isinstance(text, str) and text:
                     m[reasoning_selection] = text
-                    if is_placeholder:
-                        placeholder_count += 1
-                    else:
-                        real_count += 1
+                    real_count += 1
                 else:
                     m[reasoning_selection] = ""
                     empty_count += 1
-            if empty_count or placeholder_count:
+            if empty_count:
                 log_trace({
                     "timestamp": _request_transform_timestamp(),
                     "event": "reasoning_field_injected",
@@ -360,10 +355,31 @@ Always returns a new list (never mutates the input). One Anthropic
                     "tier": tier,
                     "real": real_count,
                     "empty": empty_count,
-                    "placeholder": placeholder_count,
                 })
     if cache_stripped and cache_stripped_out is not None:
         cache_stripped_out.append("messages")
+    if dropped["redacted_thinking"] > 0:
+        blocks = []
+        for turn_index, data_length in redacted_turns:
+            m = out[turn_index]
+            _t = reasoning_by_msg.get(id(m))
+            blocks.append({
+                "data_length": data_length,
+                "turn_has_thinking": isinstance(_t, str) and bool(_t),
+                "turn_tool_use_seen": bool(m.get("tool_calls")),
+            })
+        log_trace({
+            "timestamp": _request_transform_timestamp(),
+            "event": "redacted_thinking_detected",
+            "request_id": request_id,
+            "mode": mode,
+            "provider": provider,
+            "tier": tier,
+            "reasoning_selection": reasoning_selection,
+            "reasoning_always": bool(reasoning_always),
+            "conversation_has_tool_calls": bool(tool_use_ids),
+            "blocks": blocks,
+        })
     if sum(dropped.values()) > 0:
         log_trace({
             "timestamp": _request_transform_timestamp(),
