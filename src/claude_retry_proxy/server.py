@@ -298,7 +298,8 @@ class ProxyHandler(ChatSSEHandlerMixin, http.server.BaseHTTPRequestHandler):
 
     def _stream_upstream_response(self, resp, status, resp_headers, request_id, retries,
                                    epoch, tier=None, mode=None, tools_declared=False,
-                                   provider=None, key=None, retry_original_id=None):
+                                   provider=None, key=None, retry_original_id=None, *,
+                                   content_type):
         """Stream an upstream 2xx response body to the client as it arrives.
 
         For SSE (text/event-stream):
@@ -360,8 +361,10 @@ class ProxyHandler(ChatSSEHandlerMixin, http.server.BaseHTTPRequestHandler):
                 request_id) + b"\n\n")
             self.wfile.flush()
 
-        # Check Content-Type to determine rewriting strategy
-        content_type = resp_headers.get("Content-Type", "").lower()
+        # content_type is resolved once by the forwarder's case-insensitive
+        # dispatch and threaded here: this method must agree with that
+        # dispatch, and re-deriving from the received-casing resp_headers
+        # dict would repeat the canonical-spelling lookup defect.
         is_sse = "text/event-stream" in content_type
 
         try:

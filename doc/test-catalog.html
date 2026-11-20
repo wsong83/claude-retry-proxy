@@ -187,8 +187,10 @@ not carried — recount on demand with the command above, or read the aggregator
         <code>Date</code> and no proxy <code>Server</code> on every response path (buffered,
         streamed, proxy-generated, OPTIONS), the upstream <code>Server</code> forwarded verbatim
         and an upstream without a <code>Date</code> still yielding exactly one, the trace
-        <code>model</code> field's 512-character cap boundaries, and the analyzer's terminal
-        escaping of control-character and lone-surrogate model names</td></tr>
+        <code>model</code> field's 512-character cap boundaries, the analyzer's terminal
+        escaping of control-character and lone-surrogate model names, and the case-insensitive
+        Content-Type dispatch matrix — an upstream emitting lowercased response header names
+        dispatches identically to canonical casing on all four branches (added 2026-11-20)</td></tr>
 <tr><td><code>test_sanitize.py</code></td>
     <td>The <code>sanitize_error</code> redaction chokepoint — path and IP redaction, case variants, boundary cases, linear-time bound</td></tr>
 <tr><td><code>test_settings.py</code></td>
@@ -957,6 +959,24 @@ off-by-one in the guard or the <code>keep</code> arithmetic; 600 alone cannot).<
 lone-surrogate model name (CSI/OSC + <code>\ud800</code>) as escaped forms, exits 0 — pre-fix
 the surrogate crashed <code>print()</code> with <code>UnicodeEncodeError</code> — and emits no
 raw ESC byte.</li>
+<li><code>test_lowercase_resp_content_type_anthropic_json_rewrites_model</code> (added
+2026-11-20): an upstream serving a 200 JSON body under a lowercased
+<code>content-type:</code> header name still takes the JSON branch — the response
+<code>model</code> is rewritten to the tier alias (pre-fix it passed through raw, since the
+canonical-spelling lookup read <code>&quot;&quot;</code>).</li>
+<li><code>test_lowercase_resp_content_type_anthropic_sse_rewrites_message_start</code>
+(added 2026-11-20): the same lowercased-header upstream on the SSE branch —
+<code>message_start.message.model</code> is rewritten to the tier alias, and the received
+lowercased header <em>name</em> is forwarded to the client verbatim (pinning that dispatch
+normalization never touches the forwarded header set).</li>
+<li><code>test_lowercase_resp_content_type_chat_sse_streamed_as_anthropic</code> (added
+2026-11-20): a chat-mode tier behind the lowercased-header SSE upstream is streamed through
+the chat converter — Anthropic-shaped terminal events reach the client, not the raw chat
+body, and no <code>transform_failure</code> lands in the trace (pre-fix the stream buffered
+whole, the chat transform failed, and the raw SSE passed through as one blob).</li>
+<li><code>test_lowercase_resp_content_type_non2xx_anthropic_json_rewrite</code> (added
+2026-11-20): a 400 JSON error body under a lowercased <code>content-type:</code> name in
+anthropic mode still gets the top-level <code>model</code> rewrite.</li>
 </ul>
 <h3 id="cat-16">Category 16 — Verification-Script Isolation</h3>
 

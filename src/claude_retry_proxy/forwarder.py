@@ -1487,14 +1487,21 @@ def _forward_core(method, path, handler, request_id, config,
                     # Non-retryable response. Headers are mapped from
                     # Headers.raw — the only carrier of the raw wire pairs:
                     # dict(resp.headers) lowercases keys and comma-joins
-                    # duplicate values, which would blank the Content-Type
-                    # dispatch below and change every forwarded header's
-                    # casing. This comprehension reproduces today's
+                    # duplicate values, which would change every forwarded
+                    # header's casing. This comprehension reproduces today's
                     # dict(resp.getheaders()) exactly: received casing,
                     # last-wins duplicates.
                     resp_headers = {k.decode("latin-1"): v.decode("latin-1")
                                     for k, v in resp.headers.raw}
-                    content_type = resp_headers.get("Content-Type", "").lower()
+                    # Dispatch lookup is case-insensitive per RFC 9110
+                    # field-name rules: HTTP/2 connections and some gateways
+                    # emit lowercased names, which a canonical-spelling
+                    # lookup on the received-casing dict above would miss.
+                    # Forwarding keeps received casing; only the dispatch
+                    # value is normalized (lowercased keys, last-wins).
+                    content_type = {k.lower(): v
+                                    for k, v in resp_headers.items()}.get(
+                                        "content-type", "").lower()
 
                     # Determine response handling strategy based on status and Content-Type
                     if handler is not None and 200 <= resp.status_code < 300:
@@ -1503,7 +1510,7 @@ def _forward_core(method, path, handler, request_id, config,
                             # SSE: stream with mode-appropriate rewriting/transform
                             first_byte_ms = handler._stream_upstream_response(
                                 resp, resp.status_code, resp_headers, request_id, retries,
-                                epoch=epoch, tier=tier, mode=mode,
+                                epoch=epoch, content_type=content_type, tier=tier, mode=mode,
                                 tools_declared=tools_declared,
                                 provider=provider_name, key=key_name,
                                 retry_original_id=retry_original_id)
@@ -1616,7 +1623,7 @@ def _forward_core(method, path, handler, request_id, config,
                             else:
                                 first_byte_ms = handler._stream_upstream_response(
                                     resp, resp.status_code, resp_headers, request_id, retries,
-                                    epoch=epoch, tier=tier, mode=mode,
+                                    epoch=epoch, content_type=content_type, tier=tier, mode=mode,
                                     tools_declared=tools_declared,
                                     provider=provider_name, key=key_name,
                                     retry_original_id=retry_original_id)

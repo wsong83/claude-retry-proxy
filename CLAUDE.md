@@ -150,7 +150,12 @@ for the rest.
      `message_start`, forward the remainder unchanged. Anthropic-mode JSON:
      parse, replace `model`, re-serialize. Chat/response modes use full body
      transforms. Other Content-Types pass through untouched.
-     **Content-Type is checked FIRST, before any buffering or parsing.**
+     **Content-Type is checked FIRST, before any buffering or parsing** — the
+     field-name match is case-insensitive (RFC 9110; HTTP/2 vendors lowercase
+     response header names). Forwarding keeps the received casing verbatim on
+     the streamed path (Content-Type included); buffered paths synthesize
+     their own canonical `Content-Type` and forward the remaining upstream
+     headers as received.
   7. **`do_POST` streamed flag:** `streamed = (200 <= status < 300) and
      (resp_body == b"")` — streaming paths return `b""`, buffering paths return
      the actual body. Only buffered responses call `_send_response`.

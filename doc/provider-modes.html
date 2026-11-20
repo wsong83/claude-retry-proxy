@@ -254,8 +254,20 @@ rather than the provider's internal id.</p>
 </tr>
 </table>
 
+<p>The anthropic SSE rewrite covers the <strong>first event only</strong>: a vendor whose
+stream opens with a different event — some providers emit a keep-alive <code>ping</code>
+before <code>message_start</code> — is forwarded with the upstream model name intact
+(tracked as <code>defer-issue-sse-rewrite-ping-first</code>). The JSON row has no such
+limitation.</p>
+
 <p>Content-Type is checked <em>first</em>, before any buffering or parsing, so an unexpected
-content type is never parsed speculatively.</p>
+content type is never parsed speculatively. The field-name match is case-insensitive
+(RFC&nbsp;9110 field-name rules): an upstream emitting lowercased response header names —
+every HTTP/2 connection, and some HTTP/1.1 gateways — dispatches identically to one using
+canonical casing. Forwarding is unaffected on the streamed path: the client receives the
+upstream's header-name casing verbatim, Content-Type included. Buffered paths synthesize the
+proxy's own canonical <code>Content-Type</code> and forward the remaining upstream headers
+as received.</p>
 
 <div class="warn">
 <strong>Error responses are not translated between formats.</strong> Chat and response modes pass a
