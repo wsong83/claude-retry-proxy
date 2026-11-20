@@ -6,6 +6,7 @@ Part of the claude-retry-proxy suite; runnable standalone.
 
 import http.client
 import http.server
+import io
 import json
 import os
 import shutil
@@ -1218,6 +1219,12 @@ def test_chat_sse_non_tool_calls_finish_with_tool_blocks():
         if len(events) != 1:
             fail("non-tool_calls finish with open tool blocks must log the coalesced event, got {}".format(len(events)))
             return
+        # Valid arguments must never count as unparseable (no false positives)
+        # at the length (non-finish-disposition-independent) close site.
+        if events[0].get("unparseable_arg_count") != 0:
+            fail("valid arguments must count unparseable_arg_count 0 at the "
+                 "length disposition, got {!r}".format(events[0].get("unparseable_arg_count")))
+            return
     finally:
         cleanup()
     proxy_port2, trace_file2, cleanup2 = _start_chat_sse_proxy(base + [_cc({}, finish="stop")])
@@ -1234,9 +1241,51 @@ def test_chat_sse_non_tool_calls_finish_with_tool_blocks():
         if _sse_stop_reason(frames2) != "tool_use":
             fail("stop finish with emitted tool blocks must upgrade to tool_use, got {!r}".format(_sse_stop_reason(frames2)))
             return
+        events2 = _degraded_trace_events(trace_file2)
+        if len(events2) != 1:
+            fail("stop finish with open tool blocks must log the coalesced event, got {}".format(len(events2)))
+            return
+        if events2[0].get("unparseable_arg_count") != 0:
+            fail("valid arguments must count unparseable_arg_count 0 at the "
+                 "stop disposition, got {!r}".format(events2[0].get("unparseable_arg_count")))
+            return
     finally:
         cleanup2()
-    pass_("non-tool_calls finish with open tool blocks: close blocks, map/upgrade finish, log event")
+    # Invalid-arguments variant: the emitted-tool_use disposition must validate
+    # too, so the degradation counter is finish-disposition-independent. Before
+    # the Step 2 fix (validate=False here) this path structurally reported 0.
+    invalid = [
+        _cc({"role": "assistant"}),
+        _cc({"tool_calls": [{"index": 0, "id": "call_bad", "function": {"name": "bad_tool", "arguments": "{oops"}}]}),
+    ]
+    proxy_port3, trace_file3, cleanup3 = _start_chat_sse_proxy(invalid + [_cc({}, finish="stop")])
+    if proxy_port3 is None:
+        return
+    try:
+        frames3 = _chat_sse_fetch_frames(proxy_port3)
+        if frames3 is None:
+            return
+        blocks3 = _sse_tool_use_blocks(frames3)
+        if len(blocks3) != 1 or not blocks3[0]["closed"]:
+            fail("stop finish with an unparseable-args tool block must still close it, got {!r}".format(blocks3))
+            return
+        if _sse_stop_reason(frames3) != "tool_use":
+            fail("stop finish with emitted tool blocks must upgrade to tool_use "
+                 "even with unparseable args, got {!r}".format(_sse_stop_reason(frames3)))
+            return
+        events3 = _degraded_trace_events(trace_file3)
+        if len(events3) != 1:
+            fail("unparseable-args stop finish must log the coalesced event, got {}".format(len(events3)))
+            return
+        if events3[0].get("unparseable_arg_count", 0) < 1:
+            fail("the degradation counter must be finish-disposition-independent: "
+                 "unparseable args at the stop disposition must count at least 1, "
+                 "got {!r}".format(events3[0].get("unparseable_arg_count")))
+            return
+    finally:
+        cleanup3()
+    pass_("non-tool_calls finish with open tool blocks: close blocks, map/upgrade "
+          "finish, log event; degradation counter validates at both dispositions")
 
 
 
@@ -2633,8 +2682,10 @@ def test_chat_sse_drain_event_on_done():
             return
         # Late-frame offsets are null on a stream that ended at the finish
         # frame: the content, finish and [DONE] frames all arrive in a single
-        # read chunk, so the post-finish offset is never stamped and the
-        # late-frame block is skipped outright. A stream that ended at the
+        # read chunk. The late-frame trio IS stamped when the finish is
+        # discovered and the post-loop accounting DOES run — but the [DONE]
+        # sentinel is excluded from frames_seen, so no frame follows the
+        # finish signal and the offsets stay null. A stream that ended at the
         # finish signal must not claim something arrived after it.
         if ev.get("first_late_ms") is not None or ev.get("last_late_ms") is not None:
             fail("first_late_ms/last_late_ms must both be null when no frame "
@@ -4748,8 +4799,9 @@ def test_chat_sse_post_swap_straggler_dies_retryably():
 # Frame-cap disposition (plan 2026-11-15-httpx2-transport-sse, Step 5a)
 # ===========================================================================
 
-# The cap is a local constant in server.py (2 MB). The fixtures overshoot it by
-# a margin far larger than any read-chunk boundary, so the trip is reached on
+# The cap is chat_sse.py's MAX_EVENT_BUFFER local constant (2 MB), defined
+# inside _stream_chat_sse_to_anthropic. The fixtures overshoot it by a margin
+# far larger than any read-chunk boundary, so the trip is reached on
 # accumulated bytes rather than on a lucky split.
 _FRAME_CAP_BYTES = 2 * 1024 * 1024
 
@@ -4961,6 +5013,255 @@ def test_chat_sse_drain_read_timeout_completes_turn():
         cleanup()
 
 
+# ===========================================================================
+# Deferred chat_sse defects (plan 2026-11-20-chat-sse-deferred-fixes, Step 4)
+# ===========================================================================
+
+def test_choices_non_list_degrades_frame():
+    """A frame whose `choices` is a dict (not a list) is skipped without
+    raising; the stream continues and closes normally (Step 1 shape guard).
+
+    Before the guard, `choices = chunk.get("choices")` returning a dict made
+    `choices[0]` raise KeyError mid-stream, past except _DISCONNECT_ERRORS,
+    into do_POST's total guard after response headers were committed.
+    """
+    print("\n--- Test: Chat SSE Choices Non-List Degrades Frame ---")
+    bad = {"id": "c1", "object": "chat.completion.chunk", "created": 1,
+           "model": "gpt-4o", "choices": {"delta": {}}}
+    chunks = [_cc({"role": "assistant", "content": "hi"}),
+              bad,
+              _cc({}, finish="stop")]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        if "error" in _sse_types(frames):
+            fail("a malformed choices frame must be skipped, not surfaced as an error")
+            return
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("the stream must close normally past a malformed choices frame, "
+                 "got stop_reason {!r}".format(_sse_stop_reason(frames)))
+            return
+        deltas = _sse_frames_with_type(frames, "content_block_delta")
+        text_bits = [d.get("delta", {}).get("text") for d in deltas
+                     if isinstance(d.get("delta", {}).get("text"), str)]
+        if text_bits != ["hi"]:
+            fail("the content before the degraded frame must still stream, got {!r}".format(text_bits))
+            return
+        pass_("non-list choices frame skipped; the stream continues and closes normally")
+    finally:
+        cleanup()
+
+
+def test_choices_non_dict_element_degrades_frame():
+    """A frame whose `choices[0]` is a non-dict (e.g. a string) is skipped
+    without raising (Step 1 shape guard).
+
+    Before the guard, `choice.get("delta")` on a str raised AttributeError
+    mid-stream.
+    """
+    print("\n--- Test: Chat SSE Choices Non-Dict Element Degrades Frame ---")
+    bad = {"id": "c1", "object": "chat.completion.chunk", "created": 1,
+           "model": "gpt-4o", "choices": ["x"]}
+    chunks = [_cc({"role": "assistant", "content": "hi"}),
+              bad,
+              _cc({}, finish="stop")]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        if "error" in _sse_types(frames):
+            fail("a non-dict choices element must be skipped, not surfaced as an error")
+            return
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("the stream must close normally past a non-dict choices element, "
+                 "got stop_reason {!r}".format(_sse_stop_reason(frames)))
+            return
+        deltas = _sse_frames_with_type(frames, "content_block_delta")
+        text_bits = [d.get("delta", {}).get("text") for d in deltas
+                     if isinstance(d.get("delta", {}).get("text"), str)]
+        if text_bits != ["hi"]:
+            fail("the content before the degraded frame must still stream, got {!r}".format(text_bits))
+            return
+        pass_("non-dict choices element skipped; the stream continues and closes normally")
+    finally:
+        cleanup()
+
+
+def test_choices_none_element_still_degrades_harmlessly():
+    """A frame with a `None` choices element still behaves as today: the
+    `choices[0] or {}` idiom yields an empty delta and no raise (Step 1).
+
+    Kept as a alongside-the-guard assertion: the new isinstance(choice, dict)
+    check must not reject the harmless None element that already degraded.
+    """
+    print("\n--- Test: Chat SSE Choices None Element Still Degrades Harmlessly ---")
+    bad = {"id": "c1", "object": "chat.completion.chunk", "created": 1,
+           "model": "gpt-4o", "choices": [None]}
+    chunks = [_cc({"role": "assistant", "content": "hi"}),
+              bad,
+              _cc({}, finish="stop")]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        if "error" in _sse_types(frames):
+            fail("a None choices element must degrade harmlessly, not surface an error")
+            return
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("the stream must close normally past a None choices element, "
+                 "got stop_reason {!r}".format(_sse_stop_reason(frames)))
+            return
+        deltas = _sse_frames_with_type(frames, "content_block_delta")
+        text_bits = [d.get("delta", {}).get("text") for d in deltas
+                     if isinstance(d.get("delta", {}).get("text"), str)]
+        if text_bits != ["hi"]:
+            fail("the content before the degraded frame must still stream, got {!r}".format(text_bits))
+            return
+        pass_("None choices element degrades harmlessly; the stream closes normally")
+    finally:
+        cleanup()
+
+
+def _stream_chat_sse_in_one_read(sse_body, trace_file):
+    """Drive the chat SSE transform in-process with ONE injected iter_raw chunk.
+
+    A real socket's read boundaries are transport accidents, so the
+    spawned-proxy fixtures cannot request a coalesced finish+tail read — they
+    can only hope the kernel delivers one. Injecting one pre-built chunk makes
+    the coalesced shapes structural, so timestamp assertions never ride on TCP
+    flush coalescing (the plan's fixture discipline).
+
+    The handler double is a real ProxyHandler created without
+    BaseHTTPRequestHandler.__init__ — the transform touches only `_sse_event`
+    and `wfile`. The trace sink is rebound to `trace_file` for the synchronous
+    call and the previous sink object restored afterwards (the sinks hold
+    their own path, so assigning a module-level path would be inert).
+    """
+    from claude_retry_proxy import sinks
+    from claude_retry_proxy.server import ProxyHandler
+
+    class _OneChunkResponse:
+        def iter_raw(self):
+            yield sse_body
+
+    handler = object.__new__(ProxyHandler)
+    handler.wfile = io.BytesIO()
+    prev_trace_sink = sinks._trace
+    try:
+        sinks.configure(trace_path=trace_file)
+        handler._stream_chat_sse_to_anthropic(
+            _OneChunkResponse(), "coalesced-fixture", "sonnet",
+            time.time(), None)
+    finally:
+        sinks._trace = prev_trace_sink
+    return handler.wfile.getvalue()
+
+
+def test_coalesced_finish_tail_counted_as_late_frames():
+    """A finish frame and a trailing usage frame sharing one coalesced read
+    chunk count as late frames with a ~0 offset (Step 3a discovery capture).
+
+    The chunk is injected structurally — one pre-built iter_raw chunk carrying
+    content + finish + usage + [DONE] — never inferred from TCP flush
+    coalescing. Because every frame shares the read, the chunk-top capture ran
+    before the finish was discovered; before Step 3a the post-loop accounting
+    never saw the tail and reported late_frames 0 with null offsets. The
+    [DONE] sentinel is excluded (Step 3b), so only the usage frame counts. The
+    assertions mirror test_chat_sse_drain_late_tool_call_time_budget's window
+    checks so the two late-frame branches stay consistent.
+    """
+    print("\n--- Test: Chat SSE Coalesced Finish Tail Counted As Late Frames ---")
+    usage_tail = {"id": "c1", "object": "chat.completion.chunk", "created": 1,
+                  "model": "gpt-4o", "choices": [],
+                  "usage": {"prompt_tokens": 3, "completion_tokens": 2,
+                            "total_tokens": 5}}
+    sse_body = _sse_stream_chunks([_cc({"role": "assistant", "content": "hi"}),
+                                   _cc({}, finish="stop"),
+                                   usage_tail]) + b"data: [DONE]\n\n"
+    root = tempfile.mkdtemp(prefix="proxy_chatsse_coalesced_")
+    trace_file = os.path.join(root, "trace.jsonl")
+    try:
+        raw = _stream_chat_sse_in_one_read(sse_body, trace_file)
+        frames = _parse_sse_frames(raw)
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("the coalesced-tail stream must map stop to end_turn, got {!r}".format(
+                _sse_stop_reason(frames)))
+            return
+        events = _trace_events_named(trace_file, "chat_sse_drain")
+        if len(events) != 1:
+            fail("expected exactly one chat_sse_drain event, got {}".format(len(events)))
+            return
+        ev = events[0]
+        if not ev.get("late_frames") or ev.get("late_frames") < 1:
+            fail("a coalesced finish+tail chunk must count late_frames >= 1 "
+                 "(pre-fix reported 0), got {!r}".format(ev.get("late_frames")))
+            return
+        _first_late = ev.get("first_late_ms")
+        _last_late = ev.get("last_late_ms")
+        if _first_late != 0:
+            fail("same-chunk late frames must report first_late_ms 0 (finish_seen_at "
+                 "set one line earlier), got {!r}".format(_first_late))
+            return
+        if _last_late is None:
+            fail("last_late_ms must be populated for a coalesced tail, got None")
+            return
+        pass_("coalesced finish+usage tail: late_frames {} first_late_ms {} "
+              "last_late_ms {}".format(ev.get("late_frames"), _first_late, _last_late))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_true_no_tail_still_reports_null():
+    """Control: the coalesced content+finish+[DONE]-only shape (no usage/tool
+    tail) still reports late_frames 0 and null offsets (Step 3b).
+
+    The [DONE] sentinel is not a frame that followed the finish signal, so a
+    stream that ended at the finish frame attributes no late frame — the
+    documented null-case semantics hold after both Step 3 edits.
+    """
+    print("\n--- Test: Chat SSE True No-Tail Still Reports Null ---")
+    chunks = [_cc({"role": "assistant", "content": "hi"}),
+              _cc({}, finish="stop")]
+    proxy_port, trace_file, cleanup = _start_chat_sse_proxy(chunks)  # + [DONE], single write
+    if proxy_port is None:
+        return
+    try:
+        frames = _chat_sse_fetch_frames(proxy_port)
+        if frames is None:
+            return
+        if _sse_stop_reason(frames) != "end_turn":
+            fail("the no-tail stream must map stop to end_turn, got {!r}".format(
+                _sse_stop_reason(frames)))
+            return
+        events = _wait_for_trace_events(trace_file, "chat_sse_drain")
+        if len(events) != 1:
+            fail("expected exactly one chat_sse_drain event, got {}".format(len(events)))
+            return
+        ev = events[0]
+        if ev.get("late_frames"):
+            fail("a finish+[DONE]-only chunk must not count a late frame, "
+                 "got {!r}".format(ev.get("late_frames")))
+            return
+        if ev.get("first_late_ms") is not None or ev.get("last_late_ms") is not None:
+            fail("no frame followed the finish signal: first_late_ms/last_late_ms "
+                 "must both be null, got {!r}/{!r}".format(
+                     ev.get("first_late_ms"), ev.get("last_late_ms")))
+            return
+        pass_("coalesced finish+[DONE]-only stream: late_frames 0, null offsets")
+    finally:
+        cleanup()
+
+
 ALL_TESTS = [
     ("chat-sse-basic-streaming", test_chat_sse_basic_streaming),
     ("chat-sse-finish-reason-mapping", test_chat_sse_finish_reason_mapping),
@@ -5044,6 +5345,12 @@ ALL_TESTS = [
     ("chat-sse-first-frame-oversize-errors-loud", test_chat_sse_first_frame_oversize_errors_loud),
     ("chat-sse-drain-window-frame-oversize-drops-and-completes", test_chat_sse_drain_window_frame_oversize_drops_and_completes),
     ("chat-sse-drain-read-timeout-completes-turn", test_chat_sse_drain_read_timeout_completes_turn),
+    # Deferred chat_sse defects (plan 2026-11-20-chat-sse-deferred-fixes, Step 4)
+    ("chat-sse-choices-non-list-degrades-frame", test_choices_non_list_degrades_frame),
+    ("chat-sse-choices-non-dict-element-degrades-frame", test_choices_non_dict_element_degrades_frame),
+    ("chat-sse-choices-none-element-still-degrades-harmlessly", test_choices_none_element_still_degrades_harmlessly),
+    ("chat-sse-coalesced-finish-tail-counted-as-late-frames", test_coalesced_finish_tail_counted_as_late_frames),
+    ("chat-sse-true-no-tail-still-reports-null", test_true_no_tail_still_reports_null),
 ]
 
 

@@ -255,7 +255,6 @@ class ChatSSEHandlerMixin:
             nonlocal unparseable_arg_count
             candidates = [st for st in tool_states.values()
                           if st["started"] and not st["closed"]]
-            valid = 0
             for st in sorted(candidates, key=lambda s: s["index"]):
                 write({"type": "content_block_stop", "index": st["index"]})
                 st["closed"] = True
@@ -279,8 +278,6 @@ class ChatSSEHandlerMixin:
                     if not isinstance(parsed, dict):
                         unparseable_arg_count += 1
                         continue
-                    valid += 1
-            return valid
 
         def log_tool_degradation_summary():
             nonlocal degradation_logged
@@ -558,9 +555,11 @@ class ChatSSEHandlerMixin:
             if isinstance(u, dict):
                 usage = u
             choices = chunk.get("choices") or []
-            if not choices:
+            if not isinstance(choices, list) or not choices:
                 return None
             choice = choices[0] or {}
+            if not isinstance(choice, dict):
+                return None
             delta = choice.get("delta") or {}
             if first_frame:
                 first_frame = False
@@ -704,7 +703,16 @@ class ChatSSEHandlerMixin:
                     frame = bytes(buf[:idx])
                     del buf[:idx + 2]
                     result = handle_frame(frame)
-                    frames_seen += 1
+                    if result != "done":
+                        # The [DONE] sentinel is protocol bookkeeping, not a
+                        # frame that "followed the finish signal": counting
+                        # it would make the most common coalesced shape
+                        # (finish + [DONE], no trailing usage/tool frame)
+                        # report a spurious late frame. drain_bytes already
+                        # excludes it (the done branch breaks before
+                        # accumulation), so the frame and byte accounts
+                        # stay symmetric.
+                        frames_seen += 1
                     if result == "done":
                         if finish_reason_seen is not None:
                             drain_done = True
@@ -715,6 +723,14 @@ class ChatSSEHandlerMixin:
                     if isinstance(result, tuple) and result[0] == "finish":
                         finish_reason_seen = result[1]
                         finish_seen_at = time.time()
+                        # Frames trailing the finish inside this same coalesced
+                        # chunk are late frames with a ~0 offset: capture now,
+                        # or the post-loop accounting below never sees them —
+                        # the chunk-top capture ran before the finish was
+                        # discovered.
+                        _off = 0.0
+                        _frames_before = frames_seen
+                        _tools_before = tool_calls_seen
                         continue  # enter drain mode
                     if finish_reason_seen is not None:
                         # Drain accounting is per FRAME, not per chunk: frames
@@ -866,7 +882,10 @@ class ChatSSEHandlerMixin:
                 sr = "tool_use" if emitted_tool_use else None
                 terminal(sr)
             elif emitted_tool_use:
-                close_open_tool_blocks(validate=False)
+                # Diagnostic validation runs here too: the degradation
+                # counter must not depend on which finish disposition
+                # closed the stream.
+                close_open_tool_blocks(validate=True)
                 mapped = _map_chat_finish_reason(finish_reason_seen)
                 # Provider signalled finish before the tool_call frames: claim
                 # tool_use rather than letting the client stop for user input.

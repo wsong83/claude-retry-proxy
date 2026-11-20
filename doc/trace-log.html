@@ -268,8 +268,11 @@ reached the transform), <code>emitted_tool_use</code> (a <code>tool_use</code> b
 reached the client), and <code>tools_declared</code> (the client declared tools at all).</p>
 
 <p>The late-frame fields answer a different question: how long the drain actually had to wait.
-<code>late_frames</code> counts the drain <em>reads</em> that carried frames arriving after the
-finish signal — one per chunk, not per frame within a chunk — <code>first_late_ms</code> and
+<code>late_frames</code> counts the reads that carried frames arriving after the finish signal
+— one per chunk, not per frame within a chunk, and including the read that carried the finish
+itself when its frames shared the chunk (added 2026-11-20). Any frame counts — content, usage,
+tool-call, even a comment/keep-alive or a malformed-JSON frame — <em>except</code> the
+<code>[DONE]</code> sentinel, which is never counted — <code>first_late_ms</code> and
 <code>last_late_ms</code> bracket the offsets of the first and last such read, and
 <code>late_tool_call_ms</code> is the offset at which a tool call arrived <em>late</em> — the one
 number that says whether the 5&nbsp;s budget is generous or binding, since it measures a tool call

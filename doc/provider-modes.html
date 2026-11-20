@@ -507,6 +507,12 @@ the 5&nbsp;s budget is generous or binding). <code>first_late_ms</code> and
 fields exist to draw, and one that is now pinned by tests in both directions (the null case on
 a stream that ends at the finish frame, and the ordering
 <code>first_late_ms &lt;= late_tool_call_ms &lt;= last_late_ms</code> on a stream that drains).
+Since 2026-11-20 the read that carried the finish frame itself can also carry late frames: a
+provider coalescing the finish and its trailing usage/tool frames into one chunk reports them
+as late frames with a ~0 offset rather than a false "nothing followed" reading, and the
+<code>[DONE]</code> sentinel never counts as a late frame — it is protocol bookkeeping, and the
+frame and byte accounts are symmetric about it (<code>drain_bytes</code> never counted it
+either).
 Between them, <code>chat_sse_drain</code> and
 <code>chat_sse_truncated</code> are exhaustive: every chat-mode stream that returned 200 and
 started ends with exactly one of the two, unless the request aborts with an exception — a client
@@ -529,9 +535,11 @@ a turn reports real, non-zero <code>usage</code>, and it logs <strong>no</strong
 <code>chat_sse_drain</code> with <code>tool_calls_seen: 0</code>. The absence of the degradation
 event is the load-bearing part: every path that fails to start or drops a tool block increments a
 counter that fires it, so its absence means no delta ever carried a tool call the transform could
-read. A stream that had been cut would instead have logged <code>chat_sse_truncated</code>, and a
-stream that was still draining would have been held open rather than closed with
-<code>end_turn</code>.</p>
+read. (Frames degraded for malformed envelope shapes — a non-dict chunk, or a malformed
+<code>choices</code> payload — are skipped before delta parsing and carry no readable tool call,
+so the premise holds for them too; added 2026-11-20.) A stream that had been cut would instead
+have logged <code>chat_sse_truncated</code>, and a stream that was still draining would have been
+held open rather than closed with <code>end_turn</code>.</p>
 
 <p><strong>The detector acts on it.</strong> <code>chat_sse_unfinished_turn</code> is that same
 condition detected live, evaluated only after the drain has ended — so a tool call arriving late
@@ -625,7 +633,20 @@ accumulates per-index state. Four bounds keep a misbehaving upstream from exhaus
 rest of the stream continues, and the stream is reported once via a single bounded,
 metadata-only <code>chat_sse_tool_degradation</code> event. That event deliberately carries no
 tool names, ids, or arguments — only counts — so a degraded stream does not write model output
-into the trace log.</p>
+into the trace log. The <code>unparseable_arg_count</code> field is validated at both
+finish-bearing dispositions — <code>finish_reason: "tool_calls"</code>, and
+<code>stop</code>/<code>length</code> with an emitted tool block — so whichever finish
+disposition closes the stream, truncated or invalid-JSON fragments count; a nesting overflow
+among them logs the same <code>nesting_limit_exceeded</code> event from either disposition
+(added 2026-11-20; previously only the <code>tool_calls</code> disposition validated, so the
+stop/length one structurally reported 0). Two residuals remain by design: the non-finish close
+paths (cut stream, oversize frame, retry-nudge error, <code>[DONE]</code>-without-finish) and
+a block that was started and later dropped close unvalidated. A no-argument tool call (empty
+argument fragments) counts as unparseable — its empty string fails to parse — at both validated
+dispositions (pre-existing at the <code>tool_calls</code> site, diagnostic-only). The event's
+<code>path</code>-bearing sibling fields (<code>nesting_limit_exceeded</code>) carry an
+upstream-derived structural locator — JSON key names — into the 0600 POSIX trace, consistent
+with that event's existing <code>tool_args</code> use.</p>
 
 <h3 id="malformed-args">Malformed arguments</h3>
 
