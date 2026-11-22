@@ -146,8 +146,10 @@ for the rest.
   6. **Response model rewriting.** The tier name is resolved from the request
      body at entry and threaded through the call chain. Rewriting uses that
      per-request tier, not a reverse map — two tiers may share a model name.
-     Anthropic-mode SSE: buffer the first event (64 KB cap), rewrite `model` in
-     `message_start`, forward the remainder unchanged. Anthropic-mode JSON:
+     Anthropic-mode SSE: scan the stream's leading events under a 64 KB total
+     budget and rewrite `model` in the first `message_start` at any position
+     (ping-first vendors open with keep-alive frames); past the budget the
+     stream forwards unscanned. Anthropic-mode JSON:
      parse, replace `model`, re-serialize. Chat/response modes use full body
      transforms. Other Content-Types pass through untouched.
      **Content-Type is checked FIRST, before any buffering or parsing** — the

@@ -239,8 +239,9 @@ rather than the provider's internal id.</p>
 <tr>
   <td><span class="badge badge-anthropic">anthropic</span></td>
   <td><code>text/event-stream</code></td>
-  <td>Buffer the first event (64 KB cap), rewrite <code>model</code> inside
-      <code>message_start</code>, then forward that and every later event unchanged</td>
+  <td>Scan the leading events under a 64 KB total budget, rewrite <code>model</code> inside
+      the first <code>message_start</code> (at any position), then forward everything else
+      unchanged; past the budget the stream forwards unscanned</td>
 </tr>
 <tr>
   <td><span class="badge badge-chat">chat</span> / <span class="badge badge-response">response</span></td>
@@ -254,11 +255,15 @@ rather than the provider's internal id.</p>
 </tr>
 </table>
 
-<p>The anthropic SSE rewrite covers the <strong>first event only</strong>: a vendor whose
-stream opens with a different event — some providers emit a keep-alive <code>ping</code>
-before <code>message_start</code> — is forwarded with the upstream model name intact
-(tracked as <code>defer-issue-sse-rewrite-ping-first</code>). The JSON row has no such
-limitation.</p>
+<p>The anthropic SSE rewrite <strong>scans the stream's leading events</strong> for the first
+<code>message_start</code> — some providers emit a keep-alive <code>ping</code> before it —
+and rewrites that event wherever it sits, under a total 64&nbsp;KB budget. Leading events
+forward byte-identically either way (unparseable ones included: the scan keeps going — unless
+the unparseable event's <code>event:</code> line already reads <code>message_start</code>,
+which ends the scan degraded); if the
+budget is crossed without a <code>message_start</code>, the stream forwards unscanned with the
+upstream model name intact and <code>sse_buffer_cap_exceeded</code> recorded. The JSON row has
+no such budget.</p>
 
 <p>Content-Type is checked <em>first</em>, before any buffering or parsing, so an unexpected
 content type is never parsed speculatively. The field-name match is case-insensitive
@@ -752,7 +757,7 @@ rather than implying that a call survived.</p>
 <tr><td><code>chat_sse_unfinished_turn</code></td><td>the detector saw a turn that ends with no tool call and no tool call on the wire (tools were declared, <code>finish_reason</code> was <code>stop</code>, and the text tail ends with <code>":"</code>); with the retry nudge enabled the turn is then closed with a retryable <code>error</code> and its marker armed, instead of a terminal sequence</td></tr>
 <tr><td><code>chat_retry_nudge</code></td><td>the nudge text was injected into a retry that matched an armed unfinished-turn marker (logged after the transform, so it never claims a nudge the upstream did not see)</td></tr>
 <tr><td><code>chat_retry_passthrough</code></td><td>a recovery request stalled again; the turn is closed with the normal terminal synthesis instead of being errored a second time (the loop guard)</td></tr>
-<tr><td><code>chat_sse_malformed_json</code>, <code>chat_sse_frame_oversize</code>, <code>sse_buffer_cap_exceeded</code>, <code>sse_rewrite_malformed_json</code></td><td>an SSE frame was malformed or exceeded a buffer bound; <code>chat_sse_frame_oversize</code> (chat mode, 2&nbsp;MB bound, carries <code>bytes</code>) terminates the stream with the retryable <code>upstream_frame_oversize</code> error before <code>finish_reason</code> and merely drops-and-counts the frame inside the drain window; <code>sse_buffer_cap_exceeded</code> (anthropic mode, 64&nbsp;KB first-event bound, carries <code>bytes</code>) keeps its forward-as-is degrade</td></tr>
+<tr><td><code>chat_sse_malformed_json</code>, <code>chat_sse_frame_oversize</code>, <code>sse_buffer_cap_exceeded</code>, <code>sse_rewrite_malformed_json</code></td><td>an SSE frame was malformed or exceeded a buffer bound; <code>chat_sse_frame_oversize</code> (chat mode, 2&nbsp;MB bound, carries <code>bytes</code>) terminates the stream with the retryable <code>upstream_frame_oversize</code> error before <code>finish_reason</code> and merely drops-and-counts the frame inside the drain window; <code>sse_buffer_cap_exceeded</code> (anthropic mode, 64&nbsp;KB scan budget, carries <code>bytes</code>) keeps its forward-as-is degrade</td></tr>
 </table>
 
 <p>Full field lists and the complete event inventory live in

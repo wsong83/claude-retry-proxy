@@ -20,9 +20,11 @@ from _harness import (
     _create_test_keys,
     _create_test_keys_plain,
     _mode_tiers,
+    _parse_sse_frames,
     _send_proxy_request,
     _send_proxy_request_stream,
     _setup_tier_routing_test,
+    _sse_frames_with_type,
     _start_mode_proxy,
     _start_proxy_server_directly,
     _trace_events_named,
@@ -470,7 +472,14 @@ def test_response_model_rewrite_streaming():
 # ===========================================================================
 
 def test_response_model_rewrite_streaming_non_message_start():
-    """First SSE event is not message_start → forwarded unchanged, no rewrite attempted."""
+    """A non-message_start leading event is forwarded unchanged, and the scan
+    keeps going: the following message_start IS rewritten to the tier.
+
+    The old first-event-only rewrite inspected the ping and gave up, so the
+    message_start kept the upstream model name. The bounded scan targets the
+    first message_start event at any position within the 64 KB budget, so the
+    ping forwards verbatim and the rewrite lands on the event it belongs to.
+    """
     print("\n--- Test: Response Model Rewrite Streaming Non-Message-Start ---")
 
     upstream_port = find_free_port()
@@ -525,10 +534,414 @@ def test_response_model_rewrite_streaming_non_message_start():
             pass_("First SSE event (ping) forwarded unchanged")
         else:
             fail("First SSE event was modified")
+            return
+
+        # The scan continues past the ping: the following message_start is
+        # rewritten to the requesting tier's name.
+        frames = _parse_sse_frames(resp_data.encode())
+        starts = _sse_frames_with_type(frames, "message_start")
+        if not starts:
+            fail("no message_start frame survived the scan: {!r}".format(frames))
+            return
+        model = (starts[0].get("message") or {}).get("model")
+        if model != "sonnet":
+            fail("expected message_start.message.model 'sonnet' (tier), got "
+                 "{!r} — the scan stopped at the leading ping".format(model))
+            return
+        pass_("message_start after the ping rewritten to the tier name")
+
+        if "claude-sonnet-5" in resp_data:
+            fail("the upstream model name leaked into the response: {!r}".format(
+                resp_data[:200]))
+            return
+        pass_("upstream model name absent from the response")
 
     finally:
         cleanup()
         mock_server.shutdown()
+
+
+
+
+# ===========================================================================
+# Test: Response Model Rewrite Streaming — Ping-First Vendor (qwen shape)
+# ===========================================================================
+
+def test_response_model_rewrite_streaming_ping_first():
+    """A keep-alive frame opening the stream does not block the model rewrite.
+
+    The qwen shape (measured live 2026-11-16): the upstream opens with
+    ``data: {"type": "ping"}`` BEFORE the message_start carrying the upstream
+    model name. The first-event-only rewrite inspected the ping and gave up,
+    so the client saw ``claude-sonnet-5`` instead of its tier alias. The
+    bounded scan walks leading events until message_start is found.
+    """
+    print("\n--- Test: Response Model Rewrite Streaming Ping-First ---")
+
+    upstream_port = find_free_port()
+
+    ping_event = b'data: {"type": "ping"}\n\n'
+    message_start_event = (b'data: {"type":"message_start",'
+                           b'"message":{"model":"claude-sonnet-5"}}\n\n')
+    delta_event = (b'data: {"type":"content_block_delta",'
+                   b'"delta":{"text":"Hi"}}\n\n')
+
+    class PingFirstHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            content_len = int(self.headers.get("Content-Length", 0))
+            if content_len > 0:
+                self.rfile.read(content_len)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for event in (ping_event, message_start_event, delta_event):
+                self.wfile.write(event)
+                self.wfile.flush()
+
+        def log_message(self, format, *args):
+            pass
+
+    mock_server = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), PingFirstHandler)
+    mock_thread = threading.Thread(target=mock_server.serve_forever, daemon=True)
+    mock_thread.start()
+    time.sleep(0.2)
+
+    tiers = {
+        "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+    }
+    vendors = {"p": {"url": f"http://127.0.0.1:{upstream_port}", "key": "k"}}
+
+    temp_dir, proxy_port, proc, mock_servers, cleanup = _setup_tier_routing_test(
+        tiers, vendors, caller_owns_ports=True)
+    if proc is None:
+        mock_server.shutdown()
+        fail("Failed to set up test")
+        return
+
+    try:
+        body = json.dumps({"model": "sonnet", "messages": [{"role": "user", "content": "hi"}], "stream": True})
+        import http.client as _hc
+        conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+        conn.request("POST", "/v1/messages", body=body, headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp_data = resp.read().decode()
+        conn.close()
+
+        # The keep-alive frame forwards byte-identical.
+        if ping_event.decode() not in resp_data:
+            fail("the leading ping frame was modified: {!r}".format(resp_data[:200]))
+            return
+        pass_("leading ping frame forwarded byte-identical")
+
+        frames = _parse_sse_frames(resp_data.encode())
+        starts = _sse_frames_with_type(frames, "message_start")
+        if not starts:
+            fail("no message_start frame in the response")
+            return
+        model = (starts[0].get("message") or {}).get("model")
+        if model != "sonnet":
+            fail("expected message_start.message.model 'sonnet' (tier), got "
+                 "{!r}".format(model))
+            return
+        pass_("message_start after the ping carries the tier name")
+
+        if "claude-sonnet-5" in resp_data:
+            fail("the upstream model name leaked into the response: {!r}".format(
+                resp_data[:200]))
+            return
+        pass_("upstream model name absent from the response")
+
+        if "content_block_delta" not in resp_data:
+            fail("the trailing delta event was dropped: {!r}".format(resp_data[:200]))
+            return
+        pass_("trailing events still forwarded")
+
+    finally:
+        cleanup()
+        mock_server.shutdown()
+
+
+
+
+# ===========================================================================
+# Test: Response Model Rewrite — Malformed Leading Event Keeps Scanning
+# ===========================================================================
+
+def test_response_model_rewrite_malformed_leading_event():
+    """An unparseable leading event does not end the scan.
+
+    User-confirmed rule: a malformed (or nesting-violating) leading event is
+    forwarded byte-identically and the scan continues, so a later clean
+    message_start is still rewritten. Only an unparseable event whose SSE
+    ``event:`` line says message_start ends the scan.
+    """
+    print("\n--- Test: Response Model Rewrite Streaming Malformed Leading Event ---")
+
+    upstream_port = find_free_port()
+
+    malformed_event = b'event: ping\ndata: not-json\n\n'
+    message_start_event = (b'data: {"type":"message_start",'
+                           b'"message":{"model":"claude-sonnet-5"}}\n\n')
+
+    class MalformedLeadingHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            content_len = int(self.headers.get("Content-Length", 0))
+            if content_len > 0:
+                self.rfile.read(content_len)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for event in (malformed_event, message_start_event):
+                self.wfile.write(event)
+                self.wfile.flush()
+
+        def log_message(self, format, *args):
+            pass
+
+    mock_server = http.server.ThreadingHTTPServer(("127.0.0.1", upstream_port), MalformedLeadingHandler)
+    mock_thread = threading.Thread(target=mock_server.serve_forever, daemon=True)
+    mock_thread.start()
+    time.sleep(0.2)
+
+    tiers = {
+        "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
+        "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
+        "opus": {"provider": "p", "model": "claude-opus-5"},
+    }
+    vendors = {"p": {"url": f"http://127.0.0.1:{upstream_port}", "key": "k"}}
+
+    temp_dir, proxy_port, proc, mock_servers, cleanup = _setup_tier_routing_test(
+        tiers, vendors, caller_owns_ports=True)
+    if proc is None:
+        mock_server.shutdown()
+        fail("Failed to set up test")
+        return
+
+    try:
+        body = json.dumps({"model": "sonnet", "messages": [{"role": "user", "content": "hi"}], "stream": True})
+        import http.client as _hc
+        conn = _hc.HTTPConnection("127.0.0.1", proxy_port, timeout=10)
+        conn.request("POST", "/v1/messages", body=body, headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp_data = resp.read().decode()
+        conn.close()
+
+        if malformed_event.decode() not in resp_data:
+            fail("the malformed leading event was not forwarded byte-identically: "
+                 "{!r}".format(resp_data[:200]))
+            return
+        pass_("malformed leading event forwarded byte-identical")
+
+        frames = _parse_sse_frames(resp_data.encode())
+        starts = _sse_frames_with_type(frames, "message_start")
+        if not starts:
+            fail("no message_start frame in the response")
+            return
+        model = (starts[0].get("message") or {}).get("model")
+        if model != "sonnet":
+            fail("expected message_start.message.model 'sonnet' (tier), got "
+                 "{!r} — the scan stopped at the unparseable event".format(model))
+            return
+        pass_("clean message_start after the malformed event rewritten to the tier")
+
+        if "claude-sonnet-5" in resp_data:
+            fail("the upstream model name leaked into the response: {!r}".format(
+                resp_data[:200]))
+            return
+        pass_("upstream model name absent from the response")
+
+    finally:
+        cleanup()
+        mock_server.shutdown()
+
+
+
+
+# ===========================================================================
+# Test: Response Model Rewrite — Non-Object message_start Payload
+# ===========================================================================
+
+def test_response_model_rewrite_nonobject_message_start():
+    """An ``event: message_start`` line over a non-object payload must not
+    crash the scan mid-stream.
+
+    Review finding 2026-11-22: the per-event rewrite called
+    ``data.get("message", {})`` whenever the event was message_start, and a
+    payload such as ``data: [1,2]`` (also a bare string, number or null) made
+    that raise AttributeError. Before the scan only the FIRST event ever
+    reached the primitive; the scan feeds every leading event through it, so
+    the latent crash became reachable — and it escaped the scan's
+    httpx2/OSError handlers, leaving do_POST's catch-all to answer 502 AFTER
+    the 200 stream headers had gone out: a corrupt wire (a second status line
+    inside the SSE body).
+
+    The primitive now degrades to ``(event_bytes, True)`` for a non-object
+    message_start payload: the event forwards byte-identically, the scan ends
+    there (its ``event:`` line still declares message_start — the same
+    per-event verdict as any other message_start), and nothing raises.
+    Because the scan stops on it, the later clean message_start keeps the
+    UPSTREAM model name — the accepted broken-upstream degrade.
+
+    Pins: 200 (never 502), one clean stream with no embedded status line, the
+    degraded event byte-identical, the later message_start forwarded verbatim,
+    the trailing event still relayed, and no forward_failed trace entry.
+    """
+    print("\n--- Test: Response Model Rewrite Streaming Non-Object message_start ---")
+
+    degraded_event = b'event: message_start\ndata: [1,2]\n\n'
+    message_start_event = (b'data: {"type":"message_start",'
+                           b'"message":{"model":"claude-sonnet-5"}}\n\n')
+    delta_event = (b'data: {"type":"content_block_delta",'
+                   b'"delta":{"text":"Hi"}}\n\n')
+    sse_body = degraded_event + message_start_event + delta_event
+
+    def stream_nonobject(handler, info):
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.end_headers()
+        for event in (degraded_event, message_start_event, delta_event):
+            handler.wfile.write(event)
+            handler.wfile.flush()
+
+    upstream_port = find_free_port()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K"}}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        _mode_tiers(), vendors, streamers={"p": stream_nonobject})
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port,
+            body={"model": "sonnet",
+                  "messages": [{"role": "user", "content": "hi"}],
+                  "stream": True})
+        if status != 200:
+            fail("expected 200 (the guard degrades, it never raises), got "
+                 "{} ({!r})".format(status, raw[:160]))
+            return
+        if "text/event-stream" not in content_type:
+            fail("expected an SSE content type, got {!r}".format(content_type))
+            return
+        if b"HTTP/1." in raw:
+            fail("a second status line leaked into the SSE body — the "
+                 "corrupt-wire path the guard prevents: {!r}".format(raw[:200]))
+            return
+        if raw != sse_body:
+            fail("expected the whole stream byte-identical to upstream "
+                 "({} bytes), got {} bytes: {!r}".format(
+                     len(sse_body), len(raw), raw[:200]))
+            return
+        pass_("single 200 stream; degraded event and the rest forwarded "
+              "byte-identical")
+
+        frames = _parse_sse_frames(raw)
+        starts = _sse_frames_with_type(frames, "message_start")
+        if not starts:
+            fail("no parseable message_start frame in the response: {!r}".format(
+                frames))
+            return
+        model = (starts[0].get("message") or {}).get("model")
+        if model != "claude-sonnet-5":
+            fail("the scan must stop at the non-object message_start (its "
+                 "event: line still declares message_start), so the later "
+                 "event keeps the upstream model name — got {!r}".format(model))
+            return
+        pass_("later message_start forwarded verbatim (upstream model name kept)")
+
+        # The request entry lands after do_POST returns; wait for it so the
+        # forward_failed check cannot race the trace write.
+        if not _wait_for_trace_events(trace_file, "request"):
+            fail("no request trace entry was written")
+            return
+        forward_failures = _trace_events_named(trace_file, "forward_failed")
+        if forward_failures:
+            fail("a forward_failed trace entry was recorded: {!r}".format(
+                forward_failures))
+            return
+        pass_("no forward_failed event (the exception never escaped)")
+    finally:
+        cleanup()
+
+
+
+
+# ===========================================================================
+# Test: Response Model Rewrite — Scan Budget Exhausted (documented degrade)
+# ===========================================================================
+
+def test_response_model_rewrite_scan_budget_exhausted():
+    """Leading events past the 64 KB total budget end the scan: the stream
+    forwards unscanned (the documented degrade), and the cap is traced.
+
+    The scan gives up once scanned+buffered bytes exceed the 64 KB budget, so
+    a message_start beyond that point keeps the upstream model name. The whole
+    stream still reaches the client byte-identically, and
+    ``sse_buffer_cap_exceeded`` records the degrade with the byte count that
+    crossed the budget.
+    """
+    print("\n--- Test: Response Model Rewrite Streaming Scan Budget Exhausted ---")
+
+    ping_event = b'data: {"type":"ping"}\n\n'
+    # 2900 * 23 = 66700 bytes of keep-alive frames: comfortably past the
+    # 65536-byte budget, so the scan caps before the message_start below.
+    pings = ping_event * 2900
+    message_start_event = (b'data: {"type":"message_start",'
+                           b'"message":{"model":"claude-sonnet-5"}}\n\n')
+    sse_body = pings + message_start_event
+    budget = 64 * 1024
+
+    upstream_port = find_free_port()
+    vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port), "key": "K"}}
+    responders = {"p": lambda info: (200, "text/event-stream", sse_body)}
+    temp_dir, proxy_port, proc, mock_servers, trace_file, cleanup = _start_mode_proxy(
+        _mode_tiers(), vendors, responders=responders)
+    if proc is None:
+        fail("Failed to set up test")
+        return
+    try:
+        status, content_type, raw = _send_proxy_request_stream(
+            proxy_port,
+            body={"model": "sonnet",
+                  "messages": [{"role": "user", "content": "hi"}],
+                  "stream": True})
+        if status != 200:
+            fail("expected 200, got {} ({!r})".format(status, raw[:160]))
+            return
+        if raw != sse_body:
+            fail("expected the whole stream byte-identical to upstream "
+                 "({} bytes), got {} bytes: {!r}".format(
+                     len(sse_body), len(raw), raw[:200]))
+            return
+        pass_("capped stream forwarded byte-identical (all events present)")
+
+        if b'"model":"claude-sonnet-5"' not in raw:
+            fail("the message_start past the budget must keep the upstream "
+                 "model name: {!r}".format(raw[-200:]))
+            return
+        if b'"model":"sonnet"' in raw:
+            fail("the message_start was rewritten despite the exhausted scan "
+                 "budget: {!r}".format(raw[-200:]))
+            return
+        pass_("message_start past the budget carries the upstream model name")
+
+        events = _wait_for_trace_events(trace_file, "sse_buffer_cap_exceeded")
+        if not events:
+            fail("expected an sse_buffer_cap_exceeded trace event, got none")
+            return
+        ev = events[0]
+        if not isinstance(ev.get("bytes"), int) or ev["bytes"] <= budget:
+            fail("the cap event must report the byte count past the {} budget, "
+                 "got {!r}".format(budget, ev.get("bytes")))
+            return
+        if not ev.get("request_id"):
+            fail("the cap event must carry a request_id: {!r}".format(ev))
+            return
+        pass_("sse_buffer_cap_exceeded recorded with the crossing byte count")
+    finally:
+        cleanup()
 
 
 
@@ -1650,6 +2063,10 @@ ALL_TESTS = [
     ("response-model-rewrite", test_response_model_rewrite),
     ("response-model-rewrite-streaming", test_response_model_rewrite_streaming),
     ("response-model-rewrite-streaming-non-message-start", test_response_model_rewrite_streaming_non_message_start),
+    ("response-model-rewrite-streaming-ping-first", test_response_model_rewrite_streaming_ping_first),
+    ("response-model-rewrite-malformed-leading-event", test_response_model_rewrite_malformed_leading_event),
+    ("response-model-rewrite-scan-budget-exhausted", test_response_model_rewrite_scan_budget_exhausted),
+    ("response-model-rewrite-nonobject-message-start", test_response_model_rewrite_nonobject_message_start),
     ("response-model-rewrite-upstream-model", test_response_model_rewrite_upstream_model),
     ("two-tiers-same-model-same-provider", test_two_tiers_same_model_same_provider),
     ("non-object-body-rejected", test_non_object_body_rejected),

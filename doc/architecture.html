@@ -387,7 +387,7 @@ than real traffic reaches (deepest body observed: ~6 levels, over the trace reta
 
 <p><code>check_payload_nesting</code> runs <em>before</em> every parse of untrusted JSON — the
 client body (before tier resolution), the admin body, buffered upstream bodies, the upstream SSE
-first event, chat SSE frames, the compatibility matchers' error bodies, and the JSON carried inside
+events inside the model-rewrite scan, chat SSE frames, the compatibility matchers' error bodies, and the JSON carried inside
 tool-call argument strings, which no outer body scan can see. A payload past the limit is never
 parsed:</p>
 
@@ -402,10 +402,11 @@ parsed:</p>
     <td><code>400</code> in the admin surface's flat shape
         (<code>{"error": …, "code": "nesting_limit_exceeded"}</code>); the envelope deliberately
         does not apply there</td></tr>
-<tr><td>Upstream buffered body, SSE first event</td>
-    <td>Forwarded unchanged with a <code>nesting_limit_exceeded</code> event, and the model rewrite
-        is skipped — for the SSE first event the client therefore sees the upstream model name
-        rather than the tier</td></tr>
+<tr><td>Upstream buffered body, SSE scan event</td>
+    <td>Forwarded unchanged with a <code>nesting_limit_exceeded</code> event; inside the SSE
+        model-rewrite scan the violating event is skipped and the scan continues (an event
+        whose <code>event:</code> line reads <code>message_start</code> ends the scan,
+        degraded), so a later <code>message_start</code> is still rewritten to the tier</td></tr>
 <tr><td>Chat SSE frame, tool arguments, upstream error body</td>
     <td>The frame is skipped, the tool call degrades to its visible placeholder, or the parse
         returns nothing — each with the same event, reusing the existing malformed-input

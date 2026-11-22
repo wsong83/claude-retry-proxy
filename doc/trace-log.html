@@ -215,8 +215,10 @@ are the complete set the proxy can write.</p>
     <td>post-finish drain suppressed <code>content</code>/<code>reasoning</code> deltas
     (carries <code>count</code>)</td></tr>
 <tr><td><code>sse_buffer_cap_exceeded</code>, <code>sse_rewrite_malformed_json</code></td>
-    <td>anthropic-mode SSE buffering and rewrite problems; <code>sse_buffer_cap_exceeded</code>
-    carries the buffered size in <code>bytes</code></td></tr>
+    <td>anthropic-mode SSE rewrite-scan problems; <code>sse_buffer_cap_exceeded</code> fires when
+    the 64&nbsp;KB scan budget is crossed without a <code>message_start</code> and carries the
+    scan window's size in <code>bytes</code>; <code>sse_rewrite_malformed_json</code> fires per
+    leading event whose JSON will not parse</td></tr>
 <tr><td><code>response_sse_unexpected</code></td><td>a response-mode provider streamed despite <code>stream: false</code></td></tr>
 <tr><td><code>forward_failed</code></td>
     <td>an exception escaped the forward path entirely (outside the retry loop's

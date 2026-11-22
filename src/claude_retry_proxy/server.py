@@ -51,7 +51,7 @@ from .forwarder import (_DISCONNECT_ERRORS, _client_user_agent, _drain_for_swap,
                         _resolve_extra_request_headers, _retry_nudge_arm,
                         _retry_nudge_check, _retry_nudge_messages_bytes,
                         _retry_nudge_remember, _rewrite_json_response,
-                        _rewrite_sse_first_event, _rng, _swap_epoch_changed,
+                        _rewrite_sse_event, _rng, _swap_epoch_changed,
                         _touch_upstream_activity, _trace_model,
                         CLIENT_USER_AGENT_MAX_CHARS,
                         CLIENT_USER_AGENT_TRUNCATION_MARKER,
@@ -303,9 +303,11 @@ class ProxyHandler(ChatSSEHandlerMixin, http.server.BaseHTTPRequestHandler):
         """Stream an upstream 2xx response body to the client as it arrives.
 
         For SSE (text/event-stream):
-          - anthropic mode: buffers first event (64KB cap), rewrites model in
-            message_start event to tier name. Subsequent events forwarded
-            unchanged.
+          - anthropic mode: scans the stream's leading events under a 64 KB
+            total budget and rewrites model in the first message_start event
+            to the tier name (vendors may open with keep-alive frames, e.g.
+            event:ping). Events before and after it forward unchanged; past
+            the budget the stream forwards unscanned (the degrade).
           - chat mode: transforms the OpenAI chat-completions SSE stream into
             synthetic Anthropic Messages SSE events.
           - response mode: upstream SSE is unexpected (the request transform
@@ -388,17 +390,22 @@ class ProxyHandler(ChatSSEHandlerMixin, http.server.BaseHTTPRequestHandler):
                 if mode == "response":
                     return self._stream_response_sse_fallback(
                         resp, request_id, tier, first_byte_start, epoch)
-                # SSE path (anthropic mode): buffer first event for model
-                # rewriting. Buffer chunks until \n\n delimiter is found or
-                # 64KB cap is exceeded.
-                first_event_buffer = bytearray()
-                MAX_FIRST_EVENT_BUFFER = 64 * 1024  # 64 KB cap
-                rewrite_skipped = False
+                # SSE path (anthropic mode): scan the stream's leading events
+                # for the message_start rewrite. Vendors may open with
+                # keep-alive frames (qwen sends event:ping before
+                # message_start), so the rewrite targets the first
+                # message_start event at any position, under a total byte
+                # budget — past it the scan gives up and the stream forwards
+                # unscanned (the documented degrade).
+                scanned = bytearray()   # events processed by the rewrite scan
+                pending = bytearray()   # unprocessed tail: complete-but-unscanned events + partial event
+                MAX_SCAN_BUDGET = 64 * 1024  # total scanned bytes before the rewrite gives up
+                scan_capped = False
 
-                # ONE raw iterator serves the first-event scan and the
-                # remainder loop: an httpx2 response stream is
-                # single-consumption (a second iter_raw raises StreamConsumed),
-                # so both phases consume this same object.
+                # ONE raw iterator serves the scan and the remainder loop: an
+                # httpx2 response stream is single-consumption (a second
+                # iter_raw raises StreamConsumed), so both phases consume
+                # this same object.
                 chunks = resp.iter_raw()
                 try:
                     for chunk in chunks:
@@ -407,20 +414,31 @@ class ProxyHandler(ChatSSEHandlerMixin, http.server.BaseHTTPRequestHandler):
                             # A completed swap: never forward old-routing bytes.
                             evict_stream()
                             return first_byte_ms
-                        first_event_buffer.extend(chunk)
+                        pending.extend(chunk)
 
-                        # Check for event delimiter
-                        if b"\n\n" in first_event_buffer:
-                            break
-                        if len(first_event_buffer) > MAX_FIRST_EVENT_BUFFER:
-                            # Buffer exceeded cap - forward as-is without rewriting
-                            rewrite_skipped = True
-                            log_trace({
-                                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                                "event": "sse_buffer_cap_exceeded",
-                                "request_id": request_id,
-                                "bytes": len(first_event_buffer),
-                            })
+                        # Split complete events (\n\n-delimited) off the front
+                        # and run each through the rewrite until message_start
+                        # or the budget ends the scan. The budget check runs
+                        # before each split, so scan work stays bounded by the
+                        # budget regardless of chunk size or event count.
+                        scan_over = False
+                        while True:
+                            if len(scanned) + len(pending) > MAX_SCAN_BUDGET:
+                                scan_capped = True
+                                scan_over = True
+                                break
+                            idx = pending.find(b"\n\n")
+                            if idx < 0:
+                                break  # no complete event yet; keep reading
+                            event_bytes = bytes(pending[:idx + 2])
+                            del pending[:idx + 2]
+                            rewritten, is_message_start = _rewrite_sse_event(
+                                event_bytes, tier, request_id)
+                            scanned.extend(rewritten)
+                            if is_message_start:
+                                scan_over = True
+                                break
+                        if scan_over:
                             break
                 except httpx2.ReadTimeout:
                     # The read bound is the client timeout. A swap in progress
@@ -432,33 +450,24 @@ class ProxyHandler(ChatSSEHandlerMixin, http.server.BaseHTTPRequestHandler):
                 except (httpx2.RequestError, httpx2.StreamError, OSError):
                     pass
 
-                if first_event_buffer:
-                    # Split buffer at first \n\n to isolate first event
-                    delimiter_idx = first_event_buffer.find(b"\n\n")
-                    if delimiter_idx >= 0:
-                        # Extract first event (including \n\n)
-                        first_event_bytes = bytes(first_event_buffer[:delimiter_idx + 2])
-                        # Remainder is everything after the first \n\n
-                        remainder = bytes(first_event_buffer[delimiter_idx + 2:])
-                    else:
-                        # No delimiter found (buffer exceeded cap)
-                        first_event_bytes = bytes(first_event_buffer)
-                        remainder = b""
+                if scan_capped:
+                    log_trace({
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "event": "sse_buffer_cap_exceeded",
+                        "request_id": request_id,
+                        "bytes": len(scanned) + len(pending),
+                    })
 
-                    if not rewrite_skipped:
-                        # Try to rewrite model in first event only
-                        first_event_bytes = _rewrite_sse_first_event(
-                            first_event_bytes, tier, request_id)
-
-                    # Write rewritten first event
-                    self.wfile.write(first_event_bytes)
+                if scanned or pending:
+                    # Flush the scan window: the rewritten message_start (if
+                    # found) or the verbatim degrade, plus whatever trailed it
+                    # in the final chunk. A partial trailing event is never
+                    # parsed — it forwards as received and is completed by the
+                    # remainder loop below.
+                    head = bytes(scanned) + bytes(pending)
+                    self.wfile.write(head)
                     self.wfile.flush()
-                    bytes_streamed += len(first_event_bytes)
-                    # Write remainder (may contain additional events from the same chunk)
-                    if remainder:
-                        self.wfile.write(remainder)
-                        self.wfile.flush()
-                        bytes_streamed += len(remainder)
+                    bytes_streamed += len(head)
                     first_byte_ms = (time.time() - first_byte_start) * 1000
                     first_chunk = False
 

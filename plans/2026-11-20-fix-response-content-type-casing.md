@@ -11,6 +11,7 @@
 
 | Issue | Status | Found | Resolved | Resolved By |
 |-------|--------|-------|----------|-------------|
+| 2026-11-22-sse-scan-ping-first cross-reference — tracked as `defer-issue-sse-rewrite-ping-first` | Resolved | 2026-11-22 | 2026-11-22 | plan 2026-11-22-sse-scan-ping-first — bounded leading-event SSE scan implemented and tester-verified; the deferral was adopted into that plan's Issue Log and Resolved |
 | [response-content-type-lookup](./tmp/reports/defer-issue-response-content-type-lookup.json) | Resolved | 2026-11-16 | 2026-11-20 | [tester](./tmp/reports/2026-11-20-fix-response-content-type-casing-tester-2026-11-20.json) |
 
 ## Guidance for Coder

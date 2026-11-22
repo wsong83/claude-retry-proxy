@@ -883,18 +883,25 @@ def test_nesting_guard_transform_and_guard_encode():
 
 
 def test_nesting_guard_rewrite_sse_first_event():
-    """_rewrite_sse_first_event forwards the original event on an encode fault."""
-    print("\n--- Test: Guard — _rewrite_sse_first_event ---")
+    """_rewrite_sse_event forwards the original event on an encode fault.
+
+    The primitive now returns ``(event_bytes, is_message_start)``: an encode
+    fault on a recognized message_start degrades to the original event and
+    still reports True, so the scan stops at the event it could not rewrite
+    rather than continuing past it.
+    """
+    print("\n--- Test: Guard — _rewrite_sse_event ---")
     import claude_retry_proxy.server as srv
 
     event = (b'event: message_start\n'
              b'data: {"type":"message_start","message":{"model":"claude-sonnet-5"}}\n\n')
     with unittest.mock.patch("json.dumps", side_effect=RecursionError):
-        out = srv._rewrite_sse_first_event(event, "sonnet", "req-nesting-guard-sse")
-    if out != event:
-        fail("encode fault: expected the original event, got {!r}".format(out[:120]))
+        out = srv._rewrite_sse_event(event, "sonnet", "req-nesting-guard-sse")
+    if out != (event, True):
+        fail("encode fault: expected (original event, True), got {!r}".format(
+            out if not isinstance(out, tuple) else (out[0][:120], out[1])))
         return
-    pass_("patched json.dumps: original event returned, no raise")
+    pass_("patched json.dumps: original event returned with is_message_start True")
 
 
 def test_nesting_guard_sse_event_encode():
