@@ -27,8 +27,10 @@ rationale, mechanisms, and edge cases — and is indexed by
 ```
 src/claude_retry_proxy/
   __init__.py           __version__
-  server.py             the HTTP retry gateway server (ThreadingHTTPServer, the `ProxyHandler` request handler — whose MRO is `ChatSSEHandlerMixin` → `BaseHTTPRequestHandler` — mode dispatch, admin API, CLI entry; re-exports forwarder.py's frozen surface — attribute-form for state, which is never re-exported)
-  forwarder.py          the upstream forward path (extracted 2026-11-16): `extract_model`/`resolve_tier` tier resolution, `_forward_core` retry/backoff over the httpx2 transport, the compat + reasoning retries' orchestration, response model rewriting, the config-swap drain protocol (its state lives here; server reads it attribute-form), the chat retry-nudge store, and the shared `_DISCONNECT_ERRORS` tuple; never imports its parent
+  server.py             the HTTP retry gateway server (ThreadingHTTPServer, the `ProxyHandler` request handler — whose MRO is `AdminHandlerMixin` → `ChatSSEHandlerMixin` → `BaseHTTPRequestHandler` — mode dispatch, admin-route dispatch, CLI entry; re-exports forwarder.py's frozen surface; reads process state attribute-form from runtime_state.py)
+  admin_api.py          the admin control plane (extracted 2026-11-23, step 8): `AdminHandlerMixin` holding the eight `/admin` route handlers (page, config, swap-status, providers, providers-detail, shutdown, switch, reload) plus `_load_admin_html`, `_validate_csrf_origin`, `_CARRIED_MODELS_KEYS`, `ADMIN_BODY_LIMIT`, `_admin_html_cache`; bodies byte-verbatim from server.py's former branches; imports forwarder/runtime_state/config/keys/nesting/safety/settings/sinks, never server.py
+  runtime_state.py      process runtime-state leaf (extracted 2026-11-23, step 8): the five mutable globals (`_current_config`, `_config_path`, `_vendors`, `_shutting_down`, `_startup_state`) and `heartbeat_loop`; every cross-module access is attribute-form (state is never re-exported); the tracked owned-state conversion follow-up lands here
+  forwarder.py          the upstream forward path (extracted 2026-11-16): `extract_model`/`resolve_tier` tier resolution, `_forward_core` retry/backoff over the httpx2 transport, the compat + reasoning retries' orchestration, response model rewriting, the config-swap drain protocol (its state lives here; readers read it attribute-form), the chat retry-nudge store, and the shared `_DISCONNECT_ERRORS` tuple; never imports its parent
   chat_sse.py           the chat-mode SSE conversion mixin (extracted 2026-11-17, step 7): `ChatSSEHandlerMixin` holding `_stream_chat_sse_to_anthropic` (OpenAI chat-completions SSE → Anthropic Messages SSE, including the tool-block state machine and the post-finish drain) and `_log_response_cap_exceeded`, plus the chat/drain bounds (`SSE_EVENT_DELIMITER`, `MAX_CHAT_*`, `MAX_DRAIN_*`); `ProxyHandler` inherits it, `_sse_event` stays on the handler and resolves through the MRO; imports forwarder/sinks/settings/nesting/transforms_chat, never server.py
   compat.py             the compatibility learner: the `COMPAT_FEATURES` registry (two features — `context_management` in anthropic mode, `reasoning_field` in chat mode) whose descriptors own their mode, presence test, matcher, field set and retry budget; COMPAT_* policy constants; the owned `_CompatState` state object (default-param `state=` injection); the `context_management` state machine with its 400-shape matchers and its retry lock, and the `reasoning_field` credit learner (a per-key in-memory credit; the switch thresholds are `models.json` policy, `reasoning_field_switch`) with its lock-free, key-free rescue (its passes repair the forwarded body rather than re-rolling) and matcher, plus its demanding-turn-scoped presence gate (`_reasoning_present`: reasoning on the last `tool_use`-bearing assistant turn, read from the raw client body) (extracted from server.py; the probe-outcome + retry orchestration slice lives in forwarder.py, which imports this module — `_compat_retry_lock` is dual-read)
   sanitize.py           error-text redaction leaf: `sanitize_error`, the chokepoint for text reaching stderr, trace `error` fields and client-facing error bodies
@@ -36,7 +38,7 @@ src/claude_retry_proxy/
   settings.py           env-derived settings singleton: `SETTINGS` value object (the `PROXY_*` limits/flags, runtime paths incl. state/compat files, mode values) + `resolve_trace_file` — built at import from env, adjusted by `main()` at startup; imported by both the server and the CLI
   config.py             the config.json + models.json document pair: `models_path_for` / `load_models_document` / `load_config` / `validate_config` (the canonical validation policy) / `write_config` / `install_template` + extra-header specs; serves the server and the CLI
   keys.py               keys-index pipeline: `vendor_key_entries`/`vendor_key_names`, `_validate_vendor_keys_shape`, `load_keys_file` (encrypted or plain), `read_passphrase_from_stdin`
-  nesting.py            payload-nesting policy leaf: `MAX_JSON_NESTING_DEPTH` (500), `NestingViolation`, `check_payload_nesting` (string/escape-aware scan with a count fast path, early exit at the limit, and a repaired-prefix path diagnostic) — the pre-parse bound on every client- or upstream-derived JSON payload
+  nesting.py            payload-nesting policy leaf: `MAX_JSON_NESTING_DEPTH` (500), `NestingViolation`, `check_payload_nesting` (string/escape-aware scan with a count fast path, early exit at the limit, and a repaired-prefix path diagnostic) — the pre-parse bound on every client- or upstream-derived JSON payload; also carries `_nesting_limit_message` (the shared rejection-message builder, moved here from server.py 2026-11-23)
   safety.py             task-shaped utility leaf: string-emission-safety predicates (`_validate_admin_name` charset allowlist); docstring indexes the stay-behind safety idioms
   transforms_common.py  shared endpoint-mode transform mechanism: `_transform_and_guard` (passthrough-on-failure response guard) + `_request_transform_timestamp` helper + the tool-schema pattern sanitizers `_strip_regex_identity_escapes` / `_sanitize_schema_patterns` / `_sanitize_body_tools` (see doc/provider-modes.html#pattern-normalization)
   transforms_chat.py    Anthropic↔Chat (OpenAI chat-completions) body transforms, both directions; each assistant turn collapses to one message (its text and `tool_calls` together), and the policy-scoped always-present field (`reasoning_roundtrip`) is written here
@@ -454,8 +456,18 @@ chat-mode SSE conversion into `chat_sse.py` as a `ChatSSEHandlerMixin` that
 `_DISCONNECT_ERRORS` relocated to `forwarder.py` as a shared leaf imported by
 both modules.
 
+The admin/handler extraction (`2026-11-23-extract-admin-api`, step 8) moved the
+admin surface into `admin_api.py` as an `AdminHandlerMixin` (`ProxyHandler`
+composes it ahead of `ChatSSEHandlerMixin`), created the `runtime_state.py`
+process-state leaf (five mutable globals + `heartbeat_loop`, attribute-form
+access everywhere), and relocated `_nesting_limit_message` into `nesting.py` —
+a verbatim move under the same gate disciplines. Named follow-ups: the
+server-lifecycle extraction (`main()` + `_ProxyHTTPServer`; `server.py` remains
+marginally over the 1,000-line code threshold until it lands) and the
+owned-state-object conversion (guide §5), whose scope now covers forwarder's
+swap-drain + nudge state AND `runtime_state`'s five globals.
+
 Per-step line counts are deliberately not repeated here — they rot, and the plan
-archives hold them. The remaining clusters (the admin/handler extraction and the
-forwarder owned-state conversion) are tracked by the /refactor-split survey,
-which replaced the retired break-up backlog report on 2026-09-16. New deep
-detail belongs in `doc/`, not here.
+archives hold them. The remaining clusters are tracked by the /refactor-split
+survey, which replaced the retired break-up backlog report on 2026-09-16. New
+deep detail belongs in `doc/`, not here.

@@ -51,9 +51,14 @@ where the request should go and what it should look like when it gets there.</p>
 <code>ProxyHandler.do_POST</code> and <code>forward_request</code> in
 <code>src/claude_retry_proxy/server.py</code>, which hands the upstream call to
 <code>_forward_core</code> in <code>src/claude_retry_proxy/forwarder.py</code>
-(2026-11-16 forwarder extraction). The chat-mode SSE conversion runs in
-<code>ChatSSEHandlerMixin</code> in <code>src/claude_retry_proxy/chat_sse.py</code>,
-which <code>ProxyHandler</code> inherits (2026-11-17 chat-SSE extraction).</p>
+(2026-11-16 forwarder extraction). The admin control plane runs in
+<code>AdminHandlerMixin</code> in <code>src/claude_retry_proxy/admin_api.py</code>,
+which <code>ProxyHandler</code> also inherits (2026-11-23 admin extraction; the
+process state it swaps lives attribute-form in
+<code>src/claude_retry_proxy/runtime_state.py</code>). The chat-mode SSE conversion
+runs in <code>ChatSSEHandlerMixin</code> in
+<code>src/claude_retry_proxy/chat_sse.py</code>, which <code>ProxyHandler</code>
+inherits (2026-11-17 chat-SSE extraction).</p>
 
 <div class="step-box info">
 <div class="step-label">Step 1 — Extract the model</div>

@@ -313,6 +313,7 @@ def test_heartbeat_preserves_state():
     print("\n--- Test: Heartbeat Preserves State ---")
 
     import claude_retry_proxy.server as srv
+    import claude_retry_proxy.runtime_state as runtime_state
 
     state_path = srv.SETTINGS.state_file
     state_backup = None
@@ -335,11 +336,11 @@ def test_heartbeat_preserves_state():
             "last_heartbeat": "2026-08-26T00:00:00Z",
             "last_request_at": "2026-08-26T00:00:00Z",
         }
-        srv._startup_state = full_state
+        runtime_state._startup_state = full_state
 
         # Heartbeat write: update last_heartbeat on the in-memory copy and write it
-        srv._startup_state["last_heartbeat"] = "2026-08-26T01:00:00Z"
-        srv.write_state(srv._startup_state)
+        runtime_state._startup_state["last_heartbeat"] = "2026-08-26T01:00:00Z"
+        srv.write_state(runtime_state._startup_state)
 
         with open(state_path) as f:
             recreated = json.load(f)

@@ -217,6 +217,32 @@ def nesting_event(site, violation, **fields):
     return event
 
 
+def _nesting_limit_message(violation):
+    """Build the rejection message for a payload that exceeds the nesting limit.
+
+    Always names the offset; names the offending structure when the scanner's
+    repaired-prefix diagnostic could locate it (nesting.NestingViolation).
+    When it could not, the tail names the degrade the scanner reported: a
+    crossing past the repair cap or a walk past the node locator budget (the
+    body itself may be fine, only the locator is unavailable) versus a
+    repaired prefix that failed to parse.
+    """
+    message = "Request body nesting depth exceeds the limit of {} levels".format(
+        MAX_JSON_NESTING_DEPTH)
+    message += " (first excess at offset {}".format(violation.offset)
+    if violation.path is not None:
+        message += ": {}".format(violation.path)
+    elif violation.degrade == "cap":
+        message += "; locator unavailable past the {} MiB repair cap".format(
+            _REPAIR_MAX_OFFSET // (1024 * 1024))
+    elif violation.degrade == "budget":
+        message += "; locator unavailable past the {} node scan budget".format(
+            _REPAIR_MAX_NODES)
+    else:
+        message += "; body may not be valid JSON"
+    return message + ")"
+
+
 def _as_text(raw):
     """Decode bytes-like the way json.loads will; scan str directly; else None."""
     if isinstance(raw, str):

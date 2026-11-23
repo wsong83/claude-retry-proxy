@@ -1469,6 +1469,7 @@ def test_heartbeat_survives_failed_state_write():
     print("\n--- Test: Heartbeat Survives Failed State Write ---")
 
     import claude_retry_proxy.server as srv
+    import claude_retry_proxy.runtime_state as runtime_state
     from claude_retry_proxy import sinks
 
     root = tempfile.mkdtemp(prefix="proxy_hb_blocked_")
@@ -1480,9 +1481,9 @@ def test_heartbeat_survives_failed_state_write():
     # tests share. Both are restored in the finally block.
     prev_health = sinks._health
     prev_state_path = sinks._state._path
-    saved = (srv._startup_state, srv._shutting_down, srv.time)
+    saved = (runtime_state._startup_state, runtime_state._shutting_down, runtime_state.time)
     sinks.configure(state_path=blocked, health=sinks._SinkHealth())
-    srv._startup_state = {
+    runtime_state._startup_state = {
         "pid": 12345,
         "port": 8080,
         "started_at": "2026-09-10T00:00:00Z",
@@ -1490,14 +1491,14 @@ def test_heartbeat_survives_failed_state_write():
         "last_heartbeat": "2026-09-10T00:00:00Z",
         "last_request_at": "2026-09-10T00:00:00Z",
     }
-    srv._shutting_down = False
-    srv.time = _FastTime()
+    runtime_state._shutting_down = False
+    runtime_state.time = _FastTime()
 
     thread = None
     buf = io.StringIO()
     try:
         with contextlib.redirect_stderr(buf):
-            thread = threading.Thread(target=srv.heartbeat_loop, daemon=True)
+            thread = threading.Thread(target=runtime_state.heartbeat_loop, daemon=True)
             thread.start()
 
             deadline = time.time() + 5
@@ -1520,7 +1521,7 @@ def test_heartbeat_survives_failed_state_write():
             while time.time() < deadline and not os.path.exists(blocked):
                 time.sleep(0.02)
 
-            srv._shutting_down = True
+            runtime_state._shutting_down = True
             thread.join(timeout=5)
 
         if os.path.exists(blocked):
@@ -1533,10 +1534,10 @@ def test_heartbeat_survives_failed_state_write():
         else:
             fail("no recovery notice after the state sink recovered")
     finally:
-        srv._shutting_down = True
+        runtime_state._shutting_down = True
         if thread is not None:
             thread.join(timeout=5)
-        srv._startup_state, srv._shutting_down, srv.time = saved
+        runtime_state._startup_state, runtime_state._shutting_down, runtime_state.time = saved
         sinks.configure(state_path=prev_state_path, health=prev_health)
         shutil.rmtree(root, ignore_errors=True)
 
@@ -1553,6 +1554,7 @@ def test_sink_emission_survives_failing_stderr():
     print("\n--- Test: Sink Emission Survives Failing stderr ---")
 
     import claude_retry_proxy.server as srv
+    import claude_retry_proxy.runtime_state as runtime_state
     from claude_retry_proxy import sinks
 
     root = tempfile.mkdtemp(prefix="proxy_stderr_fail_")
@@ -1568,7 +1570,7 @@ def test_sink_emission_survives_failing_stderr():
     prev_health = sinks._health
     prev_trace_path = sinks._trace._path
     prev_state_path = sinks._state._path
-    saved = (srv._startup_state, srv._shutting_down, srv.time, sys.stderr)
+    saved = (runtime_state._startup_state, runtime_state._shutting_down, runtime_state.time, sys.stderr)
     health = sinks._SinkHealth()
     sinks.configure(trace_path=blocked_trace, state_path=blocked_state,
                     health=health)
@@ -1616,7 +1618,7 @@ def test_sink_emission_survives_failing_stderr():
             fail("health.success() raised with a failing stderr: {!r}".format(e))
 
         # (5) A real heartbeat thread survives the whole condition.
-        srv._startup_state = {
+        runtime_state._startup_state = {
             "pid": 12345,
             "port": 8080,
             "started_at": "2026-09-10T00:00:00Z",
@@ -1624,23 +1626,23 @@ def test_sink_emission_survives_failing_stderr():
             "last_heartbeat": "2026-09-10T00:00:00Z",
             "last_request_at": "2026-09-10T00:00:00Z",
         }
-        srv._shutting_down = False
-        srv.time = _FastTime()
-        thread = threading.Thread(target=srv.heartbeat_loop, daemon=True)
+        runtime_state._shutting_down = False
+        runtime_state.time = _FastTime()
+        thread = threading.Thread(target=runtime_state.heartbeat_loop, daemon=True)
         thread.start()
         time.sleep(1.0)
         alive = thread.is_alive()
-        srv._shutting_down = True
+        runtime_state._shutting_down = True
         thread.join(timeout=5)
         if alive:
             pass_("heartbeat thread survived failing writes with a failing stderr")
         else:
             fail("heartbeat thread died — the guard's own emission raised")
     finally:
-        srv._shutting_down = True
+        runtime_state._shutting_down = True
         if thread is not None:
             thread.join(timeout=5)
-        srv._startup_state, srv._shutting_down, srv.time, sys.stderr = saved
+        runtime_state._startup_state, runtime_state._shutting_down, runtime_state.time, sys.stderr = saved
         sinks.configure(trace_path=prev_trace_path, state_path=prev_state_path,
                         health=prev_health)
         shutil.rmtree(root, ignore_errors=True)

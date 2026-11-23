@@ -7,7 +7,7 @@ messages, logs, admin names). No package imports, no module state.
 The stay-behind idioms of the same task, indexed:
 - the inline control-character scans that move with the validators in
   config.py and keys.py
-- ``_crlf_safe`` (server.py), ``_validate_csrf_origin`` (server.py),
+- ``_crlf_safe`` (server.py), ``_validate_csrf_origin`` (admin_api.py),
   ``RESERVED_EXTRA_HEADER_NAMES`` / ``EXTRA_FROM_FORBIDDEN`` (config.py)
 
 Extracted from server.py verbatim.

@@ -2849,6 +2849,8 @@ def test_reload_does_not_revert_concurrent_switch():
     print("\n--- Test: Reload Does Not Revert a Concurrent Switch ---")
     import claude_retry_proxy.server as srv
     import claude_retry_proxy.forwarder as forwarder
+    import claude_retry_proxy.admin_api as admin_api
+    import claude_retry_proxy.runtime_state as runtime_state
 
     temp_dir = tempfile.mkdtemp()
     try:
@@ -2863,17 +2865,17 @@ def test_reload_does_not_revert_concurrent_switch():
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump({"tiers": original_tiers}, f)
 
-        saved_srv = {name: getattr(srv, name) for name in (
+        saved_srv = {name: getattr(runtime_state, name) for name in (
             "_config_path", "_current_config", "_vendors")}
         saved_fwd = {name: getattr(forwarder, name) for name in (
             "_config_epoch", "_config_swapping", "_inflight_count",
             "_swap_evictions")}
-        saved_drain = srv._drain_for_swap
+        saved_drain = admin_api._drain_for_swap
         try:
-            srv._config_path = config_path
-            srv._current_config = {"tiers": original_tiers}
+            runtime_state._config_path = config_path
+            runtime_state._current_config = {"tiers": original_tiers}
             forwarder._config_epoch = 5
-            srv._vendors = {
+            runtime_state._vendors = {
                 "p1": {"url": "http://127.0.0.1:1", "key": "k-p1"},
                 "p2": {"url": "http://127.0.0.1:2", "key": "k-p2"},
             }
@@ -2887,12 +2889,12 @@ def test_reload_does_not_revert_concurrent_switch():
                 # its Phase-3 install. `candidate` still holds `original_tiers`.
                 import claude_retry_proxy.forwarder as forwarder
                 forwarder._config_swapping = True
-                srv._current_config = {"tiers": switch_tiers}
+                runtime_state._current_config = {"tiers": switch_tiers}
                 forwarder._config_epoch = 6
                 forwarder._config_swapping = False
                 return (True, 0, 0.0)
 
-            srv._drain_for_swap = concurrent_switch_completes
+            admin_api._drain_for_swap = concurrent_switch_completes
 
             captured = []
             handler = object.__new__(srv.ProxyHandler)
@@ -2932,10 +2934,10 @@ def test_reload_does_not_revert_concurrent_switch():
                 fail("the refusal must carry the Anthropic envelope (type=error, "
                      "error.type=api_error, a request_id): {!r}".format(parsed))
                 return
-            if srv._current_config != {"tiers": switch_tiers}:
+            if runtime_state._current_config != {"tiers": switch_tiers}:
                 fail("the reload REVERTED the switch's mapping: _current_config is "
                      "{!r}, expected the switch's tiers {!r}".format(
-                         srv._current_config, {"tiers": switch_tiers}))
+                         runtime_state._current_config, {"tiers": switch_tiers}))
                 return
             if forwarder._config_epoch != 6:
                 fail("a refused reload must not bump the epoch; got {}".format(
@@ -2944,10 +2946,10 @@ def test_reload_does_not_revert_concurrent_switch():
             pass_("reload refused 409 config_reload_stale; the switch's mapping "
                   "survived and no epoch bump was taken")
         finally:
-            srv._drain_for_swap = saved_drain
-            srv._config_path = saved_srv["_config_path"]
-            srv._current_config = saved_srv["_current_config"]
-            srv._vendors = saved_srv["_vendors"]
+            admin_api._drain_for_swap = saved_drain
+            runtime_state._config_path = saved_srv["_config_path"]
+            runtime_state._current_config = saved_srv["_current_config"]
+            runtime_state._vendors = saved_srv["_vendors"]
             forwarder._config_epoch = saved_fwd["_config_epoch"]
             forwarder._config_swapping = saved_fwd["_config_swapping"]
             forwarder._inflight_count = saved_fwd["_inflight_count"]
@@ -3033,11 +3035,12 @@ def test_admin_config_serialize_failure_500():
     """
     print("\n--- Test: Admin API Config Serialize Failure Is a 500 ---")
     import claude_retry_proxy.server as srv
+    import claude_retry_proxy.runtime_state as runtime_state
 
     provider = "p1"
     model = "claude-sonnet-5"
     tiers = ("haiku", "sonnet", "opus")
-    saved = srv._current_config
+    saved = runtime_state._current_config
     # {1, 2} is the unserializable value: a set has no JSON encoder.
     poisoned = {
         "tiers": {t: {"provider": provider, "model": model, "key": "",
@@ -3045,7 +3048,7 @@ def test_admin_config_serialize_failure_500():
         "models": {provider: [model]},
     }
     try:
-        srv._current_config = poisoned
+        runtime_state._current_config = poisoned
         try:
             captured = _drive_get_in_process(srv, "/admin/api/config")
         except Exception as e:
@@ -3079,7 +3082,7 @@ def test_admin_config_serialize_failure_500():
         pass_("the 500 body is exactly {\"error\": \"the configuration could "
               "not be serialized\"}")
     finally:
-        srv._current_config = saved
+        runtime_state._current_config = saved
 
     # Survival: the guard must not wedge the endpoint. The document is set to a
     # LITERAL serializable one rather than "restored" from `saved`: in this
@@ -3093,7 +3096,7 @@ def test_admin_config_serialize_failure_500():
         "models": {provider: [model]},
     }
     try:
-        srv._current_config = restored
+        runtime_state._current_config = restored
         try:
             captured = _drive_get_in_process(srv, "/admin/api/config")
         except Exception as e:
@@ -3122,7 +3125,7 @@ def test_admin_config_serialize_failure_500():
         pass_("the endpoint answers 200 again with the restored document once a "
               "serializable config is back")
     finally:
-        srv._current_config = saved
+        runtime_state._current_config = saved
 
 
 def test_switch_nesting_gate_precedes_key_echo():
@@ -3170,6 +3173,7 @@ def test_switch_nesting_gate_precedes_key_echo():
     print("\n--- Test: Switch Nesting Gate Precedes Key Echo ---")
     import claude_retry_proxy.server as srv
     import claude_retry_proxy.forwarder as forwarder
+    import claude_retry_proxy.runtime_state as runtime_state
 
     limit = srv.MAX_JSON_NESTING_DEPTH
     # A real container, not a string of brackets: brackets inside a JSON string
@@ -3197,7 +3201,7 @@ def test_switch_nesting_gate_precedes_key_echo():
     # every later test in the same process. Snapshot/restore the neighbours'
     # way, and assert the refusal left the epoch alone (a refusal must never
     # advance it).
-    saved_srv = {name: getattr(srv, name) for name in (
+    saved_srv = {name: getattr(runtime_state, name) for name in (
         "_config_path", "_current_config", "_vendors")}
     saved_fwd = {name: getattr(forwarder, name) for name in (
         "_config_epoch", "_config_swapping", "_inflight_count")}
@@ -3268,9 +3272,9 @@ def test_switch_nesting_gate_precedes_key_echo():
             return
         pass_("both refusals left the config epoch unchanged")
     finally:
-        srv._config_path = saved_srv["_config_path"]
-        srv._current_config = saved_srv["_current_config"]
-        srv._vendors = saved_srv["_vendors"]
+        runtime_state._config_path = saved_srv["_config_path"]
+        runtime_state._current_config = saved_srv["_current_config"]
+        runtime_state._vendors = saved_srv["_vendors"]
         forwarder._config_epoch = saved_fwd["_config_epoch"]
         forwarder._config_swapping = saved_fwd["_config_swapping"]
         forwarder._inflight_count = saved_fwd["_inflight_count"]
@@ -3299,6 +3303,7 @@ def test_admin_reload_serialize_failure_500():
     print("\n--- Test: Admin Reload Serialize Failure Is a 500 ---")
     import claude_retry_proxy.server as srv
     import claude_retry_proxy.forwarder as forwarder
+    import claude_retry_proxy.runtime_state as runtime_state
 
     provider = "p1"
     model = "claude-sonnet-5"
@@ -3322,15 +3327,15 @@ def test_admin_reload_serialize_failure_500():
             "models": {provider: [model]},
         }
 
-        saved_srv = {name: getattr(srv, name) for name in (
+        saved_srv = {name: getattr(runtime_state, name) for name in (
             "_config_path", "_current_config", "_vendors")}
         saved_fwd = {name: getattr(forwarder, name) for name in (
             "_config_epoch", "_config_swapping", "_inflight_count",
             "_swap_evictions", "_swap_started_at")}
-        srv._config_path = config_path
-        srv._current_config = poisoned
+        runtime_state._config_path = config_path
+        runtime_state._current_config = poisoned
         forwarder._config_epoch = 5
-        srv._vendors = {provider: {"url": "http://127.0.0.1:1", "key": "k-p1"}}
+        runtime_state._vendors = {provider: {"url": "http://127.0.0.1:1", "key": "k-p1"}}
         forwarder._config_swapping = False
         forwarder._inflight_count = 0
         forwarder._swap_evictions = 0
@@ -3351,10 +3356,10 @@ def test_admin_reload_serialize_failure_500():
             fail("the 500 does not carry the message: {}".format(text[:300]))
             return
         pass_("the 500 names the serialization failure")
-        if srv._current_config is not poisoned:
+        if runtime_state._current_config is not poisoned:
             fail("the 500 branch installed a config — _current_config is no "
                  "longer the poisoned document ({}); a truthful 500 installs "
-                 "nothing".format(type(srv._current_config).__name__))
+                 "nothing".format(type(runtime_state._current_config).__name__))
             return
         pass_("nothing was installed (_current_config is still the poisoned doc)")
         if forwarder._config_epoch != 5:
@@ -3367,9 +3372,9 @@ def test_admin_reload_serialize_failure_500():
         # failure before that point leaves the dicts empty — an unguarded
         # restore would raise KeyError and mask the real exception.
         if saved_srv:
-            srv._config_path = saved_srv["_config_path"]
-            srv._current_config = saved_srv["_current_config"]
-            srv._vendors = saved_srv["_vendors"]
+            runtime_state._config_path = saved_srv["_config_path"]
+            runtime_state._current_config = saved_srv["_current_config"]
+            runtime_state._vendors = saved_srv["_vendors"]
         if saved_fwd:
             forwarder._config_epoch = saved_fwd["_config_epoch"]
             forwarder._config_swapping = saved_fwd["_config_swapping"]
@@ -3407,12 +3412,14 @@ def test_admin_reload_serializability_probe_precedes_drain():
     print("\n--- Test: Admin Reload Serializability Probe Precedes the Drain ---")
     import claude_retry_proxy.server as srv
     import claude_retry_proxy.forwarder as forwarder
+    import claude_retry_proxy.admin_api as admin_api
+    import claude_retry_proxy.runtime_state as runtime_state
 
     provider = "p1"
     model = "claude-sonnet-5"
     tiers = ("haiku", "sonnet", "opus")
     temp_dir = tempfile.mkdtemp()
-    real_drain = srv._drain_for_swap
+    real_drain = admin_api._drain_for_swap
     saved_srv = {}
     saved_fwd = {}
     try:
@@ -3430,15 +3437,15 @@ def test_admin_reload_serializability_probe_precedes_drain():
             "models": {provider: [model]},
         }
 
-        saved_srv = {name: getattr(srv, name) for name in (
+        saved_srv = {name: getattr(runtime_state, name) for name in (
             "_config_path", "_current_config", "_vendors")}
         saved_fwd = {name: getattr(forwarder, name) for name in (
             "_config_epoch", "_config_swapping", "_inflight_count",
             "_swap_evictions", "_swap_started_at")}
-        srv._config_path = config_path
-        srv._current_config = poisoned
+        runtime_state._config_path = config_path
+        runtime_state._current_config = poisoned
         forwarder._config_epoch = 5
-        srv._vendors = {provider: {"url": "http://127.0.0.1:1", "key": "k-p1"}}
+        runtime_state._vendors = {provider: {"url": "http://127.0.0.1:1", "key": "k-p1"}}
         forwarder._config_swapping = False
         forwarder._inflight_count = 0
         forwarder._swap_evictions = 0
@@ -3450,7 +3457,7 @@ def test_admin_reload_serializability_probe_precedes_drain():
             drain_calls.append(1)
             return real_drain()
 
-        srv._drain_for_swap = counting_drain
+        admin_api._drain_for_swap = counting_drain
 
         captured = _drive_post_in_process(srv, "/admin/api/reload", b"")
         if not captured:
@@ -3482,7 +3489,7 @@ def test_admin_reload_serializability_probe_precedes_drain():
         # must now run exactly once and the reload must succeed. Without this
         # case a stand-in that silently never fires would pass the assertion
         # above.
-        srv._current_config = {
+        runtime_state._current_config = {
             "tiers": {t: {"provider": provider, "model": model, "key": ""}
                       for t in tiers},
             "models": {provider: [model]},
@@ -3506,15 +3513,15 @@ def test_admin_reload_serializability_probe_precedes_drain():
                  "the zero-count assertion above cannot be trusted".format(
                      len(drain_calls)))
     finally:
-        srv._drain_for_swap = real_drain
+        admin_api._drain_for_swap = real_drain
         # Guarded: the snapshots above populate INSIDE the try, so a setup
         # failure before that point leaves the dicts empty — an unguarded
         # restore would raise KeyError and mask the real exception. The drain
         # stand-in and the temp-dir removal stay unconditional.
         if saved_srv:
-            srv._config_path = saved_srv["_config_path"]
-            srv._current_config = saved_srv["_current_config"]
-            srv._vendors = saved_srv["_vendors"]
+            runtime_state._config_path = saved_srv["_config_path"]
+            runtime_state._current_config = saved_srv["_current_config"]
+            runtime_state._vendors = saved_srv["_vendors"]
         if saved_fwd:
             forwarder._config_epoch = saved_fwd["_config_epoch"]
             forwarder._config_swapping = saved_fwd["_config_swapping"]
@@ -3550,6 +3557,7 @@ def test_admin_switch_apply_rewrites_tier_map():
     print("\n--- Test: Admin Switch Apply Rewrites the Tier Map ---")
     import claude_retry_proxy.server as srv
     import claude_retry_proxy.forwarder as forwarder
+    import claude_retry_proxy.runtime_state as runtime_state
 
     provider = "p1"
     model = "claude-sonnet-5"
@@ -3565,18 +3573,18 @@ def test_admin_switch_apply_rewrites_tier_map():
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump({"tiers": four_tiers}, f)
 
-        saved_srv = {name: getattr(srv, name) for name in (
+        saved_srv = {name: getattr(runtime_state, name) for name in (
             "_config_path", "_current_config", "_vendors")}
         saved_fwd = {name: getattr(forwarder, name) for name in (
             "_config_epoch", "_config_swapping", "_inflight_count",
             "_swap_evictions", "_swap_started_at")}
-        srv._config_path = config_path
-        srv._current_config = {
+        runtime_state._config_path = config_path
+        runtime_state._current_config = {
             "tiers": {t: dict(cfg) for t, cfg in four_tiers.items()},
             "models": {provider: [model]},
         }
         forwarder._config_epoch = 5
-        srv._vendors = {provider: {"url": "http://127.0.0.1:1", "key": "k-p1"}}
+        runtime_state._vendors = {provider: {"url": "http://127.0.0.1:1", "key": "k-p1"}}
         forwarder._config_swapping = False
         forwarder._inflight_count = 0
         forwarder._swap_evictions = 0
@@ -3611,11 +3619,11 @@ def test_admin_switch_apply_rewrites_tier_map():
                  "Apply now preserves extra tiers, update doc/operations.html's "
                  "'Apply rewrites the tier map' paragraph in the same "
                  "change".format(sorted(disk), sorted(expected)))
-        if set(srv._current_config.get("tiers", {})) == expected:
+        if set(runtime_state._current_config.get("tiers", {})) == expected:
             pass_("the in-memory tier map is exactly the three standard tiers")
         else:
             fail("the in-memory tier map is {!r}, expected exactly {!r}".format(
-                sorted(srv._current_config.get("tiers", {})),
+                sorted(runtime_state._current_config.get("tiers", {})),
                 sorted(expected)))
         if disk.get("haiku", {}).get("key") == "default":
             pass_("the empty key selector resolved to the provider's first key")
@@ -3627,9 +3635,9 @@ def test_admin_switch_apply_rewrites_tier_map():
         # failure before that point leaves the dicts empty — an unguarded
         # restore would raise KeyError and mask the real exception.
         if saved_srv:
-            srv._config_path = saved_srv["_config_path"]
-            srv._current_config = saved_srv["_current_config"]
-            srv._vendors = saved_srv["_vendors"]
+            runtime_state._config_path = saved_srv["_config_path"]
+            runtime_state._current_config = saved_srv["_current_config"]
+            runtime_state._vendors = saved_srv["_vendors"]
         if saved_fwd:
             forwarder._config_epoch = saved_fwd["_config_epoch"]
             forwarder._config_swapping = saved_fwd["_config_swapping"]
@@ -3646,7 +3654,7 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
     The press validates against a catalog snapshot taken before it owns the
     swap, while Phase 3 carries the LIVE catalog forward — so a reload that
     completes in between can leave the switch persisting a tier the Reload path
-    then refuses. `_drain_for_swap` is reached through the server module's
+    then refuses. `_drain_for_swap` is reached through admin_api's module
     binding in the switch handler, so rebinding it puts this test exactly
     inside that window with no scheduling race.
 
@@ -3657,12 +3665,14 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
     print("\n--- Test: Admin Switch Re-checks the Catalog After an Epoch Move ---")
     import claude_retry_proxy.server as srv
     import claude_retry_proxy.forwarder as forwarder
+    import claude_retry_proxy.admin_api as admin_api
+    import claude_retry_proxy.runtime_state as runtime_state
 
     provider = "p1"
     model = "claude-sonnet-5"
     tiers = ("haiku", "sonnet", "opus")
-    real_drain = srv._drain_for_swap
-    saved_srv = {name: getattr(srv, name) for name in (
+    real_drain = admin_api._drain_for_swap
+    saved_srv = {name: getattr(runtime_state, name) for name in (
         "_config_path", "_current_config", "_vendors")}
     saved_fwd = {name: getattr(forwarder, name) for name in (
         "_config_epoch", "_config_swapping", "_inflight_count",
@@ -3678,13 +3688,13 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
             baseline = {t: {"provider": provider, "model": model} for t in tiers}
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump({"tiers": baseline}, f)
-            srv._config_path = config_path
-            srv._current_config = {
+            runtime_state._config_path = config_path
+            runtime_state._current_config = {
                 "tiers": {t: dict(cfg) for t, cfg in baseline.items()},
                 "models": {provider: [model]},
             }
             forwarder._config_epoch = 5
-            srv._vendors = {provider: {"url": "http://127.0.0.1:1",
+            runtime_state._vendors = {provider: {"url": "http://127.0.0.1:1",
                                        "key": "k-p1"}}
             forwarder._config_swapping = False
             forwarder._inflight_count = 0
@@ -3705,10 +3715,10 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
         def reload_lands_dropping_model():
             import claude_retry_proxy.forwarder as forwarder
             forwarder._config_epoch += 1                 # a reload completed here...
-            srv._current_config["models"] = {provider: []}   # ...minus the model
+            runtime_state._current_config["models"] = {provider: []}   # ...minus the model
             return real_drain()
 
-        srv._drain_for_swap = reload_lands_dropping_model
+        admin_api._drain_for_swap = reload_lands_dropping_model
         captured = _drive_post_in_process(srv, "/admin/api/switch", body)
         if not captured:
             fail("case 1: the switch handler sent no response")
@@ -3751,7 +3761,7 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
             forwarder._config_epoch += 1                 # a reload completed here...
             return real_drain()                    # ...and the model survived
 
-        srv._drain_for_swap = reload_lands_keeping_model
+        admin_api._drain_for_swap = reload_lands_keeping_model
         captured = _drive_post_in_process(srv, "/admin/api/switch", body)
         if not captured:
             fail("case 2: the switch handler sent no response")
@@ -3772,16 +3782,16 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
                 ghost))
             return
         pass_("case 2: the extra tier reached the persisted config.json")
-        if srv._current_config.get("models") != {provider: [model]}:
+        if runtime_state._current_config.get("models") != {provider: [model]}:
             fail("case 2: the live catalog was not carried forward: {!r}".format(
-                srv._current_config.get("models")))
+                runtime_state._current_config.get("models")))
             return
         pass_("case 2: the live catalog was carried forward")
     finally:
-        srv._drain_for_swap = real_drain
-        srv._config_path = saved_srv["_config_path"]
-        srv._current_config = saved_srv["_current_config"]
-        srv._vendors = saved_srv["_vendors"]
+        admin_api._drain_for_swap = real_drain
+        runtime_state._config_path = saved_srv["_config_path"]
+        runtime_state._current_config = saved_srv["_current_config"]
+        runtime_state._vendors = saved_srv["_vendors"]
         forwarder._config_epoch = saved_fwd["_config_epoch"]
         forwarder._config_swapping = saved_fwd["_config_swapping"]
         forwarder._inflight_count = saved_fwd["_inflight_count"]
@@ -4436,7 +4446,7 @@ def test_admin_html_pending_status_styled():
         # The LOAD path's gate, read ONCE for (q)-(r). Step 4.6 landed the same
         # discipline (l) and (m)-(o) apply to the other two call sites;
         # `checkInFlightSwapOnLoad` was its last asymmetric survivor. Why it
-        # matters here and not only there: server.py installs `_current_config`
+        # matters here and not only there: the switch installs `_current_config`
         # AFTER the drain, so in the branch this code exists for the row on
         # screen is the PRE-swap document, and /admin/api/switch carries no
         # staleness guard — so leaving that row unlocked passes the operator's

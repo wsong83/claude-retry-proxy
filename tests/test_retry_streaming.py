@@ -2899,6 +2899,7 @@ def test_retry_path_print_failure_does_not_misclassify():
     print("\n--- Test: Retry-Path Print Failure Does Not Misclassify ---")
 
     import claude_retry_proxy.server as srv
+    import claude_retry_proxy.runtime_state as runtime_state
     from claude_retry_proxy import sinks
 
     upstream_port = find_free_port()
@@ -2911,8 +2912,8 @@ def test_retry_path_print_failure_does_not_misclassify():
     # configure(); assigning server.PROXY_TRACE_FILE would be inert here.
     prev_trace_path = sinks._trace._path
     prev_state_path = sinks._state._path
-    saved = (srv._current_config,
-             srv._vendors, srv.SETTINGS.max_retries,
+    saved = (runtime_state._current_config,
+             runtime_state._vendors, srv.SETTINGS.max_retries,
              srv.SETTINGS.initial_delay, srv.SETTINGS.max_delay, sys.stderr)
     try:
         sinks.configure(trace_path=os.path.join(root, "trace.jsonl"),
@@ -2921,7 +2922,7 @@ def test_retry_path_print_failure_does_not_misclassify():
         srv.SETTINGS.max_retries = 1
         srv.SETTINGS.initial_delay = 1
         srv.SETTINGS.max_delay = 1
-        srv._current_config = {
+        runtime_state._current_config = {
             "tiers": {
                 "haiku": {"provider": "p", "model": "claude-haiku-4-5"},
                 "sonnet": {"provider": "p", "model": "claude-sonnet-5"},
@@ -2930,7 +2931,7 @@ def test_retry_path_print_failure_does_not_misclassify():
             "models": {"p": ["claude-haiku-4-5", "claude-sonnet-5",
                              "claude-opus-5"]},
         }
-        srv._vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port),
+        runtime_state._vendors = {"p": {"url": "http://127.0.0.1:{}".format(upstream_port),
                               "key": "K"}}
         srv._compat_validate_constants()
         srv._load_compat_state()
@@ -2956,8 +2957,8 @@ def test_retry_path_print_failure_does_not_misclassify():
         else:
             fail("expected exactly 2 upstream requests, got {}".format(len(reqs)))
     finally:
-        (srv._current_config,
-         srv._vendors, srv.SETTINGS.max_retries,
+        (runtime_state._current_config,
+         runtime_state._vendors, srv.SETTINGS.max_retries,
          srv.SETTINGS.initial_delay, srv.SETTINGS.max_delay, sys.stderr) = saved
         sinks.configure(trace_path=prev_trace_path, state_path=prev_state_path)
         try:
