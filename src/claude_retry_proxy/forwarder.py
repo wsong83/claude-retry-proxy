@@ -3,8 +3,8 @@
 Owns everything between "the client body has arrived" and "the upstream
 response is returned": the transport and policy helpers, the retry loop,
 the compatibility and reasoning retries, and the config-swap drain
-protocol's state. The chat retry-nudge marker store (chat_nudge.py) and
-the anthropic-mode model projection (model_rewrite.py) are re-exported here.
+protocol's state. Re-exported here: the nudge store (chat_nudge.py), the
+model projection (model_rewrite.py), the tier pair (tier_resolution.py).
 The parent module imports this one; this module never imports its parent.
 """
 
@@ -35,6 +35,7 @@ from .compat import (COMPAT_FEATURE, COMPAT_FEATURES,
 from .config import reasoning_roundtrip_models, reasoning_switch_params
 from .keys import vendor_key_entries
 from .model_rewrite import (_rewrite_json_response, _rewrite_sse_event)
+from .tier_resolution import (extract_model, resolve_tier)
 from .sanitize import sanitize_error
 from .settings import SETTINGS
 from .chat_nudge import (_retry_nudge_arm, _retry_nudge_check,
@@ -1532,71 +1533,3 @@ def _forward_core(method, path, handler, request_id, config,
             request_id), None, total_elapsed, retries, tier, provider_name, actual_model
     finally:
         client.close()
-
-
-# ---------------------------------------------------------------------------
-# Model extraction and tier resolution
-# ---------------------------------------------------------------------------
-
-def extract_model(body_bytes):
-    """Extract model name from request body.
-
-    Returns a 2-tuple (model_name, body_error). The contract is total —
-    exactly five outcomes:
-      - empty body: ("unknown", None) — early return, never reaches json.loads
-        (empty bodies continue to surface as unrecognized_model)
-      - object body, usable model: (name, None)
-      - object body, model missing/None/non-string: ("unknown", None)
-      - parses but is not a dict: (None, "invalid_body_type")
-      - does not parse: (None, "invalid_json")
-    """
-    if not body_bytes:
-        return "unknown", None
-    try:
-        data = json.loads(body_bytes)
-    except Exception:  # total per compat._compat_guarded_parse (RecursionError is not a ValueError)
-        return None, "invalid_json"
-    if not isinstance(data, dict):
-        return None, "invalid_body_type"
-    model = data.get("model")
-    # Guard against None or non-string model values
-    if model is None or not isinstance(model, str):
-        return "unknown", None
-    return model, None
-
-
-def resolve_tier(model_name, config):
-    """Resolve a model name to a tier name.
-
-    Resolution order:
-    1. None guard: if model_name is None or not a string, return "unknown"
-    2. Direct match: if model_name is "haiku"/"sonnet"/"opus"
-    3. Reverse lookup: scan config tiers for matching model
-    4. Pattern match: check if tier keyword is in model_name (opus, sonnet, haiku order)
-
-    Returns:
-        str: tier name ("haiku", "sonnet", "opus") or "unknown" if unresolvable
-    """
-    # 1. None guard
-    if model_name is None or not isinstance(model_name, str):
-        return "unknown"
-
-    # 2. Direct match
-    if model_name in ("haiku", "sonnet", "opus"):
-        return model_name
-
-    # 3. Reverse lookup: find tier whose configured model matches
-    tiers = config.get("tiers", {})
-    for tier_name, tier_config in tiers.items():
-        if isinstance(tier_config, dict):
-            configured_model = tier_config.get("model")
-            if configured_model and configured_model == model_name:
-                return tier_name
-
-    # 4. Pattern match: check in order opus, sonnet, haiku (most-specific first)
-    model_lower = model_name.lower()
-    for tier in ("opus", "sonnet", "haiku"):
-        if tier in model_lower:
-            return tier
-
-    return "unknown"

@@ -63,9 +63,13 @@ inherits (2026-11-17 chat-SSE extraction).</p>
 <div class="step-box info">
 <div class="step-label">Step 1 — Extract the model</div>
 <p><code>extract_model(body_bytes)</code> parses the request body and reads its
-<code>model</code> field. It returns the literal string <code>"unknown"</code> when the body is
-empty, is not valid JSON, or has a missing, <code>null</code>, or non-string
-<code>model</code>.</p>
+<code>model</code> field. The contract is total — five outcomes: the pair
+<code>("unknown", None)</code> for an empty body and for a body whose
+<code>model</code> is missing, <code>null</code>, or non-string;
+<code>(None, "invalid_json")</code> for a body that does not parse;
+<code>(None, "invalid_body_type")</code> for a body that parses but is not a
+JSON object; and <code>(name, None)</code> with the model string for a usable
+object body.</p>
 </div>
 
 <div class="step-box info">
