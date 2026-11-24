@@ -3488,9 +3488,9 @@ def test_chat_retry_nudge_sweep_expires_armed_only():
     """
     print("\n--- Test: Chat Retry Nudge Sweep Expires Armed Only ---")
     import claude_retry_proxy.server as srv
-    import claude_retry_proxy.forwarder as forwarder
-    with forwarder._retry_nudge_lock:
-        forwarder._retry_nudge_entries.clear()
+    from claude_retry_proxy import chat_nudge
+    with chat_nudge._store._lock:
+        chat_nudge._store._entries.clear()
     try:
         # --- Half 1: backdated UNARMED entry survives another request's sweep. ---
         msgs1 = [{"role": "user", "content": "a very long generation"}]
@@ -3500,8 +3500,8 @@ def test_chat_retry_nudge_sweep_expires_armed_only():
                                          json.loads(body1)):
             fail("remember(long-generation) must store an entry")
             return
-        with forwarder._retry_nudge_lock:
-            forwarder._retry_nudge_entries["rid-long-generation"]["stored_at"] = \
+        with chat_nudge._store._lock:
+            chat_nudge._store._entries["rid-long-generation"]["stored_at"] = \
                 time.time() - srv.RETRY_NUDGE_TTL_SECONDS - 60
         # A second eligible request's remember runs the production sweep.
         msgs2 = [{"role": "user", "content": "an unrelated conversation"}]
@@ -3511,8 +3511,8 @@ def test_chat_retry_nudge_sweep_expires_armed_only():
                                          json.loads(body2)):
             fail("remember(unrelated) must store an entry")
             return
-        with forwarder._retry_nudge_lock:
-            survived = "rid-long-generation" in forwarder._retry_nudge_entries
+        with chat_nudge._store._lock:
+            survived = "rid-long-generation" in chat_nudge._store._entries
         if not survived:
             fail("an unarmed entry backdated past the TTL was swept by a "
                  "concurrent remember — a long generation loses its own marker")
@@ -3543,16 +3543,16 @@ def test_chat_retry_nudge_sweep_expires_armed_only():
         if not srv._retry_nudge_arm("rid-armed"):
             fail("arm(rid-armed) must succeed")
             return
-        with forwarder._retry_nudge_lock:
-            forwarder._retry_nudge_entries["rid-armed"]["stored_at"] = \
+        with chat_nudge._store._lock:
+            chat_nudge._store._entries["rid-armed"]["stored_at"] = \
                 time.time() - srv.RETRY_NUDGE_TTL_SECONDS - 60
         msgsB = [{"role": "user", "content": "another sweep trigger"}]
         bodyB = json.dumps({"model": "sonnet", "stream": True,
                             "messages": msgsB}).encode()
         srv._retry_nudge_remember("rid-sweep-trigger", bodyB,
                                   json.loads(bodyB))
-        with forwarder._retry_nudge_lock:
-            armed_present = "rid-armed" in forwarder._retry_nudge_entries
+        with chat_nudge._store._lock:
+            armed_present = "rid-armed" in chat_nudge._store._entries
         if armed_present:
             fail("an armed entry past the TTL must be swept, but it survived")
             return
@@ -3569,8 +3569,8 @@ def test_chat_retry_nudge_sweep_expires_armed_only():
             return
         pass_("armed entry past the TTL is swept: arm False, recovery matches nothing")
     finally:
-        with forwarder._retry_nudge_lock:
-            forwarder._retry_nudge_entries.clear()
+        with chat_nudge._store._lock:
+            chat_nudge._store._entries.clear()
 
 
 
@@ -3705,9 +3705,9 @@ def test_chat_retry_nudge_large_conversation_is_nudgeable():
     silently killed the feature on every real chat-mode body."""
     print("\n--- Test: Chat Retry Nudge — Large Conversation Is Nudgeable ---")
     import claude_retry_proxy.server as srv
-    import claude_retry_proxy.forwarder as forwarder
-    with forwarder._retry_nudge_lock:
-        forwarder._retry_nudge_entries.clear()
+    from claude_retry_proxy import chat_nudge
+    with chat_nudge._store._lock:
+        chat_nudge._store._entries.clear()
     messages = [
         {"role": "user", "content": "x" * 1_500_000},
         {"role": "assistant", "content": "Now running the suite:"},
@@ -3739,9 +3739,9 @@ def test_chat_retry_nudge_prefix_digest_matches_strict_extension():
     near-misses: a same-length different-content body and a shorter body."""
     print("\n--- Test: Chat Retry Nudge — Prefix Digest Pass 2 ---")
     import claude_retry_proxy.server as srv
-    import claude_retry_proxy.forwarder as forwarder
-    with forwarder._retry_nudge_lock:
-        forwarder._retry_nudge_entries.clear()
+    from claude_retry_proxy import chat_nudge
+    with chat_nudge._store._lock:
+        chat_nudge._store._entries.clear()
     messages = [{"role": "user", "content": "alpha"},
                 {"role": "assistant", "content": "beta"}]
     body = json.dumps({"messages": messages}).encode("utf-8")
@@ -3758,8 +3758,8 @@ def test_chat_retry_nudge_prefix_digest_matches_strict_extension():
     if srv._retry_nudge_check(sbody, json.loads(sbody)) is not None:
         fail("a same-length non-identical body must not match the prefix digest")
         return
-    with forwarder._retry_nudge_lock:
-        if "rid-digest" not in forwarder._retry_nudge_entries:
+    with chat_nudge._store._lock:
+        if "rid-digest" not in chat_nudge._store._entries:
             fail("the non-match must not consume the marker")
             return
     # (b) shorter -> no match
@@ -3774,8 +3774,8 @@ def test_chat_retry_nudge_prefix_digest_matches_strict_extension():
     if srv._retry_nudge_check(ebody, json.loads(ebody)) != "rid-digest":
         fail("a strict extension must match")
         return
-    with forwarder._retry_nudge_lock:
-        if "rid-digest" in forwarder._retry_nudge_entries:
+    with chat_nudge._store._lock:
+        if "rid-digest" in chat_nudge._store._entries:
             fail("a match must consume the single-use marker")
             return
     pass_("prefix digest: extension matches; same-length and shorter rejected")
@@ -3786,19 +3786,19 @@ def test_chat_retry_nudge_evicts_at_sixty_four_entries():
     unarmed one and the store never exceeds the cap."""
     print("\n--- Test: Chat Retry Nudge — Eviction At 64 Entries ---")
     import claude_retry_proxy.server as srv
-    import claude_retry_proxy.forwarder as forwarder
-    with forwarder._retry_nudge_lock:
-        forwarder._retry_nudge_entries.clear()
+    from claude_retry_proxy import chat_nudge
+    with chat_nudge._store._lock:
+        chat_nudge._store._entries.clear()
     for i in range(65):
         messages = [{"role": "user", "content": "conv-%d" % i}]
         body = json.dumps({"messages": messages}).encode("utf-8")
         if not srv._retry_nudge_remember("rid-%d" % i, body, json.loads(body)):
             fail("remember(rid-%d) must store" % i)
             return
-    with forwarder._retry_nudge_lock:
-        n = len(forwarder._retry_nudge_entries)
-        oldest = "rid-0" in forwarder._retry_nudge_entries
-        newest = "rid-64" in forwarder._retry_nudge_entries
+    with chat_nudge._store._lock:
+        n = len(chat_nudge._store._entries)
+        oldest = "rid-0" in chat_nudge._store._entries
+        newest = "rid-64" in chat_nudge._store._entries
     if n != 64:
         fail("store must hold exactly 64 entries, got {}".format(n))
         return

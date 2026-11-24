@@ -31,8 +31,9 @@ src/claude_retry_proxy/
   lifecycle.py          the process lifecycle (extracted 2026-11-24): `run_server(handler_class)` — argument parsing, keys/config load + validation, the port-ownership probe, state/marker writes, the stderr-guard swap, heartbeat start, signal handlers, readiness, the serve loop, teardown — plus the two private mechanisms it owns, `_ProxyHTTPServer` and `_BestEffortStderr` (both re-exported through server.py for the test surface); the console script, `python -m claude_retry_proxy.server`, and in-process test spawns all enter through server.py's wrapper; imports leaf modules only (settings/keys/config/compat/sinks/runtime_state), never server.py
   admin_api.py          the admin control plane (extracted 2026-11-23, step 8): `AdminHandlerMixin` holding the eight `/admin` route handlers (page, config, swap-status, providers, providers-detail, shutdown, switch, reload) plus `_load_admin_html`, `_validate_csrf_origin`, `_CARRIED_MODELS_KEYS`, `ADMIN_BODY_LIMIT`, `_admin_html_cache`; bodies byte-verbatim from server.py's former branches; imports forwarder/runtime_state/config/keys/nesting/safety/settings/sinks, never server.py
   runtime_state.py      process runtime-state leaf (extracted 2026-11-23, step 8): the five mutable globals (`_current_config`, `_config_path`, `_vendors`, `_shutting_down`, `_startup_state`) and `heartbeat_loop`; every cross-module access is attribute-form (state is never re-exported); the tracked owned-state conversion follow-up lands here
-  forwarder.py          the upstream forward path (extracted 2026-11-16): `extract_model`/`resolve_tier` tier resolution, `_forward_core` retry/backoff over the httpx2 transport, the compat + reasoning retries' orchestration, response model rewriting, the config-swap drain protocol (its state lives here; readers read it attribute-form), the chat retry-nudge store, and the shared `_DISCONNECT_ERRORS` tuple; never imports its parent
+  forwarder.py          the upstream forward path (extracted 2026-11-16): `extract_model`/`resolve_tier` tier resolution, `_forward_core` retry/backoff over the httpx2 transport, the compat + reasoning retries' orchestration, response model rewriting, the config-swap drain protocol (its state lives here; readers read it attribute-form), and the shared `_DISCONNECT_ERRORS` tuple; re-exports `chat_nudge.py`'s five-name surface (the four nudge wrappers + `RETRY_NUDGE_TTL_SECONDS`); never imports its parent
   chat_sse.py           the chat-mode SSE conversion mixin (extracted 2026-11-17, step 7): `ChatSSEHandlerMixin` holding `_stream_chat_sse_to_anthropic` (OpenAI chat-completions SSE → Anthropic Messages SSE, including the tool-block state machine and the post-finish drain) and `_log_response_cap_exceeded`, plus the chat/drain bounds (`SSE_EVENT_DELIMITER`, `MAX_CHAT_*`, `MAX_DRAIN_*`); `ProxyHandler` inherits it, `_sse_event` stays on the handler and resolves through the MRO; imports forwarder/sinks/settings/nesting/transforms_chat, never server.py
+  chat_nudge.py         the chat retry-nudge marker store (extracted 2026-11-24): the owned `_NudgeStore` — the lock and the bounded single-use entry table live on the instance (`_store` is the module singleton) — with the four frozen-name delegation wrappers (`_retry_nudge_remember` / `_retry_nudge_arm` / `_retry_nudge_messages_bytes` / `_retry_nudge_check`) and `RETRY_NUDGE_TTL_SECONDS` / `RETRY_NUDGE_MAX_ENTRIES`; stdlib-only leaf (hashlib/json/threading/time) that never imports its parent; production callers reach it through forwarder's re-export, the tests through `chat_nudge._store` directly
   compat.py             the compatibility learner: the `COMPAT_FEATURES` registry (two features — `context_management` in anthropic mode, `reasoning_field` in chat mode) whose descriptors own their mode, presence test, matcher, field set and retry budget; COMPAT_* policy constants; the owned `_CompatState` state object (default-param `state=` injection); the `context_management` state machine with its 400-shape matchers and its retry lock, and the `reasoning_field` credit learner (a per-key in-memory credit; the switch thresholds are `models.json` policy, `reasoning_field_switch`) with its lock-free, key-free rescue (its passes repair the forwarded body rather than re-rolling) and matcher, plus its demanding-turn-scoped presence gate (`_reasoning_present`: reasoning on the last `tool_use`-bearing assistant turn, read from the raw client body) (extracted from server.py; the probe-outcome + retry orchestration slice lives in forwarder.py, which imports this module — `_compat_retry_lock` is dual-read)
   sanitize.py           error-text redaction leaf: `sanitize_error`, the chokepoint for text reaching stderr, trace `error` fields and client-facing error bodies
   sinks.py              sink class family: private `_Sink` base, `TraceSink` (JSONL append + counters + markers), `StateSink` (atomic state document), shared `_SinkHealth` failure reporter, process-wide pair + `configure()`
@@ -449,8 +450,11 @@ orchestration, response rewriting, the config-swap drain protocol, and the chat
 retry-nudge store — into `forwarder.py` as a byte-identical verbatim move behind
 a frozen surface that `server.py` re-exports (state names deliberately
 never re-exported — attribute form mandatory). Named follow-up: forwarder
-owned-state-object conversion (guide §5 — swap-drain + nudge state as owned
-objects; supersedes the bare-globals relocation of 2026-11-16-extract-forwarder).
+owned-state-object conversion (guide §5 — swap-drain state as an owned object;
+supersedes the bare-globals relocation of 2026-11-16-extract-forwarder). The
+nudge half of that conversion landed 2026-11-24 (plan
+`2026-11-24-extract-nudge-store`: the store is the owned `_NudgeStore` in
+`chat_nudge.py`, extracted byte-verbatim then shaped).
 
 The chat-SSE extraction (`2026-11-17-extract-chat-sse`, step 7) moved the
 chat-mode SSE conversion into `chat_sse.py` as a `ChatSSEHandlerMixin` that
@@ -468,8 +472,9 @@ server-lifecycle extraction — landed 2026-11-24 (plan
 `2026-11-24-extract-server-lifecycle`: `run_server(handler_class)` and the two
 lifecycle classes moved verbatim into `lifecycle.py`, bringing `server.py` under
 the code threshold) — and the owned-state-object conversion (guide §5), whose
-scope now covers forwarder's swap-drain + nudge state AND `runtime_state`'s
-five globals; the conversion is the open one.
+scope now covers forwarder's swap-drain state AND `runtime_state`'s five
+globals (the nudge half landed 2026-11-24 via
+`2026-11-24-extract-nudge-store`); the conversion is the open one.
 
 Per-step line counts are deliberately not repeated here — they rot, and the plan
 archives hold them. The remaining clusters are tracked by the /refactor-split
