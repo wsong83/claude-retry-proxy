@@ -1100,7 +1100,8 @@ def _setup_tier_routing_test(tiers_config, vendors, default_passphrase="test-pas
 
 class _MockHTTPServer(http.server.ThreadingHTTPServer):
     """ThreadingHTTPServer with POSIX-only SO_REUSEADDR, mirroring the
-    proxy's own _ProxyHTTPServer (src server.py): http.server's default
+    proxy's own _ProxyHTTPServer (src lifecycle.py, re-exported by
+    server.py): http.server's default
     allow_reuse_address=1 lets a second listener bind a port a live
     listener already holds on Windows, which would defeat the EADDRINUSE
     fallback _bind_mock_server depends on."""

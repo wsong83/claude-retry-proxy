@@ -9,6 +9,7 @@
 
 | Issue | Status | Found | Resolved | Resolved By |
 |-------|--------|-------|----------|-------------|
+| 2026-11-24-extract-server-lifecycle cross-reference — server.py lands ≈1,040 lines — still over threshold (corrected estimate from the ≈990 first quoted). Full retirement needs the server-lifecycle extraction (`main` + `_ProxyHTTPServer`), which this plan names as the follow-up rather than batching (one cluster per plan). | Resolved | 2026-11-24 | 2026-11-24 | plan 2026-11-24-extract-server-lifecycle — performed exactly that extraction: `run_server(handler_class)` + the two classes moved into `lifecycle.py`; server.py dropped below the 1,000-line code threshold (770 lines at round exit), completing the threshold retirement the caveat named. |
 
 ## Guidance for Coder
 

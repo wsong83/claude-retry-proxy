@@ -29,6 +29,7 @@ from test_parse_guards import ALL_TESTS as PARSE_GUARDS_TESTS
 from test_harness_hardening import ALL_TESTS as HARNESS_HARDENING_TESTS
 from test_response_headers import ALL_TESTS as RESPONSE_HEADERS_TESTS
 from test_spawn_isolation import ALL_TESTS as SPAWN_ISOLATION_TESTS
+from test_lifecycle import ALL_TESTS as LIFECYCLE_TESTS
 
 ALL_TESTS = (
     UNIT_TESTS +
@@ -52,7 +53,8 @@ ALL_TESTS = (
     PARSE_GUARDS_TESTS +
     HARNESS_HARDENING_TESTS +
     RESPONSE_HEADERS_TESTS +
-    SPAWN_ISOLATION_TESTS
+    SPAWN_ISOLATION_TESTS +
+    LIFECYCLE_TESTS
 )
 
 if __name__ == "__main__":

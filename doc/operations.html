@@ -120,7 +120,7 @@ CLI prompts for the passphrase (input hidden)<br>
 ↓<br>
 CLI writes <code>&lt;passphrase&gt;\n</code> to the server's stdin, then <strong>closes</strong> it<br>
 ↓<br>
-server reads exactly one line from stdin in <code>main()</code>, before serving<br>
+the startup sequence (<code>lifecycle.run_server</code>) reads exactly one line from stdin, before serving — server.py's <code>main</code> is the zero-arg entry wrapper<br>
 ↓<br>
 decryption failure → error on stderr, non-zero exit<br>
 ↓<br>

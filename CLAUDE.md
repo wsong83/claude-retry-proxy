@@ -27,7 +27,8 @@ rationale, mechanisms, and edge cases — and is indexed by
 ```
 src/claude_retry_proxy/
   __init__.py           __version__
-  server.py             the HTTP retry gateway server (ThreadingHTTPServer, the `ProxyHandler` request handler — whose MRO is `AdminHandlerMixin` → `ChatSSEHandlerMixin` → `BaseHTTPRequestHandler` — mode dispatch, admin-route dispatch, CLI entry; re-exports forwarder.py's frozen surface; reads process state attribute-form from runtime_state.py)
+  server.py             the HTTP retry gateway server (ThreadingHTTPServer, the `ProxyHandler` request handler — whose MRO is `AdminHandlerMixin` → `ChatSSEHandlerMixin` → `BaseHTTPRequestHandler` — mode dispatch, admin-route dispatch; the zero-arg `main()` entry wrapper, which binds `ProxyHandler` into `lifecycle.run_server` and hosts the `__main__` guard; re-exports forwarder.py's frozen surface and lifecycle.py's two classes; reads process state attribute-form from runtime_state.py)
+  lifecycle.py          the process lifecycle (extracted 2026-11-24): `run_server(handler_class)` — argument parsing, keys/config load + validation, the port-ownership probe, state/marker writes, the stderr-guard swap, heartbeat start, signal handlers, readiness, the serve loop, teardown — plus the two private mechanisms it owns, `_ProxyHTTPServer` and `_BestEffortStderr` (both re-exported through server.py for the test surface); the console script, `python -m claude_retry_proxy.server`, and in-process test spawns all enter through server.py's wrapper; imports leaf modules only (settings/keys/config/compat/sinks/runtime_state), never server.py
   admin_api.py          the admin control plane (extracted 2026-11-23, step 8): `AdminHandlerMixin` holding the eight `/admin` route handlers (page, config, swap-status, providers, providers-detail, shutdown, switch, reload) plus `_load_admin_html`, `_validate_csrf_origin`, `_CARRIED_MODELS_KEYS`, `ADMIN_BODY_LIMIT`, `_admin_html_cache`; bodies byte-verbatim from server.py's former branches; imports forwarder/runtime_state/config/keys/nesting/safety/settings/sinks, never server.py
   runtime_state.py      process runtime-state leaf (extracted 2026-11-23, step 8): the five mutable globals (`_current_config`, `_config_path`, `_vendors`, `_shutting_down`, `_startup_state`) and `heartbeat_loop`; every cross-module access is attribute-form (state is never re-exported); the tracked owned-state conversion follow-up lands here
   forwarder.py          the upstream forward path (extracted 2026-11-16): `extract_model`/`resolve_tier` tier resolution, `_forward_core` retry/backoff over the httpx2 transport, the compat + reasoning retries' orchestration, response model rewriting, the config-swap drain protocol (its state lives here; readers read it attribute-form), the chat retry-nudge store, and the shared `_DISCONNECT_ERRORS` tuple; never imports its parent
@@ -35,7 +36,7 @@ src/claude_retry_proxy/
   compat.py             the compatibility learner: the `COMPAT_FEATURES` registry (two features — `context_management` in anthropic mode, `reasoning_field` in chat mode) whose descriptors own their mode, presence test, matcher, field set and retry budget; COMPAT_* policy constants; the owned `_CompatState` state object (default-param `state=` injection); the `context_management` state machine with its 400-shape matchers and its retry lock, and the `reasoning_field` credit learner (a per-key in-memory credit; the switch thresholds are `models.json` policy, `reasoning_field_switch`) with its lock-free, key-free rescue (its passes repair the forwarded body rather than re-rolling) and matcher, plus its demanding-turn-scoped presence gate (`_reasoning_present`: reasoning on the last `tool_use`-bearing assistant turn, read from the raw client body) (extracted from server.py; the probe-outcome + retry orchestration slice lives in forwarder.py, which imports this module — `_compat_retry_lock` is dual-read)
   sanitize.py           error-text redaction leaf: `sanitize_error`, the chokepoint for text reaching stderr, trace `error` fields and client-facing error bodies
   sinks.py              sink class family: private `_Sink` base, `TraceSink` (JSONL append + counters + markers), `StateSink` (atomic state document), shared `_SinkHealth` failure reporter, process-wide pair + `configure()`
-  settings.py           env-derived settings singleton: `SETTINGS` value object (the `PROXY_*` limits/flags, runtime paths incl. state/compat files, mode values) + `resolve_trace_file` — built at import from env, adjusted by `main()` at startup; imported by both the server and the CLI
+  settings.py           env-derived settings singleton: `SETTINGS` value object (the `PROXY_*` limits/flags, runtime paths incl. state/compat files, mode values) + `resolve_trace_file` — built at import from env, adjusted by the startup sequence (`lifecycle.run_server`); imported by both the server and the CLI
   config.py             the config.json + models.json document pair: `models_path_for` / `load_models_document` / `load_config` / `validate_config` (the canonical validation policy) / `write_config` / `install_template` + extra-header specs; serves the server and the CLI
   keys.py               keys-index pipeline: `vendor_key_entries`/`vendor_key_names`, `_validate_vendor_keys_shape`, `load_keys_file` (encrypted or plain), `read_passphrase_from_stdin`
   nesting.py            payload-nesting policy leaf: `MAX_JSON_NESTING_DEPTH` (500), `NestingViolation`, `check_payload_nesting` (string/escape-aware scan with a count fast path, early exit at the limit, and a repaired-prefix path diagnostic) — the pre-parse bound on every client- or upstream-derived JSON payload; also carries `_nesting_limit_message` (the shared rejection-message builder, moved here from server.py 2026-11-23)
@@ -233,8 +234,9 @@ for the rest.
   [doc/architecture.html#sinks](doc/architecture.html#sinks).
 
 - **Passphrase pipe protocol.** Encrypted keys: the CLI writes
-  `<passphrase>\n` to the child's stdin and closes it; the server reads one line
-  in `main()` before `serve_forever()`. Plain JSON: nothing is sent, the CLI
+  `<passphrase>\n` to the child's stdin and closes it; the startup sequence
+  (`lifecycle.run_server`) reads one line before `serve_forever()` — server.py's
+  `main` is the zero-arg entry wrapper. Plain JSON: nothing is sent, the CLI
   closes stdin, and the server skips the read. A decryption failure is a
   non-zero server exit, which the CLI reports as a startup failure.
   `--passphrase-file` passes it on the command line instead — visible to
@@ -462,10 +464,12 @@ composes it ahead of `ChatSSEHandlerMixin`), created the `runtime_state.py`
 process-state leaf (five mutable globals + `heartbeat_loop`, attribute-form
 access everywhere), and relocated `_nesting_limit_message` into `nesting.py` —
 a verbatim move under the same gate disciplines. Named follow-ups: the
-server-lifecycle extraction (`main()` + `_ProxyHTTPServer`; `server.py` remains
-marginally over the 1,000-line code threshold until it lands) and the
-owned-state-object conversion (guide §5), whose scope now covers forwarder's
-swap-drain + nudge state AND `runtime_state`'s five globals.
+server-lifecycle extraction — landed 2026-11-24 (plan
+`2026-11-24-extract-server-lifecycle`: `run_server(handler_class)` and the two
+lifecycle classes moved verbatim into `lifecycle.py`, bringing `server.py` under
+the code threshold) — and the owned-state-object conversion (guide §5), whose
+scope now covers forwarder's swap-drain + nudge state AND `runtime_state`'s
+five globals; the conversion is the open one.
 
 Per-step line counts are deliberately not repeated here — they rot, and the plan
 archives hold them. The remaining clusters are tracked by the /refactor-split
