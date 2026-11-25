@@ -2821,9 +2821,9 @@ def test_reload_does_not_revert_concurrent_switch():
     review-2-reload-stale-candidate), driven DETERMINISTICALLY in-process.
 
     The guard closes the window between the reload's gated tier read
-    (`gated_epoch = forwarder._config_epoch`, captured in the SAME
-    `_config_lock` acquisition that reads the candidate's tiers) and Phase 3's
-    compare-and-install (`if forwarder._config_epoch != gated_epoch:`).
+    (`gated_epoch = forwarder._drain._config_epoch`, captured in the SAME
+    `_drain.lock` acquisition that reads the candidate's tiers) and Phase 3's
+    compare-and-install (`if forwarder._drain._config_epoch != gated_epoch:`).
     A /admin/api/switch that completes its whole press -> drain -> swap ->
     release cycle inside that window must not have its mapping silently
     reverted by the reload installing its stale candidate.
@@ -2833,7 +2833,7 @@ def test_reload_does_not_revert_concurrent_switch():
     wide, and a test that depended on winning that scheduling race would flake
     on a CORRECT tree — the reviewer could not reproduce it in 15 attempts.
     This test therefore drives the guard's PRECONDITION deterministically
-    instead: it monkeypatches `_drain_for_swap` — the one call the reload
+    instead: it monkeypatches `forwarder._drain.drain` — the one call the reload
     handler makes between its gate and Phase 3 — to simulate a switch that
     completed inside the window (clearing the flag, installing the switch's
     tiers, bumping the epoch), then invokes the reload handler in-process via
@@ -2843,13 +2843,13 @@ def test_reload_does_not_revert_concurrent_switch():
 
     Deleting the guard (or a defaulted `epoch`) fails this test twice over: the
     status becomes 200, and `_current_config` is reverted to the pre-switch
-    tiers. The module globals the handler reads are saved and restored in a
-    `finally` so the in-process state cannot leak into a later test.
+    tiers. The drain singleton's fields the handler reads are saved and
+    restored in a `finally` (with the patched method deleted off the instance)
+    so the in-process state cannot leak into a later test.
     """
     print("\n--- Test: Reload Does Not Revert a Concurrent Switch ---")
     import claude_retry_proxy.server as srv
     import claude_retry_proxy.forwarder as forwarder
-    import claude_retry_proxy.admin_api as admin_api
     import claude_retry_proxy.runtime_state as runtime_state
 
     temp_dir = tempfile.mkdtemp()
@@ -2867,34 +2867,33 @@ def test_reload_does_not_revert_concurrent_switch():
 
         saved_srv = {name: getattr(runtime_state, name) for name in (
             "_config_path", "_current_config", "_vendors")}
-        saved_fwd = {name: getattr(forwarder, name) for name in (
+        saved_fwd = {name: getattr(forwarder._drain, name) for name in (
             "_config_epoch", "_config_swapping", "_inflight_count",
             "_swap_evictions")}
-        saved_drain = admin_api._drain_for_swap
         try:
             runtime_state._config_path = config_path
             runtime_state._current_config = {"tiers": original_tiers}
-            forwarder._config_epoch = 5
+            forwarder._drain._config_epoch = 5
             runtime_state._vendors = {
                 "p1": {"url": "http://127.0.0.1:1", "key": "k-p1"},
                 "p2": {"url": "http://127.0.0.1:2", "key": "k-p2"},
             }
-            forwarder._config_swapping = False
-            forwarder._inflight_count = 0
-            forwarder._swap_evictions = 0
+            forwarder._drain._config_swapping = False
+            forwarder._drain._inflight_count = 0
+            forwarder._drain._swap_evictions = 0
 
             def concurrent_switch_completes():
                 # The interleaving the guard exists for: a switch presses, swaps
                 # and releases entirely between the reload's gated tier read and
                 # its Phase-3 install. `candidate` still holds `original_tiers`.
                 import claude_retry_proxy.forwarder as forwarder
-                forwarder._config_swapping = True
+                forwarder._drain._config_swapping = True
                 runtime_state._current_config = {"tiers": switch_tiers}
-                forwarder._config_epoch = 6
-                forwarder._config_swapping = False
+                forwarder._drain._config_epoch = 6
+                forwarder._drain._config_swapping = False
                 return (True, 0, 0.0)
 
-            admin_api._drain_for_swap = concurrent_switch_completes
+            forwarder._drain.drain = concurrent_switch_completes
 
             captured = []
             handler = object.__new__(srv.ProxyHandler)
@@ -2939,21 +2938,21 @@ def test_reload_does_not_revert_concurrent_switch():
                      "{!r}, expected the switch's tiers {!r}".format(
                          runtime_state._current_config, {"tiers": switch_tiers}))
                 return
-            if forwarder._config_epoch != 6:
+            if forwarder._drain._config_epoch != 6:
                 fail("a refused reload must not bump the epoch; got {}".format(
-                    forwarder._config_epoch))
+                    forwarder._drain._config_epoch))
                 return
             pass_("reload refused 409 config_reload_stale; the switch's mapping "
                   "survived and no epoch bump was taken")
         finally:
-            admin_api._drain_for_swap = saved_drain
+            del forwarder._drain.drain
             runtime_state._config_path = saved_srv["_config_path"]
             runtime_state._current_config = saved_srv["_current_config"]
             runtime_state._vendors = saved_srv["_vendors"]
-            forwarder._config_epoch = saved_fwd["_config_epoch"]
-            forwarder._config_swapping = saved_fwd["_config_swapping"]
-            forwarder._inflight_count = saved_fwd["_inflight_count"]
-            forwarder._swap_evictions = saved_fwd["_swap_evictions"]
+            forwarder._drain._config_epoch = saved_fwd["_config_epoch"]
+            forwarder._drain._config_swapping = saved_fwd["_config_swapping"]
+            forwarder._drain._inflight_count = saved_fwd["_inflight_count"]
+            forwarder._drain._swap_evictions = saved_fwd["_swap_evictions"]
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -3203,9 +3202,9 @@ def test_switch_nesting_gate_precedes_key_echo():
     # advance it).
     saved_srv = {name: getattr(runtime_state, name) for name in (
         "_config_path", "_current_config", "_vendors")}
-    saved_fwd = {name: getattr(forwarder, name) for name in (
+    saved_fwd = {name: getattr(forwarder._drain, name) for name in (
         "_config_epoch", "_config_swapping", "_inflight_count")}
-    epoch_before = forwarder._config_epoch
+    epoch_before = forwarder._drain._config_epoch
     try:
         try:
             captured = _drive_post_in_process(srv, "/admin/api/switch",
@@ -3266,18 +3265,18 @@ def test_switch_nesting_gate_precedes_key_echo():
               "\"invalid key name: ['a']\" — the echo branch is live and runs "
               "after the gate")
 
-        if forwarder._config_epoch != epoch_before:
+        if forwarder._drain._config_epoch != epoch_before:
             fail("a refused switch must not advance the config epoch; {} -> "
-                 "{}".format(epoch_before, forwarder._config_epoch))
+                 "{}".format(epoch_before, forwarder._drain._config_epoch))
             return
         pass_("both refusals left the config epoch unchanged")
     finally:
         runtime_state._config_path = saved_srv["_config_path"]
         runtime_state._current_config = saved_srv["_current_config"]
         runtime_state._vendors = saved_srv["_vendors"]
-        forwarder._config_epoch = saved_fwd["_config_epoch"]
-        forwarder._config_swapping = saved_fwd["_config_swapping"]
-        forwarder._inflight_count = saved_fwd["_inflight_count"]
+        forwarder._drain._config_epoch = saved_fwd["_config_epoch"]
+        forwarder._drain._config_swapping = saved_fwd["_config_swapping"]
+        forwarder._drain._inflight_count = saved_fwd["_inflight_count"]
 
 
 def test_admin_reload_serialize_failure_500():
@@ -3329,16 +3328,16 @@ def test_admin_reload_serialize_failure_500():
 
         saved_srv = {name: getattr(runtime_state, name) for name in (
             "_config_path", "_current_config", "_vendors")}
-        saved_fwd = {name: getattr(forwarder, name) for name in (
+        saved_fwd = {name: getattr(forwarder._drain, name) for name in (
             "_config_epoch", "_config_swapping", "_inflight_count",
             "_swap_evictions", "_swap_started_at")}
         runtime_state._config_path = config_path
         runtime_state._current_config = poisoned
-        forwarder._config_epoch = 5
+        forwarder._drain._config_epoch = 5
         runtime_state._vendors = {provider: {"url": "http://127.0.0.1:1", "key": "k-p1"}}
-        forwarder._config_swapping = False
-        forwarder._inflight_count = 0
-        forwarder._swap_evictions = 0
+        forwarder._drain._config_swapping = False
+        forwarder._drain._inflight_count = 0
+        forwarder._drain._swap_evictions = 0
 
         captured = _drive_post_in_process(srv, "/admin/api/reload", b"")
         if not captured:
@@ -3362,9 +3361,9 @@ def test_admin_reload_serialize_failure_500():
                  "nothing".format(type(runtime_state._current_config).__name__))
             return
         pass_("nothing was installed (_current_config is still the poisoned doc)")
-        if forwarder._config_epoch != 5:
+        if forwarder._drain._config_epoch != 5:
             fail("a refused reload must not bump the epoch; got {}".format(
-                forwarder._config_epoch))
+                forwarder._drain._config_epoch))
             return
         pass_("no epoch bump was taken")
     finally:
@@ -3376,11 +3375,11 @@ def test_admin_reload_serialize_failure_500():
             runtime_state._current_config = saved_srv["_current_config"]
             runtime_state._vendors = saved_srv["_vendors"]
         if saved_fwd:
-            forwarder._config_epoch = saved_fwd["_config_epoch"]
-            forwarder._config_swapping = saved_fwd["_config_swapping"]
-            forwarder._inflight_count = saved_fwd["_inflight_count"]
-            forwarder._swap_evictions = saved_fwd["_swap_evictions"]
-            forwarder._swap_started_at = saved_fwd["_swap_started_at"]
+            forwarder._drain._config_epoch = saved_fwd["_config_epoch"]
+            forwarder._drain._config_swapping = saved_fwd["_config_swapping"]
+            forwarder._drain._inflight_count = saved_fwd["_inflight_count"]
+            forwarder._drain._swap_evictions = saved_fwd["_swap_evictions"]
+            forwarder._drain._swap_started_at = saved_fwd["_swap_started_at"]
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -3389,15 +3388,16 @@ def test_admin_reload_serializability_probe_precedes_drain():
     (plan 2026-10-25, Step 10 coder edit B; Step 11 Part B).
 
     Step 8's guard made the serialize failure answer `500` instead of aborting
-    with no response — but it did so AFTER `_drain_for_swap()`, which pauses
-    every new admission, waits with no wall-clock cap, and abandons retry
+    with no response — but it did so AFTER `forwarder._drain.drain()`, which
+    pauses every new admission, waits with no wall-clock cap, and abandons retry
     chains. A press that can never succeed therefore still performed a
     disruptive press. The probe added ahead of the drain makes the refusal free.
 
     The assertion that makes this a test of ORDERING rather than of the guard is
-    the invocation count: `_drain_for_swap` is called by global lookup, so
-    rebinding it to a counting stand-in measures whether the press happened at
-    all. The post-drain guard is still there and is pinned separately by
+    the invocation count: `forwarder._drain.drain` is reached through the
+    singleton the handler calls, so shadowing it on the instance with a counting
+    stand-in measures whether the press happened at all. The post-drain guard is
+    still there and is pinned separately by
     `test_admin_reload_serialize_failure_500` — this test would pass with the
     probe present even if that guard were removed, and would FAIL on the
     pre-Step-10 tree where the same 500 arrives after a drain (count 1).
@@ -3412,14 +3412,13 @@ def test_admin_reload_serializability_probe_precedes_drain():
     print("\n--- Test: Admin Reload Serializability Probe Precedes the Drain ---")
     import claude_retry_proxy.server as srv
     import claude_retry_proxy.forwarder as forwarder
-    import claude_retry_proxy.admin_api as admin_api
     import claude_retry_proxy.runtime_state as runtime_state
 
     provider = "p1"
     model = "claude-sonnet-5"
     tiers = ("haiku", "sonnet", "opus")
     temp_dir = tempfile.mkdtemp()
-    real_drain = admin_api._drain_for_swap
+    real_drain = forwarder._drain.drain
     saved_srv = {}
     saved_fwd = {}
     try:
@@ -3439,16 +3438,16 @@ def test_admin_reload_serializability_probe_precedes_drain():
 
         saved_srv = {name: getattr(runtime_state, name) for name in (
             "_config_path", "_current_config", "_vendors")}
-        saved_fwd = {name: getattr(forwarder, name) for name in (
+        saved_fwd = {name: getattr(forwarder._drain, name) for name in (
             "_config_epoch", "_config_swapping", "_inflight_count",
             "_swap_evictions", "_swap_started_at")}
         runtime_state._config_path = config_path
         runtime_state._current_config = poisoned
-        forwarder._config_epoch = 5
+        forwarder._drain._config_epoch = 5
         runtime_state._vendors = {provider: {"url": "http://127.0.0.1:1", "key": "k-p1"}}
-        forwarder._config_swapping = False
-        forwarder._inflight_count = 0
-        forwarder._swap_evictions = 0
+        forwarder._drain._config_swapping = False
+        forwarder._drain._inflight_count = 0
+        forwarder._drain._swap_evictions = 0
 
         drain_calls = []
 
@@ -3457,7 +3456,7 @@ def test_admin_reload_serializability_probe_precedes_drain():
             drain_calls.append(1)
             return real_drain()
 
-        admin_api._drain_for_swap = counting_drain
+        forwarder._drain.drain = counting_drain
 
         captured = _drive_post_in_process(srv, "/admin/api/reload", b"")
         if not captured:
@@ -3481,7 +3480,7 @@ def test_admin_reload_serializability_probe_precedes_drain():
                  "chains".format(len(drain_calls)))
             return
         pass_("no drain ran: the refusal happened before the press "
-              "(_drain_for_swap invocations = 0)")
+              "(forwarder._drain.drain invocations = 0)")
 
         # POSITIVE CONTROL. `len(drain_calls) == 0` means nothing unless the
         # counting stand-in can ever observe a press. Drive the SAME handler,
@@ -3513,7 +3512,7 @@ def test_admin_reload_serializability_probe_precedes_drain():
                  "the zero-count assertion above cannot be trusted".format(
                      len(drain_calls)))
     finally:
-        admin_api._drain_for_swap = real_drain
+        del forwarder._drain.drain
         # Guarded: the snapshots above populate INSIDE the try, so a setup
         # failure before that point leaves the dicts empty — an unguarded
         # restore would raise KeyError and mask the real exception. The drain
@@ -3523,11 +3522,11 @@ def test_admin_reload_serializability_probe_precedes_drain():
             runtime_state._current_config = saved_srv["_current_config"]
             runtime_state._vendors = saved_srv["_vendors"]
         if saved_fwd:
-            forwarder._config_epoch = saved_fwd["_config_epoch"]
-            forwarder._config_swapping = saved_fwd["_config_swapping"]
-            forwarder._inflight_count = saved_fwd["_inflight_count"]
-            forwarder._swap_evictions = saved_fwd["_swap_evictions"]
-            forwarder._swap_started_at = saved_fwd["_swap_started_at"]
+            forwarder._drain._config_epoch = saved_fwd["_config_epoch"]
+            forwarder._drain._config_swapping = saved_fwd["_config_swapping"]
+            forwarder._drain._inflight_count = saved_fwd["_inflight_count"]
+            forwarder._drain._swap_evictions = saved_fwd["_swap_evictions"]
+            forwarder._drain._swap_started_at = saved_fwd["_swap_started_at"]
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -3575,7 +3574,7 @@ def test_admin_switch_apply_rewrites_tier_map():
 
         saved_srv = {name: getattr(runtime_state, name) for name in (
             "_config_path", "_current_config", "_vendors")}
-        saved_fwd = {name: getattr(forwarder, name) for name in (
+        saved_fwd = {name: getattr(forwarder._drain, name) for name in (
             "_config_epoch", "_config_swapping", "_inflight_count",
             "_swap_evictions", "_swap_started_at")}
         runtime_state._config_path = config_path
@@ -3583,11 +3582,11 @@ def test_admin_switch_apply_rewrites_tier_map():
             "tiers": {t: dict(cfg) for t, cfg in four_tiers.items()},
             "models": {provider: [model]},
         }
-        forwarder._config_epoch = 5
+        forwarder._drain._config_epoch = 5
         runtime_state._vendors = {provider: {"url": "http://127.0.0.1:1", "key": "k-p1"}}
-        forwarder._config_swapping = False
-        forwarder._inflight_count = 0
-        forwarder._swap_evictions = 0
+        forwarder._drain._config_swapping = False
+        forwarder._drain._inflight_count = 0
+        forwarder._drain._swap_evictions = 0
 
         # Page-identical: `saveConfig` builds exactly provider/model/key per
         # standard tier, with `key: value || ''`.
@@ -3639,11 +3638,11 @@ def test_admin_switch_apply_rewrites_tier_map():
             runtime_state._current_config = saved_srv["_current_config"]
             runtime_state._vendors = saved_srv["_vendors"]
         if saved_fwd:
-            forwarder._config_epoch = saved_fwd["_config_epoch"]
-            forwarder._config_swapping = saved_fwd["_config_swapping"]
-            forwarder._inflight_count = saved_fwd["_inflight_count"]
-            forwarder._swap_evictions = saved_fwd["_swap_evictions"]
-            forwarder._swap_started_at = saved_fwd["_swap_started_at"]
+            forwarder._drain._config_epoch = saved_fwd["_config_epoch"]
+            forwarder._drain._config_swapping = saved_fwd["_config_swapping"]
+            forwarder._drain._inflight_count = saved_fwd["_inflight_count"]
+            forwarder._drain._swap_evictions = saved_fwd["_swap_evictions"]
+            forwarder._drain._swap_started_at = saved_fwd["_swap_started_at"]
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -3654,8 +3653,8 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
     The press validates against a catalog snapshot taken before it owns the
     swap, while Phase 3 carries the LIVE catalog forward — so a reload that
     completes in between can leave the switch persisting a tier the Reload path
-    then refuses. `_drain_for_swap` is reached through admin_api's module
-    binding in the switch handler, so rebinding it puts this test exactly
+    then refuses. `forwarder._drain.drain` is reached through the singleton the
+    switch handler calls, so shadowing it on the instance puts this test exactly
     inside that window with no scheduling race.
 
     Two cases, and the second is what makes the first meaningful: refusing
@@ -3665,16 +3664,15 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
     print("\n--- Test: Admin Switch Re-checks the Catalog After an Epoch Move ---")
     import claude_retry_proxy.server as srv
     import claude_retry_proxy.forwarder as forwarder
-    import claude_retry_proxy.admin_api as admin_api
     import claude_retry_proxy.runtime_state as runtime_state
 
     provider = "p1"
     model = "claude-sonnet-5"
     tiers = ("haiku", "sonnet", "opus")
-    real_drain = admin_api._drain_for_swap
+    real_drain = forwarder._drain.drain
     saved_srv = {name: getattr(runtime_state, name) for name in (
         "_config_path", "_current_config", "_vendors")}
-    saved_fwd = {name: getattr(forwarder, name) for name in (
+    saved_fwd = {name: getattr(forwarder._drain, name) for name in (
         "_config_epoch", "_config_swapping", "_inflight_count",
         "_swap_evictions", "_swap_started_at")}
     temp_dirs = []
@@ -3693,12 +3691,12 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
                 "tiers": {t: dict(cfg) for t, cfg in baseline.items()},
                 "models": {provider: [model]},
             }
-            forwarder._config_epoch = 5
+            forwarder._drain._config_epoch = 5
             runtime_state._vendors = {provider: {"url": "http://127.0.0.1:1",
                                        "key": "k-p1"}}
-            forwarder._config_swapping = False
-            forwarder._inflight_count = 0
-            forwarder._swap_evictions = 0
+            forwarder._drain._config_swapping = False
+            forwarder._drain._inflight_count = 0
+            forwarder._drain._swap_evictions = 0
             return config_path, baseline
 
         def disk_tiers(config_path):
@@ -3714,11 +3712,11 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
 
         def reload_lands_dropping_model():
             import claude_retry_proxy.forwarder as forwarder
-            forwarder._config_epoch += 1                 # a reload completed here...
+            forwarder._drain._config_epoch += 1                 # a reload completed here...
             runtime_state._current_config["models"] = {provider: []}   # ...minus the model
             return real_drain()
 
-        admin_api._drain_for_swap = reload_lands_dropping_model
+        forwarder._drain.drain = reload_lands_dropping_model
         captured = _drive_post_in_process(srv, "/admin/api/switch", body)
         if not captured:
             fail("case 1: the switch handler sent no response")
@@ -3747,9 +3745,9 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
                 disk_tiers(config_path)))
             return
         pass_("case 1: the persisted config.json is untouched")
-        if forwarder._config_epoch != 6:
+        if forwarder._drain._config_epoch != 6:
             fail("case 1: the refused switch took its own epoch bump; got "
-                 "{}".format(forwarder._config_epoch))
+                 "{}".format(forwarder._drain._config_epoch))
             return
         pass_("case 1: no install and no epoch bump of its own")
 
@@ -3758,10 +3756,10 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
 
         def reload_lands_keeping_model():
             import claude_retry_proxy.forwarder as forwarder
-            forwarder._config_epoch += 1                 # a reload completed here...
+            forwarder._drain._config_epoch += 1                 # a reload completed here...
             return real_drain()                    # ...and the model survived
 
-        admin_api._drain_for_swap = reload_lands_keeping_model
+        forwarder._drain.drain = reload_lands_keeping_model
         captured = _drive_post_in_process(srv, "/admin/api/switch", body)
         if not captured:
             fail("case 2: the switch handler sent no response")
@@ -3788,15 +3786,15 @@ def test_admin_switch_rechecks_catalog_after_epoch_move():
             return
         pass_("case 2: the live catalog was carried forward")
     finally:
-        admin_api._drain_for_swap = real_drain
+        del forwarder._drain.drain
         runtime_state._config_path = saved_srv["_config_path"]
         runtime_state._current_config = saved_srv["_current_config"]
         runtime_state._vendors = saved_srv["_vendors"]
-        forwarder._config_epoch = saved_fwd["_config_epoch"]
-        forwarder._config_swapping = saved_fwd["_config_swapping"]
-        forwarder._inflight_count = saved_fwd["_inflight_count"]
-        forwarder._swap_evictions = saved_fwd["_swap_evictions"]
-        forwarder._swap_started_at = saved_fwd["_swap_started_at"]
+        forwarder._drain._config_epoch = saved_fwd["_config_epoch"]
+        forwarder._drain._config_swapping = saved_fwd["_config_swapping"]
+        forwarder._drain._inflight_count = saved_fwd["_inflight_count"]
+        forwarder._drain._swap_evictions = saved_fwd["_swap_evictions"]
+        forwarder._drain._swap_started_at = saved_fwd["_swap_started_at"]
         for temp_dir in temp_dirs:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -5338,10 +5336,10 @@ def test_admin_html_status_stack_keyed_removal():
 
 
 def test_request_blocked_at_admission_not_evicted():
-    """A request blocked in _swap_done.wait() while a swap runs must NOT be
-    evicted by the swap it waited on: after the release it is admitted with the
-    POST-swap epoch and completes against the new provider, never
-    config_swap_restart."""
+    """A request blocked in the drain's completion-event wait while a swap runs
+    must NOT be evicted by the swap it waited on: after the release it is
+    admitted with the POST-swap epoch and completes against the new provider,
+    never config_swap_restart."""
     print("\n--- Test: Admission-Blocked Request Is Not Evicted ---")
     held = threading.Event()
 
@@ -5403,6 +5401,316 @@ def test_request_blocked_at_admission_not_evicted():
         straggler.join(0.1)
     finally:
         cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Config-swap drain: singleton invariants (plan 2026-11-25-extract-swap-drain)
+#
+# The drain state is now owned by one process-global `_SwapDrain` singleton.
+# These tests pin the class's own invariants on FRESH LOCAL instances so they
+# never leave a pressed singleton behind — a process-global `_drain` left with
+# `swapping=True` would wedge every later `admit()` forever (the completion
+# wait has no timeout).
+# ---------------------------------------------------------------------------
+
+
+def _fresh_drain():
+    """A fresh local drain instance for the pure-state invariant tests.
+
+    Resolved as the singleton's TYPE rather than importing `_SwapDrain` by
+    name: the class's home module changes with the planned extraction
+    (forwarder today, swap_drain.py after it), while the re-exported `_drain`
+    singleton is the one handle guaranteed stable across that move.
+    """
+    import claude_retry_proxy.forwarder as forwarder
+    return type(forwarder._drain)()
+
+
+def test_drain_admit_snapshot_under_lock():
+    """admit() snapshots inside the admitting lock acquisition, BEFORE it
+    increments the in-flight counter.
+
+    Two invariants, both load-bearing for the reviewer-drain-swap-race fix and
+    the phantom-admission guard:
+
+      - While the snapshot callback runs, the drain lock is held (a
+        non-blocking acquire from another thread fails) — so config, vendors,
+        and epoch are read in one atomic admission, and no swap can interleave
+        with a snapshot read.
+      - The snapshot runs BEFORE the counter increment, so a callback that
+        raises propagates with the in-flight counter untouched and cannot leak
+        a phantom admission the caller's `release()` would then drive negative.
+    """
+    print("\n--- Test: Drain admit() Snapshots Under the Lock ---")
+    drain = _fresh_drain()
+
+    inside = threading.Event()
+    proceed = threading.Event()
+    observed = {}
+
+    def snapshot():
+        # Runs inside admit()'s admitting acquisition.
+        observed["count_at_snapshot"] = drain._inflight_count
+        inside.set()
+        proceed.wait(5)
+        return ("cfg", "vendors")
+
+    admitted = {}
+
+    def worker():
+        try:
+            admitted["value"] = drain.admit(snapshot)
+        except Exception as e:  # surfaced through the assertions below
+            admitted["error"] = e
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    try:
+        if not inside.wait(5):
+            fail("the snapshot callback never ran — admit() did not invoke it "
+                 "inside the admitting acquisition")
+            return
+        if observed.get("count_at_snapshot") == 0:
+            pass_("the snapshot callback runs BEFORE the in-flight counter is "
+                  "incremented (a raising callback cannot leak a phantom "
+                  "admission)")
+        else:
+            fail("the counter was already {} when the snapshot callback ran — "
+                 "the increment precedes the snapshot, so a raising callback "
+                 "would leak a phantom admission".format(
+                     observed.get("count_at_snapshot")))
+
+        got_lock = drain.lock.acquire(blocking=False)
+        if got_lock:
+            drain.lock.release()
+            fail("the admitting acquisition does NOT hold the drain lock while "
+                 "the snapshot callback runs — a swap could interleave with "
+                 "the config/vendors snapshot")
+        else:
+            pass_("the drain lock is held while the snapshot callback runs")
+
+        proceed.set()
+        t.join(5)
+        if t.is_alive():
+            fail("admit() did not return within 5 s after its snapshot callback "
+                 "released it")
+            return
+        if "error" in admitted:
+            fail("admit() raised on a non-raising snapshot_fn: {!r}".format(
+                admitted["error"]))
+            return
+        expected = ("cfg", "vendors", drain._config_epoch)
+        if admitted.get("value") == expected:
+            pass_("admit() returned (config, vendors, epoch) after the callback")
+        else:
+            fail("admit() returned {!r}, expected the three-tuple {!r}".format(
+                admitted.get("value"), expected))
+    finally:
+        proceed.set()
+        t.join(5)
+        # Mirror the caller protocol so the local instance is left at rest.
+        if drain._inflight_count:
+            drain.release()
+
+    # Second half: a raising snapshot_fn propagates and leaves the count alone.
+    drain2 = _fresh_drain()
+    before = drain2._inflight_count
+
+    def boom():
+        raise ValueError("boom")
+
+    try:
+        drain2.admit(boom)
+    except ValueError:
+        if drain2._inflight_count == before:
+            pass_("a raising snapshot_fn propagated and left the in-flight "
+                  "counter unchanged ({} -> {})".format(
+                      before, drain2._inflight_count))
+        else:
+            fail("a raising snapshot_fn leaked a phantom admission: counter "
+                 "{} -> {}".format(before, drain2._inflight_count))
+    else:
+        fail("admit() swallowed the snapshot_fn's exception instead of "
+             "propagating it")
+
+
+def test_drain_complete_invariant():
+    """complete() clears the swapping flag and the press timestamp together.
+
+    The status endpoint guards `waited_s` on its own source precisely so a
+    `time.time() - None` can never 500 it; that guard is pointless if
+    `complete()` can still expose swapping=True beside a None started_at. A
+    real press (inflight 0, so it exits at count-zero immediately) is completed
+    and the post-complete snapshot must read swapping=False with waited_s=None.
+    """
+    print("\n--- Test: Drain complete() Invariant ---")
+    drain = _fresh_drain()
+    press = drain.drain()
+    try:
+        if press is None:
+            fail("the first press on a fresh instance was refused")
+            return
+        swapping, waited_s, _inflight, _silence_s = drain.status_snapshot()
+        if swapping is True and waited_s is not None:
+            pass_("a live press reads swapping=True with a numeric waited_s")
+        else:
+            fail("a live press must read swapping=True with a numeric "
+                 "waited_s; got swapping={!r} waited_s={!r}".format(
+                     swapping, waited_s))
+    finally:
+        drain.complete()
+
+    swapping, waited_s, _inflight, _silence_s = drain.status_snapshot()
+    if swapping is False and waited_s is None:
+        pass_("after complete(): swapping=False and waited_s=None")
+    else:
+        fail("after complete() the status must read swapping=False with "
+             "waited_s=None; got swapping={!r} waited_s={!r}".format(
+                 swapping, waited_s))
+    if drain._config_swapping is False and drain._swap_started_at is None:
+        pass_("the raw fields agree: swapping False, started_at None")
+    else:
+        fail("complete() left a half-cleared press: swapping={!r} "
+             "started_at={!r}".format(drain._config_swapping,
+                                      drain._swap_started_at))
+
+
+def test_drain_bump_epoch_reentrant():
+    """bump_epoch() succeeds inside an already-held drain lock (RLock).
+
+    Both admin Phase-3 install sections hold `_drain.lock` across a larger
+    compare-and-install span and bump the epoch inside it, so the lock MUST be
+    reentrant (a plain Lock would deadlock there). Reentrancy is measured with a
+    same-thread non-blocking re-acquire — which returns True only for an RLock
+    and cannot itself hang — and then the bump is taken inside an open `with`.
+    """
+    print("\n--- Test: Drain bump_epoch() Reentrancy ---")
+    drain = _fresh_drain()
+
+    with drain.lock:
+        reentrant = drain.lock.acquire(blocking=False)
+        if reentrant:
+            drain.lock.release()
+    if not reentrant:
+        fail("the drain lock is not reentrant: a same-thread re-acquire failed "
+             "— bump_epoch() inside an open lock section would deadlock")
+        return
+    pass_("the drain lock is reentrant (same-thread re-acquire succeeded)")
+
+    before = drain._config_epoch
+    try:
+        with drain.lock:
+            drain.bump_epoch()
+    except RuntimeError as e:
+        fail("bump_epoch() raised inside a held lock ({}: {})".format(
+            type(e).__name__, e))
+        return
+    if drain._config_epoch == before + 1:
+        pass_("bump_epoch() took exactly one bump from inside an open lock "
+              "section")
+    else:
+        fail("bump_epoch() inside a held lock moved the epoch {} -> {}, "
+             "expected exactly +1".format(before, drain._config_epoch))
+
+
+def test_drain_single_flight_refusal():
+    """A second drain() while one is in progress returns None.
+
+    That None is the single-flight 409 config_swap_in_progress refusal's whole
+    mechanism: the guard and the press share ONE lock acquisition, so a second
+    press cannot pass and must leave the first press's counters and timestamp
+    untouched. A fresh instance's first press exits at count-zero immediately
+    (inflight 0) and stays owned until complete().
+    """
+    print("\n--- Test: Drain Single-Flight Refusal ---")
+    drain = _fresh_drain()
+    try:
+        first = drain.drain()
+        if first is None:
+            fail("the first press was refused — the fresh instance was "
+                 "already owned")
+            return
+        if first[0] is True and first[1] == 0:
+            pass_("the first press returned (drained=True, inflight_at_press=0)")
+        else:
+            fail("the first press returned {!r}, expected drained=True with "
+                 "inflight_at_press=0".format(first))
+        started_at = drain._swap_started_at
+        evictions_at_press = drain._swap_evictions
+
+        second = drain.drain()
+        if second is None:
+            pass_("a second press returned None (the 409 single-flight refusal)")
+        else:
+            fail("a second press entered a drain while one was in progress: "
+                 "{!r}".format(second))
+
+        if (drain._swap_started_at == started_at
+                and drain._swap_evictions == evictions_at_press
+                and drain._config_swapping is True):
+            pass_("the refused press left the first press's state untouched")
+        else:
+            fail("the refused press mutated the live press: started_at {!r} -> "
+                 "{!r}, evictions {} -> {}, swapping={!r}".format(
+                     started_at, drain._swap_started_at, evictions_at_press,
+                     drain._swap_evictions, drain._config_swapping))
+    finally:
+        drain.complete()
+
+
+def test_drain_predicate_semantics():
+    """epoch_changed() and chain_abort() predicate semantics.
+
+    Three rules the retry loop relies on:
+      - epoch_changed(None) is False — a request admitted with no epoch is
+        never an old-snapshot straggler;
+      - epoch_changed() is True only once the epoch has moved off the entry
+        value;
+      - chain_abort() is True at the PRESS even when the epoch still matches —
+        retry chains abandon at the press, not only at the completed swap.
+    """
+    print("\n--- Test: Drain Predicate Semantics ---")
+    drain = _fresh_drain()
+    baseline = drain._config_epoch
+
+    if drain.epoch_changed(None) is False:
+        pass_("epoch_changed(None) is False")
+    else:
+        fail("epoch_changed(None) must be False — a None entry epoch is not a "
+             "straggler")
+    if drain.epoch_changed(baseline) is False:
+        pass_("epoch_changed(current epoch) is False")
+    else:
+        fail("epoch_changed() returned True on a matching epoch")
+    if drain.epoch_changed(baseline + 1) is True:
+        pass_("epoch_changed(entry epoch) is True once the epoch has moved")
+    else:
+        fail("epoch_changed() did not detect a moved epoch")
+    if drain.chain_abort(baseline) is False:
+        pass_("chain_abort() is False when no swap runs and the epoch matches")
+    else:
+        fail("chain_abort() returned True with no press and a matching epoch")
+
+    drain._config_swapping = True
+    try:
+        if drain.chain_abort(baseline) is True:
+            pass_("chain_abort() is True at the press even with a matching "
+                  "epoch")
+        else:
+            fail("chain_abort() did not abandon at the press — retry chains "
+                 "would keep sleeping through a swap")
+    finally:
+        drain._config_swapping = False
+
+    drain.bump_epoch()
+    if drain.chain_abort(baseline) is True:
+        pass_("chain_abort() is True after a completed swap moved the epoch")
+    else:
+        fail("chain_abort() did not abandon after a completed swap")
+    if drain.epoch_changed(None) is False:
+        pass_("epoch_changed(None) stays False after a bump")
+    else:
+        fail("epoch_changed(None) became True after a bump")
 
 
 ALL_TESTS = [
@@ -5475,6 +5783,12 @@ ALL_TESTS = [
     ("admin-html-status-stack-keyed-removal",
      test_admin_html_status_stack_keyed_removal),
     ("admin-admission-blocked-not-evicted", test_request_blocked_at_admission_not_evicted),
+    # Drain-singleton invariants (plan 2026-11-25-extract-swap-drain)
+    ("drain-admit-snapshot-under-lock", test_drain_admit_snapshot_under_lock),
+    ("drain-complete-invariant", test_drain_complete_invariant),
+    ("drain-bump-epoch-reentrant", test_drain_bump_epoch_reentrant),
+    ("drain-single-flight-refusal", test_drain_single_flight_refusal),
+    ("drain-predicate-semantics", test_drain_predicate_semantics),
 ]
 
 

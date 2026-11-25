@@ -10,6 +10,7 @@ Rows ordered newest-first (latest issues at top). New issues are prepended; reso
 
 | Issue | Status | Found | Resolved | Resolved By |
 |-------|--------|-------|----------|-------------|
+| 2026-11-25-extract-swap-drain cross-reference — the open scope is now forwarder's swap-drain state + `runtime_state`'s five globals | Resolved | 2026-11-25 | 2026-11-25 | plan 2026-11-25-extract-swap-drain — Partially resolved: the swap-drain half landed here; `runtime_state`'s five globals remain the open remainder of the conversion |
 | [step2-cut-range-vs-seam](./tmp/reports/2026-11-24-extract-nudge-store-step2-cut-range-vs-seam.json) | Resolved | 2026-11-24 | 2026-11-24 | [planner](./tmp/reports/2026-11-24-extract-nudge-store-step2-cut-range-vs-seam.json) |
 | [step3-frozen-surface-contradiction](./tmp/reports/2026-11-24-extract-nudge-store-step3-frozen-surface-contradiction.json) | Resolved | 2026-11-24 | 2026-11-24 | [planner](./tmp/reports/2026-11-24-extract-nudge-store-step3-frozen-surface-contradiction.json) |
 

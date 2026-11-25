@@ -42,12 +42,11 @@ from .safety import _ADMIN_NAME_RE
 from .settings import SETTINGS
 from . import forwarder
 from .forwarder import (_DISCONNECT_ERRORS, _client_user_agent,
-                        _error_body, _forward_request_impl, _note_swap_eviction,
+                        _error_body, _forward_request_impl,
                         _resolve_extra_request_headers, _retry_nudge_arm,
                         _retry_nudge_check, _retry_nudge_messages_bytes,
                         _retry_nudge_remember, _rewrite_json_response,
-                        _rewrite_sse_event, _rng, _swap_epoch_changed,
-                        _touch_upstream_activity, _trace_model,
+                        _rewrite_sse_event, _rng, _trace_model,
                         CLIENT_USER_AGENT_MAX_CHARS,
                         CLIENT_USER_AGENT_TRUNCATION_MARKER,
                         RETRY_NUDGE_TTL_SECONDS, compute_delay,
@@ -80,30 +79,20 @@ def forward_request(method, path, headers, body, handler=None, request_id=None):
     streamed to the client in real time via the handler (body_bytes is then
     b""); otherwise the body is buffered and returned.
     """
-    # Drain-and-swap: snapshot config state at request start
-    # If a config swap is in progress, wait for it to complete before proceeding
-    # Snapshot config and vendors together under the same lock
-    # to prevent race where config is read before lock but vendors is
-    # snapshotted inside lock (reviewer-drain-swap-race fix).
-    while True:
-        with forwarder._config_lock:
-            if not forwarder._config_swapping:
-                # No swap in progress - increment counter and snapshot all state together
-                forwarder._inflight_count += 1
-                config_snapshot = runtime_state._current_config
-                vendors_snapshot = runtime_state._vendors
-                epoch_snapshot = forwarder._config_epoch
-                break
-        # Swap in progress - wait for it to complete
-        forwarder._swap_done.wait()
+    # Drain-and-swap: snapshot config state at request start. The snapshot
+    # callback runs inside the admitting lock acquisition — config, vendors,
+    # and epoch are read together so a completed swap can never leave this
+    # request holding a pre-swap document with a post-swap epoch
+    # (reviewer-drain-swap-race fix).
+    config_snapshot, vendors_snapshot, epoch_snapshot = forwarder._drain.admit(
+        lambda: (runtime_state._current_config, runtime_state._vendors))
 
     try:
         return _forward_request_impl(method, path, headers, body, handler, request_id,
                                      config_snapshot, vendors_snapshot, epoch_snapshot)
     finally:
         # Decrement counter when request completes (success or failure)
-        with forwarder._config_lock:
-            forwarder._inflight_count -= 1
+        forwarder._drain.release()
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +193,7 @@ class ProxyHandler(AdminHandlerMixin, ChatSSEHandlerMixin, http.server.BaseHTTPR
             stream first — an error frame with no preceding message_start is
             a shape clients may not surface correctly.
             """
-            _note_swap_eviction("stream", request_id, tier=tier, provider=provider)
+            forwarder._drain.note_eviction("stream", request_id, tier=tier, provider=provider)
             if first_byte_ms is None:
                 self.wfile.write(self._sse_event({
                     "type": "message_start",
@@ -267,8 +256,8 @@ class ProxyHandler(AdminHandlerMixin, ChatSSEHandlerMixin, http.server.BaseHTTPR
                 chunks = resp.iter_raw()
                 try:
                     for chunk in chunks:
-                        _touch_upstream_activity()
-                        if _swap_epoch_changed(epoch):
+                        forwarder._drain.touch()
+                        if forwarder._drain.epoch_changed(epoch):
                             # A completed swap: never forward old-routing bytes.
                             evict_stream()
                             return first_byte_ms
@@ -302,7 +291,7 @@ class ProxyHandler(AdminHandlerMixin, ChatSSEHandlerMixin, http.server.BaseHTTPR
                     # The read bound is the client timeout. A swap in progress
                     # owns this wake (evict retryably); otherwise the stall is
                     # what ends the stream.
-                    if forwarder._config_swapping or _swap_epoch_changed(epoch):
+                    if forwarder._drain.chain_abort(epoch):
                         evict_stream()
                         return first_byte_ms
                 except (httpx2.RequestError, httpx2.StreamError, OSError):
@@ -333,8 +322,8 @@ class ProxyHandler(AdminHandlerMixin, ChatSSEHandlerMixin, http.server.BaseHTTPR
                 # stream stays single-consumption.
                 try:
                     for chunk in chunks:
-                        _touch_upstream_activity()
-                        if _swap_epoch_changed(epoch):
+                        forwarder._drain.touch()
+                        if forwarder._drain.epoch_changed(epoch):
                             evict_stream()
                             return first_byte_ms
                         bytes_streamed += len(chunk)
@@ -352,7 +341,7 @@ class ProxyHandler(AdminHandlerMixin, ChatSSEHandlerMixin, http.server.BaseHTTPR
                         self.wfile.write(chunk)
                         self.wfile.flush()
                 except httpx2.ReadTimeout:
-                    if forwarder._config_swapping or _swap_epoch_changed(epoch):
+                    if forwarder._drain.chain_abort(epoch):
                         evict_stream()
                         return first_byte_ms
                 except (httpx2.RequestError, httpx2.StreamError, OSError):
@@ -362,8 +351,8 @@ class ProxyHandler(AdminHandlerMixin, ChatSSEHandlerMixin, http.server.BaseHTTPR
                 # consumer of the response, so it owns the iterator.
                 try:
                     for chunk in resp.iter_raw():
-                        _touch_upstream_activity()
-                        if _swap_epoch_changed(epoch):
+                        forwarder._drain.touch()
+                        if forwarder._drain.epoch_changed(epoch):
                             evict_stream()
                             return first_byte_ms
                         bytes_streamed += len(chunk)
@@ -384,7 +373,7 @@ class ProxyHandler(AdminHandlerMixin, ChatSSEHandlerMixin, http.server.BaseHTTPR
                             first_byte_ms = (time.time() - first_byte_start) * 1000
                             first_chunk = False
                 except httpx2.ReadTimeout:
-                    if forwarder._config_swapping or _swap_epoch_changed(epoch):
+                    if forwarder._drain.chain_abort(epoch):
                         evict_stream()
                         return first_byte_ms
                 except (httpx2.RequestError, httpx2.StreamError, OSError):
@@ -445,9 +434,9 @@ class ProxyHandler(AdminHandlerMixin, ChatSSEHandlerMixin, http.server.BaseHTTPR
             })
             try:
                 for chunk in resp.iter_raw():
-                    _touch_upstream_activity()
-                    if _swap_epoch_changed(epoch):
-                        _note_swap_eviction("stream", request_id, tier=tier)
+                    forwarder._drain.touch()
+                    if forwarder._drain.epoch_changed(epoch):
+                        forwarder._drain.note_eviction("stream", request_id, tier=tier)
                         break
             except (httpx2.RequestError, httpx2.StreamError, OSError):
                 pass

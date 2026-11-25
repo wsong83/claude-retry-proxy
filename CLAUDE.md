@@ -31,11 +31,13 @@ src/claude_retry_proxy/
   lifecycle.py          the process lifecycle (extracted 2026-11-24): `run_server(handler_class)` — argument parsing, keys/config load + validation, the port-ownership probe, state/marker writes, the stderr-guard swap, heartbeat start, signal handlers, readiness, the serve loop, teardown — plus the two private mechanisms it owns, `_ProxyHTTPServer` and `_BestEffortStderr` (both re-exported through server.py for the test surface); the console script, `python -m claude_retry_proxy.server`, and in-process test spawns all enter through server.py's wrapper; imports leaf modules only (settings/keys/config/compat/sinks/runtime_state), never server.py
   admin_api.py          the admin control plane (extracted 2026-11-23, step 8): `AdminHandlerMixin` holding the eight `/admin` route handlers (page, config, swap-status, providers, providers-detail, shutdown, switch, reload) plus `_load_admin_html`, `_validate_csrf_origin`, `_CARRIED_MODELS_KEYS`, `ADMIN_BODY_LIMIT`, `_admin_html_cache`; bodies byte-verbatim from server.py's former branches; imports forwarder/runtime_state/config/keys/nesting/safety/settings/sinks, never server.py
   runtime_state.py      process runtime-state leaf (extracted 2026-11-23, step 8): the five mutable globals (`_current_config`, `_config_path`, `_vendors`, `_shutting_down`, `_startup_state`) and `heartbeat_loop`; every cross-module access is attribute-form (state is never re-exported); the tracked owned-state conversion follow-up lands here
-  forwarder.py          the upstream forward path (extracted 2026-11-16): `_forward_core` retry/backoff over the httpx2 transport, the compat + reasoning retries' orchestration, the config-swap drain protocol (its state lives here; readers read it attribute-form), and the shared `_DISCONNECT_ERRORS` tuple; re-exports `chat_nudge.py`'s five-name surface (the four nudge wrappers + `RETRY_NUDGE_TTL_SECONDS`), `model_rewrite.py`'s rewrite pair (`_rewrite_sse_event` / `_rewrite_json_response`), and `tier_resolution.py`'s resolution pair (`extract_model` / `resolve_tier`); never imports its parent
+  forwarder.py          the upstream forward path (extracted 2026-11-16): `_forward_core` retry/backoff over the httpx2 transport, the compat + reasoning retries' orchestration, and the shared `_DISCONNECT_ERRORS` tuple; the config-swap drain protocol moved to swap_drain.py and `_error_body` to error_body.py (both 2026-11-25); re-exports `swap_drain.py`'s surface (`_drain` + `_interruptible_sleep` / `_swap_abort_tuple`), `error_body.py`'s `_error_body`, `chat_nudge.py`'s five-name surface (the four nudge wrappers + `RETRY_NUDGE_TTL_SECONDS`), `model_rewrite.py`'s rewrite pair (`_rewrite_sse_event` / `_rewrite_json_response`), and `tier_resolution.py`'s resolution pair (`extract_model` / `resolve_tier`); never imports its parent
   model_rewrite.py      the response-model-rewriting leaf (extracted 2026-11-24): `_rewrite_sse_event` (rewrites `model` in the first `message_start` SSE event — the anthropic-mode stream scan that calls it, including the 64 KB scan budget, stays in server.py) and `_rewrite_json_response` (buffered JSON body rewrite, 2xx and non-2xx) — the anthropic-mode model projection; chat/response modes get the model written by their body transforms and never reach this module; imports only leaves (json/time/nesting/sinks), never its parent; production callers reach it through forwarder's re-export
   tier_resolution.py    the request model/tier resolution leaf (extracted 2026-11-24): `extract_model` (total five-outcome body parse — the model name or the `invalid_json`/`invalid_body_type` error codes) and `resolve_tier` (four-rule mapping: direct match, reverse lookup over the configured tiers, keyword pattern match); a utility-cluster leaf whose only import is stdlib `json` — never its parent or a sibling; consumed by server.py at request entry and by forwarder's forward path, both reaching it through forwarder's re-export
   chat_sse.py           the chat-mode SSE conversion mixin (extracted 2026-11-17, step 7): `ChatSSEHandlerMixin` holding `_stream_chat_sse_to_anthropic` (OpenAI chat-completions SSE → Anthropic Messages SSE, including the tool-block state machine and the post-finish drain) and `_log_response_cap_exceeded`, plus the chat/drain bounds (`SSE_EVENT_DELIMITER`, `MAX_CHAT_*`, `MAX_DRAIN_*`); `ProxyHandler` inherits it, `_sse_event` stays on the handler and resolves through the MRO; imports forwarder/sinks/settings/nesting/transforms_chat, never server.py
   chat_nudge.py         the chat retry-nudge marker store (extracted 2026-11-24): the owned `_NudgeStore` — the lock and the bounded single-use entry table live on the instance (`_store` is the module singleton) — with the four frozen-name delegation wrappers (`_retry_nudge_remember` / `_retry_nudge_arm` / `_retry_nudge_messages_bytes` / `_retry_nudge_check`) and `RETRY_NUDGE_TTL_SECONDS` / `RETRY_NUDGE_MAX_ENTRIES`; stdlib-only leaf (hashlib/json/threading/time) that never imports its parent; production callers reach it through forwarder's re-export, the tests through `chat_nudge._store` directly
+  error_body.py         the client-facing error-envelope leaf (extracted 2026-11-25): `_error_body` builds the Anthropic standard error body (`error.type` taxonomy + `error.code` discriminator + optional `request_id`) serialized with `json.dumps` because messages carry client- and exception-controlled text; stdlib-only leaf (json) whose direct consumer is forwarder (and swap_drain), re-exported through forwarder for server/chat_sse/admin_api
+  swap_drain.py         the config-swap drain protocol (extracted 2026-11-25): the owned `_SwapDrain`, module singleton `_drain` — the RLock (also the config-document lock), in-flight counter, swapping flag, completion event, epoch, shared upstream-activity clock, press timestamp, and eviction counter live on the instance — behind a method surface: `admit(snapshot_fn)` (blocking admission; config/vendors/epoch snapshotted in the admitting acquisition), `release()`, lock-free `touch()` / `epoch_changed()` / `chain_abort()`, `note_eviction()` (counter under lock, trace event outside), single-flight `drain()`, atomic `status_snapshot()`, RLock-reentrant `bump_epoch()`, `complete()`; plus the retry-loop collaborators `_interruptible_sleep` / `_swap_abort_tuple`; imports leaves only (threading/time/error_body/settings/sinks); production callers reach it through forwarder's re-export, cross-module state access attribute-form on the singleton, the state fields never re-exported as module names
   compat.py             the compatibility learner: the `COMPAT_FEATURES` registry (two features — `context_management` in anthropic mode, `reasoning_field` in chat mode) whose descriptors own their mode, presence test, matcher, field set and retry budget; COMPAT_* policy constants; the owned `_CompatState` state object (default-param `state=` injection); the `context_management` state machine with its 400-shape matchers and its retry lock, and the `reasoning_field` credit learner (a per-key in-memory credit; the switch thresholds are `models.json` policy, `reasoning_field_switch`) with its lock-free, key-free rescue (its passes repair the forwarded body rather than re-rolling) and matcher, plus its demanding-turn-scoped presence gate (`_reasoning_present`: reasoning on the last `tool_use`-bearing assistant turn, read from the raw client body) (extracted from server.py; the probe-outcome + retry orchestration slice lives in forwarder.py, which imports this module — `_compat_retry_lock` is dual-read)
   sanitize.py           error-text redaction leaf: `sanitize_error`, the chokepoint for text reaching stderr, trace `error` fields and client-facing error bodies
   sinks.py              sink class family: private `_Sink` base, `TraceSink` (JSONL append + counters + markers), `StateSink` (atomic state document), shared `_SinkHealth` failure reporter, process-wide pair + `configure()`
@@ -200,22 +202,24 @@ for the rest.
 
 - **Drain-and-swap (silence-based).** Config changes (switch and reload) are
   **single-flight** — a second press while one is in progress is refused `409`
-  `config_swap_in_progress`, and the check-and-set is atomic under one
-  `_config_lock` acquisition in `_drain_for_swap()` (a `None` return is the
-  refusal signal). The owner pauses new admissions, stamps the shared
-  `_last_upstream_activity` clock, snapshots `_inflight_count`, and drains while
-  the count is non-zero **and** an upstream byte arrived within
-  `PROXY_SWAP_SILENCE_TIMEOUT` (default 30 s); quiet for `budget + 2 s`
+  `config_swap_in_progress`, and the check-and-set is atomic under one lock
+  acquisition inside `_drain.drain()` (a `None` return is the refusal signal).
+  The owner pauses new admissions (blocked inside `admit()` on the completion
+  event), stamps the shared upstream-activity clock (`_drain.touch()`), and
+  drains while the in-flight count is non-zero **and** an upstream byte arrived
+  within `PROXY_SWAP_SILENCE_TIMEOUT` (default 30 s); quiet for `budget + 2 s`
   (`_SWAP_QUIET_GRACE`) means every survivor is silent by construction. There is
   **no wall-clock cap** — live work is waited to completion — and retry chains
   abandon at the press with a retryable `503 config_swap_restart` instead of
   being awaited. A *streamed* response silent at the press has no armed wake
   anymore — it wakes at its next read boundary (≤ `PROXY_READ_TIMEOUT`) and
-  dies retryably there. The swap then bumps `_config_epoch` under lock and signals
-  `_swap_done`; old-epoch stragglers die retryably at their next checkpoint, so
-  no old-routing result is delivered after a swap. `forward_request` snapshots
-  config, vendors **and** the epoch at entry and threads them throughout.
-  **Shutdown does not use this path** — see Gotchas.
+  dies retryably there. The swap then bumps the epoch under lock
+  (`_drain.bump_epoch()`) and signals completion (`_drain.complete()`); old-epoch
+  stragglers die retryably at their next checkpoint, so no old-routing result is
+  delivered after a swap. `forward_request` snapshots config, vendors **and**
+  the epoch at entry — one `admit()` acquisition — and threads them throughout.
+  The protocol lives in `swap_drain.py` (extracted 2026-11-25). **Shutdown does
+  not use this path** — see Gotchas.
   [doc/architecture.html#config-swap](doc/architecture.html#config-swap).
 
 - **`GET /admin/api/swap-status`** reports a swap in progress live
@@ -456,7 +460,11 @@ owned-state-object conversion (guide §5 — swap-drain state as an owned object
 supersedes the bare-globals relocation of 2026-11-16-extract-forwarder). The
 nudge half of that conversion landed 2026-11-24 (plan
 `2026-11-24-extract-nudge-store`: the store is the owned `_NudgeStore` in
-`chat_nudge.py`, extracted byte-verbatim then shaped).
+`chat_nudge.py`, extracted byte-verbatim then shaped), and the drain half
+landed 2026-11-25 (plan `2026-11-25-extract-swap-drain`: the protocol is the
+owned `_SwapDrain` singleton in `swap_drain.py`, shaped in place then moved
+byte-verbatim; `_error_body` left for the `error_body.py` leaf in the same
+plan).
 
 The chat-SSE extraction (`2026-11-17-extract-chat-sse`, step 7) moved the
 chat-mode SSE conversion into `chat_sse.py` as a `ChatSSEHandlerMixin` that
@@ -474,9 +482,10 @@ server-lifecycle extraction — landed 2026-11-24 (plan
 `2026-11-24-extract-server-lifecycle`: `run_server(handler_class)` and the two
 lifecycle classes moved verbatim into `lifecycle.py`, bringing `server.py` under
 the code threshold) — and the owned-state-object conversion (guide §5), whose
-scope now covers forwarder's swap-drain state AND `runtime_state`'s five
-globals (the nudge half landed 2026-11-24 via
-`2026-11-24-extract-nudge-store`); the conversion is the open one.
+scope covered forwarder's swap-drain state AND `runtime_state`'s five globals
+(the nudge half landed 2026-11-24 via `2026-11-24-extract-nudge-store`; the
+drain half landed 2026-11-25 via `2026-11-25-extract-swap-drain`); the open
+remainder is the `runtime_state` five-globals conversion.
 
 The response-rewrite extraction (`2026-11-24-extract-model-rewrite`, 2026-11-24)
 moved the anthropic-mode model projection (`_rewrite_sse_event` /

@@ -543,8 +543,8 @@ nothing to the config; rather than dead-ending in a red line, the page attaches 
 the in-flight swap, keeps reporting it, and stays locked until it ends — then
 re-reads the tier row from the server and unlocks, so the operator's next press is
 based on a truthful baseline. The real single-flight guard is server-side in
-`_drain_for_swap()`; the page's lockout is an affordance on top of it, not the
-enforcement.
+`_drain.drain()` (the config-swap drain's owned singleton); the page's lockout is
+an affordance on top of it, not the enforcement.
 
 If the swap-status poll fails repeatedly (5 consecutive failures) the page says the
 proxy is unreachable and that reloading is now safe — it stays locked, because an

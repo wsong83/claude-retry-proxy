@@ -4435,8 +4435,8 @@ def test_chat_sse_swap_evicts_pre_finish():
             [_cc({"role": "assistant", "content": "hi"})]))
         handler.wfile.flush()
         # A byte AFTER the press, then silence: the loop's next read then
-        # blocks until the request read timeout, with _config_swapping (or the
-        # completed swap's epoch) owning the wake.
+        # blocks until the request read timeout, with the drain's swapping
+        # flag (or the completed swap's epoch) owning the wake.
         post_press_byte.wait(15)
         handler.wfile.write(_sse_stream_chunks([_cc({"content": "more"})]))
         handler.wfile.flush()
@@ -4611,9 +4611,9 @@ def test_chat_sse_eviction_stranded_sentinel_never_flushes():
             [_cc({"role": "assistant", "content": "hi"})]))
         handler.wfile.flush()
         # The stranded sentinel arrives AFTER the press, so it lands in buf
-        # while _config_swapping; the next read then blocks until the request
-        # read timeout (pinned to 10 s below) and wakes into the pre-finish
-        # eviction arm.
+        # while the drain's swapping flag is set; the next read then blocks
+        # until the request read timeout (pinned to 10 s below) and wakes into
+        # the pre-finish eviction arm.
         post_press_byte.wait(15)
         handler.wfile.write(b"data: [DONE]\n")
         handler.wfile.flush()

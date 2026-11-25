@@ -16,9 +16,8 @@ import uuid
 import httpx2
 
 from . import forwarder
-from .forwarder import (_DISCONNECT_ERRORS, _error_body, _note_swap_eviction,
-                        _retry_nudge_arm, _retry_nudge_messages_bytes,
-                        _swap_epoch_changed, _touch_upstream_activity)
+from .forwarder import (_DISCONNECT_ERRORS, _error_body, _retry_nudge_arm,
+                        _retry_nudge_messages_bytes)
 from .nesting import check_payload_nesting, nesting_event
 from .settings import SETTINGS
 from .sinks import log_trace
@@ -486,7 +485,7 @@ class ChatSSEHandlerMixin:
             "swap_abort", emitted through the drain's own event.
             """
             nonlocal drain_exit, drain_ended_at
-            _note_swap_eviction("stream", request_id, tier=tier, provider=provider)
+            forwarder._drain.note_eviction("stream", request_id, tier=tier, provider=provider)
             if not message_started:
                 start_message()
             if finish_reason_seen is not None:
@@ -656,30 +655,30 @@ class ChatSSEHandlerMixin:
                         # swap still owns this wake: close with the retryable
                         # error instead of synthesizing a terminal on old
                         # routing.
-                        if _swap_epoch_changed(epoch):
+                        if forwarder._drain.epoch_changed(epoch):
                             return evict_swap()
                         drain_exit = "read_timeout"
                         break
                     # Pre-finish: a read timeout is terminal, so the only
                     # question is how to close. A swap owns this wake — evict;
                     # otherwise the stall cuts the stream.
-                    if forwarder._config_swapping or _swap_epoch_changed(epoch):
+                    if forwarder._drain.chain_abort(epoch):
                         return evict_swap()
                     break
                 except (httpx2.RequestError, httpx2.StreamError, OSError):
                     # A completed swap owns this exit too: dying retryably beats
                     # delivering an old-routing result the client would trust.
-                    if _swap_epoch_changed(epoch):
+                    if forwarder._drain.epoch_changed(epoch):
                         return evict_swap()
                     drain_exit = "read_error"
                     break
                 if not chunk:
-                    if _swap_epoch_changed(epoch):
+                    if forwarder._drain.epoch_changed(epoch):
                         return evict_swap()
                     drain_exit = "eof"
                     break
-                _touch_upstream_activity()
-                if _swap_epoch_changed(epoch):
+                forwarder._drain.touch()
+                if forwarder._drain.epoch_changed(epoch):
                     # A completed swap: no old-routing bytes reach the client.
                     # In the drain window the epoch rule applies too — close
                     # instead of synthesizing a terminal.

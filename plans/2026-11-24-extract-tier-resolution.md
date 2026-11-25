@@ -9,6 +9,7 @@ Rows ordered newest-first (latest issues at top). New issues are prepended; reso
 
 | Issue | Status | Found | Resolved | Resolved By |
 |-------|--------|-------|----------|-------------|
+| 2026-11-25-extract-swap-drain cross-reference — swap-drain owned-state conversion (plan 3, declared follow-up) | Resolved | 2026-11-25 | 2026-11-25 | plan 2026-11-25-extract-swap-drain — This plan is that plan 3: the drain state is the owned `_SwapDrain` singleton in swap_drain.py |
 | [forwarder-docstring-stale](./tmp/reports/2026-11-24-extract-tier-resolution-forwarder-docstring-stale.json) | Resolved | 2026-11-24 | 2026-11-24 | [coder round 3](./tmp/reports/2026-11-24-extract-tier-resolution-coder-2026-11-24.json) — Step 5 applied per pin, step-2 gate 13/13 proving line-neutrality |
 | arch-doc-extract-model-contract — pre-existing doc/code imprecision (tester prose, no report): architecture.html Step 1 box claimed extract_model returns "unknown" for unparseable bodies; the code returns (None, "invalid_json") | Resolved | 2026-11-24 | 2026-11-24 | planner — Step 1 box rewritten to the five-outcome contract (this session) |
 | trace-doc-extract-model-parenthetical — pre-existing doc/code imprecision (tester prose, no report): trace-log.html model-field parenthetical read "returns None" as covering the no-string-model case, which returns ("unknown", None) | Resolved | 2026-11-24 | 2026-11-24 | planner — parenthetical corrected to the per-case returns (this session) |

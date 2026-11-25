@@ -708,30 +708,33 @@ administrator presses Apply / Reload<br>
 ↓<br>
 single-flight: a second press while a swap is in progress is refused with <code>409 config_swap_in_progress</code><br>
 ↓<br>
-set <code>_config_swapping</code> — new requests block on <code>_swap_done</code>; retry chains abandon at their next checkpoint (<code>503 config_swap_restart</code>)<br>
+set the swapping flag (<code>_drain.drain()</code> presses it single-flight) — new requests block inside <code>_drain.admit()</code> on the completion event; retry chains abandon at their next checkpoint (<code>503 config_swap_restart</code>)<br>
 ↓<br>
 drain: while in-flight &gt; 0 <em>and</em> an upstream byte arrived within <code>PROXY_SWAP_SILENCE_TIMEOUT</code>, sleep 0.1 s<br>
 &nbsp;&nbsp;<span class="optional">(no wall-clock cap — live work is waited out)</span><br>
 ↓<br>
 quiet for <code>budget + 2 s</code>: every remaining request is silent ≥ budget by construction, so the swap proceeds<br>
 ↓<br>
-swap configuration under lock → <code>_config_epoch += 1</code> → clear flag → signal <code>_swap_done</code><br>
+swap configuration under lock → <code>_drain.bump_epoch()</code> → clear flag and signal completion (<code>_drain.complete()</code>)<br>
 ↓<br>
 blocked requests proceed with the new snapshot; old-epoch stragglers die at their next checkpoint
 </div>
 
 <p>What <em>is</em> waited for is live work: a healthy generation of any length finishes and is
 delivered on its original snapshot, with no wall-clock cap. What is not waited for is silence. One
-shared clock — <code>_last_upstream_activity</code>, reset by any upstream byte from <em>any</em>
-in-flight request — is the only clock the drain reads; there are no per-request timers. When that
+shared clock — <code>_drain._last_upstream_activity</code>, reset by any upstream byte from <em>any</em>
+in-flight request (<code>_drain.touch()</code>) — is the only clock the drain reads; there are no per-request timers. When that
 clock has been quiet for the full budget, every request still in the set is silent by
 <em>construction</em>, and the drain stops rather than waiting on a request that has stopped
 producing. The residual case is silence that does not mean death: a long time-to-first-byte or an
 unusually long inter-token gap looks identical on a shared clock and is evicted retryably — raise
-<code>PROXY_SWAP_SILENCE_TIMEOUT</code> if that is hit in practice. The quiet exit is deliberately
-<code>2 s</code> (<code>_SWAP_QUIET_GRACE</code>) longer than the wake a mid-swap stream arms for
-itself, so an evictable straggler is always evicted <em>before</em> the drain exits and the
-reported <code>drained</code> field is a fact rather than a race.</p>
+<code>PROXY_SWAP_SILENCE_TIMEOUT</code> if that is hit in practice. The <code>2 s</code> grace
+(<code>_SWAP_QUIET_GRACE</code>) extends the quiet window past the budget so that quiet exit
+implies every survivor was silent ≥ budget on the shared clock. A straggler that was silent at the
+press has no armed wake before its next read boundary (≤ <code>PROXY_READ_TIMEOUT</code>): it
+wakes <em>after</em> the drain exit and dies retryably there, at the post-bump epoch checkpoint —
+so the reported <code>drained</code> field remains a fact about the drain window, not a promise
+about post-exit wakes.</p>
 
 <p>Eviction is retryable, never a silent truncation, and the client is always told: a
 pre-first-byte or buffered request gets <code>503</code> with the
@@ -773,8 +776,8 @@ disagree is an external <code>update-claude-env</code> write landing between the
 
 <div class="warn">
 <strong>A swap can block every new admission for as long as its drain runs.</strong> The drain has
-no wall-clock bound, so while <code>_config_swapping</code> is true new requests stall on
-<code>_swap_done.wait()</code> with no timeout. In practice the drain ends within one live
+no wall-clock bound, so while the swapping flag is true new requests stall inside
+<code>_drain.admit()</code> on the completion event with no timeout. In practice the drain ends within one live
 generation plus the quiet window — retry chains no longer hold it, because they abandon at the
 press. The case that does not terminate is an upstream that is stuck but keeps sending bytes: it
 keeps the activity clock fresh forever, so the drain never observes quiet. Two escape hatches

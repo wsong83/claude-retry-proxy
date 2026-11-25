@@ -24,7 +24,7 @@ from . import forwarder
 from . import runtime_state
 from .config import (load_models_document, models_path_for, validate_config,
                      write_config)
-from .forwarder import _drain_for_swap, _error_body
+from .forwarder import _error_body
 from .keys import vendor_key_names
 from .nesting import (_nesting_limit_message, check_payload_nesting,
                       nesting_event)
@@ -118,7 +118,7 @@ class AdminHandlerMixin:
         # json.dumps(json.loads(json.dumps(x))) is byte-identical to
         # json.dumps(x), so the round-trip bought nothing.
         try:
-            with forwarder._config_lock:
+            with forwarder._drain.lock:
                 payload = json.dumps(runtime_state._current_config).encode("utf-8")
         except Exception:
             # Reachable: a hand-edited config.json can hold a document that
@@ -140,18 +140,7 @@ class AdminHandlerMixin:
             self.wfile.write(b'{"error":"forbidden"}')
             return
 
-        # Each nullable field is guarded on its own source, not on
-        # `swapping`: a `time.time() - None` TypeError would 500 the
-        # endpoint, and the admin page swallows poll failures — the bug
-        # would degrade silently into a dead status line.
-        with forwarder._config_lock:
-            swapping = forwarder._config_swapping
-            now = time.time()
-            waited_s = (now - forwarder._swap_started_at) \
-                if (swapping and forwarder._swap_started_at is not None) else None
-            silence_s = (now - forwarder._last_upstream_activity) \
-                if (swapping and forwarder._last_upstream_activity) else None
-            inflight = forwarder._inflight_count
+        swapping, waited_s, inflight, silence_s = forwarder._drain.status_snapshot()
         self._send_response(200, json.dumps({
             "swapping": swapping,
             "waited_s": waited_s,
@@ -354,8 +343,8 @@ class AdminHandlerMixin:
         # check below validates against this snapshot, and Phase 3 re-checks
         # it when the epoch has moved by then (see there). Reading the two
         # separately would let a reload land between them.
-        with forwarder._config_lock:
-            validated_epoch = forwarder._config_epoch
+        with forwarder._drain.lock:
+            validated_epoch = forwarder._drain._config_epoch
             validated_models = runtime_state._current_config.get("models") or {}
         for tier_name, tier_config in new_tiers.items():
             provider = tier_config.get("provider", "")
@@ -396,10 +385,10 @@ class AdminHandlerMixin:
         # legitimately continue on the old mapping.
         response_status = None
         response_body = None
-        drain = _drain_for_swap()
+        drain = forwarder._drain.drain()
         if drain is None:
             # Single-flight: a swap is already in progress. The guard and
-            # the press share one lock acquisition inside _drain_for_swap,
+            # the press share one lock acquisition inside _drain.drain(),
             # so two concurrent presses cannot both enter a drain — the
             # second is refused here without disturbing the first swap's
             # mapping, epoch, or drain counters.
@@ -412,7 +401,7 @@ class AdminHandlerMixin:
 
         # Phase 3: Perform the swap
         try:
-            with forwarder._config_lock:
+            with forwarder._drain.lock:
                 # The snapshot validated above was taken before this press
                 # owned the swap, so a reload that finished in between can
                 # have replaced the catalog it was checked against -- and
@@ -423,7 +412,7 @@ class AdminHandlerMixin:
                 # remove. Answering the same 400 keeps the operator's
                 # diagnostic identical to a fresh press.
                 if (response_status is None
-                        and forwarder._config_epoch != validated_epoch):
+                        and forwarder._drain._config_epoch != validated_epoch):
                     live_models = runtime_state._current_config.get("models") or {}
                     for _name, _cfg in new_tiers.items():
                         _catalog = live_models.get(_cfg.get("provider", ""))
@@ -459,7 +448,7 @@ class AdminHandlerMixin:
                         runtime_state._current_config = new_config
                         # The epoch bump is the eviction signal for any
                         # straggler still holding an old snapshot.
-                        forwarder._config_epoch += 1
+                        forwarder._drain.bump_epoch()
                         response_status = 200
                         response_body = json.dumps({
                             "status": "ok",
@@ -477,10 +466,7 @@ class AdminHandlerMixin:
             # timestamp clears in the SAME acquisition: the status
             # endpoint must never observe swapping True with a None
             # started_at.
-            with forwarder._config_lock:
-                forwarder._config_swapping = False
-                forwarder._swap_started_at = None
-                forwarder._swap_done.set()
+            forwarder._drain.complete()
 
         # Send response after releasing lock
         self._send_response(response_status, response_body)
@@ -517,14 +503,14 @@ class AdminHandlerMixin:
         # Safe now that single-flight keeps a concurrent switch from
         # completing — and being silently reverted in memory — mid-drain,
         # which is what the original after-drain ordering guarded against.
-        with forwarder._config_lock:
+        with forwarder._drain.lock:
             # The epoch these tiers are read at, captured in the SAME
             # acquisition. A /admin/api/switch that completes its whole
             # press -> drain -> swap -> release cycle after this gate and
             # before Phase 3 leaves this candidate stale; Phase 3 compares
             # the epoch before installing, so it can never revert the
             # switch's mapping.
-            gated_epoch = forwarder._config_epoch
+            gated_epoch = forwarder._drain._config_epoch
             candidate = {
                 "tiers": runtime_state._current_config.get("tiers", {}),
                 "models": models_doc.get("models", {}),
@@ -593,10 +579,10 @@ class AdminHandlerMixin:
 
         # Drain-and-swap: pause admissions and wait for in-flight work
         # (see /admin/api/switch).
-        drain = _drain_for_swap()
+        drain = forwarder._drain.drain()
         if drain is None:
             # Single-flight, shared with /admin/api/switch: the guard and
-            # the press share one lock acquisition inside _drain_for_swap,
+            # the press share one lock acquisition inside _drain.drain(),
             # so a reload racing a switch is refused here and leaves the
             # in-progress swap's mapping intact (see there).
             self._send_response(409, _error_body(
@@ -608,8 +594,8 @@ class AdminHandlerMixin:
 
         # Phase 3: swap in the gated candidate and bump the epoch.
         try:
-            with forwarder._config_lock:
-                if forwarder._config_epoch != gated_epoch:
+            with forwarder._drain.lock:
+                if forwarder._drain._config_epoch != gated_epoch:
                     # A concurrent /admin/api/switch completed a swap
                     # between the gate above and this install, so
                     # `candidate`'s tiers predate it: installing them would
@@ -649,16 +635,13 @@ class AdminHandlerMixin:
                         }).encode("utf-8")
                     else:
                         runtime_state._current_config = candidate
-                        forwarder._config_epoch += 1
+                        forwarder._drain.bump_epoch()
                         response_status = 200
                         response_body = success_body
         finally:
             # Phase 4: Clear swap flag and signal completion (the
             # timestamp clears in the same acquisition — see there).
-            with forwarder._config_lock:
-                forwarder._config_swapping = False
-                forwarder._swap_started_at = None
-                forwarder._swap_done.set()
+            forwarder._drain.complete()
 
         # Send response after releasing lock
         self._send_response(response_status, response_body)

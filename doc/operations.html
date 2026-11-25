@@ -324,7 +324,7 @@ double-clicked Apply, or the CLI racing the page — is refused with <code>409</
 drain is entered and the refused press changes nothing <em>to the config</em>. The page does not
 dead-end on that refusal: it <strong>attaches</strong> to the in-flight swap, keeps reporting it,
 and stays locked until the swap ends. The enforcement is server-side in
-<code>_drain_for_swap()</code>; the page's lockout is an affordance on top of it. A
+<code>_drain.drain()</code> (the config-swap drain's owned singleton); the page's lockout is an affordance on top of it. A
 <strong>reload</strong> carries a second 409 of its own: it gates its candidate catalog
 <em>before</em> pressing, so if a switch completes its whole cycle between that gate and the
 install, the reload answers <code>409 config_reload_stale</code> instead of installing tiers that
