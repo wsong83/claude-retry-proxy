@@ -14,6 +14,12 @@ from test_tier_routing import ALL_TESTS as TIER_ROUTING_TESTS
 from test_config_keys import ALL_TESTS as CONFIG_KEYS_TESTS
 from test_config_split import ALL_TESTS as CONFIG_SPLIT_TESTS
 from test_admin import ALL_TESTS as ADMIN_TESTS
+from test_admin_switch import ALL_TESTS as ADMIN_SWITCH_TESTS
+from test_admin_swap import ALL_TESTS as ADMIN_SWAP_TESTS
+from test_admin_write import ALL_TESTS as ADMIN_WRITE_TESTS
+from test_admin_html import ALL_TESTS as ADMIN_HTML_TESTS
+from test_admin_html_status import ALL_TESTS as ADMIN_HTML_STATUS_TESTS
+from test_swap_drain import ALL_TESTS as SWAP_DRAIN_TESTS
 from test_cli import ALL_TESTS as CLI_TESTS
 from test_mode_dispatch import ALL_TESTS as MODE_DISPATCH_TESTS
 from test_chat_transform import ALL_TESTS as CHAT_TRANSFORM_TESTS
@@ -39,6 +45,12 @@ ALL_TESTS = (
     CONFIG_KEYS_TESTS +
     CONFIG_SPLIT_TESTS +
     ADMIN_TESTS +
+    ADMIN_SWITCH_TESTS +
+    ADMIN_SWAP_TESTS +
+    ADMIN_WRITE_TESTS +
+    ADMIN_HTML_TESTS +
+    ADMIN_HTML_STATUS_TESTS +
+    SWAP_DRAIN_TESTS +
     CLI_TESTS +
     MODE_DISPATCH_TESTS +
     CHAT_TRANSFORM_TESTS +
