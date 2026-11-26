@@ -36,8 +36,11 @@ python tests/test_claude_proxy.py -t &lt;name&gt;    # one or more named tests</
 
 <p><code>tests/test_claude_proxy.py</code> is an aggregator, not a test module. It imports each
 area module's <code>ALL_TESTS</code> list and concatenates them in historical section order into
-one run. Adding a test means adding it to its module's <code>ALL_TESTS</code>; the aggregator
-needs no edit unless you add a whole new module.</p>
+one run. A partitioned area chains its sub-modules: the area's kept module imports the
+siblings' <code>ALL_TESTS</code> lists and re-exports the merged list (see
+<code>tests/test_compat.py</code>), so the aggregator still imports one module per area. Adding
+a test means adding it to its module's <code>ALL_TESTS</code>; the aggregator needs no edit
+unless you add a whole new module.</p>
 
 <div class="note">
 <strong>The suite is safe to run alongside a live proxy.</strong> This was not always true. The
@@ -142,9 +145,24 @@ not carried — recount on demand with the command above, or read the aggregator
 <table>
 <tr><th>Module</th><th>Covers</th></tr>
 <tr><td><code>test_compat.py</code></td>
-    <td>The compatibility learner — both features (<code>context_management</code>,
-        <code>reasoning_field</code>): persistence, detection, state machine, concurrency.
+    <td>The compatibility learner's <code>_CompatState</code> persistence layer
+        (kept module; chains the four sub-module <code>ALL_TESTS</code> lists).
         See <a href="compatibility.html">compatibility.html</a>.</td></tr>
+<tr><td><code>test_compat_cm.py</code></td>
+    <td>The compatibility learner's <code>context_management</code> live loop —
+        400-shape detection and the learn/strip/suppress flow</td></tr>
+<tr><td><code>test_compat_policy.py</code></td>
+    <td>The compatibility learner's <code>context_management</code> switch policy —
+        threshold ladder, probation, delisting</td></tr>
+<tr><td><code>test_compat_retry.py</code></td>
+    <td>The compatibility learner's retry orchestration — locks, config snapshots,
+        stream interaction, trace privacy</td></tr>
+<tr><td><code>test_compat_reasoning.py</code></td>
+    <td>The compatibility learner's <code>reasoning_field</code> credit learner —
+        walk, rescue, admin carry</td></tr>
+<tr><td><code>_compat_support.py</code></td>
+    <td>Not a test module. Shared compatibility-learning fixtures and constants,
+        moved byte-verbatim from <code>test_compat.py</code></td></tr>
 <tr><td><code>test_chat_transform.py</code></td>
     <td>Anthropic → Chat Completions request and response transforms</td></tr>
 <tr><td><code>test_response_transform.py</code></td>
@@ -648,7 +666,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> Both learner features — the <code>context_management</code> probe ladder, probation, suppression, and its persistence file, and the <code>reasoning_field</code> credit rule (saturate, drain, edge-switch) with its lock-free rescue.</p>
 
-<h4><code>tests/test_compat.py</code> — the compatibility learner</h4>
+<h4><code>tests/test_compat.py</code> — the _CompatState persistence layer</h4>
 <ul>
 <li><code>test_compat_state_load_missing_file</code>: Missing state file means empty state: discovery still works and no startup failure occurs.</li>
 <li><code>test_compat_state_load_corrupt_fails_open</code>: A corrupt (non-JSON) state file warns and fails open with empty state: requests forward unchanged and the proxy does not crash.</li>
@@ -664,10 +682,13 @@ EOF</code></pre>
 <li><code>test_compat_state_concurrent_updates_no_loss</code>: Concurrent stripped requests keep counter integrity: every client gets a 2xx, no more than the expected probe requests go unstripped, and state stays valid.</li>
 <li><code>test_compat_state_key_isolation</code>: Learned state for one (provider, mode, model) key does not strip other keys&#x27; requests.</li>
 <li><code>test_compat_locks_present</code>: The plan-named locks exist and _compat_retry_lock is non-blocking.</li>
-  <li><code>test_compat_state_object_shape</code>: The owned state exists as one <code>_CompatState</code> singleton with live lock aliases; explicit <code>state=</code> injection isolates state (valid-file fill, failure branch leaves the injected entries empty, a <code>persist=False</code> mutate keeps the real state file untouched).</li>
+<li><code>test_compat_state_object_shape</code>: The owned state exists as one <code>_CompatState</code> singleton with live lock aliases; explicit <code>state=</code> injection isolates state (valid-file fill, failure branch leaves the injected entries empty, a <code>persist=False</code> mutate keeps the real state file untouched).</li>
 <li><code>test_compat_normalize_threshold_ladder</code>: Off-ladder thresholds snap onto the doubling ladder: the returned value is the largest ladder element &lt;= value, clamped to [COMPAT_INITIAL_THRESHOLD…</li>
 <li><code>test_compat_temp_file_cleanup</code>: A failed os.replace leaves no temp file behind: the persist failure path unlinks the unique-named temp file.</li>
 <li><code>test_compat_field_stripped_trace_accuracy</code>: compatibility_field_stripped fires only for requests whose outbound body was actually stripped — the probe-owning request emits compatibility_probe_started instead, so…</li>
+</ul>
+<h4><code>tests/test_compat_cm.py</code> — context_management live loop</h4>
+<ul>
 <li><code>test_compat_detector_message_form</code>: The exact observed message-form 400 triggers exactly one stripped compatibility retry.</li>
 <li><code>test_compat_detector_structured</code>: A structured extra_forbidden 400 identifying the top-level field triggers exactly one stripped compatibility retry.</li>
 <li><code>test_compat_detector_nested_path_rejected</code>: A nested-path rejection (tools.0.input.context_management) does not trigger a compatibility retry.</li>
@@ -683,30 +704,40 @@ EOF</code></pre>
 <li><code>test_compat_non_matching_400_passthrough</code>: A non-matching 400 on a context_management request passes through with no compatibility retry and no state change.</li>
 <li><code>test_compat_one_retry_cap</code>: At most one compatibility retry per client request (COMPAT_MAX_RETRIES_PER_REQUEST = 1).</li>
 <li><code>test_compat_count_tokens_excluded</code>: count_tokens requests skip compatibility processing entirely.</li>
+</ul>
+<h4><code>tests/test_compat_policy.py</code> — context_management switch policy</h4>
+<ul>
 <li><code>test_compat_initial_threshold_probe</code>: Exactly 32 strips precede the first unstripped probe; the request whose strip count reaches the threshold IS the probe (unstripped), and its rejected result is retried…</li>
 <li><code>test_compat_rejection_doubles_threshold</code>: A rejected probe doubles the threshold (capped at max) and persists the doubled value.</li>
 <li><code>test_compat_probation_cycle</code>: After a successful probe, the entry enters probation: 8 strips, then the next probe; one success keeps probation.</li>
 <li><code>test_compat_delist_after_two_successes</code>: A seeded probation entry earns two successful probes and is delisted; afterwards requests are no longer stripped.</li>
 <li><code>test_compat_inconclusive_reschedules</code>: An inconclusive probe (non-matching 500) resets the strip counter and reschedules at the current threshold without doubling.</li>
 <li><code>test_compat_probe_counter_semantics</code>: Repeated rejection from probation resets probation to zero but keeps (and further doubles) the threshold — it never resets to base.</li>
+</ul>
+<h4><code>tests/test_compat_retry.py</code> — retry orchestration and trace privacy</h4>
+<ul>
 <li><code>test_compat_single_retry_global</code>: Concurrent first-time requests. The <code>context_management</code> half: exactly one compatibility retry occurs globally; losers receive the original 400. The <code>reasoning_field</code> half (rewritten 2026-10-22 by this plan): five concurrent chat clients <strong>all</strong> receive 2xx (a client whose selection read lands after the credit switch is served directly, without complaining); the number of lock-free rescues equals the number of complaints the mock received, and the shared-key credit drained during the episode, so a switch happened (asserted through the switch event / the moved selection, never an exact end state).</li>
 <li><code>test_compat_retry_lock_released_on_exception</code>: An upstream failure during the compatibility retry releases the retry lock: later requests can still retry and learn.</li>
 <li><code>test_compat_config_swap_during_retry</code>: The compatibility retry uses the entry-time config snapshot: the in-flight request completes against its original provider, and the admin switch (drained afterwards)…</li>
 <li><code>test_compat_retry_stream_interaction</code>: Interaction with streaming and the existing retry loop: learning works from streamed 2xx (status-receipt evidence, no rollback on mid-stream failure), and the 429/503…</li>
 <li><code>test_compat_trace_metadata_only</code>: All compatibility_* trace events are metadata-only: no field values, no prompt text, no raw upstream error text.</li>
-<li><code>test_reasoning_present_gates_on_demanding_turn</code> (added 2026-10-23): The demanding-turn gate — a bare demanding turn over a reasoned history is not learnable; a reasoned demanding turn is; reasoning with no tool-call turn anywhere is not; a later assistant turn carrying no <code>tool_use</code> does not change the verdict (the scan runs from the end and skips past it); totality guards hold.</li>
-<li><code>test_reasoning_rescue_repairs_forwarded_body</code> (added 2026-10-23): The repair contract on the wire — a rescue pass's <em>forwarded body</em> carries the injected field on every assistant message (the real reasoning where available, <code>""</code> otherwise), for both a real field candidate and a <code>"none"</code> candidate.</li>
+</ul>
+<h4><code>tests/test_compat_reasoning.py</code> — reasoning_field credit learner</h4>
+<ul>
 <li><code>test_reasoning_walk_sends_advanced_candidate</code>: Each rescue pass sends the advanced candidate's field, including the wrap pass whose candidate is the literal <code>"none"</code> — where the field <em>actually sent</em> is the resolved <code>effective_field</code>, since a <code>"none"</code> candidate has no field name to write (revised 2026-10-23 to the fallback and <code>effective_field</code>).</li>
 <li><code>test_reasoning_non_complaint_errors_are_not_counted</code>: A 401/403/500, an unparseable body, and a 400 naming no field change no credit and start no rescue; a rescue pass returning one stops the rescue, with attempt 1's original error returned to the client.</li>
-<li><code>test_reasoning_matcher_shapes</code>: The reasoning matcher's accept/reject contract — message form, structured <code>loc</code> form, sentence-final form; rejects the dotted prose path, an echoed request payload, and every non-400. Revised 2026-10-25: its deep-body branch now exercises the nesting check (the body is refused before the parse) rather than an interpreter <code>RecursionError</code>.</li>
 <li><code>compat-guarded-parse-nesting-limit</code> (added 2026-10-25): <code>_compat_guarded_parse</code> refuses a >limit error body <em>without parsing it</em> — returning <code>None</code> and logging <code>nesting_limit_exceeded</code> at <code>site: &quot;compat_error_body&quot;</code> with the shared builder's exact field set (<code>timestamp</code>, <code>event</code>, <code>site</code>, <code>depth</code>, <code>offset</code>, <code>path</code>, <code>degrade</code> — null here, a well-formed crossing resolves a path; no request_id, provider, tier or mode) — so an over-deep body cannot register a complaint. This is the one test that pins the event's full key set, so a field added to the single-sourced builder fails here.</li>
+<li><code>test_reasoning_matcher_shapes</code>: The reasoning matcher's accept/reject contract — message form, structured <code>loc</code> form, sentence-final form; rejects the dotted prose path, an echoed request payload, and every non-400. Revised 2026-10-25: its deep-body branch now exercises the nesting check (the body is refused before the parse) rather than an interpreter <code>RecursionError</code>.</li>
 <li><code>test_reasoning_delist_on_none_success</code>: A credit-driven switch whose next candidate is <code>"none"</code> removes the entry rather than writing <code>selection: "none"</code> — the switch, not a served candidate, is what delists (rewritten 2026-10-22 to the credit model; revised 2026-10-23 to assert the repaired bytes are served and the pass reports candidate <code>none</code> with its <code>effective_field</code>).</li>
 <li><code>test_reasoning_credit_saturates_and_drains</code> (added 2026-10-22): With <code>reasoning_field_switch</code> set small (4/2), the credit saturates at <code>saturation_max</code> under gate-true successes (many successes never exceed the cap) and drains one step per matched complaint; a switch persists exactly on the edge where a decrement reaches zero — asserted through the persisted selection and the switch event — the credit is re-armed to <code>saturation_on_switch</code>, so the next switch needs exactly that many further complaints, and the advance moves one step from the <em>entry's current</em> selection.</li>
+<li><code>test_reasoning_present_gates_on_demanding_turn</code> (added 2026-10-23): The demanding-turn gate — a bare demanding turn over a reasoned history is not learnable; a reasoned demanding turn is; reasoning with no tool-call turn anywhere is not; a later assistant turn carrying no <code>tool_use</code> does not change the verdict (the scan runs from the end and skips past it); totality guards hold.</li>
 <li><code>test_reasoning_rescued_success_does_not_teach</code> (added 2026-10-22): The attempt-1-only pin — a rescued 2xx must not refill the credit, so <code>saturation_on_switch</code> consecutive episodes in which attempt 1 complains and the rescue serves still drain the credit to zero and switch.</li>
 <li><code>test_reasoning_rescue_runs_without_thinking</code> (added 2026-10-22): A matched complaint on a body with <strong>no</strong> thinking block is still rescued — the gate-false case, where the rescue is the only thing that can serve. A mock that 400s the first call and 200s the second yields a client 200 plus a <code>reasoning_rescue</code> event, and the persisted selection is unchanged after several such episodes: gate-false complaints are not learning evidence.</li>
 <li><code>test_reasoning_rescue_events_and_merge</code> (added 2026-10-22): The rescue's trace and merge contract — one <code>reasoning_rescue</code> event per pass with the documented key set <em>exactly</em> (the data-exposure invariant pinned as a contract; the set gained <code>effective_field</code> 2026-10-23); on exhaustion the client receives attempt 1's original error (status and shape); a 429/503 on a rescue pass stops the rescue and serves attempt 1's error; the entry's <code>retries</code> still counts 429/503 retries only.</li>
+<li><code>test_reasoning_rescue_repairs_forwarded_body</code> (added 2026-10-23): The repair contract on the wire — a rescue pass's <em>forwarded body</em> carries the injected field on every assistant message (the real reasoning where available, <code>""</code> otherwise), for both a real field candidate and a <code>"none"</code> candidate.</li>
 <li><code>test_reasoning_switch_params_carried_across_admin</code> (added 2026-10-22): A non-default <code>reasoning_field_switch</code> in the fixture's <code>models.json</code> survives both admin paths — <code>/admin/api/switch</code> and <code>/admin/api/reload</code> keep the effective policy, observable through drain/threshold behaviour — and a reload whose <code>reasoning_field_switch</code> is structurally invalid is refused with a 400 and installs nothing.</li>
 </ul>
+
 
 <h3 id="cat-8">Category 8 — Admin API</h3>
 
@@ -1301,7 +1332,9 @@ counted.</p>
   <li>Put it in the module matching the area it exercises (see <a href="#catalog">the catalog</a>).
       If no module matches, a new one is fine — but read step 3 first.</li>
   <li>Add the function to that module's <code>ALL_TESTS</code> list.</li>
-  <li><strong>If you created a new module, register it in the aggregator.</strong>
+  <li><strong>If you created a new module, register it in the aggregator</strong> — or, for a
+      sub-module of a partitioned area, through that area's kept module's chained
+      <code>ALL_TESTS</code> (the <code>tests/test_compat.py</code> pattern).
       <code>tests/test_claude_proxy.py</code> imports every module's <code>ALL_TESTS</code>
       explicitly — there is no discovery, no <code>conftest.py</code>, and no pytest config — so a
       module that is not imported <strong>never runs</strong>: the suite stays green while
