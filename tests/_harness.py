@@ -1738,11 +1738,13 @@ def _trace_events_named(trace_file, event_name):
 
 
 def _wait_for_trace_events(trace_file, event_name, timeout_s=3.0):
-    """Poll `trace_file` until at least one `event_name` event appears.
+    """Poll trace_file until at least one `event_name` event appears.
 
-    A client that returns as soon as the terminal frames land can outrun the
-    proxy's trace write, so an immediate single read races the proxy process.
-    Returns the events found, or [] if none landed within `timeout_s`.
+    A client that returns at message_stop can outrun the proxy's trace write:
+    the terminal frames are flushed to the wire before chat_sse_drain (or the
+    detector events) reach the sink, so a single immediate read races the
+    proxy process. Returns the events found, or [] if none landed within
+    `timeout_s` seconds.
     """
     deadline = time.time() + timeout_s
     while True:
@@ -1750,6 +1752,16 @@ def _wait_for_trace_events(trace_file, event_name, timeout_s=3.0):
         if out or time.time() >= deadline:
             return out
         time.sleep(0.05)
+
+
+
+
+def _message_delta_usage(frames):
+    """Return the usage dict on the first message_delta frame, or None."""
+    deltas = _sse_frames_with_type(frames, "message_delta")
+    if not deltas:
+        return None
+    return deltas[0].get("usage")
 
 
 

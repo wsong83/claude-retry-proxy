@@ -9,6 +9,7 @@
 
 | Issue | Status | Found | Resolved | Resolved By |
 |-------|--------|-------|----------|-------------|
+| 2026-11-26-consolidate-trace-helpers cross-reference — Consolidate the byte-identical `_trace_events_named` (and docstring-only `_wait_for_trace_events`) copies between `tests/_harness.py` and the drain file. | Resolved | 2026-11-26 | 2026-11-26 | plan 2026-11-26-consolidate-trace-helpers — Consolidated 2026-11-26: both names (plus the same-block sibling `_message_delta_usage`) are harness-only; the drain file and all four consumers import from `_harness`; the sibling-import seam is dissolved. |
 
 ## Guidance for Coder
 
@@ -251,7 +252,7 @@ Documentation tasks you will execute yourself (not the coder):
 
 ### Recorded follow-ups (out of scope, from the plan)
 
-- Consolidate the byte-identical `_trace_events_named` (and docstring-only `_wait_for_trace_events`) copies between `tests/_harness.py` and the drain file.
+- ~~Consolidate the byte-identical `_trace_events_named` (and docstring-only `_wait_for_trace_events`) copies between `tests/_harness.py` and the drain file.~~ Resolved 2026-11-26 by plan 2026-11-26-consolidate-trace-helpers: Consolidated 2026-11-26: both names (plus the same-block sibling `_message_delta_usage`) are harness-only; the drain file and all four consumers import from `_harness`; the sibling-import seam is dissolved.
 - Add a standing suite assertion for the harness-before-package import order across `tests/*.py` so the rule outlives this plan's transient gates.
 
 (Populated after implementation completes; commit and evidence sweep ride `/update-and-commit` on user approval.)

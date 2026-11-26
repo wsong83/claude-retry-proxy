@@ -14,16 +14,14 @@ from _harness import (
     _sse_frame_type,
     _sse_stream_chunks,
     _start_mode_proxy,
+    _trace_events_named,
     _wait_admin_swapping,
+    _wait_for_trace_events,
     _wait_upstream_request,
     fail,
     find_free_port,
     pass_,
     run_cli,
-)
-from test_chat_sse_drain import (
-    _trace_events_named,
-    _wait_for_trace_events,
 )
 
 

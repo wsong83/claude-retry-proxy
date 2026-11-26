@@ -14,12 +14,12 @@ from _harness import (
     _sse_stream_chunks,
     _sse_types,
     _start_mode_proxy,
+    _trace_events_named,
     fail,
     find_free_port,
     pass_,
     run_cli,
 )
-from test_chat_sse_drain import _trace_events_named
 
 
 # --- Retry-nudge: the unfinished-turn detector acts (2026-10-05 plan) ---

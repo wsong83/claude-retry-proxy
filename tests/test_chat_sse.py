@@ -12,6 +12,7 @@ import time
 from _harness import (
     _cc,
     _chat_sse_fetch_frames,
+    _message_delta_usage,
     _mode_tiers,
     _parse_sse_frames,
     _send_proxy_request_stream,
@@ -22,15 +23,12 @@ from _harness import (
     _sse_types,
     _start_chat_sse_proxy,
     _start_mode_proxy,
+    _trace_events_named,
+    _wait_for_trace_events,
     fail,
     find_free_port,
     pass_,
     run_cli,
-)
-from test_chat_sse_drain import (
-    _message_delta_usage,
-    _trace_events_named,
-    _wait_for_trace_events,
 )
 
 

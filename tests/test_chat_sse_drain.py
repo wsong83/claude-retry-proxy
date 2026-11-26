@@ -20,6 +20,7 @@ from _harness import (
     _create_test_config,
     _create_test_keys_plain,
     _degraded_trace_events,
+    _message_delta_usage,
     _mode_tiers,
     _models_for_vendors,
     _parse_sse_frames,
@@ -34,6 +35,8 @@ from _harness import (
     _start_chat_sse_proxy,
     _start_mode_proxy,
     _start_proxy_server_directly,
+    _trace_events_named,
+    _wait_for_trace_events,
     fail,
     find_free_port,
     pass_,
@@ -164,50 +167,6 @@ def _read_sse_until_stop(port, deadline_s, body=None):
         elapsed = time.time() - start
         conn.close()
     return b"".join(chunks), saw_stop, elapsed
-
-
-def _trace_events_named(trace_file, event_name):
-    """Return every trace event in `trace_file` whose "event" is `event_name`."""
-    out = []
-    if not trace_file or not os.path.exists(trace_file):
-        return out
-    with open(trace_file) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                ev = json.loads(line)
-            except Exception:
-                continue
-            if ev.get("event") == event_name:
-                out.append(ev)
-    return out
-
-
-def _wait_for_trace_events(trace_file, event_name, timeout_s=3.0):
-    """Poll trace_file until at least one `event_name` event appears.
-
-    A client that returns at message_stop can outrun the proxy's trace write:
-    the terminal frames are flushed to the wire before chat_sse_drain (or the
-    detector events) reach the sink, so a single immediate read races the
-    proxy process. Returns the events found, or [] if none landed within
-    `timeout_s` seconds.
-    """
-    deadline = time.time() + timeout_s
-    while True:
-        out = _trace_events_named(trace_file, event_name)
-        if out or time.time() >= deadline:
-            return out
-        time.sleep(0.05)
-
-
-def _message_delta_usage(frames):
-    """Return the usage dict on the first message_delta frame, or None."""
-    deltas = _sse_frames_with_type(frames, "message_delta")
-    if not deltas:
-        return None
-    return deltas[0].get("usage")
 
 
 # ===========================================================================

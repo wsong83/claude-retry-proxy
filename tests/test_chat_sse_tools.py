@@ -19,14 +19,12 @@ from _harness import (
     _sse_types,
     _start_chat_sse_proxy,
     _start_mode_proxy,
+    _trace_events_named,
+    _wait_for_trace_events,
     fail,
     find_free_port,
     pass_,
     run_cli,
-)
-from test_chat_sse_drain import (
-    _trace_events_named,
-    _wait_for_trace_events,
 )
 from claude_retry_proxy.nesting import MAX_JSON_NESTING_DEPTH
 
