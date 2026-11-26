@@ -24,6 +24,10 @@ from test_cli import ALL_TESTS as CLI_TESTS
 from test_mode_dispatch import ALL_TESTS as MODE_DISPATCH_TESTS
 from test_chat_transform import ALL_TESTS as CHAT_TRANSFORM_TESTS
 from test_chat_sse import ALL_TESTS as CHAT_SSE_TESTS
+from test_chat_sse_drain import ALL_TESTS as CHAT_SSE_DRAIN_TESTS
+from test_chat_sse_tools import ALL_TESTS as CHAT_SSE_TOOLS_TESTS
+from test_chat_nudge import ALL_TESTS as CHAT_NUDGE_TESTS
+from test_chat_sse_swap import ALL_TESTS as CHAT_SSE_SWAP_TESTS
 from test_response_transform import ALL_TESTS as RESPONSE_TRANSFORM_TESTS
 from test_compat import ALL_TESTS as COMPAT_TESTS
 from test_sinks import ALL_TESTS as SINKS_TESTS
@@ -55,6 +59,10 @@ ALL_TESTS = (
     MODE_DISPATCH_TESTS +
     CHAT_TRANSFORM_TESTS +
     CHAT_SSE_TESTS +
+    CHAT_SSE_DRAIN_TESTS +
+    CHAT_SSE_TOOLS_TESTS +
+    CHAT_NUDGE_TESTS +
+    CHAT_SSE_SWAP_TESTS +
     RESPONSE_TRANSFORM_TESTS +
     COMPAT_TESTS +
     SINKS_TESTS +
