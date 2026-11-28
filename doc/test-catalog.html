@@ -194,7 +194,18 @@ not carried — recount on demand with the command above, or read the aggregator
 <tr><td><code>test_swap_drain.py</code></td>
     <td><code>swap_drain._drain</code> singleton invariants — snapshot-under-lock admission, the complete() shape contract, RLock reentrancy, single-flight refusal, and predicate semantics</td></tr>
 <tr><td><code>test_retry_streaming.py</code></td>
-    <td>Retry behaviour, streaming, response-size caps</td></tr>
+    <td>Retry backoff, 429/503 exhaustion envelopes, give-up body preservation
+        (kept module; chains the five sub-module <code>ALL_TESTS</code> lists)</td></tr>
+<tr><td><code>test_retry_streaming_count_tokens.py</code></td>
+    <td>The <code>disable_retry_claude_count_tokens</code> flag across failure paths, anchoring, and types</td></tr>
+<tr><td><code>test_retry_streaming_flow.py</code></td>
+    <td>Streaming bodies, mid-stream failure, response-size caps, stall bounds, swap-abort SSE fallback</td></tr>
+<tr><td><code>test_retry_streaming_concurrency.py</code></td>
+    <td>Concurrent requests, retry-path thread safety, 429 drain bounding, accept backlog</td></tr>
+<tr><td><code>test_retry_streaming_disconnects.py</code></td>
+    <td>Client disconnects, trace-write failure, stderr misclassification guards</td></tr>
+<tr><td><code>test_retry_streaming_transport.py</code></td>
+    <td>Entry auth, Accept-Encoding identity, cookie isolation, IPv6 URLs</td></tr>
 <tr><td><code>test_config_keys.py</code></td>
     <td>Config validation, key decryption, multi-key shapes</td></tr>
 <tr><td><code>test_config_split.py</code></td>
@@ -361,40 +372,55 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> The retry ladder, the streaming and buffered response paths, and the body/response size limits that cut them short.</p>
 
-<h4><code>tests/test_retry_streaming.py</code> — retry, streaming, size caps</h4>
+<h4><code>tests/test_retry_streaming.py</code> — retry backoff and exhaustion envelopes</h4>
 <ul>
-<li><code>test_concurrent_requests</code>: 10+ parallel requests complete successfully.</li>
 <li><code>test_retry_logic</code>: Start proxy; mock upstream returns 503 3x then 200; verify exponential backoff.</li>
 <li><code>test_retry_429</code>: Mock upstream returns 429 3x then 200; assert success, trace reason:&#x27;429&#x27;.</li>
 <li><code>test_retry_429_exhaust_returns_429</code>: Mock upstream always returns 429; verify client gets 429 on exhaustion.</li>
-<li><code>test_thread_safety</code>: N parallel requests produce exactly N trace entries (no lost entries).</li>
-<li><code>test_proxy_listen_backlog</code> (added 2026-11-19): The listener's accept backlog is pinned — <code>_ProxyHTTPServer.request_queue_size == 128</code> (socketserver's default 5 overflowed under simultaneous bursts; see <a href="operations.html#readiness">operations.html</a>). Permanent guard so a future server-class refactor cannot silently revert the backlog.</li>
-<li><code>test_start_no_auth_header_required</code>: Start proxy, send POST without X-Proxy-Auth header; assert 200 (forwarded).</li>
 <li><code>test_exhaust_429_preserves_body</code>: Mock upstream always returns 429 with body &#x27;{&quot;error&quot;:&quot;rate_limited&quot;}&#x27;; PROXY_MAX_RETRIES=1; verify client receives 429 with body containing &#x27;rate_limited&#x27; (not empty)…</li>
 <li><code>test_exhaust_connection_error_synthesizes_body</code>: Point proxy at a port with no listener; PROXY_MAX_RETRIES=1; verify trace &#x27;error&#x27; field contains &#x27;upstream_unreachable&#x27; (not &#x27;HTTP 0&#x27;).</li>
-<li><code>test_client_disconnect_no_traceback</code>: Start proxy with mock upstream returning 200; send request via raw socket, close socket before reading response; assert stderr has no Traceback, contains &#x27;[proxy] client…</li>
-<li><code>test_streaming_response_body</code>: Mock upstream streams 5 chunks with 50ms delays between them; proxy forwards to the client in real time; client reads incrementally. Verify: (a) first byte arrives…</li>
-<li><code>test_streaming_mid_stream_upstream_failure</code>: Two mock modes validate the proxy&#x27;s dual-path truncation detection:</li>
 <li><code>test_empty_body_429_exhaust</code>: Mock upstream always returns 429 with Content-Length: 0 (empty body) through all retries; PROXY_MAX_RETRIES=1. The client must receive a proper HTTP 429 status line (not…</li>
+<li><code>test_give_up_truncated_body_envelope</code>: A truncated give-up body carries <code>upstream_body_truncated</code> and the status-appropriate <code>error.type</code>. On retry exhaustion the loop drains the upstream body through <code>_read_capped</code>; when that drain hits <code>PROXY_MAX_BODY_SIZE</code> the proxy substitutes its own body.</li>
+<li><code>test_retry_stability_extra_header</code>: A 429-retried request to a ruled provider carries the SAME x-opencode-session value on every attempt.</li>
+<li><code>test_connection_error_retry_mapping</code> (added 2026-11-15): A mid-response reset surfaces as a <code>retry</code> trace event with <code>reason: &quot;connection_error&quot;</code> under the httpx2 exception mapping (<code>RemoteProtocolError</code> is a <code>RequestError</code>).</li>
+<li><code>test_forward_failure_returns_envelope</code> (added 2026-11-15): An exception outside the retry tuple (an <code>InvalidURL</code> from a NUL in the vendor host) yields the 502 <code>upstream_unreachable</code> envelope and a <code>forward_failed</code> trace entry — never a closed connection with no record (the do_POST outer guard).</li>
+</ul>
+<h4><code>tests/test_retry_streaming_count_tokens.py</code> — the count-tokens retry flag</h4>
+<ul>
 <li><code>test_disable_retry_count_tokens_503</code>: Flag=true, upstream 503s /count_tokens → exactly 1 attempt, drained body returned.</li>
 <li><code>test_disable_retry_count_tokens_conn_error</code>: Flag=true, upstream connection reset → 1 attempt, upstream_unreachable body.</li>
 <li><code>test_disable_retry_count_tokens_normal_path_unaffected</code>: Flag=true, /v1/messages still retries normally (503 then 200).</li>
 <li><code>test_disable_retry_count_tokens_false_retries</code>: Flag=false, count_tokens still retries (503 then 200).</li>
 <li><code>test_disable_retry_count_tokens_path_anchoring</code>: Flag=true: only /v1/messages/count_tokens* is affected; /v1/messages, /v1/messages?x=count_tokens, /v1/messages/count_tokens_batch retry normally.</li>
 <li><code>test_disable_retry_count_tokens_invalid_type</code>: validate_config rejects non-boolean disable_retry_claude_count_token — and, beside it (extended 2026-10-22), the <code>reasoning_field_switch</code> rejection surface: non-object, non-int/bool field values, values below 1, unknown inner keys, and the <em>effective</em> pair <code>{"saturation_max": 2}</code> against the defaulted <code>saturation_on_switch</code> 3 (refused, not clamped), with a valid 4/2 pair accepted.</li>
+</ul>
+<h4><code>tests/test_retry_streaming_flow.py</code> — streaming and response flow</h4>
+<ul>
+<li><code>test_streaming_response_body</code>: Mock upstream streams 5 chunks with 50ms delays between them; proxy forwards to the client in real time; client reads incrementally. Verify: (a) first byte arrives…</li>
+<li><code>test_streaming_mid_stream_upstream_failure</code>: Two mock modes validate the proxy&#x27;s dual-path truncation detection:</li>
 <li><code>test_buffered_response_size_cap</code>: Buffered 2xx-JSON and non-2xx response paths cap the upstream body at PROXY_MAX_RESPONSE_SIZE: the body is truncated, a response_size_cap_exceeded trace event fires, and…</li>
-<li><code>test_retry_stability_extra_header</code>: A 429-retried request to a ruled provider carries the SAME x-opencode-session value on every attempt.</li>
+<li><code>test_response_mode_swap_aborts_sse_fallback</code>: In response mode, the SSE-fallback drain's epoch check stops the drain and closes once a swap completes — the client never receives old-routing bytes after the swap, and a <code>swap_abort</code> event fires with phase <code>stream</code>.</li>
+<li><code>test_stream_read_timeout_bounds_stall</code> (added 2026-11-15): With <code>PROXY_READ_TIMEOUT=10</code> (the validation floor), a silent SSE stream ends the client-visible response at ≈ the read timeout instead of hanging — the timeout plumbing bounds reads end-to-end.</li>
+</ul>
+<h4><code>tests/test_retry_streaming_concurrency.py</code> — concurrency and listener</h4>
+<ul>
+<li><code>test_concurrent_requests</code>: 10+ parallel requests complete successfully.</li>
+<li><code>test_thread_safety</code>: N parallel requests produce exactly N trace entries (no lost entries).</li>
+<li><code>test_429_drain_bounded</code> (added 2026-11-15): A 429 whose body ignores the identity pin (a real gzip blob, 8&nbsp;MiB decoded) and exceeds <code>PROXY_MAX_BODY_SIZE</code> still retries cleanly — the bounded non-decoding drain neither hangs nor decompresses into memory.</li>
+<li><code>test_proxy_listen_backlog</code> (added 2026-11-19): The listener's accept backlog is pinned — <code>_ProxyHTTPServer.request_queue_size == 128</code> (socketserver's default 5 overflowed under simultaneous bursts; see <a href="operations.html#readiness">operations.html</a>). Permanent guard so a future server-class refactor cannot silently revert the backlog.</li>
+</ul>
+<h4><code>tests/test_retry_streaming_disconnects.py</code> — disconnects and stderr classification</h4>
+<ul>
+<li><code>test_client_disconnect_no_traceback</code>: Start proxy with mock upstream returning 200; send request via raw socket, close socket before reading response; assert stderr has no Traceback, contains &#x27;[proxy] client…</li>
 <li><code>test_trace_write_failure_does_not_duplicate_upstream_request</code>: A trace-write failure inside the retry loop must not be misread as a connection error and re-issue the upstream POST.</li>
 <li><code>test_retry_path_print_failure_does_not_misclassify</code>: A failing print inside the retry loop must not read as a connection error.</li>
-<li><code>test_give_up_truncated_body_envelope</code>: A truncated give-up body carries <code>upstream_body_truncated</code> and the status-appropriate <code>error.type</code>. On retry exhaustion the loop drains the upstream body through <code>_read_capped</code>; when that drain hits <code>PROXY_MAX_BODY_SIZE</code> the proxy substitutes its own body.</li>
-<li><code>test_response_mode_swap_aborts_sse_fallback</code>: In response mode, the SSE-fallback drain's epoch check stops the drain and closes once a swap completes — the client never receives old-routing bytes after the swap, and a <code>swap_abort</code> event fires with phase <code>stream</code>.</li>
+</ul>
+<h4><code>tests/test_retry_streaming_transport.py</code> — upstream transport</h4>
+<ul>
+<li><code>test_start_no_auth_header_required</code>: Start proxy, send POST without X-Proxy-Auth header; assert 200 (forwarded).</li>
 <li><code>test_upstream_accept_encoding_identity</code> (added 2026-11-15): The forwarded upstream request carries exactly one <code>Accept-Encoding: identity</code> — the defence-in-depth pin (correctness rests on <code>iter_raw</code>, which is byte-faithful regardless).</li>
 <li><code>test_upstream_cookie_isolation</code> (added 2026-11-15): A <code>Set-Cookie</code> on request 1 never replays as a <code>Cookie</code> header on request 2 to the same provider — the per-chain client lifetime keeps cross-request state out of the wire.</li>
-<li><code>test_stream_read_timeout_bounds_stall</code> (added 2026-11-15): With <code>PROXY_READ_TIMEOUT=10</code> (the validation floor), a silent SSE stream ends the client-visible response at ≈ the read timeout instead of hanging — the timeout plumbing bounds reads end-to-end.</li>
-<li><code>test_connection_error_retry_mapping</code> (added 2026-11-15): A mid-response reset surfaces as a <code>retry</code> trace event with <code>reason: &quot;connection_error&quot;</code> under the httpx2 exception mapping (<code>RemoteProtocolError</code> is a <code>RequestError</code>).</li>
-<li><code>test_forward_failure_returns_envelope</code> (added 2026-11-15): An exception outside the retry tuple (an <code>InvalidURL</code> from a NUL in the vendor host) yields the 502 <code>upstream_unreachable</code> envelope and a <code>forward_failed</code> trace entry — never a closed connection with no record (the do_POST outer guard).</li>
 <li><code>test_ipv6_provider_url_routes</code> (added 2026-11-15): A provider URL with an IPv6-literal authority (<code>http://[::1]:port/v1</code>) routes to a local stub — the bracketed <code>host_part</code> builds a valid <code>base_url</code> instead of raising <code>InvalidURL</code> at construction.</li>
-<li><code>test_429_drain_bounded</code> (added 2026-11-15): A 429 whose body ignores the identity pin (a real gzip blob, 8&nbsp;MiB decoded) and exceeds <code>PROXY_MAX_BODY_SIZE</code> still retries cleanly — the bounded non-decoding drain neither hangs nor decompresses into memory.</li>
 </ul>
 
 <h4><code>tests/test_unit.py</code> — delay and header helpers</h4>
@@ -1205,7 +1231,7 @@ headers, path, and body — rather than only on what came back.</p>
 <tr><td><code>_send_proxy_request_stream(port, body, path)</code></td><td>Send and read a streaming response</td></tr>
 <tr><td><code>_admin_get</code> / <code>_admin_post</code></td><td>Hit the admin API with a correct Origin by default. <code>_admin_post</code> also carries the transport tolerance its sibling <code>_send_proxy_request</code> has: a <code>ConnectionAbortedError</code> or other transport abort during the request/read is returned as <code>(0, str(e))</code> rather than raised, so a whole-suite abort under load surfaces as a <strong>failed assertion carrying the error text</strong> instead of <code>Test crashed</code> with no diagnostic. The error is a <code>str</code>, not the sibling's <code>bytes</code>, matching <code>_admin_post</code>'s own decoded-<code>str</code> contract</td></tr>
 <tr><td><code>_drain_child_stderr(proc)</code></td>
-    <td>Install a daemon reader for a long-lived child's stderr so the ~64&nbsp;KiB pipe buffer cannot fill and block the child. Called at spawn time by the spawn helpers (<code>_start_proxy_server_directly</code>, and <code>_spawn_proxy_with_bind_retry</code> which delegates to it) and by the <strong>21 long-lived spawn sites whose children nothing else reads</strong> — 17 in <code>test_retry_streaming.py</code>, 4 in <code>test_trace.py</code>. The reader is keyed <em>by the child</em> (<code>weakref.WeakKeyDictionary</code>), so its buffer is released when the child is collected rather than by an address that a later child could reuse</td></tr>
+    <td>Install a daemon reader for a long-lived child's stderr so the ~64&nbsp;KiB pipe buffer cannot fill and block the child. Called at spawn time by the spawn helpers (<code>_start_proxy_server_directly</code>, and <code>_spawn_proxy_with_bind_retry</code> which delegates to it) and by the <strong>long-lived spawn sites whose children nothing else reads</strong>, spread across the retry-streaming test modules and <code>test_trace.py</code>. The reader is keyed <em>by the child</em> (<code>weakref.WeakKeyDictionary</code>), so its buffer is released when the child is collected rather than by an address that a later child could reuse</td></tr>
 <tr><td><code>_read_child_stderr(proc, timeout)</code></td>
     <td>Read a spawned child's stderr. This is the <strong>only</strong> accessor for a child whose stderr is drained at spawn: the reader owns that pipe, so <em>any</em> direct read returns <code>""</code> — a plain <code>proc.communicate()</code> (measured, plan 2026-10-15-test-harness-robustness's Step&nbsp;2 issue report) and equally a plain <code>proc.stderr.read()</code> (measured, that plan's Step&nbsp;6 issue: it is the one failure a whole-suite run caught, because the assertions that break <em>silently</em> are the ones checking for absence). Returns the retained buffer, so a repeat read gives the same text. Falls back to the original kill-then-<code>communicate()</code> path for every other child</td></tr>
 <tr><td><code>_parse_sse_frames(raw)</code>, <code>_sse_types(frames)</code>, <code>_sse_frames_with_type</code></td>
