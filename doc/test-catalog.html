@@ -164,7 +164,15 @@ not carried — recount on demand with the command above, or read the aggregator
     <td>Not a test module. Shared compatibility-learning fixtures and constants,
         moved byte-verbatim from <code>test_compat.py</code></td></tr>
 <tr><td><code>test_chat_transform.py</code></td>
-    <td>Anthropic → Chat Completions request and response transforms</td></tr>
+    <td>Anthropic → Chat request message conversion (kept module; chains the four sub-module <code>ALL_TESTS</code> lists)</td></tr>
+<tr><td><code>test_chat_transform_tools.py</code></td>
+    <td>Tools array, tool_choice mapping, request traces, tool-argument edge cases</td></tr>
+<tr><td><code>test_chat_transform_patterns.py</code></td>
+    <td>The shared pattern-sanitization helpers — unit tests plus the chat-mode confirmation</td></tr>
+<tr><td><code>test_chat_transform_chat_to_anthropic.py</code></td>
+    <td>Chat → Anthropic response conversion, tool-args degradation, nesting guards</td></tr>
+<tr><td><code>test_chat_transform_images.py</code></td>
+    <td>Image content blocks, both directions</td></tr>
 <tr><td><code>test_response_transform.py</code></td>
     <td>Anthropic → Responses request and response transforms</td></tr>
 <tr><td><code>test_chat_sse.py</code></td>
@@ -471,7 +479,7 @@ EOF</code></pre>
 
 <p><strong>Scope:</strong> The Anthropic↔Chat request and response conversions, including tool calls, thinking blocks, and cache control.</p>
 
-<h4><code>tests/test_chat_transform.py</code> — Anthropic → Chat request and response transforms</h4>
+<h4><code>tests/test_chat_transform.py</code> — Anthropic → Chat request messages</h4>
 <ul>
 <li><code>test_anthropic_to_chat_messages_transform</code>: Full message array (thinking/text/tool_use/tool_result) -&gt; valid OpenAI Chat messages, with each assistant turn collapsed to <em>one</em> message carrying its text and its <code>tool_calls</code> together.</li>
 <li><code>test_anthropic_to_chat_messages_thinking_stripped</code>: At the default selection no reasoning field is emitted for a thinking block; the echo is the learned per-pair selection's call, not an always-on conversion.</li>
@@ -481,23 +489,23 @@ EOF</code></pre>
 <li><code>test_anthropic_to_chat_messages_mixed_text_and_tool_use</code>: Assistant with both text and tool_use -&gt; <em>one</em> assistant message carrying the text and the <code>tool_calls</code> together.</li>
 <li><code>test_anthropic_to_chat_messages_mixed_text_and_tool_result</code>: User with both text and tool_result -&gt; tool message first, then user text message.</li>
 <li><code>test_anthropic_to_chat_messages_interleaved_thinking_tool_use</code>: Real-world interleaved pattern: thinking, text, tool_use, text in one assistant turn, collapsed to one message; also pins the default-selection no-echo behavior.</li>
+<li><code>test_chat_transform_emits_only_selected_field</code>: The request-direction selection matrix — no reasoning field for <code>none</code> (default, explicit, <code>None</code>, or an unrecognized value); exactly <code>reasoning_content</code> or exactly <code>reasoning</code> for those selections; never both. Extended 2026-10-23 with the <code>reasoning_always</code> axis: the selected field forced onto <em>every</em> assistant message once the conversation contains a tool call — the real reasoning where a thinking block exists, <code>""</code> where none does — and inert without any tool-call turn and inert for the <code>none</code> selection.</li>
+<li><code>test_anthropic_to_chat_injection_trace_counts</code> (added 2026-10-23, revised 2026-11-19): The injection event's <code>real</code> / <code>empty</code> counters — it fires only when <code>empty &gt; 0</code>; a redacted-only demanding turn behaves as a bare turn.</li>
+<li><code>test_anthropic_to_chat_real_thinking_and_redacted_dropped</code> (added 2026-10-24, revised 2026-11-19): A real <code>thinking</code> block is echoed regardless of a dropped <code>redacted_thinking</code> on the same turn — block order irrelevant — and the tripwire's per-block record carries <code>turn_has_thinking: true</code>; nothing blank filled means no injection event; the drop guard: a redacted-only demanding turn forwards <code>""</code> and counts <code>empty=1</code> with <code>content_block_dropped</code>.</li>
+<li><code>test_anthropic_to_chat_redacted_selection_without_always</code> (added 2026-11-19): The accepted presence delta — a learned selection with <code>reasoning_always</code> omitted forwards <em>no</em> reasoning field for a redacted-only demanding turn; the tripwire fires, the injection event does not; the <code>reasoning_field</code> rescue is the backstop (see the <a href="provider-modes.html#redacted-standing-note">standing design note</a>).</li>
 <li><code>test_anthropic_to_chat_messages_string_content_passthrough</code>: String content passes through unchanged in a NEW message dict (input not reused).</li>
 <li><code>test_anthropic_to_chat_messages_cache_control_stripped</code>: Block-level cache_control removed from blocks; cache_control_stripped trace event logged.</li>
 <li><code>test_anthropic_to_chat_messages_non_list_guarded</code>: Non-list messages input returns [].</li>
 <li><code>test_anthropic_to_chat_messages_non_dict_entries_skipped</code>: Non-dict message entries are skipped.</li>
 <li><code>test_anthropic_to_chat_messages_null_user_content</code>: Null user content becomes &#x27;&#x27; (OpenAI requires non-null user content).</li>
+</ul>
+
+<h4><code>tests/test_chat_transform_tools.py</code> — tools, tool_choice, and request traces</h4>
+<ul>
 <li><code>test_anthropic_to_chat_tools_transform</code>: Anthropic tools -&gt; OpenAI tools (input_schema -&gt; parameters).</li>
 <li><code>test_anthropic_to_chat_tools_cache_control_stripped</code>: cache_control on tool definitions is stripped; cache_control_stripped trace event logged.</li>
 <li><code>test_anthropic_to_chat_tools_non_list_guarded</code>: Non-list tools returns [] (tools: null treated as absent).</li>
 <li><code>test_anthropic_to_chat_tools_malformed_entries_skipped</code>: Entries missing name or input_schema are skipped with a content_block_dropped trace event.</li>
-<li><code>test_strip_regex_identity_escapes_table</code>: The ECMA identity-escape stripper's full reference table (metacharacter/letter-digit/class-`-` rows).</li>
-<li><code>test_sanitize_schema_patterns_walk</code>: The schema walk rewrites <code>pattern</code>/<code>patternProperties</code> at every depth, with totality across malformed shapes.</li>
-<li><code>test_sanitize_schema_patterns_no_mutation</code>: The walk never mutates its argument; returns a freshly-built structure.</li>
-<li><code>test_sanitize_schema_patterns_value_positions</code>: Position-aware split — <code>const</code>/<code>enum</code>/<code>default</code>/<code>examples</code> data is untouched while a property named <code>default</code> is still sanitized.</li>
-<li><code>test_sanitize_schema_patterns_collision_merge</code>: <code>patternProperties</code> keys that collapse to one after stripping merge as <code>allOf</code> rather than dropping an entry.</li>
-<li><code>test_anthropic_to_chat_tools_pattern_sanitized</code>: Chat mode sanitizes <code>input_schema</code> patterns before forwarding; input unmutated.</li>
-<li><code>test_sanitize_body_tools_sanitized_copy</code>: <code>_sanitize_body_tools</code> sanitizes tool schemas in a copy; input not mutated.</li>
-<li><code>test_sanitize_body_tools_totality</code>: <code>_sanitize_body_tools</code> totality across malformed bodies, tool entries and schemas.</li>
 <li><code>test_anthropic_to_chat_tool_choice_mapping</code>: All 4 tool_choice variants map correctly.</li>
 <li><code>test_anthropic_to_chat_tool_choice_none_omitted</code>: None/absent tool_choice is omitted from output.</li>
 <li><code>test_anthropic_to_chat_tool_choice_malformed_omitted</code>: Malformed/unknown tool_choice maps to None (omitted, defensive).</li>
@@ -510,10 +518,23 @@ EOF</code></pre>
 <li><code>test_anthropic_to_chat_nan_placeholder_with_valid_tool_use</code>: NaN tool_use alongside a valid one -&gt; <em>one</em> assistant message whose <code>content</code> carries the placeholder and whose <code>tool_calls</code> carries the surviving call; a turn in which <em>every</em> call was degraded stays plain text with no <code>tool_calls</code> key at all.</li>
 <li><code>test_anthropic_to_chat_tool_result_list_content</code>: tool_result.content as a list of text blocks is joined with newlines.</li>
 <li><code>test_anthropic_to_chat_no_input_mutation</code>: _anthropic_to_chat does not mutate the input dict or its nested structures.</li>
-<li><code>test_chat_transform_emits_only_selected_field</code>: The request-direction selection matrix — no reasoning field for <code>none</code> (default, explicit, <code>None</code>, or an unrecognized value); exactly <code>reasoning_content</code> or exactly <code>reasoning</code> for those selections; never both. Extended 2026-10-23 with the <code>reasoning_always</code> axis: the selected field forced onto <em>every</em> assistant message once the conversation contains a tool call — the real reasoning where a thinking block exists, <code>""</code> where none does — and inert without any tool-call turn and inert for the <code>none</code> selection.</li>
-<li><code>test_anthropic_to_chat_injection_trace_counts</code> (added 2026-10-23, revised 2026-11-19): The injection event's <code>real</code> / <code>empty</code> counters — it fires only when <code>empty &gt; 0</code>; a redacted-only demanding turn behaves as a bare turn.</li>
-<li><code>test_anthropic_to_chat_real_thinking_and_redacted_dropped</code> (added 2026-10-24, revised 2026-11-19): A real <code>thinking</code> block is echoed regardless of a dropped <code>redacted_thinking</code> on the same turn — block order irrelevant — and the tripwire's per-block record carries <code>turn_has_thinking: true</code>; nothing blank filled means no injection event; the drop guard: a redacted-only demanding turn forwards <code>""</code> and counts <code>empty=1</code> with <code>content_block_dropped</code>.</li>
-<li><code>test_anthropic_to_chat_redacted_selection_without_always</code> (added 2026-11-19): The accepted presence delta — a learned selection with <code>reasoning_always</code> omitted forwards <em>no</em> reasoning field for a redacted-only demanding turn; the tripwire fires, the injection event does not; the <code>reasoning_field</code> rescue is the backstop (see the <a href="provider-modes.html#redacted-standing-note">standing design note</a>).</li>
+<li><code>test_chat_anthropic_to_chat_zero_arg_tool</code>: A zero-argument call (<code>arguments: &quot;{}&quot;</code>) is valid, not malformed — it emits a real <code>tool_use</code> block with <code>input: {}</code>, claims <code>tool_use</code>, and fires no <code>tool_args_parse_failure</code>; a genuinely unparseable arguments string still degrades to the placeholder and <code>null</code>.</li>
+</ul>
+
+<h4><code>tests/test_chat_transform_patterns.py</code> — pattern sanitization</h4>
+<ul>
+<li><code>test_strip_regex_identity_escapes_table</code>: The ECMA identity-escape stripper's full reference table (metacharacter/letter-digit/class-`-` rows).</li>
+<li><code>test_sanitize_schema_patterns_walk</code>: The schema walk rewrites <code>pattern</code>/<code>patternProperties</code> at every depth, with totality across malformed shapes.</li>
+<li><code>test_sanitize_schema_patterns_no_mutation</code>: The walk never mutates its argument; returns a freshly-built structure.</li>
+<li><code>test_sanitize_schema_patterns_value_positions</code>: Position-aware split — <code>const</code>/<code>enum</code>/<code>default</code>/<code>examples</code> data is untouched while a property named <code>default</code> is still sanitized.</li>
+<li><code>test_sanitize_schema_patterns_collision_merge</code>: <code>patternProperties</code> keys that collapse to one after stripping merge as <code>allOf</code> rather than dropping an entry.</li>
+<li><code>test_anthropic_to_chat_tools_pattern_sanitized</code>: Chat mode sanitizes <code>input_schema</code> patterns before forwarding; input unmutated.</li>
+<li><code>test_sanitize_body_tools_sanitized_copy</code>: <code>_sanitize_body_tools</code> sanitizes tool schemas in a copy; input not mutated.</li>
+<li><code>test_sanitize_body_tools_totality</code>: <code>_sanitize_body_tools</code> totality across malformed bodies, tool entries and schemas.</li>
+</ul>
+
+<h4><code>tests/test_chat_transform_chat_to_anthropic.py</code> — Chat → Anthropic response conversion</h4>
+<ul>
 <li><code>test_chat_to_anthropic_basic</code>: content, model, stop_reason, usage mapped correctly.</li>
 <li><code>test_chat_to_anthropic_reasoning_content_to_thinking</code>: reasoning_content in the chat message becomes a thinking block first in content.</li>
 <li><code>test_chat_to_anthropic_reasoning_field_compat</code>: vLLM &#x27;reasoning&#x27; field is also recognized; reasoning_content wins when both present.</li>
@@ -525,14 +546,17 @@ EOF</code></pre>
 <li><code>test_chat_to_anthropic_usage_absent</code>: Missing usage maps to zero input/output tokens.</li>
 <li><code>test_chat_to_anthropic_content_array</code>: Array content blocks map individually.</li>
 <li><code>test_chat_to_anthropic_malformed_tool_args_text_block</code>: Malformed tool args degrade to a text block, not a tool_use with input {}.</li>
+<li><code>chat-to-anthropic-nesting-limit-tool-args</code>: A tool-arguments JSON string nested past <code>MAX_JSON_NESTING_DEPTH</code> degrades to the visible placeholder and logs <code>nesting_limit_exceeded</code> at <code>site: &quot;tool_args&quot;</code> — the depth rides inside a JSON string, so no outer body scan can bound it (added 2026-10-25).</li>
+<li><code>chat-to-anthropic-nesting-guard-total</code>: The widened catch around that parse is total — a <code>RecursionError</code> (monkeypatched) degrades to the same placeholder instead of escaping, which the previous <code>except json.JSONDecodeError</code> would have let through (added 2026-10-25).</li>
 <li><code>test_chat_to_anthropic_malformed_tool_args_mixed</code>: Mixed valid + malformed tool calls: valid tool_use kept, malformed degrades.</li>
-<li><code>test_chat_anthropic_to_chat_zero_arg_tool</code>: A zero-argument call (<code>arguments: &quot;{}&quot;</code>) is valid, not malformed — it emits a real <code>tool_use</code> block with <code>input: {}</code>, claims <code>tool_use</code>, and fires no <code>tool_args_parse_failure</code>; a genuinely unparseable arguments string still degrades to the placeholder and <code>null</code>.</li>
+</ul>
+
+<h4><code>tests/test_chat_transform_images.py</code> — image content blocks</h4>
+<ul>
 <li><code>test_anthropic_to_chat_image_blocks_converted</code>: User-message image blocks become <code>image_url</code> parts — base64 as <code>data:</code> URIs, url sources verbatim, images after the merged text part in block order; the string shape is kept for text-only messages; inconvertible images are dropped and counted.</li>
 <li><code>test_anthropic_to_chat_tool_result_images_converted</code>: Images nested in <code>tool_result</code> content ride the following user message as parts (pairing-independent), while the tool text stays on the <code>role:tool</code> message; malformed nested images are counted.</li>
 <li><code>test_anthropic_to_chat_image_blocks_no_mutation</code>: <code>_transform_anthropic_messages_to_chat</code> conversion does not mutate the input messages or the image blocks' nested structures.</li>
 <li><code>test_chat_to_anthropic_image_parts_filtered</code>: Response direction stays text-only by design — a provider <code>image_url</code> part in a buffered chat response is filtered, never converted to an Anthropic image block.</li>
-<li><code>chat-to-anthropic-nesting-limit-tool-args</code>: A tool-arguments JSON string nested past <code>MAX_JSON_NESTING_DEPTH</code> degrades to the visible placeholder and logs <code>nesting_limit_exceeded</code> at <code>site: &quot;tool_args&quot;</code> — the depth rides inside a JSON string, so no outer body scan can bound it (added 2026-10-25).</li>
-<li><code>chat-to-anthropic-nesting-guard-total</code>: The widened catch around that parse is total — a <code>RecursionError</code> (monkeypatched) degrades to the same placeholder instead of escaping, which the previous <code>except json.JSONDecodeError</code> would have let through (added 2026-10-25).</li>
 </ul>
 
 <h3 id="cat-5">Category 5 — Responses API Transforms</h3>
